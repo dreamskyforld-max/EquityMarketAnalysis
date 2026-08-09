@@ -1,0 +1,31 @@
+# EquityMarketAnalysis 依赖清单
+# 生成方式: .venv/bin/pip freeze 过滤项目真实使用的第三方库
+# 安装: python3 -m pip install -r requirements.txt
+
+# ── 数据库 (PostgreSQL) ──
+psycopg2-binary==2.9.12
+
+# ── 行情数据源 ──
+futu-api==10.4.6408          # 富途 OpenD（HK/SH 指数、逐笔、实时行情）
+akshare==1.18.60             # 新浪源国际指数(日经/KOSPI/DAX)、美债、南向资金、财务
+pandas-datareader==0.11.1    # FRED 美股指数/VIX/美债/美元指数
+
+# ── 调度 ──
+APScheduler==3.11.2          # market_scheduler 后台定时任务
+
+# ── 配置/工具 ──
+python-dotenv==1.2.2         # .env 加载 FRED_API_KEY 等
+
+# ── 数据处理 (akshare/pandas-datareader 间接依赖，显式锁定) ──
+pandas==3.0.2
+numpy==2.4.4
+requests==2.33.1
+lxml==6.1.0
+beautifulsoup4==4.14.3
+html5lib==1.1
+openpyxl==3.1.5
+multitasking==0.0.13
+trio-websocket==0.12.2
+websocket-client==1.9.0
+websockets==16.0
+requests-toolbelt==1.0.0
