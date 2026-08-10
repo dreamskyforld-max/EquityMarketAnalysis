@@ -12,8 +12,10 @@
 import os
 import sys
 import datetime
-from futu import OpenQuoteContext, RET_OK, KLType, AuType
-from db import get_conn, upsert
+from db import get_conn, bulk_upsert
+
+# futu 改为惰性导入：仅 backfill_futu 内部使用，避免无 futu 环境的服务器
+# （如只回补 A股/美债/外汇/国际指数时）在模块加载阶段即崩溃。
 
 # ── 自动加载 .env ──
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -30,8 +32,9 @@ BENCHMARKS = {
     # 富途 K线
     "HK.800000":  ("恒生指数",               "futu"),
     "HK.800700":  ("恒生科技指数",           "futu"),
-    "SH.000001":  ("上证指数",               "futu"),
-    "SZ.399001":  ("深证成指",               "futu"),
+    # A股指数（服务器端 futu 无权限，改用 AKShare 新浪 A 股指数源）
+    "SH.000001":  ("上证指数",               "sina_a"),
+    "SZ.399001":  ("深证成指",               "sina_a"),
     # FRED
     "US.SP500":       ("标普500指数",        "fred"),
     "US.DJIA":        ("道琼斯工业指数",     "fred"),
@@ -46,6 +49,10 @@ BENCHMARKS = {
 
 EM_SECID = {
     "JP.N225": "100.N225", "KR.KS11": "100.KS11", "DE.GDAXI": "100.GDAXI",
+}
+
+SINA_A_CODE = {
+    "SH.000001": "sh000001", "SZ.399001": "sz399001",
 }
 
 FRED_TICKER = {
@@ -75,20 +82,22 @@ def build_records(kl_data, bench_code, bench_name):
 
 
 def write_records(records):
-    """批量 upsert"""
-    inserted, skipped = 0, 0
-    for rec in records:
-        try:
-            with get_conn() as conn:
-                upsert(conn, "daily_benchmark", rec, conflict_cols=["bench_code", "trade_date"])
-            inserted += 1
-        except Exception:
-            skipped += 1
-    return inserted, skipped
+    """单连接批量 upsert（优化：替代逐条开连接，改用 bulk_upsert）"""
+    if not records:
+        return 0, 0
+    try:
+        with get_conn() as conn:
+            bulk_upsert(conn, "daily_benchmark", records,
+                        conflict_cols=["bench_code", "trade_date"])
+        return len(records), 0
+    except Exception as e:
+        print(f"  ❌ 批量写入失败: {type(e).__name__}: {e}")
+        return 0, len(records)
 
 
 def backfill_futu(bench_code, bench_name, days):
     """富途 K线回补"""
+    from futu import OpenQuoteContext, RET_OK, KLType, AuType
     quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
     try:
         end = datetime.date.today()
@@ -113,6 +122,50 @@ def backfill_futu(bench_code, bench_name, days):
         return ins
     finally:
         quote_ctx.close()
+
+
+def backfill_sina_a(bench_code, bench_name, days):
+    """AKShare 新浪 A股指数回补（服务器端 futu 无权限时的替代源）"""
+    import warnings; warnings.filterwarnings("ignore")
+    import akshare as ak
+
+    sina_code = SINA_A_CODE.get(bench_code)
+    if not sina_code:
+        print(f"  ❌ 未配置新浪 A股代码映射: {bench_code}")
+        return 0
+    try:
+        df = ak.stock_zh_index_daily(symbol=sina_code)
+    except Exception as e:
+        print(f"  ❌ 拉取失败: {type(e).__name__}: {e}")
+        return 0
+    if df is None or len(df) < 2:
+        print(f"  ⚠️ 数据不足 ({len(df) if df is not None else 0}行)")
+        return 0
+    df = df.dropna().reset_index(drop=True)
+    # 按 days 截断（保留足够算 20d 的前序）
+    if days and len(df) > days:
+        df = df.iloc[-(days + 20):]
+    print(f"  获取 {len(df)} 行 ({df.iloc[0]['date']} ~ {df.iloc[-1]['date']})")
+
+    recs = []
+    for i in range(len(df)):
+        td = df.iloc[i]["date"]
+        if not isinstance(td, datetime.date):
+            td = datetime.date.fromisoformat(str(td)[:10])
+        last_val = float(df.iloc[i]["close"])
+        prev_val = float(df.iloc[i - 1]["close"]) if i > 0 else None
+        chg = round((last_val / prev_val - 1) * 100, 4) if prev_val and prev_val != 0 else None
+        c20 = float(df.iloc[i - 20]["close"]) if i >= 20 else None
+        recs.append({
+            "bench_code": bench_code, "bench_name": bench_name,
+            "trade_date": td,
+            "update_time": datetime.datetime.combine(td, datetime.time.min),
+            "last_price": last_val, "prev_close": prev_val,
+            "change_pct": chg, "close_20d_ago": c20,
+        })
+    ins, skip = write_records(recs)
+    print(f"  写入 {ins} 条, 跳过 {skip} 条")
+    return ins
 
 
 def backfill_fred(bench_code, bench_name, days):
@@ -211,7 +264,7 @@ def backfill_eastmoney(bench_code, bench_name, days):
 
 
 def backfill(bench_code, days):
-    """总入口：根据 bench_code 路由到富途或 FRED"""
+    """总入口：根据 bench_code 路由到对应数据源"""
     info = BENCHMARKS.get(bench_code)
     if info is None:
         print(f"未知指数: {bench_code}")
@@ -223,19 +276,29 @@ def backfill(bench_code, days):
         backfill_futu(bench_code, name, days)
     elif source == "fred":
         backfill_fred(bench_code, name, days)
+    elif source == "sina_a":
+        backfill_sina_a(bench_code, name, days)
     elif source == "eastmoney":
         backfill_eastmoney(bench_code, name, days)
 
 
 if __name__ == "__main__":
-    days = int(sys.argv[1]) if len(sys.argv) > 1 else 1000
-    bench = sys.argv[2] if len(sys.argv) > 2 else None
+    # 参数兼容两种写法：
+    #   python3 backfill_benchmark.py [code] [days]   # 推荐：先代码后天数
+    #   python3 backfill_benchmark.py [days] [code]   # 旧写法：先天数后代码
+    #   python3 backfill_benchmark.py                 # 全部指数，默认 1000 天
+    args = sys.argv[1:]
+    code = None
+    days = 1000
+    for a in args:
+        try:
+            days = int(a)
+        except ValueError:
+            code = a  # 非整数即视为指数代码
 
-    if bench:
-        # 回补单个指数
-        backfill(bench, days)
+    if code:
+        backfill(code, days)
     else:
-        # 回补全部指数
-        for code in BENCHMARKS:
-            backfill(code, days)
+        for c in BENCHMARKS:
+            backfill(c, days)
             print()

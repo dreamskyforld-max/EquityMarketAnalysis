@@ -267,8 +267,14 @@ def main():
         conn.close()
 
     if not args.dry_run:
+        conn_params = load_conn_params()
+        pwd = conn_params["password"]
+        host = conn_params["host"]
+        user = conn_params["user"]
+        dbname = conn_params["dbname"]
         print("\n完成。将生成的 .sql 复制到服务器后执行：")
-        print(f"  PGPASSWORD='<pwd>' psql -h localhost -U market_user -d market_db -f <table>_backfill_{day.strftime('%Y%m%d')}.sql")
+        for table in tables:
+            print(f"  PGPASSWORD='{pwd}' psql -h {host} -U {user} -d {dbname} -f {table}_backfill_{day.strftime('%Y%m%d')}.sql")
 
 
 if __name__ == "__main__":

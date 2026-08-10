@@ -31,6 +31,7 @@ _ctx_lock = threading.Lock()       # 保护 ctx 创建/重连
 _call_lock = threading.Lock()      # 串行化所有 futu 调用
 
 _MOD_CACHE = {}
+_IMPORT_LOCK = threading.Lock()    # 串行化模块首次 import
 
 
 class _LockedCtx:
@@ -81,9 +82,12 @@ def run_module(script_name, codes=None, **kwargs):
     """惰性导入采集模块并调用其 run(codes)。import 仅发生一次/进程。"""
     mod = _MOD_CACHE.get(script_name)
     if mod is None:
-        modname = script_name[:-3] if script_name.endswith(".py") else script_name
-        mod = importlib.import_module(modname)
-        _MOD_CACHE[script_name] = mod
+        with _IMPORT_LOCK:
+            mod = _MOD_CACHE.get(script_name)
+            if mod is None:
+                modname = script_name[:-3] if script_name.endswith(".py") else script_name
+                mod = importlib.import_module(modname)
+                _MOD_CACHE[script_name] = mod
     fn = getattr(mod, "run", None)
     if fn is None:
         raise RuntimeError(f"{script_name} 未实现 run()，无法常驻调用")

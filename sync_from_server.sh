@@ -125,6 +125,7 @@ SMALL_TABLES_FILTERED=(
 # ==================================================================
 SMALL_TABLES_FULL=(
     "daily_benchmark"
+    "benchmark_minute"
     "daily_northbound_flow"
 )
 

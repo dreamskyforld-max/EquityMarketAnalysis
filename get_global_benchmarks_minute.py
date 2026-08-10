@@ -3,8 +3,10 @@
 全球基准指数分钟级采集 — 独立脚本（不改动现有 get_global_benchmarks.py）。
 
 数据源:
-  - 富途 OpenAPI K_1M:     恒生指数 / 恒生科技 / 上证指数
-  - 东财直调 klt=1:        日经225 / KOSPI / DAX / 道琼斯 / 纳斯达克 / 标普500
+  - 富途 OpenAPI K_1M:     恒生指数 / 恒生科技
+  - 腾讯分钟接口:           上证指数 / 深证成指
+  - yfinance:              日经225 / KOSPI
+  - 东财直调 klt=1:        DAX / 道琼斯 / 纳斯达克 / 标普500
 
 说明:
   - 美债收益率 / 离岸人民币 / VIX / 美元指数 无公开分钟源，不采集。
@@ -54,19 +56,23 @@ _load_dotenv()
 
 
 # ── 指数定义（仅能采到分钟级的）──
-# code: 统一代码(市场.代码)  source: futu/eastmoney  tz: 市场时区(用于转UTC)
+# code: 统一代码(市场.代码)  source: futu/tencent_a/yfinance/eastmoney
+# tz: 市场时区(用于转UTC)  yf_ticker: yfinance ticker  em_secid: 东财 secid
 MINUTE_BENCHMARKS: List[Dict] = [
-    # 富途（港股/上证）
+    # 富途（港股）
     {"code": "HK.800000", "name": "恒生指数",     "source": "futu",     "tz": "Asia/Hong_Kong"},
     {"code": "HK.800700", "name": "恒生科技指数", "source": "futu",     "tz": "Asia/Hong_Kong"},
-    {"code": "SH.000001", "name": "上证指数",     "source": "futu",     "tz": "Asia/Hong_Kong"},
-    # 东财全球指数（klt=1）
-    {"code": "JP.N225",   "name": "日经225指数",   "source": "eastmoney", "em_secid": "100.N225",  "tz": "Asia/Tokyo"},
-    {"code": "KR.KS11",   "name": "韩国KOSPI指数", "source": "eastmoney", "em_secid": "100.KS11",  "tz": "Asia/Seoul"},
-    {"code": "DE.GDAXI",  "name": "德国DAX指数",   "source": "eastmoney", "em_secid": "100.GDAXI",  "tz": "Europe/Berlin"},
-    {"code": "US.DJIA",   "name": "道琼斯工业指数", "source": "eastmoney", "em_secid": "100.DJIA",  "tz": "America/New_York"},
-    {"code": "US.NDX",    "name": "纳斯达克综合指数", "source": "eastmoney", "em_secid": "100.NDX", "tz": "America/New_York"},
-    {"code": "US.SPX",    "name": "标普500指数",   "source": "eastmoney", "em_secid": "100.SPX",   "tz": "America/New_York"},
+    # 腾讯分钟接口（A股指数）
+    {"code": "SH.000001", "name": "上证指数",     "source": "tencent_a", "tz": "Asia/Hong_Kong"},
+    {"code": "SZ.399001", "name": "深证成指",     "source": "tencent_a", "tz": "Asia/Hong_Kong"},
+    # yfinance（日经 / KOSPI）
+    {"code": "JP.N225",   "name": "日经225指数",   "source": "yfinance", "yf_ticker": "^N225", "tz": "Asia/Tokyo"},
+    {"code": "KR.KS11",   "name": "韩国KOSPI指数", "source": "yfinance", "yf_ticker": "^KS11", "tz": "Asia/Seoul"},
+    # 东财全球指数 — 反爬拦截严重，暂不采集
+    # {"code": "DE.GDAXI",  "name": "德国DAX指数",   "source": "eastmoney", "em_secid": "100.GDAXI",  "tz": "Europe/Berlin"},
+    # {"code": "US.DJIA",   "name": "道琼斯工业指数", "source": "eastmoney", "em_secid": "100.DJIA",  "tz": "America/New_York"},
+    # {"code": "US.NDX",    "name": "纳斯达克综合指数", "source": "eastmoney", "em_secid": "100.NDX", "tz": "America/New_York"},
+    # {"code": "US.SPX",    "name": "标普500指数",   "source": "eastmoney", "em_secid": "100.SPX",   "tz": "America/New_York"},
 ]
 
 
@@ -232,6 +238,111 @@ def _collect_eastmoney(items: list, klt: str = "1", days: int = 1) -> list:
     return records
 
 
+# ── 腾讯分钟采集（A股指数）──
+def _collect_tencent_a(items: list, klt: str = "1", days: int = 1) -> list:
+    import requests as req
+    import time as _t
+
+    url = "https://web.ifzq.gtimg.cn/appstock/app/minute/query"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://gu.qq.com/",
+    }
+    code_map = {
+        "SH.000001": "sh000001",
+        "SZ.399001": "sz399001",
+    }
+    records = []
+    for it in items:
+        qcode = code_map.get(it["code"])
+        if not qcode:
+            continue
+        try:
+            r = req.get(url, params={"code": qcode}, headers=headers, timeout=20)
+            data = r.json()
+            node = (data.get("data", {}) or {}).get(qcode, {})
+            minute = node.get("data", {}).get("data") if isinstance(node, dict) else None
+            if not minute:
+                print(f"  [腾讯] ⚠️ {it['name']} 无分钟数据")
+                continue
+            kept = 0
+            for line in minute:
+                # 腾讯格式: "HHMM  price  avg_price  volume  "
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                hm = parts[0]
+                price = _r(parts[1])
+                if price is None:
+                    continue
+                # 拼成当日本地时间
+                today = date.today()
+                dt = datetime.strptime(f"{today} {hm[:2]}:{hm[2:]}", "%Y-%m-%d %H:%M")
+                utc = _to_utc(dt.strftime("%Y-%m-%d %H:%M:%S"), it["tz"])
+                records.append({
+                    "bench_code": it["code"], "bench_name": it["name"],
+                    "ts": utc, "mkt_time": dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "open": price, "high": price, "low": price, "close": price,
+                    "source": "tencent_a",
+                })
+                kept += 1
+            print(f"  [腾讯] ✅ {it['name']} {kept}根")
+        except Exception as e:
+            print(f"  [腾讯] ❌ {it['name']} {type(e).__name__}: {e}")
+        _t.sleep(0.5)
+    return records
+
+
+# ── yfinance 分钟采集（日经 / KOSPI）──
+def _collect_yfinance(items: list, klt: str = "1", days: int = 1) -> list:
+    import time as _t
+
+    try:
+        import yfinance as yf
+    except Exception as e:
+        print(f"  [yfinance] ❌ 库未安装: {e}")
+        return []
+
+    records = []
+    for it in items:
+        ticker = it.get("yf_ticker")
+        if not ticker:
+            continue
+        last_err = None
+        for attempt in range(3):  # 3 次重试，应对 429 限流
+            try:
+                if attempt > 0:
+                    _t.sleep(10 * attempt)  # 10s / 20s 递增退避
+                t = yf.Ticker(ticker)
+                df = t.history(period="1d", interval="1m", auto_adjust=False)
+                if df is None or len(df) == 0:
+                    last_err = "无数据"
+                    continue
+                kept = 0
+                for idx, row in df.iterrows():
+                    # yfinance 索引为 tz-aware (市场时区)
+                    local = idx.tz_convert(it["tz"]) if idx.tzinfo else idx
+                    utc = idx.astimezone(timezone.utc) if idx.tzinfo else _to_utc(
+                        local.strftime("%Y-%m-%d %H:%M:%S"), it["tz"])
+                    records.append({
+                        "bench_code": it["code"], "bench_name": it["name"],
+                        "ts": utc, "mkt_time": local.strftime("%Y-%m-%d %H:%M:%S"),
+                        "open": _r(row.get("Open")), "high": _r(row.get("High")),
+                        "low": _r(row.get("Low")), "close": _r(row.get("Close")),
+                        "source": "yfinance",
+                    })
+                    kept += 1
+                print(f"  [yfinance] ✅ {it['name']}({ticker}) {kept}根")
+                break
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                _t.sleep(0.5)
+        else:
+            print(f"  [yfinance] ❌ {it['name']}({ticker}) {last_err}")
+        _t.sleep(0.5)
+    return records
+
+
 # ── 调度入口 ──
 def collect_all(sources: Optional[set] = None, klt: str = "1", days: int = 1):
     by_source = {}
@@ -243,6 +354,8 @@ def collect_all(sources: Optional[set] = None, klt: str = "1", days: int = 1):
     collectors = {
         "futu": lambda its: _collect_futu(its, klt, days),
         "eastmoney": lambda its: _collect_eastmoney(its, klt, days),
+        "tencent_a": lambda its: _collect_tencent_a(its, klt, days),
+        "yfinance": lambda its: _collect_yfinance(its, klt, days),
     }
 
     _ensure_table()
@@ -260,11 +373,22 @@ def collect_all(sources: Optional[set] = None, klt: str = "1", days: int = 1):
     return saved, len(all_rec)
 
 
+# ── 常驻调用入口（供 market_scheduler.run_module 调用）──
+def run(codes: Optional[List[str]] = None, ctx=None, source: Optional[str] = None):
+    """分钟级全球基准指数采集入口。
+
+    codes 未使用（全量采集）；source 可指定数据源子集如 {'futu'}；
+    klt/days 默认 1 分钟 / 近 1 天（调度场景只需当日增量，无需回溯）。
+    """
+    s = {x.strip() for x in source.split(",")} if source else None
+    return collect_all(s, klt="1", days=1)
+
+
 # ── CLI ──
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="全球基准指数分钟级采集")
-    ap.add_argument("--source", default=None, help="futu / eastmoney / futu,eastmoney")
+    ap.add_argument("--source", default=None, help="futu / tencent_a / yfinance / eastmoney")
     ap.add_argument("--klt", default="1", help="1/5/15/60 分钟")
     ap.add_argument("--days", type=int, default=1, help="回溯天数")
     ns = ap.parse_args()

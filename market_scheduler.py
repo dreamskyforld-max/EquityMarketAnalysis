@@ -107,12 +107,27 @@ STOCKS = [
     {"code": "SH.520900", "market": "A"},
     {"code": "SH.600941", "market": "A"},
     {"code": "HK.09660", "market": "HK"},
+    {"code": "HK.00857", "market": "HK"},
+    {"code": "HK.01088", "market": "HK"},
+    {"code": "HK.00883", "market": "HK"},
+    {"code": "HK.00941", "market": "HK"},
+    {"code": "HK.00386", "market": "HK"},
+    {"code": "HK.01919", "market": "HK"},
+    {"code": "HK.06869", "market": "HK"},
+    {"code": "HK.00728", "market": "HK"},
+    {"code": "HK.03328", "market": "HK"},
+    {"code": "HK.03968", "market": "HK"},
 ]
 
 # ── 全局任务（与具体股票无关）──────────────────────────────
 GLOBAL_TASKS = [
     ("数据清理", "cleanup_old_data.py", {"hour": 4, "minute": 0}),            # 清理36个月前盘中实时数据+逐笔成交数据
-    ("全球指数采集", "get_global_benchmarks.py", {"hour": 16, "minute": 30}),  # 美股指数/VIX/美债/汇率（美盘隔夜数据+亚太当日收盘）
+    ("全球指数采集(早)", "get_global_benchmarks.py", {"hour": 6, "minute": 0}),   # 早盘: 美债T-0(美东收盘后)+亚太前一日收盘
+    ("全球指数采集(晚)", "get_global_benchmarks.py", {"hour": 16, "minute": 30}),  # 美股指数/VIX/美债/汇率（美盘隔夜数据+亚太当日收盘）
+    # 全球指数分钟级采集：覆盖亚太(08:00–16:00 HK)+欧美盘至凌晨，避开低频 04:00–08:00
+    # 每5分钟一次，仅交易日；run 忽略 codes，全局只跑一次
+    ("全球指数分钟采集", "get_global_benchmarks_minute.py",
+     {"minute": "*/5", "hour": "8-11,13-16,17-23,0-3", "day_of_week": "mon-fri"}),
     # 股票-指数成分归属（参考数据，季度刷新即可；run 忽略 codes，全局只跑一次）
     ("指数成分归属", "get_stock_sector.py", {"day_of_week": 2, "hour": 18, "minute": 0}),
 ]
@@ -276,7 +291,34 @@ def build_scheduler():
             misfire_grace_time=300,
         )
         registered += 1
-        log.info(f"已注册: [{g_name}] (全局) {g_cron.get('hour',0):02d}:{g_cron.get('minute',0):02d}")
+        _h = g_cron.get('hour', 0)
+        _m = g_cron.get('minute', 0)
+        _h = f"{_h:02d}" if isinstance(_h, int) else str(_h)
+        _m = f"{_m:02d}" if isinstance(_m, int) else str(_m)
+        log.info(f"已注册: [{g_name}] (全局) {_h}:{_m}")
+
+    # 5. Linux 端：每天早上 5:00 重启 FutuOpenD（缓解长时间运行 CPU/内存泄漏）
+    if sys.platform == "linux":
+        def _restart_futuopend():
+            import subprocess
+            try:
+                subprocess.run(["sudo", "systemctl", "restart", "FutuOpenD.service"],
+                               capture_output=True, text=True, timeout=30, check=True)
+                log.info("[FutuOpenD 重启] 执行成功")
+            except subprocess.CalledProcessError as e:
+                log.warning(f"[FutuOpenD 重启] 失败: {e.stderr.strip()}")
+            except Exception as e:
+                log.warning(f"[FutuOpenD 重启] 异常: {e}")
+
+        sched.add_job(
+            _restart_futuopend,
+            trigger=CronTrigger(hour=5, minute=0),
+            id="重启FutuOpenD",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+        registered += 1
+        log.info("已注册: [重启FutuOpenD] (仅Linux) 05:00")
 
     log.info(f"共计注册 {registered} 个任务")
     return sched

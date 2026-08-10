@@ -107,9 +107,11 @@ except Exception as e:
 
 # ── 步骤 3: 回填 daily_quote ───────────────────────────────
 
-log.info("回填 daily_quote 60 日数据...")
+# 回填窗口：默认 3 年历史日线（约 1095 自然日；含 52 周高低所需 pad，由 backfill 内部再加 260+ 天）
+BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "1095"))
+log.info(f"回填 daily_quote {BACKFILL_DAYS} 日数据...")
 result = subprocess.run(
-    [sys.executable, os.path.join(SCRIPTS_DIR, "backfill_daily_quote.py"), stock_code, "60"],
+    [sys.executable, os.path.join(SCRIPTS_DIR, "backfill_daily_quote.py"), stock_code, str(BACKFILL_DAYS)],
     capture_output=True, text=True, timeout=180, cwd=SCRIPTS_DIR,
 )
 if result.returncode == 0:
@@ -229,7 +231,7 @@ print(f"""
 {'='*60}
 新股接入完成: {stock_code} ({stock_name})
   ├─ stock_info       ✅
-  ├─ daily_quote 60日  ✅
+  ├─ daily_quote 回填  ✅ ({BACKFILL_DAYS}日)
   ├─ 融资余额首采      {'✅' if stock_type == 'A' else '— (港股跳过)'}
   ├─ market_scheduler  ✅
   ├─ ticker_config     ✅

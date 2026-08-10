@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-回填 daily_quote 历史数据（富途 API 版）
+回填 daily_quote 历史数据（富途 API 版，支持大跨度自动分页）
 
 用法：
-    python3 backfill_daily_quote.py                # 默认 SH.600900，60天
-    python3 backfill_daily_quote.py SH.600900 90   # 指定股票+天数
-    python3 backfill_daily_quote.py HK.00700 30
+    python3 backfill_daily_quote.py                   # 默认 SH.600900，60天
+    python3 backfill_daily_quote.py HK.00700 365      # 指定股票+天数
+    python3 backfill_daily_quote.py HK.00700 2000     # 大跨度自动分页补录
 
 数据源：富途 OpenAPI request_history_kline
 写入表：daily_quote（ON CONFLICT DO UPDATE，可重复执行）
@@ -19,41 +19,81 @@ from db import get_conn, upsert
 logging.basicConfig(level=logging.WARNING, format='%(message)s')
 logger = logging.getLogger(__name__)
 
+# 富途单次请求最大 K 线条数（避免超限）
+FUTU_MAX_BARS = 800
+
+
+def _fetch_batch(ctx, stock_code, start_date: str, end_date: str, fields) -> list:
+    """单批拉取 K 线，返回 DataFrame 或空列表。"""
+    from futu import RET_OK, KLType, AuType
+    ret, data, page = ctx.request_history_kline(
+        stock_code, start=start_date, end=end_date,
+        ktype=KLType.K_DAY, autype=AuType.QFQ,
+        fields=fields, max_count=FUTU_MAX_BARS,
+    )
+    if ret != RET_OK:
+        print(f"  富途API错误 ({start_date}~{end_date}): {data}")
+        return []
+    return data.sort_values('time_key').reset_index(drop=True) if len(data) > 0 else []
+
 
 def backfill(stock_code, days=60):
-    """回填指定股票的 daily_quote 历史数据"""
-    from futu import OpenQuoteContext, RET_OK, KLType, AuType, KL_FIELD
+    """回填指定股票的 daily_quote 历史数据（自动分页支持大跨度）。"""
+    from futu import OpenQuoteContext, KL_FIELD
+    import pandas as pd
 
-    # 需要比 days 多取一些来算 52 周高低 + 首条的前收盘
-    fetch_days = max(days, 260) + 5  # 250个交易日≈52周
+    # 52 周高低需要往前多取 ~250 个交易日
+    pad_days = 260 + 5
+    fetch_calendar_days = days + pad_days
 
-    end = date.today().isoformat()
-    start = (date.today() - timedelta(days=fetch_days)).isoformat()
+    end = date.today()
+    start = end - timedelta(days=fetch_calendar_days)
 
-    print(f"通过富途API获取 {stock_code} K线: {start} ~ {end}（含{250}天窗口算52周高低）")
+    fields = [
+        KL_FIELD.DATE_TIME, KL_FIELD.OPEN, KL_FIELD.CLOSE, KL_FIELD.HIGH, KL_FIELD.LOW,
+        KL_FIELD.TRADE_VOL, KL_FIELD.TRADE_VAL, KL_FIELD.TURNOVER_RATE,
+        KL_FIELD.CHANGE_RATE, KL_FIELD.LAST_CLOSE,
+    ]
+
+    print(f"通过富途API获取 {stock_code} K线: {start} ~ {end}（目标{end}前{days}个自然日）")
 
     ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
     try:
-        # 显式指定需要 volume_ratio（默认 ALL 不包含）
-        fields = [
-            KL_FIELD.DATE_TIME, KL_FIELD.OPEN, KL_FIELD.CLOSE, KL_FIELD.HIGH, KL_FIELD.LOW,
-            KL_FIELD.TRADE_VOL, KL_FIELD.TRADE_VAL, KL_FIELD.TURNOVER_RATE,
-            KL_FIELD.CHANGE_RATE, KL_FIELD.LAST_CLOSE,
-        ]
-        ret, data, page = ctx.request_history_kline(
-            stock_code, start=start, end=end,
-            ktype=KLType.K_DAY, autype=AuType.QFQ,
-            fields=fields, max_count=fetch_days,
-        )
-        if ret != RET_OK:
-            print(f"富途API错误: {data}")
+        # ── 大跨度自动分页 ──
+        all_data_parts = []
+        batch_end = end
+        remaining_days = fetch_calendar_days
+        while remaining_days > 0:
+            batch_days = min(remaining_days, FUTU_MAX_BARS)
+            batch_start = batch_end - timedelta(days=batch_days)
+            part = _fetch_batch(ctx, stock_code,
+                                batch_start.isoformat(), batch_end.isoformat(), fields)
+            if len(part) == 0:
+                # 空结果直接跳过（可能该段无交易）
+                pass
+            elif len(all_data_parts) > 0:
+                # 去重叠：本批第一条可能=上批最后一条
+                last_prev = all_data_parts[-1]['time_key'].iloc[-1]
+                first_this = part['time_key'].iloc[0]
+                if str(last_prev)[:10] == str(first_this)[:10]:
+                    part = part.iloc[1:]
+                if len(part) > 0:
+                    all_data_parts.append(part)
+            else:
+                all_data_parts.append(part)
+            remaining_days -= batch_days
+            batch_end = batch_start
+
+        if not all_data_parts:
+            print("未获取到任何K线数据")
             return
 
-        print(f"获取到 {len(data)} 条K线数据")
+        data = pd.concat(all_data_parts, ignore_index=True)
         data = data.sort_values('time_key').reset_index(drop=True)
+        print(f"获取到 {len(data)} 条K线数据")
 
         # 取最近 days 条写入（前面的用来算 52 周高低）
-        write_data = data.tail(days)
+        write_data = data.tail(min(days, len(data)))
 
         inserted = 0
         for idx, row in write_data.iterrows():
@@ -84,10 +124,13 @@ def backfill(stock_code, days=60):
             if change_rate is not None and float(change_rate) != 0:
                 change_pct = round(float(change_rate), 4)
 
-            # 52周最高/最低：从全部数据中取最近250条计算
+            # 52周最高/最低：取该行之前最近250个交易日
             high_52w = None
             low_52w = None
-            window = data.iloc[max(0, idx + len(data) - days - 250): idx + len(data) - days + 1]
+            # idx 是 write_data 在原 data 中的位置；取其前 250 行
+            pos_in_data = data.index.get_loc(idx)
+            win_start = max(0, pos_in_data - 250)
+            window = data.iloc[win_start:pos_in_data]
             if len(window) > 0:
                 high_vals = window['high'].dropna()
                 low_vals = window['low'].dropna()

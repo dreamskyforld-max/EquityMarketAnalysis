@@ -6,7 +6,7 @@
   - 富途 OpenAPI:       恒生 / 恒生科技 / 上证
   - FRED (美联储):      标普500 / 道琼斯 / 纳斯达克 / VIX / 美元指数
   - AKShare:           美债10Y / 美债2Y / 离岸人民币
-  - 待定 (yfinance):    日经225 / KOSPI / DAX
+  - AKShare(新浪源):    日经225 / KOSPI / DAX  （东财接口不稳，改用新浪源）
 
 前置: export FRED_API_KEY=xxx
 用法:
@@ -49,7 +49,10 @@ ALL_BENCHMARKS: List[Dict] = [
     # ── 富途 OpenAPI ──
     {"code": "HK.800000",  "name": "恒生指数",               "source": "futu"},
     {"code": "HK.800700",  "name": "恒生科技指数",           "source": "futu"},
-    {"code": "SH.000001",  "name": "上证指数",               "source": "futu"},
+    # ── A股指数（服务器端 futu 权限不足，改用 AKShare 新浪 A 股指数源）──
+    # sina_code 为 stock_zh_index_daily 的带市场前缀代码（小写）
+    {"code": "SH.000001",  "name": "上证指数",               "source": "sina_a", "sina_code": "sh000001"},
+    {"code": "SZ.399001",  "name": "深证成指",               "source": "sina_a", "sina_code": "sz399001"},
     # ── FRED 美联储 ──
     {"code": "US.SP500",       "name": "标普500指数",        "source": "fred", "fred_ticker": "SP500"},
     {"code": "US.DJIA",        "name": "道琼斯工业指数",     "source": "fred", "fred_ticker": "DJIA"},
@@ -60,10 +63,11 @@ ALL_BENCHMARKS: List[Dict] = [
     {"code": "US.DGS10",       "name": "美国10年期国债收益率", "source": "akshare", "ak_func": "bond"},
     {"code": "US.DGS2",        "name": "美国2年期国债收益率",  "source": "akshare", "ak_func": "bond"},
     {"code": "FX.USDCNY",      "name": "离岸人民币(USD/CNY)", "source": "akshare", "ak_func": "currency"},
-    # ── 东财全球指数（直调东方财富 API）──
-    {"code": "JP.N225",       "name": "日经225指数",       "source": "eastmoney", "em_secid": "100.N225"},
-    {"code": "KR.KS11",       "name": "韩国KOSPI指数",     "source": "eastmoney", "em_secid": "100.KS11"},
-    {"code": "DE.GDAXI",      "name": "德国DAX指数",       "source": "eastmoney", "em_secid": "100.GDAXI"},
+    # ── 国际指数（AKShare 新浪源，东财接口不稳故改用新浪）──
+    # sina_name 为 AKShare index_global_hist_sina 的键（中文全名）
+    {"code": "JP.N225",       "name": "日经225指数",       "source": "sina", "sina_name": "日经225指数"},
+    {"code": "KR.KS11",       "name": "韩国KOSPI指数",     "source": "sina", "sina_name": "首尔综合指数"},
+    {"code": "DE.GDAXI",      "name": "德国DAX指数",       "source": "sina", "sina_name": "德国DAX 30种股价指数"},
 ]
 
 
@@ -74,24 +78,22 @@ def _r(v, ndigits=4):
 
 
 def _save(records: list):
-    """批量写入 daily_benchmark"""
+    """批量写入 daily_benchmark（单连接 execute_values upsert）"""
     if not records:
         return 0
-    from db import get_conn, upsert
-    saved, skipped = 0, 0
-    for rec in records:
-        try:
-            with get_conn() as conn:
-                upsert(conn, "daily_benchmark", rec, conflict_cols=["bench_code", "trade_date"])
-            saved += 1
-        except Exception:
-            skipped += 1
-    return saved
+    from db import get_conn, bulk_upsert
+    try:
+        with get_conn() as conn:
+            bulk_upsert(conn, "daily_benchmark", records, conflict_cols=["bench_code", "trade_date"])
+        return len(records)
+    except Exception as e:
+        print(f"  ❌ 批量写入失败: {type(e).__name__}: {e}")
+        return 0
 
 
 # ── 富途采集 ──
 def _collect_futu(items: list) -> list:
-    """采集富途指数：snapshot + 20日历史K线"""
+    """采集富途指数：snapshot（价格） + K线（20日前收盘 + 成交量/额）"""
     from futu import RET_OK, KLType, AuType
     from collector_runtime import get_shared_ctx
 
@@ -113,6 +115,10 @@ def _collect_futu(items: list) -> list:
                 ut = row.get('update_time', 'N/A')
                 td = date.fromisoformat(str(ut)[:10]) if ut and str(ut) != 'N/A' else date.today()
 
+                # 当日成交量/额（snapshot 自带）
+                vol = int(row.get('volume', 0)) if row.get('volume') else None
+                to = float(row.get('turnover', 0)) if row.get('turnover') else None
+
                 # 20日前收盘
                 ret_k, kl, _ = ctx.request_history_kline(
                     it["code"], ktype=KLType.K_DAY, autype=AuType.QFQ,
@@ -125,8 +131,10 @@ def _collect_futu(items: list) -> list:
                     "update_time": ut if ut != 'N/A' else None,
                     "last_price": close, "prev_close": _r(prev),
                     "change_pct": _r(change), "close_20d_ago": close_20d,
+                    "volume": vol, "turnover": _r(to) if to else None,
                 })
-                print(f"  [富途] ✅ {it['name']}({it['code']})  {close:.2f}  ({change:+.2f}%)")
+                print(f"  [富途] ✅ {it['name']}({it['code']})  {close:.2f}  ({change:+.2f}%)  "
+                      f"量:{vol or '-'}")
             except Exception as e:
                 print(f"  [富途] ❌ {it['name']}({it['code']})  {type(e).__name__}: {e}")
     except Exception as e:
@@ -271,7 +279,8 @@ def _collect_eastmoney(items: list) -> list:
     """直调东方财富全球指数 API（无需 AKShare 封装）"""
     import requests as req
     import time as _time
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    # 注意: push2his.eastmoney.com 在当前网络不可达，改用 push2.eastmoney.com（同款 kline 接口）
+    url = "https://push2.eastmoney.com/api/qt/stock/kline/get"
     base = {
         "klt": "101", "fqt": "1", "lmt": "50000", "end": "20500000",
         "iscca": "1",
@@ -307,23 +316,124 @@ def _collect_eastmoney(items: list) -> list:
                 rows = [l.split(",") for l in kls]
                 last = rows[-1]; prev = rows[-2]
                 td = last[0][:10]
+                # 东财 klines: f51=日期 f52=开 f53=收 f54=高 f55=低 f56=量 f57=额 ...
                 last_val = float(last[2]); prev_val = float(prev[2])
                 change = (last_val / prev_val - 1) * 100 if prev_val != 0 else 0.0
                 c20 = float(rows[-21][2]) if len(rows) >= 21 else None
+                vol = int(float(last[5])) if len(last) > 5 and last[5] and last[5] != '-' else None
+                to = _r(float(last[6])) if len(last) > 6 and last[6] and last[6] != '-' else None
                 records.append({
                     "bench_code": it["code"], "bench_name": it["name"],
                     "trade_date": date.fromisoformat(td),
                     "update_time": datetime.combine(date.fromisoformat(td), datetime.min.time()),
                     "last_price": last_val, "prev_close": _r(prev_val),
                     "change_pct": _r(change), "close_20d_ago": _r(c20) if c20 else None,
+                    "volume": vol, "turnover": to,
                 })
-                print(f"  [东财] ✅ {it['name']}({secid})  {last_val:,.2f}  ({change:+.2f}%)  {td}")
+                print(f"  [东财] ✅ {it['name']}({secid})  {last_val:,.2f}  ({change:+.2f}%)  {td}  "
+                      f"量:{vol or '-'}")
                 break
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
                 _time.sleep(0.5)
         else:
             print(f"  [东财] ❌ {it['name']}({secid})  {last_err}")
+    return records
+
+
+# ── AKShare 新浪源国际指数 ──
+def _collect_sina(items: list) -> list:
+    """采集 AKShare 新浪源国际指数（日经225 / KOSPI / DAX）。
+
+    东财 push2 接口对当前 IP 不稳定（RemoteDisconnected），改用 AKShare 的
+    index_global_hist_sina（新浪源），稳定返回日线 OHLC。此处只取最新一天做增量写入，
+    全历史回填请见 collect_benchmark_sina.py。
+    """
+    import akshare as ak
+    import warnings; warnings.filterwarnings("ignore")
+
+    records = []
+    for it in items:
+        sina_name = it.get("sina_name")
+        if not sina_name:
+            print(f"  [新浪] ❌ {it['name']} 缺少 sina_name")
+            continue
+        try:
+            df = ak.index_global_hist_sina(symbol=sina_name)
+            if df is None or len(df) < 2:
+                print(f"  [新浪] ⚠️ {it['name']}({sina_name}) 数据不足")
+                continue
+            df = df.dropna()
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            td = last["date"]
+            if not isinstance(td, date):
+                td = date.fromisoformat(str(td)[:10])
+            last_val = float(last["close"])
+            prev_val = float(prev["close"])
+            change = (last_val / prev_val - 1) * 100 if prev_val != 0 else 0.0
+
+            records.append({
+                "bench_code": it["code"], "bench_name": it["name"],
+                "trade_date": td,
+                "update_time": datetime.combine(td, datetime.min.time()),
+                "last_price": _r(last_val), "prev_close": _r(prev_val),
+                "change_pct": _r(change),
+                "close_20d_ago": _r(float(df.iloc[-21]["close"])) if len(df) >= 21 else None,
+                "volume": int(last["volume"]) if "volume" in last.index and last["volume"] else None,
+            })
+            print(f"  [新浪] ✅ {it['name']}({sina_name})  {last_val:,.2f}  ({change:+.2f}%)  {td}  "
+                  f"量:{last.get('volume', '-')}")
+        except Exception as e:
+            print(f"  [新浪] ❌ {it['name']}({sina_name})  {type(e).__name__}: {e}")
+    return records
+
+
+# ── AKShare 新浪源 A股指数（服务器端 futu 无 A股权限，改用此源）──
+def _collect_sina_a(items: list) -> list:
+    """采集 AKShare 新浪源 A股指数（上证 / 深证成指）。
+
+    使用 stock_zh_index_daily（新浪源），返回日线 OHLCV，代码格式为带市场前缀
+    小写（如 sh000001 / sz399001）。此处只取最新一天做增量写入，全历史回填请见
+    backfill_benchmark.py（同源）。
+    """
+    import akshare as ak
+    import warnings; warnings.filterwarnings("ignore")
+
+    records = []
+    for it in items:
+        sina_code = it.get("sina_code")
+        if not sina_code:
+            print(f"  [新浪A股] ❌ {it['name']} 缺少 sina_code")
+            continue
+        try:
+            df = ak.stock_zh_index_daily(symbol=sina_code)
+            if df is None or len(df) < 2:
+                print(f"  [新浪A股] ⚠️ {it['name']}({sina_code}) 数据不足")
+                continue
+            df = df.dropna()
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            td = last["date"]
+            if not isinstance(td, date):
+                td = date.fromisoformat(str(td)[:10])
+            last_val = float(last["close"])
+            prev_val = float(prev["close"])
+            change = (last_val / prev_val - 1) * 100 if prev_val != 0 else 0.0
+
+            records.append({
+                "bench_code": it["code"], "bench_name": it["name"],
+                "trade_date": td,
+                "update_time": datetime.combine(td, datetime.min.time()),
+                "last_price": _r(last_val), "prev_close": _r(prev_val),
+                "change_pct": _r(change),
+                "close_20d_ago": _r(float(df.iloc[-21]["close"])) if len(df) >= 21 else None,
+                "volume": int(last["volume"]) if "volume" in last.index and last["volume"] else None,
+            })
+            print(f"  [新浪A股] ✅ {it['name']}({sina_code})  {last_val:,.2f}  ({change:+.2f}%)  {td}  "
+                  f"量:{last.get('volume', '-')}")
+        except Exception as e:
+            print(f"  [新浪A股] ❌ {it['name']}({sina_code})  {type(e).__name__}: {e}")
     return records
 
 
@@ -345,6 +455,8 @@ def collect_all(sources: Optional[set] = None):
         "futu":      _collect_futu,
         "fred":      _collect_fred,
         "akshare":   _collect_akshare,
+        "sina":      _collect_sina,
+        "sina_a":    _collect_sina_a,
         "eastmoney": _collect_eastmoney,
     }
 
