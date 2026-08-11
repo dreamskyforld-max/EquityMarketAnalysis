@@ -201,6 +201,67 @@ class TestHandleTrendFormatting(unittest.TestCase):
         self.assertIn("成交 N/A", output)
 
 
+class TestFetchTrendFromDb(unittest.TestCase):
+    """fetch_trend_from_db 映射逻辑 —— mock 掉 DB 连接"""
+
+    def _mock_conn(self, rows):
+        """构造一个返回 rows 的 get_conn 上下文管理器（psycopg2 风格）"""
+        class FakeCursor:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def execute(self, *a, **k): pass
+            def fetchall(self): return rows
+        class FakeConn:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def cursor(self): return FakeCursor()
+        return FakeConn()
+
+    def test_empty_returns_not_found(self):
+        from unittest.mock import patch
+        from wecom_server_collector import fetch_trend_from_db
+        with patch('db.get_conn', return_value=self._mock_conn([])):
+            res = fetch_trend_from_db("HK.00700", "20260811")
+        self.assertFalse(res["found"])
+        self.assertEqual(res["am"], [])
+        self.assertEqual(res["pm"], [])
+
+    def test_am_pm_split_and_mapping(self):
+        """验证 record 字段映射 + 上午(hour<13)/下午(hour>=13) 分段"""
+        from unittest.mock import patch
+        from datetime import datetime
+        from wecom_server_collector import fetch_trend_from_db
+
+        am_time = datetime(2026, 8, 11, 10, 30, 0)
+        pm_time = datetime(2026, 8, 11, 14, 5, 0)
+        rows = [
+            (am_time, 460.0, 1.5, 2.0, 0.8, 0.5, 0.75, 2.1, 12340000, 56.78, "b1,b2", "s1,s2"),
+            (pm_time, 465.0, 1.8, 2.5, 0.9, 0.2, 0.90, 3.0, 45600000, 89.01, "b3", "s3"),
+        ]
+        with patch('db.get_conn', return_value=self._mock_conn(rows)):
+            res = fetch_trend_from_db("HK.00700", "20260811")
+
+        self.assertTrue(res["found"])
+        self.assertEqual(len(res["am"]), 1)
+        self.assertEqual(len(res["pm"]), 1)
+        self.assertEqual(res["am"][0]["time"], "10:30")
+        self.assertEqual(res["pm"][0]["time"], "14:05")
+        self.assertEqual(res["am"][0]["price"], 460.0)
+        self.assertEqual(res["am"][0]["super_in"], 1.5)
+        self.assertEqual(res["am"][0]["buy_str"], "b1,b2")
+        self.assertEqual(res["pm"][0]["turnover"], 89.01)
+
+    def test_none_levels_str_defaults_to_na(self):
+        from unittest.mock import patch
+        from datetime import datetime
+        from wecom_server_collector import fetch_trend_from_db
+        rows = [(datetime(2026, 8, 11, 11, 0, 0), 460.0, None, None, None, None, None, None, None, None, None, None)]
+        with patch('db.get_conn', return_value=self._mock_conn(rows)):
+            res = fetch_trend_from_db("HK.00700", "20260811")
+        self.assertEqual(res["am"][0]["buy_str"], "N/A")
+        self.assertEqual(res["am"][0]["super_in"], None)
+
+
 class TestRegexMatching(unittest.TestCase):
     """消息路由正则 —— 防止关键词匹配错误"""
 

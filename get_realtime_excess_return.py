@@ -25,10 +25,13 @@ def calc_change_rate(last_price, prev_close):
         return None
     return (float(last_price) - float(prev_close)) / float(prev_close) * 100
 
-def get_realtime_excess_return(stock_code, bench_code, quote_ctx):
-    ret, snap = quote_ctx.get_market_snapshot([stock_code, bench_code])
-    if ret != RET_OK or snap.empty:
-        return None
+def get_realtime_excess_return(stock_code, bench_code, quote_ctx, snapshot=None):
+    if snapshot is None:
+        ret, snap = quote_ctx.get_market_snapshot([stock_code, bench_code])
+        if ret != RET_OK or snap.empty:
+            return None
+    else:
+        snap = snapshot
 
     stock_row = snap[snap['code'] == stock_code]
     bench_row = snap[snap['code'] == bench_code]
@@ -83,8 +86,10 @@ def format_text(data, full_code, currency):
     lines.append(f"实时超额收益: {fmt_price(excess, 2)}%" if excess is not None else "实时超额收益: N/A")
     return "\n".join(lines)
 
-def run(codes=None, ctx=None):
-    """采集入口（常驻调用）。codes: 代码列表；ctx: 共享上下文（可空）。返回单 dict 或 list。"""
+def run(codes=None, ctx=None, snapshot=None):
+    """采集入口（常驻调用）。codes: 代码列表；ctx: 共享上下文（可空）。返回单 dict 或 list。
+    snapshot: 可选，批量快照 DataFrame（含 stock_code + bench_code），传入时复用。
+    """
     ctx = ctx or get_shared_ctx()
     results = []
     for code in (codes or []):
@@ -92,7 +97,7 @@ def run(codes=None, ctx=None):
         bench_code = BENCH_BY_MARKET.get(prefix)
         if not bench_code:
             continue
-        results.append(get_realtime_excess_return(code, bench_code, ctx))
+        results.append(get_realtime_excess_return(code, bench_code, ctx, snapshot))
     return results[0] if len(results) == 1 else results
 
 if __name__ == "__main__":

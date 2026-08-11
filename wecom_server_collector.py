@@ -175,32 +175,75 @@ def format_trend_records(records, stock_code, title):
     return "\n".join(lines)
 
 
+def fetch_trend_from_db(stock_code, date_str):
+    """从 trend_snapshot 表读取当日趋势序列，映射为 handle_trend 所需的 record 结构。
+
+    返回 dict: {"am": [...], "pm": [...], "found": bool}
+    """
+    from db import get_conn
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT snapshot_time, price,
+                           super_in_net, big_in_net, mid_in_net, small_in_net,
+                           buy_sell_ratio, excess_return_pct, volume, turnover,
+                           buy_levels_str, sell_levels_str
+                    FROM trend_snapshot
+                    WHERE stock_code = %s
+                      AND snapshot_time::date = %s
+                    ORDER BY snapshot_time ASC
+                    """,
+                    (stock_code, date_str),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[趋势] DB查询失败: {e}")
+        return {"am": [], "pm": [], "found": False, "error": True}
+
+    if not rows:
+        return {"am": [], "pm": [], "found": False}
+
+    am, pm = [], []
+    for (snap_time, price, super_in, big_in, mid_in, small_in,
+         ratio, excess, volume, turnover, buy_str, sell_str) in rows:
+        rec = {
+            "time": snap_time.strftime('%H:%M'),
+            "price": float(price) if price is not None else None,
+            "super_in": float(super_in) if super_in is not None else None,
+            "big_in": float(big_in) if big_in is not None else None,
+            "mid_in": float(mid_in) if mid_in is not None else None,
+            "small_in": float(small_in) if small_in is not None else None,
+            "ratio": float(ratio) if ratio is not None else None,
+            "excess": float(excess) if excess is not None else None,
+            "volume": float(volume) if volume is not None else None,
+            "turnover": float(turnover) if turnover is not None else None,
+            "buy_str": buy_str or "N/A",
+            "sell_str": sell_str or "N/A",
+        }
+        if snap_time.hour < 13:
+            am.append(rec)
+        else:
+            pm.append(rec)
+    return {"am": am, "pm": pm, "found": True}
+
+
 async def handle_trend(ws_client, frame, stock_code):
     date_str = datetime.now().strftime('%Y%m%d')
-    file_name = f"trend_{stock_code.replace('.', '_')}_{date_str}.json"
-    cache_path = os.path.join(CACHE_DIR, file_name)
 
-    if not os.path.exists(cache_path):
+    result = fetch_trend_from_db(stock_code, date_str)
+    if result.get("error"):
+        await ws_client.reply_stream(frame, generate_req_id('stream'),
+                                     f"趋势数据 ({stock_code}): 读取失败", True)
+        return
+    if not result["found"]:
         await ws_client.reply_stream(frame, generate_req_id('stream'),
                                      f"趋势数据 ({stock_code}): 暂无今日记录", True)
         return
 
-    try:
-        with open(cache_path, 'r') as f:
-            all_records = json.load(f)
-    except:
-        await ws_client.reply_stream(frame, generate_req_id('stream'),
-                                     f"趋势数据 ({stock_code}): 读取失败", True)
-        return
-
-    if not all_records:
-        await ws_client.reply_stream(frame, generate_req_id('stream'),
-                                     f"趋势数据 ({stock_code}): 无数据", True)
-        return
-
-    # 按时间分割上/下午
-    am_records = [r for r in all_records if r['time'] < '13:00']
-    pm_records = [r for r in all_records if r['time'] >= '13:00']
+    am_records = result["am"]
+    pm_records = result["pm"]
 
     # 分块发送（每块最多35条记录，约4000字符，避免企业微信流式消息截断）
     async def send_chunked(records, session_title):

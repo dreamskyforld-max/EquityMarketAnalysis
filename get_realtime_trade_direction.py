@@ -23,12 +23,16 @@ def fmt_price(val, max_dec=4):
 def get_currency(full_code):
     return "港元" if full_code.upper().startswith("HK") else "元"
 
-def get_trade_direction(full_code, quote_ctx):
-    ret, snapshot = quote_ctx.get_market_snapshot([full_code])
-    if ret != RET_OK or snapshot.empty:
-        return None
+def get_trade_direction(full_code, quote_ctx, snapshot=None):
+    if snapshot is None:
+        ret, snapshot = quote_ctx.get_market_snapshot([full_code])
+        if ret != RET_OK or snapshot.empty:
+            return None
 
-    row = snapshot.iloc[0]
+    row = snapshot[snapshot['code'] == full_code]
+    if row.empty:
+        return None
+    row = row.iloc[0]
     price = row.get('last_price', None)
     update_time = row.get('update_time', None)
     bid_vol = row.get('bid_vol', None)   # 主动性买盘
@@ -66,12 +70,21 @@ def format_text(data, full_code, currency):
     lines.append(f"成交额: {turnover:.2f} 亿{currency}" if turnover is not None else "成交额: N/A")
     return "\n".join(lines)
 
-def run(codes=None, ctx=None):
-    """采集入口（常驻调用）。codes: 代码列表；ctx: 共享行情上下文（可空）。返回单 dict 或 list。"""
+def run(codes=None, ctx=None, snapshot=None):
+    """采集入口（常驻调用）。codes: 代码列表；ctx: 共享行情上下文（可空）。返回单 dict 或 list。
+    snapshot: 可选，批量快照 DataFrame（含多只 code），传入时复用，避免重复调用 API。
+    """
     ctx = ctx or get_shared_ctx()
     results = []
     for code in (codes or []):
-        results.append(get_trade_direction(code, ctx))
+        snap = snapshot
+        if snap is not None:
+            # 筛出当前 code 的行（调用方可能传入多 code 的批量快照）
+            matched = snap[snap['code'] == code]
+            snap_arg = matched if not matched.empty else None
+        else:
+            snap_arg = None
+        results.append(get_trade_direction(code, ctx, snap_arg))
     return results[0] if len(results) == 1 else results
 
 if __name__ == "__main__":

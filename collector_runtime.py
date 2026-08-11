@@ -35,7 +35,11 @@ _IMPORT_LOCK = threading.Lock()    # 串行化模块首次 import
 
 
 class _LockedCtx:
-    """包装 OpenQuoteContext：每次方法调用自动加锁；断线时重建并重试一次。"""
+    """包装 OpenQuoteContext：每次方法调用自动加锁；断线时重建并重试一次。
+
+    重连失败时抛 RuntimeError（普通 Exception），而非让 futu SDK 的
+    ECONNREFUSED 等异常向上传播可能导致进程级崩溃。
+    """
     def __getattr__(self, name):
         raw = _raw_ctx()
         attr = getattr(raw, name)
@@ -47,8 +51,16 @@ class _LockedCtx:
                 try:
                     return attr(*args, **kwargs)
                 except Exception:
+                    pass  # 第一次调用失败，尝试重连
+                # 重连并重试一次
+                try:
                     _reconnect()
                     return getattr(_raw_ctx(), name)(*args, **kwargs)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"futu 调用 {name} 失败（重连后仍不可用）: "
+                        f"{type(e).__name__}: {e}"
+                    ) from e
         return _wrapper
 
 

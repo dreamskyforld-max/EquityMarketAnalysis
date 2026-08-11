@@ -16,6 +16,7 @@ from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.executors.pool import ThreadPoolExecutor as APSchedThreadPool
 
 # ── 日志配置 ────────────────────────────────────────────────
 logging.basicConfig(
@@ -122,14 +123,20 @@ STOCKS = [
 # ── 全局任务（与具体股票无关）──────────────────────────────
 GLOBAL_TASKS = [
     ("数据清理", "cleanup_old_data.py", {"hour": 4, "minute": 0}),            # 清理36个月前盘中实时数据+逐笔成交数据
-    ("全球指数采集(早)", "get_global_benchmarks.py", {"hour": 6, "minute": 0}),   # 早盘: 美债T-0(美东收盘后)+亚太前一日收盘
-    ("全球指数采集(晚)", "get_global_benchmarks.py", {"hour": 16, "minute": 30}),  # 美股指数/VIX/美债/汇率（美盘隔夜数据+亚太当日收盘）
+    ("全球指数采集(每小时)", "get_global_benchmarks.py", {"hour": "*", "minute": 0}),  # 每小时刷新: 富途系盘中实时, FRED/债券/汇率为日频(T-1)
     # 全球指数分钟级采集：覆盖亚太(08:00–16:00 HK)+欧美盘至凌晨，避开低频 04:00–08:00
     # 每5分钟一次，仅交易日；run 忽略 codes，全局只跑一次
     ("全球指数分钟采集", "get_global_benchmarks_minute.py",
      {"minute": "*/5", "hour": "8-11,13-16,17-23,0-3", "day_of_week": "mon-fri"}),
     # 股票-指数成分归属（参考数据，季度刷新即可；run 忽略 codes，全局只跑一次）
     ("指数成分归属", "get_stock_sector.py", {"day_of_week": 2, "hour": 18, "minute": 0}),
+    # 股票 vs 全球指数日收益率相关性分析（读 daily_quote/daily_benchmark 日频数据，
+    # 盘后跑即可，盘中重算结果不变；run 循环 STOCKS，全局只跑一次）
+    ("指数相关性分析", "benchmark_correlation_daily.py",
+     {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}),
+    # 宏观环境三维评分（股/债/汇；读 daily_benchmark，盘后跑；run 忽略 codes，全局只跑一次）
+    ("宏观环境评分", "macro_environment_score.py",
+     {"hour": 18, "minute": 0, "day_of_week": "mon-fri"}),
 ]
 
 
@@ -140,17 +147,37 @@ def run_script(script_name: str, stock_code: str | None, timeout: int = 180) -> 
 
     通过 collector_runtime.run_module 惰性导入模块并调用其 run(codes, ctx)，
     import 整个进程仅发生一次，FutuOpenD 连接由共享上下文复用。
+    用线程+Event 实现超时：超时后线程被标记为 daemon 自动随进程退出，
+    不阻塞 scheduler 主循环。
     """
     codes = [stock_code] if stock_code else None
-    try:
-        from collector_runtime import run_module
-        run_module(script_name, codes)
-        return True
-    except Exception as e:
+    result = {"ok": False, "err": None}
+
+    def _target():
+        try:
+            from collector_runtime import run_module
+            run_module(script_name, codes)
+            result["ok"] = True
+        except BaseException as e:
+            result["err"] = e
+
+    import threading
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        log.warning(f"  [{script_name}] 执行超时 (>{timeout}s)")
+        return False
+
+    if result["err"] is not None:
+        e = result["err"]
         import traceback
-        log.warning(f"  [{script_name}] 执行异常: {e}")
+        log.warning(f"  [{script_name}] 执行异常: {type(e).__name__}: {e}")
         log.warning(traceback.format_exc())
         return False
+
+    return result["ok"]
 
 
 def execute_task(name: str, modules: list, stock_code: str | None,
@@ -213,6 +240,8 @@ def is_trading_hours(market: str = "HK") -> bool:
 def build_scheduler():
     """根据 STOCKS + MARKET_PRESETS 自动生成调度任务"""
     sched = BackgroundScheduler(timezone="Asia/Hong_Kong", daemon=True)
+    # 默认线程池只有 10 个线程，盘中每分钟同时触发 15+ 个任务会排队延迟
+    sched.add_executor(APSchedThreadPool(max_workers=20), "default")
     registered = 0
     _fin_offset = {}  # 按市场错开财务指标任务的分钟偏移
 

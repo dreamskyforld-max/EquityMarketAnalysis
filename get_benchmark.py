@@ -97,6 +97,10 @@ def _run_sina_a(bench_code, bench_name):
         print(f"[DB] 基准指数入库失败 ({bench_code}): {e}")
 
 
+# 20日前收盘价缓存：盘中同一交易日内不会变化，避免每分钟重复拉 K线
+_close_20d_cache = {}
+
+
 def run(codes=None, ctx=None):
     """采集入口（常驻调用）。codes: [股票代码]；ctx: 共享行情上下文（可空）。"""
     stock_code = codes[0] if (codes and len(codes) > 0) else "HK.00700"
@@ -130,18 +134,23 @@ def run(codes=None, ctx=None):
     change_pct = (float(close) / float(prev_close) - 1) * 100 if prev_close and float(prev_close) != 0 else 0
     update_time = row.get('update_time', 'N/A')
 
-    # 2. 拉取历史K线
-    ret_kl, kl_data, _ = ctx.request_history_kline(
-        bench_code,
-        ktype=KLType.K_DAY,
-        autype=AuType.QFQ,
-        max_count=40,
-        extended_time=False
-    )
-    if ret_kl == RET_OK and len(kl_data) >= 20:
-        close_20d_ago = kl_data.iloc[-20]['close']
-    else:
-        close_20d_ago = None
+    # 2. 拉取历史K线（盘中缓存：同一交易日只拉一次）
+    today = date.today()
+    cache_key = f"{bench_code}_{today.isoformat()}"
+    close_20d_ago = _close_20d_cache.get(cache_key)
+    if close_20d_ago is None:
+        ret_kl, kl_data, _ = ctx.request_history_kline(
+            bench_code,
+            ktype=KLType.K_DAY,
+            autype=AuType.QFQ,
+            max_count=40,
+            extended_time=False
+        )
+        if ret_kl == RET_OK and len(kl_data) >= 20:
+            close_20d_ago = kl_data.iloc[-20]['close']
+            _close_20d_cache[cache_key] = close_20d_ago
+        else:
+            close_20d_ago = None
 
     # 输出
     print(f"{name} ({bench_code})")

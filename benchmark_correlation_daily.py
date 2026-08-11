@@ -68,6 +68,116 @@ def load_data(stock_code: str) -> pd.DataFrame:
         return pd.read_sql(sql, c, params=(stock_code,))
 
 
+# ── 结果落库 ──
+# benchmark_correlation: 每只(股票, 指数, 计算日)一行，存各维度头条相关系数 + §8 结论
+# + detail_json 全量结构化明细。PK (stock_code, bench_code, calc_date)，重跑 upsert。
+def ensure_correlation_table(conn) -> None:
+    """幂等建表（首次运行自动创建，之后 no-op）。"""
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS benchmark_correlation (
+            stock_code   TEXT    NOT NULL,
+            bench_code   TEXT    NOT NULL,
+            bench_name   TEXT    NOT NULL,
+            calc_date    DATE    NOT NULL,
+            days         INTEGER,
+            pearson      DOUBLE PRECISION,
+            spearman     DOUBLE PRECISION,
+            lead_lag_neg1 DOUBLE PRECISION,
+            gap_r        DOUBLE PRECISION,
+            window5_r    DOUBLE PRECISION,
+            window10_r   DOUBLE PRECISION,
+            window20_r   DOUBLE PRECISION,
+            siphon5_r    DOUBLE PRECISION,
+            siphon10_r   DOUBLE PRECISION,
+            siphon20_r   DOUBLE PRECISION,
+            regime_up_r  DOUBLE PRECISION,
+            regime_down_r DOUBLE PRECISION,
+            shock_r_normal   DOUBLE PRECISION,
+            shock_r_volatile DOUBLE PRECISION,
+            extreme_signal TEXT,
+            verdict      TEXT,
+            signals      TEXT,
+            data_start   DATE,
+            data_end     DATE,
+            detail_json  JSONB,
+            updated_at   TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (stock_code, bench_code, calc_date)
+        )
+        """)
+        conn.commit()
+
+
+def save_correlation_results(stock_code: str, calc_date, results: List[dict],
+                             data_start, data_end) -> int:
+    """把 results(每只指数一行 dict) upsert 进 benchmark_correlation。返回写入行数。"""
+    from db import bulk_upsert
+    from psycopg2.extras import Json
+
+    if not results:
+        return 0
+    import numpy as np
+
+    def _to_py(v):
+        """把 numpy 标量 / NaN 转成 psycopg2 可识别的 Python 原生类型。"""
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            return {k: _to_py(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_to_py(x) for x in v]
+        if isinstance(v, (np.floating, float)):
+            f = float(v)
+            return None if (f != f or f in (float("inf"), float("-inf"))) else f
+        if isinstance(v, (np.integer,)):
+            return int(v)
+        if isinstance(v, (np.bool_,)):
+            return bool(v)
+        return v
+
+    calc_date = pd.to_datetime(calc_date).date() if calc_date is not None else pd.Timestamp.now().date()
+    data_start = pd.to_datetime(data_start).date() if data_start is not None else None
+    data_end = pd.to_datetime(data_end).date() if data_end is not None else None
+
+    rows = []
+    for r in results:
+        row = {
+            "stock_code": stock_code,
+            "bench_code": _to_py(r.get("bench_code")),
+            "bench_name": _to_py(r.get("bench_name")),
+            "calc_date": calc_date,
+            "days": _to_py(r.get("days")),
+            "pearson": _to_py(r.get("pearson")),
+            "spearman": _to_py(r.get("spearman")),
+            "lead_lag_neg1": _to_py(r.get("lead_lag_neg1")),
+            "gap_r": _to_py(r.get("gap_r")),
+            "window5_r": _to_py(r.get("window5_r")),
+            "window10_r": _to_py(r.get("window10_r")),
+            "window20_r": _to_py(r.get("window20_r")),
+            "siphon5_r": _to_py(r.get("siphon5_r")),
+            "siphon10_r": _to_py(r.get("siphon10_r")),
+            "siphon20_r": _to_py(r.get("siphon20_r")),
+            "regime_up_r": _to_py(r.get("regime_up_r")),
+            "regime_down_r": _to_py(r.get("regime_down_r")),
+            "shock_r_normal": _to_py(r.get("shock_r_normal")),
+            "shock_r_volatile": _to_py(r.get("shock_r_volatile")),
+            "extreme_signal": _to_py(r.get("extreme_signal")),
+            "verdict": _to_py(r.get("verdict")),
+            "signals": _to_py(r.get("signals")),
+            "data_start": data_start,
+            "data_end": data_end,
+            "detail_json": Json(_to_py(r.get("detail", {}))),
+        }
+        rows.append(row)
+
+    with get_conn() as conn:
+        ensure_correlation_table(conn)
+        bulk_upsert(conn, "benchmark_correlation", rows,
+                    conflict_cols=["stock_code", "bench_code", "calc_date"])
+    print(f"\n✅ 已落库 {len(rows)} 行 → benchmark_correlation (stock={stock_code}, calc_date={calc_date})")
+    return len(rows)
+
+
 def analyze_correlation(df: pd.DataFrame) -> pd.DataFrame:
     """计算每个指数与 HK.00700 的同期 Pearson / Spearman 相关性。"""
     rows: List[dict] = []
@@ -516,15 +626,27 @@ def main(stock_code: str = "HK.00700"):
         sub = df_outer[df_outer["bench_code"] == code]
         return sub[col].values[0] if len(sub) else None
 
+    # 收集每只指数的各维度头条指标，用于落库 benchmark_correlation
+    results: List[dict] = []
+
+    def _get_r_win(dfo, code, window, col="pearson"):
+        if dfo is None or dfo.empty:
+            return None
+        sub = dfo[(dfo["bench_code"] == code) & (dfo["window"] == window)]
+        return sub[col].values[0] if len(sub) else None
+
     for _, r in corr.iterrows():
         code, name = r["bench_code"], r["bench_name"]
         sync = r["pearson"]       # §1 同期
         lag1 = _get_r(lags[lambda x: x["lag"] == -1], code)  # §2 T-1领先
         gap_r = _get_r(gap, code)  # §3 隔夜跳空
         siphon_5 = None
+        siphon_10 = None
+        siphon_20 = None
         if not siphon.empty:
-            s5 = siphon[(siphon["bench_code"] == code) & (siphon["window"] == 5)]
-            siphon_5 = s5["pearson"].values[0] if len(s5) else None
+            siphon_5 = _get_r_win(siphon, code, 5)
+            siphon_10 = _get_r_win(siphon, code, 10)
+            siphon_20 = _get_r_win(siphon, code, 20)
 
         # 构建评价
         signals = []
@@ -623,6 +745,8 @@ def main(stock_code: str = "HK.00700"):
             signals.append(f"{direction}({lag1:+.2f})")
 
         # 波动日增强
+        shock_r_normal = None
+        shock_r_volatile = None
         if not thresh["shock_days"].empty:
             shock = thresh["shock_days"][thresh["shock_days"]["bench_code"] == code]
             if len(shock) == 2:
@@ -630,8 +754,19 @@ def main(stock_code: str = "HK.00700"):
                 shock_day = shock[shock["condition"] == "剧烈波动(|ret|>2σ)"]
                 r_n = normal["pearson"].values[0] if len(normal) else None
                 r_s = shock_day["pearson"].values[0] if len(shock_day) else None
+                shock_r_normal, shock_r_volatile = r_n, r_s
                 if r_n is not None and r_s is not None and abs(r_s - r_n) >= DELTA_NOTABLE:
                     signals.append(f"波动日增强Δ={abs(r_s-r_n):.2f}")
+
+        # 趋势分岔取值（regime up/down）
+        regime_up, regime_down = None, None
+        if not regime.empty:
+            reg = regime[regime["bench_code"] == code]
+            if len(reg) == 2:
+                up = reg[reg["regime"] == "上升"]
+                dn = reg[reg["regime"] == "下降"]
+                regime_up = up["pearson"].values[0] if len(up) else None
+                regime_down = dn["pearson"].values[0] if len(dn) else None
 
         # 综合判定（仅当上述规则都未命中时走 fallback）
         if verdict == "无关":
@@ -643,11 +778,62 @@ def main(stock_code: str = "HK.00700"):
         signal_str = " | ".join(signals) if signals else "无显著信号"
         print(f"  [{verdict:<6s}] {name:<21s} {signal_str}")
 
+        results.append({
+            "bench_code": code, "bench_name": name, "days": int(r["days"]),
+            "pearson": r.get("pearson"), "spearman": r.get("spearman"),
+            "lead_lag_neg1": lag1, "gap_r": gap_r,
+            "window5_r": _get_r_win(win, code, 5) if not win.empty else None,
+            "window10_r": _get_r_win(win, code, 10) if not win.empty else None,
+            "window20_r": _get_r_win(win, code, 20) if not win.empty else None,
+            "siphon5_r": siphon_5, "siphon10_r": siphon_10, "siphon20_r": siphon_20,
+            "regime_up_r": regime_up, "regime_down_r": regime_down,
+            "shock_r_normal": shock_r_normal, "shock_r_volatile": shock_r_volatile,
+            "extreme_signal": extreme_signal,
+            "verdict": verdict, "signals": signal_str,
+            "detail": {
+                "pearson": r.get("pearson"), "spearman": r.get("spearman"),
+                "lead_lag": lag1, "gap_r": gap_r,
+                "window_eff": (_get_r_win(win, code, 5) if not win.empty else None,
+                               _get_r_win(win, code, 10) if not win.empty else None,
+                               _get_r_win(win, code, 20) if not win.empty else None),
+                "siphon": (siphon_5, siphon_10, siphon_20),
+                "regime": (regime_up, regime_down),
+                "shock": (shock_r_normal, shock_r_volatile),
+                "extreme_signal": extreme_signal,
+            },
+        })
+
     # ═══ 汇总 ═══
     print(f"\n{'═' * 64}")
     print(f"  数据区间: {data_start} ~ {data_end}")
     print(f"  r≥0.5 ★较强  r≥0.3 *有意义  Δr≥0.15 ⚡显著差异")
     print(f"{'═' * 64}")
+
+    # ═══ 落库 ═══
+    if results:
+        save_correlation_results(
+            stock_code, pd.Timestamp.now().normalize(), results,
+            data_start, data_end,
+        )
+
+
+def run(codes=None, ctx=None):
+    """常驻调用入口（由 market_scheduler 通过 collector_runtime 调用）。
+
+    codes: 股票代码列表；为空时回退到默认 HK.00700。
+    ctx: 共享行情上下文（本分析仅读数据库，不使用，保留以对齐常驻入口约定）。
+    """
+    targets = codes if codes else ["HK.00700"]
+    # 去重保序
+    seen = set()
+    for code in targets:
+        if code in seen:
+            continue
+        seen.add(code)
+        try:
+            main(code)
+        except Exception as e:  # 单只失败不影响其他标的
+            print(f"❌ {code} 相关性分析失败: {e}")
 
 
 if __name__ == "__main__":

@@ -97,9 +97,22 @@ def bulk_upsert(conn, table, data_list, conflict_cols):
     """
     批量 INSERT ... ON CONFLICT DO UPDATE
     data_list: dict 列表
+
+    自动对齐所有 record 的 keys：不同数据源构造的 record 可能字段不一致
+    （如富途带 volume/turnover，FRED 不带），用 data_list[0].keys() 取列名
+    会导致后续 record KeyError。这里收集所有 record 的并集 keys，缺失字段补 None。
     """
     if not data_list:
         return
+
+    # 收集所有 record 的 keys 并集，保证每条 record 都有相同的字段
+    all_keys = set()
+    for d in data_list:
+        all_keys.update(d.keys())
+    for d in data_list:
+        for k in all_keys:
+            if k not in d:
+                d[k] = None
 
     columns = list(data_list[0].keys())
     update_cols = [c for c in columns if c not in conflict_cols and c != "id"]

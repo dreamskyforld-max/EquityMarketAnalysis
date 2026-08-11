@@ -26,6 +26,7 @@ import sys
 import logging
 from datetime import datetime, timedelta, date, timezone
 from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from zoneinfo import ZoneInfo
@@ -138,11 +139,12 @@ def _save(records: list) -> int:
 
 # ── 富途分钟采集 ──
 def _collect_futu(items: list, klt: str = "1", days: int = 1) -> list:
-    from futu import OpenQuoteContext, RET_OK, KLType, AuType
+    from futu import RET_OK, KLType, AuType
+    from collector_runtime import get_shared_ctx
 
     ktype = {"1": KLType.K_1M, "5": KLType.K_5M, "15": KLType.K_15M,
              "60": KLType.K_60M}.get(klt, KLType.K_1M)
-    ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
+    ctx = get_shared_ctx()  # 复用常驻进程共享上下文（不关闭）
     records = []
     try:
         end_day = date.today()
@@ -172,7 +174,7 @@ def _collect_futu(items: list, klt: str = "1", days: int = 1) -> list:
                 except Exception as e:
                     print(f"  [富途] ❌ {it['name']} {day} {type(e).__name__}: {e}")
     finally:
-        ctx.close()
+        pass  # 共享 ctx 由进程持有，此处不关闭
     return records
 
 
@@ -294,62 +296,99 @@ def _collect_tencent_a(items: list, klt: str = "1", days: int = 1) -> list:
 
 
 # ── yfinance 分钟采集（日经 / KOSPI）──
-def _collect_yfinance(items: list, klt: str = "1", days: int = 1) -> list:
+# 每 5 分钟只取最近 1 小时增量（替代全天 period="1d"），缩短下载/解析耗时。
+# 说明：yfinance 对高频请求会返回 YFRateLimitError(429)，故退避大幅拉长，
+# 且 collect_all 已限制 yfinance 仅在整点批次采集（每小时 1 次），降低限流概率。
+def _collect_yfinance_one(it: dict, klt: str = "1") -> list:
     import time as _t
+    import yfinance as yf
 
+    ticker = it.get("yf_ticker")
+    if not ticker:
+        return []
+    records = []
+    last_err = None
+    # 3 次重试；针对 429 限流采用指数退避 30s / 60s（短退避救不回 429）
+    _backoff = [0, 30, 60]
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                _t.sleep(_backoff[min(attempt, len(_backoff) - 1)])
+            t = yf.Ticker(ticker)
+            df = t.history(period="1h", interval="1m", auto_adjust=False)
+            if df is None or len(df) == 0:
+                last_err = "无数据"
+                continue
+            kept = 0
+            for idx, row in df.iterrows():
+                # yfinance 索引为 tz-aware (市场时区)
+                local = idx.tz_convert(it["tz"]) if idx.tzinfo else idx
+                utc = idx.astimezone(timezone.utc) if idx.tzinfo else _to_utc(
+                    local.strftime("%Y-%m-%d %H:%M:%S"), it["tz"])
+                records.append({
+                    "bench_code": it["code"], "bench_name": it["name"],
+                    "ts": utc, "mkt_time": local.strftime("%Y-%m-%d %H:%M:%S"),
+                    "open": _r(row.get("Open")), "high": _r(row.get("High")),
+                    "low": _r(row.get("Low")), "close": _r(row.get("Close")),
+                    "source": "yfinance",
+                })
+                kept += 1
+            print(f"  [yfinance] ✅ {it['name']}({ticker}) {kept}根")
+            break
+        except Exception as e:
+            # 识别限流类异常，明确提示（便于从日志区分"真无数据"与"被限流"）
+            err_name = type(e).__name__
+            is_rate = "rate" in err_name.lower() or "429" in str(e).lower()
+            last_err = f"{err_name}: {e}"
+            if is_rate:
+                print(f"  [yfinance] ⚠️ {it['name']}({ticker}) 限流({err_name})，"
+                      f"退避 {_backoff[min(attempt + 1, len(_backoff) - 1)]}s 后重试")
+            _t.sleep(0.5)
+    else:
+        print(f"  [yfinance] ❌ {it['name']}({ticker}) {last_err}")
+    return records
+
+
+def _collect_yfinance(items: list, klt: str = "1", days: int = 1) -> list:
+    """并行拉取多个 yfinance ticker（各 ticker 独立线程），降低总耗时。"""
     try:
-        import yfinance as yf
+        import importlib
+        importlib.import_module("yfinance")  # 提前确认库已安装
     except Exception as e:
         print(f"  [yfinance] ❌ 库未安装: {e}")
         return []
-
     records = []
-    for it in items:
-        ticker = it.get("yf_ticker")
-        if not ticker:
-            continue
-        last_err = None
-        for attempt in range(3):  # 3 次重试，应对 429 限流
+    if not items:
+        return records
+    with ThreadPoolExecutor(max_workers=len(items)) as ex:
+        futs = {ex.submit(_collect_yfinance_one, it, klt): it for it in items}
+        for fut in as_completed(futs):
             try:
-                if attempt > 0:
-                    _t.sleep(10 * attempt)  # 10s / 20s 递增退避
-                t = yf.Ticker(ticker)
-                df = t.history(period="1d", interval="1m", auto_adjust=False)
-                if df is None or len(df) == 0:
-                    last_err = "无数据"
-                    continue
-                kept = 0
-                for idx, row in df.iterrows():
-                    # yfinance 索引为 tz-aware (市场时区)
-                    local = idx.tz_convert(it["tz"]) if idx.tzinfo else idx
-                    utc = idx.astimezone(timezone.utc) if idx.tzinfo else _to_utc(
-                        local.strftime("%Y-%m-%d %H:%M:%S"), it["tz"])
-                    records.append({
-                        "bench_code": it["code"], "bench_name": it["name"],
-                        "ts": utc, "mkt_time": local.strftime("%Y-%m-%d %H:%M:%S"),
-                        "open": _r(row.get("Open")), "high": _r(row.get("High")),
-                        "low": _r(row.get("Low")), "close": _r(row.get("Close")),
-                        "source": "yfinance",
-                    })
-                    kept += 1
-                print(f"  [yfinance] ✅ {it['name']}({ticker}) {kept}根")
-                break
+                records.extend(fut.result())
             except Exception as e:
-                last_err = f"{type(e).__name__}: {e}"
-                _t.sleep(0.5)
-        else:
-            print(f"  [yfinance] ❌ {it['name']}({ticker}) {last_err}")
-        _t.sleep(0.5)
+                it = futs[fut]
+                print(f"  [yfinance] ❌ {it['name']} 异常: {type(e).__name__}: {e}")
     return records
 
 
 # ── 调度入口 ──
-def collect_all(sources: Optional[set] = None, klt: str = "1", days: int = 1):
+def collect_all(sources: Optional[set] = None, klt: str = "1", days: int = 1,
+                yf_hourly: bool = True):
+    """yf_hourly=True 时，yfinance(日经/KOSPI)仅在整点或半点批次采集（每 30 分钟 1 次），
+    降低 yfinance 429 限流概率；其余源(富途/腾讯)保持原频率（每 5 分钟）。
+    显式传 sources={'yfinance'} 时忽略此限制（手动补采不受限）。"""
     by_source = {}
     for b in MINUTE_BENCHMARKS:
         if sources and b["source"] not in sources:
             continue
         by_source.setdefault(b["source"], []).append(b)
+
+    # 降频：非整点/半点且未显式指定 yfinance 源时，跳过 yfinance
+    if yf_hourly and not (sources and "yfinance" in sources):
+        now_min = datetime.now().minute
+        if now_min not in (0, 30):
+            by_source.pop("yfinance", None)
+            print("  [调度] 非整点/半点批次，跳过 yfinance（每 30 分钟才采日经/KOSPI）")
 
     collectors = {
         "futu": lambda its: _collect_futu(its, klt, days),
@@ -360,13 +399,24 @@ def collect_all(sources: Optional[set] = None, klt: str = "1", days: int = 1):
 
     _ensure_table()
     all_rec = []
-    for src, items in by_source.items():
-        fn = collectors.get(src)
-        if not fn:
-            print(f"  ❌ 未知数据源: {src}")
-            continue
-        print(f"\n── {src.upper()} ({len(items)}个) ──")
-        all_rec.extend(fn(items))
+
+    # 各数据源互不依赖，并行执行（数据源头总耗时 ≈ max(各源耗时)，
+    # 避免 yfinance 退避叠加在串行链路上逼近 scheduler timeout）。
+    with ThreadPoolExecutor(max_workers=max(len(by_source), 1)) as ex:
+        fut_map = {}
+        for src, items in by_source.items():
+            fn = collectors.get(src)
+            if not fn:
+                continue
+            fut_map[ex.submit(fn, items)] = src
+        for fut in as_completed(fut_map):
+            src = fut_map[fut]
+            try:
+                recs = fut.result()
+                all_rec.extend(recs)
+                print(f"  [{src}] 采集 {len(recs)} 条")
+            except Exception as e:
+                print(f"  [{src}] ❌ 采集异常: {type(e).__name__}: {e}")
 
     saved = _save(all_rec)
     print(f"\n总计: 采集 {len(all_rec)} 条, 写入 {saved} 条")

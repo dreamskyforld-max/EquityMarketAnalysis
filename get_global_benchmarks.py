@@ -106,14 +106,20 @@ def _collect_futu(items: list) -> list:
         if ret != RET_OK:
             print(f"  [富途] ❌ 快照失败: {snap}")
             return []
-        for i, it in enumerate(items):
+        # 按 code 建索引，避免 snapshot 返回顺序与传入 codes 不一致导致错位
+        snap_map = {str(r['code']): r for _, r in snap.iterrows()}
+        for it in items:
             try:
-                row = snap.iloc[i]
+                row = snap_map.get(it["code"])
+                if row is None:
+                    print(f"  [富途] ⚠️ {it['name']}({it['code']}) 快照未返回，跳过")
+                    continue
                 close = float(row['last_price'])
                 prev = float(row.get('prev_close_price', close) or close)
                 change = (close / prev - 1) * 100 if prev != 0 else 0.0
                 ut = row.get('update_time', 'N/A')
                 td = date.fromisoformat(str(ut)[:10]) if ut and str(ut) != 'N/A' else date.today()
+                print(f"  [富途] {it['name']}({it['code']}) snapshot update_time={ut} → trade_date={td}")
 
                 # 当日成交量/额（snapshot 自带）
                 vol = int(row.get('volume', 0)) if row.get('volume') else None
@@ -352,6 +358,11 @@ def _collect_sina(items: list) -> list:
     import akshare as ak
     import warnings; warnings.filterwarnings("ignore")
 
+    # 接口不支持区间参数，拉全量后在本地截断到最近约 20 个交易日
+    # 保留 22 行：last(当天) + prev(昨) + 20 日前(iloc[-21]) 需 21 行窗口，多留 1 行余量
+    # 避免 close_20d_ago 取 iloc[-21] 时越界，同时避免拉取全历史（数千行）的浪费
+    _KEEP = 22
+
     records = []
     for it in items:
         sina_name = it.get("sina_name")
@@ -363,7 +374,7 @@ def _collect_sina(items: list) -> list:
             if df is None or len(df) < 2:
                 print(f"  [新浪] ⚠️ {it['name']}({sina_name}) 数据不足")
                 continue
-            df = df.dropna()
+            df = df.dropna().tail(_KEEP)
             last = df.iloc[-1]
             prev = df.iloc[-2]
             td = last["date"]
@@ -400,6 +411,11 @@ def _collect_sina_a(items: list) -> list:
     import akshare as ak
     import warnings; warnings.filterwarnings("ignore")
 
+    # 接口不支持区间参数，拉全量后在本地截断到最近约 20 个交易日
+    # 保留 22 行：last(当天) + prev(昨) + 20 日前(iloc[-21]) 需 21 行窗口，多留 1 行余量
+    # 避免 close_20d_ago 取 iloc[-21] 时越界，同时避免拉取全历史（数千行）的浪费
+    _KEEP = 22
+
     records = []
     for it in items:
         sina_code = it.get("sina_code")
@@ -411,7 +427,7 @@ def _collect_sina_a(items: list) -> list:
             if df is None or len(df) < 2:
                 print(f"  [新浪A股] ⚠️ {it['name']}({sina_code}) 数据不足")
                 continue
-            df = df.dropna()
+            df = df.dropna().tail(_KEEP)
             last = df.iloc[-1]
             prev = df.iloc[-2]
             td = last["date"]
