@@ -104,9 +104,6 @@ MARKET_PRESETS = {
 # ── 股票列表（添加新股只需加一行）─────────────────────────
 STOCKS = [
     {"code": "HK.00700", "market": "HK"},
-    {"code": "SH.600900", "market": "A"},
-    {"code": "SH.520900", "market": "A"},
-    {"code": "SH.600941", "market": "A"},
     {"code": "HK.09660", "market": "HK"},
     {"code": "HK.00857", "market": "HK"},
     {"code": "HK.01088", "market": "HK"},
@@ -131,26 +128,34 @@ GLOBAL_TASKS = [
     # 股票-指数成分归属（参考数据，季度刷新即可；run 忽略 codes，全局只跑一次）
     ("指数成分归属", "get_stock_sector.py", {"day_of_week": 2, "hour": 18, "minute": 0}),
     # 股票 vs 全球指数日收益率相关性分析（读 daily_quote/daily_benchmark 日频数据，
-    # 盘后跑即可，盘中重算结果不变；run 循环 STOCKS，全局只跑一次）
+    # 盘后跑即可，盘中重算结果不变；run 循环全票 STOCKS，全局跑一次）
     ("指数相关性分析", "benchmark_correlation_daily.py",
-     {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}),
-    # 宏观环境三维评分（股/债/汇；读 daily_benchmark，盘后跑；run 忽略 codes，全局只跑一次）
+     {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS]),
+    # 宏观环境三维评分（股/债/汇；读 daily_benchmark，盘后跑；run 循环全票 STOCKS，全局跑一次）
     ("宏观环境评分", "macro_environment_score.py",
-     {"hour": 18, "minute": 0, "day_of_week": "mon-fri"}),
+     {"hour": 18, "minute": 0, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS]),
 ]
 
 
 # ── 执行器 ──────────────────────────────────────────────────
 
-def run_script(script_name: str, stock_code: str | None, timeout: int = 180) -> bool:
+def run_script(script_name: str, codes=None, timeout: int = 180) -> bool:
     """运行采集模块（常驻进程内调用，无 subprocess 冷启动）。
 
     通过 collector_runtime.run_module 惰性导入模块并调用其 run(codes, ctx)，
     import 整个进程仅发生一次，FutuOpenD 连接由共享上下文复用。
     用线程+Event 实现超时：超时后线程被标记为 daemon 自动随进程退出，
     不阻塞 scheduler 主循环。
+
+    Args:
+        codes: 股票代码列表；可为 None（全局任务，由模块自行决定范围）、
+               str（单票，自动包成 [str]）或 list（多票全局任务）。
     """
-    codes = [stock_code] if stock_code else None
+    if codes is None:
+        pass  # 保持 None，交给模块 run() 决定默认范围
+    elif isinstance(codes, str):
+        codes = [codes]
+    # list 则原样传入
     result = {"ok": False, "err": None}
 
     def _target():
@@ -180,14 +185,15 @@ def run_script(script_name: str, stock_code: str | None, timeout: int = 180) -> 
     return result["ok"]
 
 
-def execute_task(name: str, modules: list, stock_code: str | None,
+def execute_task(name: str, modules: list, codes=None,
                  force: bool = False, market: str | None = None, timeout: int = 180):
     """执行一组采集模块（顺序执行）
 
     Args:
         name: 任务名称（日志用）
         modules: 脚本名列表，空列表跳过
-        stock_code: 股票代码，None 表示全局任务
+        codes: 股票代码列表；None 表示全局任务（由模块自行决定范围）、
+               str 表示单票任务、list 表示多票全局任务（如全票相关性分析）
         force: 是否跳过交易时段检查
         market: 市场标识（"HK"/"A"），用于交易时段判断；None 时不检查
         timeout: 单个脚本超时秒数，默认 180
@@ -203,7 +209,7 @@ def execute_task(name: str, modules: list, stock_code: str | None,
 
     fail = 0
     for script in modules:
-        ok = run_script(script, stock_code, timeout)
+        ok = run_script(script, codes, timeout)
         if not ok:
             fail += 1
 
@@ -310,11 +316,13 @@ def build_scheduler():
             log.info(f"已注册: [{job_name}] {cron.get('hour',0):02d}:{cron.get('minute',0):02d}")
 
     # 4. 全局任务
-    for g_name, g_script, g_cron in GLOBAL_TASKS:
+    for g_item in GLOBAL_TASKS:
+        g_name, g_script, g_cron = g_item[0], g_item[1], g_item[2]
+        g_codes = g_item[3] if len(g_item) > 3 else None  # 第四元素：全局股票列表（可空）
         sched.add_job(
             execute_task,
             trigger=CronTrigger(**g_cron),
-            args=[g_name, [g_script], None, True],
+            args=[g_name, [g_script], g_codes, True],
             id=g_name,
             replace_existing=True,
             misfire_grace_time=300,

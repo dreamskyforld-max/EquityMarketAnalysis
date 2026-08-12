@@ -296,9 +296,9 @@ def _collect_tencent_a(items: list, klt: str = "1", days: int = 1) -> list:
 
 
 # ── yfinance 分钟采集（日经 / KOSPI）──
-# 每 5 分钟只取最近 1 小时增量（替代全天 period="1d"），缩短下载/解析耗时。
+# 取当日分钟序列（period="1d"，yfinance 新版已不支持 "1h"），upsert 按 (bench_code,ts) 去重。
 # 说明：yfinance 对高频请求会返回 YFRateLimitError(429)，故退避大幅拉长，
-# 且 collect_all 已限制 yfinance 仅在整点批次采集（每小时 1 次），降低限流概率。
+# 且 collect_all 已限制 yfinance 仅在整点/半点批次采集（每 30 分钟 1 次），降低限流概率。
 def _collect_yfinance_one(it: dict, klt: str = "1") -> list:
     import time as _t
     import yfinance as yf
@@ -315,7 +315,10 @@ def _collect_yfinance_one(it: dict, klt: str = "1") -> list:
             if attempt > 0:
                 _t.sleep(_backoff[min(attempt, len(_backoff) - 1)])
             t = yf.Ticker(ticker)
-            df = t.history(period="1h", interval="1m", auto_adjust=False)
+            # 注：yfinance 新版已移除 period="1h"，最小有效单位为 "1d"。
+            # 用 "1d" 取当日分钟序列（盘中到当前时刻 / 收盘后到全天），
+            # 由调用方 days=1 控制只取当日；upsert 按 (bench_code,ts) 去重。
+            df = t.history(period="1d", interval="1m", auto_adjust=False)
             if df is None or len(df) == 0:
                 last_err = "无数据"
                 continue

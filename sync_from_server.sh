@@ -121,6 +121,37 @@ SMALL_TABLES_FILTERED=(
     "collection_run_log"
 )
 
+sync_small_table_filtered() {
+    local table="$1"
+    echo "=== Sync $table ($STOCK_FILTER only) === (start: $(date '+%H:%M:%S'))"
+
+    echo -n "  Remote rows ($STOCK_FILTER): "
+    run_remote_sql "SELECT COUNT(*) FROM ${table} WHERE stock_code='${STOCK_FILTER}';" | tr -d ' '
+
+    # get local column names (exclude id to avoid conflicts)
+    local cols
+    cols=$(run_local_sql "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name='${table}' AND table_schema='public' AND column_name != 'id';" | tr -d ' ')
+
+    echo "  Deleting local $STOCK_FILTER data ..."
+    run_local_exec "DELETE FROM ${table} WHERE stock_code='${STOCK_FILTER}';"
+
+    echo "  Transferring (COPY, $(echo "$cols" | tr ',' ' ' | wc -w | tr -d ' ') cols) ..."
+    local t0
+    t0=$(date +%s)
+
+    run_remote_copy "\\COPY (SELECT ${cols} FROM ${table} WHERE stock_code='${STOCK_FILTER}') TO STDOUT CSV HEADER" \
+        | run_local_copy "\\COPY ${table}(${cols}) FROM STDIN CSV HEADER" \
+        | tail -3
+    local elapsed
+    elapsed=$(($(date +%s) - t0))
+
+    echo -n "  Local rows (after import): "
+    run_local_sql "SELECT COUNT(*) FROM ${table} WHERE stock_code='${STOCK_FILTER}';" | tr -d ' '
+
+    echo "  $table sync done (${elapsed}s)"
+    echo ""
+}
+
 # ==================================================================
 # 小表（无 stock_code）：全量覆盖（市场级数据）
 #   仅保留 benchmark_minute（分钟级大盘，体积小 ~1.3MB）。
