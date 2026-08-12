@@ -9,8 +9,9 @@
 # ============================================================================
 # 策略:
 #   - 小表有stock_code: DELETE WHERE stock_code + COPY (仅同步指定股票)
-#   - 小表无stock_code (benchmark/northbound): TRUNCATE + pg_dump 全量
 #   - 大表 (tick_data / trend_snapshot): 按日比对 + stock_code 过滤
+# 注意: 大盘天指标(daily_benchmark / benchmark_minute / daily_northbound_flow)
+#       已不再同步 —— 本地各自独立采集，避免双向覆盖。
 # ============================================================================
 set -uo pipefail
 
@@ -122,46 +123,13 @@ SMALL_TABLES_FILTERED=(
 
 # ==================================================================
 # 小表（无 stock_code）：全量覆盖（市场级数据）
+#   仅保留 benchmark_minute（分钟级大盘，体积小 ~1.3MB）。
+#   注意: daily_benchmark / daily_northbound_flow 已不再同步 ——
+#         本地各自独立采集，避免双向覆盖。
 # ==================================================================
 SMALL_TABLES_FULL=(
-    "daily_benchmark"
     "benchmark_minute"
-    "daily_northbound_flow"
 )
-
-sync_small_table_filtered() {
-    local table="$1"
-    echo "=== Sync $table ($STOCK_FILTER only) === (start: $(date '+%H:%M:%S'))"
-
-    echo -n "  Remote rows ($STOCK_FILTER): "
-    run_remote_sql "SELECT COUNT(*) FROM ${table} WHERE stock_code='${STOCK_FILTER}';" | tr -d ' '
-
-    # get local column names (exclude id to avoid conflicts)
-    local cols
-    cols=$(run_local_sql "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name='${table}' AND table_schema='public' AND column_name != 'id';" | tr -d ' ')
-
-    echo "  Deleting local $STOCK_FILTER data ..."
-    run_local_exec "DELETE FROM ${table} WHERE stock_code='${STOCK_FILTER}';"
-
-    echo "  Transferring (COPY, $(echo "$cols" | tr ',' ' ' | wc -w | tr -d ' ') cols) ..."
-    local t0
-    t0=$(date +%s)
-
-    run_remote_copy "\\COPY (SELECT ${cols} FROM ${table} WHERE stock_code='${STOCK_FILTER}') TO STDOUT CSV HEADER" \
-        | run_local_copy "\\COPY ${table}(${cols}) FROM STDIN CSV HEADER" \
-        | tail -3
-    local elapsed
-    elapsed=$(($(date +%s) - t0))
-
-    # reset sequence (id auto-generated locally, MAX(id) may shift after COPY)
-    run_local_exec "SELECT setval(pg_get_serial_sequence('${table}','id'), COALESCE((SELECT MAX(id) FROM ${table}), 1));" >/dev/null
-
-    echo -n "  Local rows (after import): "
-    run_local_sql "SELECT COUNT(*) FROM ${table} WHERE stock_code='${STOCK_FILTER}';" | tr -d ' '
-
-    echo "  $table sync done (${elapsed}s)"
-    echo ""
-}
 
 sync_small_table_full() {
     local table="$1"

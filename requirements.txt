@@ -20,6 +20,8 @@ python-dotenv==1.2.2         # .env 加载 FRED_API_KEY 等
 pandas==3.0.2
 numpy==2.4.4
 requests==2.33.1
+scipy>=1.11.0              # direction_backtest / multi_factor_analysis / ofi_short_horizon 等统计检验 (服务器最高可见 1.17.1)
+scikit-learn>=1.3.0        # direction_backtest / ofi_short_horizon 的 LogisticRegression/AUC
 lxml==6.1.0
 beautifulsoup4==4.14.3
 html5lib==1.1
