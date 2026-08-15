@@ -3,7 +3,7 @@
 市场数据定时调度服务
 - 以股票为中心配置，自动生成盘中（分钟级）和收盘（全量）采集任务
 - 支持港股和A股，通过 MARKET_PRESETS 定义各市场采集模块
-- 添加新股：在 STOCKS 中加一行即可
+- 股票列表从 stock_info 表(is_active)动态加载，新股接入/停用由 setup_new_stock(s).py 管理
 
 用法：
     python3 market_scheduler.py          # 前台运行
@@ -46,21 +46,20 @@ import collector_runtime  # noqa: E402  (导入即把 SCRIPTS_DIR 加入 sys.pat
 
 # ── 市场预设 ────────────────────────────────────────────────
 # 不同市场默认采集的模块集合，股票自动继承
-# 添加 A 股：在 STOCKS 中加一行，继承 "A" 市场的预设模块
+# stock_info.market 填交易所代码(HK/SH/SZ) 即可，SH/SZ 会在 build_scheduler 归一化为 "A" 预设
 MARKET_PRESETS = {
     "HK": {
-        "intraday": [  # 盘中每分钟
-            "get_quote.py",      # 行情快照（富途API）→ daily_quote
-            "get_benchmark.py",  # 恒生等基准指数 → benchmark_daily
-            "record_trend.py",   # 盘中趋势记录（分钟快照+缓存）→ trend_snapshot + trend_cache/
-        ],
+        # 注意：盘中采集（get_quote.py / record_trend.py）已从「每只股票每分钟一个任务」
+        # 改为「按市场全局批量任务」（见下方 INTRADAY_GLOBAL_MODULES + GLOBAL_TASKS 动态追加），
+        # 避免 90 只股票 × 每分钟各打一次 get_market_snapshot 触发富途限频
+        # （get_market_snapshot 上限 60 次/30秒）。此处 intraday 置空。
+        "intraday": [],
         "daily": {     # 收盘后全量采集
             "time": {"hour": 16, "minute": 20},
             "modules": [
                 "get_quote.py",                          # 行情快照（富途API）→ daily_quote
                 "get_benchmark.py",                      # 恒生等基准指数 → benchmark_daily
                 "get_excess_return.py",                  # 超额收益计算 → excess_return_daily
-                "get_south_flow.py",                     # 南向资金（港股通流向）
                 "get_cbbc.py",                           # 牛熊证街货分布（港交所）→ cbbc_daily
                 "get_short_selling.py",                  # 沽空数据（实时）
                 "get_trend.py",                          # 全日趋势数据
@@ -74,15 +73,10 @@ MARKET_PRESETS = {
             ("全日沽空数据-2", "get_realtime_short_selling_fullday.py", {"hour": 16, "minute": 30}),  # 全日沽空 第2次补采
             ("全日沽空数据-3", "get_realtime_short_selling_fullday.py", {"hour": 17, "minute": 0}),   # 全日沽空 第3次补采
             ("公司回购", "get_buyback.py", {"hour": 9, "minute": 0}),                                  # 公司回购（港交所）→ buyback_daily
-            ("南向资金", "get_south_flow.py", {"hour": 9, "minute": 0}),                               # 南向资金（港股通流向）
         ],
     },
     "A": {
-        "intraday": [
-            "get_quote.py",      # 行情快照（富途API）→ daily_quote
-            "get_benchmark.py",  # 上证等基准指数 → benchmark_daily
-            "record_trend.py",   # 盘中趋势记录（分钟快照+缓存）→ trend_snapshot + trend_cache/
-        ],
+        "intraday": [],
         "daily": {
             "time": {"hour": 15, "minute": 10},  # A股 15:00 收盘
             "modules": [
@@ -101,40 +95,91 @@ MARKET_PRESETS = {
     },
 }
 
-# ── 股票列表（添加新股只需加一行）─────────────────────────
-STOCKS = [
-    {"code": "HK.00700", "market": "HK"},
-    {"code": "HK.09660", "market": "HK"},
-    {"code": "HK.00857", "market": "HK"},
-    {"code": "HK.01088", "market": "HK"},
-    {"code": "HK.00883", "market": "HK"},
-    {"code": "HK.00941", "market": "HK"},
-    {"code": "HK.00386", "market": "HK"},
-    {"code": "HK.01919", "market": "HK"},
-    {"code": "HK.06869", "market": "HK"},
-    {"code": "HK.00728", "market": "HK"},
-    {"code": "HK.03328", "market": "HK"},
-    {"code": "HK.03968", "market": "HK"},
-]
+# ── 股票列表（从 stock_info 表读取 is_active 的股票）──────────
+def load_stocks():
+    """从 stock_info 表读取活跃股票，返回 [{'code':..., 'market':...}, ...]"""
+    from db import get_conn
+    stocks = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT stock_code, market FROM stock_info "
+                    "WHERE is_active = TRUE ORDER BY stock_code"
+                )
+                for code, market in cur.fetchall():
+                    stocks.append({"code": code, "market": market})
+        log.info(f"从 stock_info 加载活跃股票 {len(stocks)} 只")
+    except Exception as e:
+        log.warning(f"加载 stock_info 失败，回退到空列表: {e}")
+    return stocks
+
+
+STOCKS = load_stocks()
 
 # ── 全局任务（与具体股票无关）──────────────────────────────
-GLOBAL_TASKS = [
-    ("数据清理", "cleanup_old_data.py", {"hour": 4, "minute": 0}),            # 清理36个月前盘中实时数据+逐笔成交数据
-    ("全球指数采集(每小时)", "get_global_benchmarks.py", {"hour": "*", "minute": 0}),  # 每小时刷新: 富途系盘中实时, FRED/债券/汇率为日频(T-1)
+# 每条任务: (name, script, cron, codes=None, force=True, market=None, timeout=180)
+#   name    : 任务名（也是 job id）
+#   script  : 采集脚本，单个用 str，多个用 list[str]（如盘中批量采集）
+#   cron    : CronTrigger 参数字典
+#   codes   : 全局股票列表（None=由模块自行决定范围；list=循环全票）
+#   force   : True=跳过交易时段检查（默认）；False=需配合 market 做交易时段门控
+#   market  : 交易时段判断用的市场标识（"HK"/"A"），仅当 force=False 时生效
+#   timeout : 单脚本超时秒数（默认 180）
+GlobalTask = tuple[str, str | list[str], dict[str, int | str], list[str] | None, bool, str | None, int]
+GLOBAL_TASKS: list[GlobalTask] = [
+    # 删除 3 年前过期数据（tick_data / trend_snapshot / realtime_order_size / collection_run_log 共 4 表）
+    ("数据清理", "cleanup_old_data.py", {"hour": 4, "minute": 0}, None, True, None, 180),
+
+    # 每小时刷新: 富途系盘中实时, FRED/债券/汇率为日频(T-1)
+    ("全球指数采集(每小时)", "get_global_benchmarks.py", {"hour": "*", "minute": 0}, None, True, None, 180),
+
     # 全球指数分钟级采集：覆盖亚太(08:00–16:00 HK)+欧美盘至凌晨，避开低频 04:00–08:00
     # 每5分钟一次，仅交易日；run 忽略 codes，全局只跑一次
     ("全球指数分钟采集", "get_global_benchmarks_minute.py",
-     {"minute": "*/5", "hour": "8-11,13-16,17-23,0-3", "day_of_week": "mon-fri"}),
-    # 股票-指数成分归属（参考数据，季度刷新即可；run 忽略 codes，全局只跑一次）
-    ("指数成分归属", "get_stock_sector.py", {"day_of_week": 2, "hour": 18, "minute": 0}),
+     {"minute": "*/5", "hour": "8-11,13-16,17-23,0-3", "day_of_week": "mon-fri"}, None, True, None, 180),
+
+    # 股票-指数成分归属（参考数据，每周二 18:00 刷新；run 忽略 codes，全局只跑一次）
+    ("指数成分归属", "get_stock_sector.py", {"day_of_week": 2, "hour": 18, "minute": 0}, None, True, None, 180),
+
+    # 港股指数成分权重（恒生官网 factsheet 解析，每周二 19:00 刷新；
+    ("指数成分权重", "get_stock_sector_weight.py", {"day_of_week": 2, "hour": 19, "minute": 0}, None, True, None, 180),
+
     # 股票 vs 全球指数日收益率相关性分析（读 daily_quote/daily_benchmark 日频数据，
-    # 盘后跑即可，盘中重算结果不变；run 循环全票 STOCKS，全局跑一次）
+    # 盘后跑即可，盘中重算结果不变；单 job 内循环全部 STOCKS 逐票执行）
     ("指数相关性分析", "benchmark_correlation_daily.py",
-     {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS]),
-    # 宏观环境三维评分（股/债/汇；读 daily_benchmark，盘后跑；run 循环全票 STOCKS，全局跑一次）
+     {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS], True, None, 180),
+
+    # 宏观环境三维评分（股/债/汇；读 daily_benchmark，盘后跑；单 job 内循环全部 STOCKS 逐票执行）
     ("宏观环境评分", "macro_environment_score.py",
-     {"hour": 18, "minute": 0, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS]),
+     {"hour": 18, "minute": 0, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS], True, None, 180),
+
+    # 港股全市场总成交额：富途 get_market_snapshot 批量（~30秒）聚合全港股成交额，
+    # 落 daily_market_turnover 作为「市场总体流动性水位」分母。
+    # 富途快照盘中实时更新，交易时段内每 5 分钟跑一次（force=False + market="HK"），
+    # 盘中拿实时累计、盘后拿全天完整值。
+    ("港股全市场成交额", "get_hk_market_turnover.py",
+     {"minute": "*/5", "second": 0}, None, False, "HK", 300),
+    
+    # 南向资金（港股通持股）：AKShare 批量接口一次拉全市场 ~1200 只港股通标的，
+    # 落 daily_ggt_hold。盘前 8:00、盘后 19:00 各跑一次（run 忽略 codes，全局批量，force=True）。
+    ("南向资金", "get_south_flow.py",
+     {"hour": "8,19", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
 ]
+
+# ── 盘中批量采集（按市场拆分）────────────────────────────────
+# 「每个市场每分钟一个全局任务」，codes=该市场全量股票，一次批量快照分发。
+# 作为 GLOBAL_TASKS 项追加，与其他全局任务共用同一条注册循环。
+INTRADAY_GLOBAL_MODULES = ["get_quote.py", "record_trend.py"]
+_intraday_by_market = {}
+for _s in STOCKS:
+    _mkt = "A" if _s["market"] in ("SH", "SZ") else _s["market"]
+    _intraday_by_market.setdefault(_mkt, []).append(_s["code"])
+for _mkt, _mkt_codes in sorted(_intraday_by_market.items()):
+    GLOBAL_TASKS.append(
+        (f"盘中批量采集-{_mkt}", INTRADAY_GLOBAL_MODULES,
+         {"second": 0}, _mkt_codes, False, _mkt, 180)
+    )
 
 
 # ── 执行器 ──────────────────────────────────────────────────
@@ -254,7 +299,10 @@ def build_scheduler():
     for stock in STOCKS:
         code = stock["code"]
         market = stock["market"]
-        preset = MARKET_PRESETS.get(market)
+        # 归一化：stock_info.market 存的是交易所代码(SH/SZ/HK)，
+        # 而 MARKET_PRESETS 用 HK/A 分类，这里把 A 股交易所统一映射到 "A"
+        norm_market = "A" if market in ("SH", "SZ") else market
+        preset = MARKET_PRESETS.get(norm_market)
         if not preset:
             log.warning(f"未知市场 [{market}]，跳过 {code}")
             continue
@@ -295,10 +343,17 @@ def build_scheduler():
             job_name = f"{extra_name}-{code}"
 
             # 财务指标采集：错开执行时间（每只股票间隔2分钟）+ 延长超时（600s）
+            # 注意：偏移可能跨小时，必须同时进位 hour 并对 minute 取模（0-59），
+            # 否则股票数 > 30 时 minute 会超过 59 触发 CronTrigger ValueError → 进程崩溃重启循环。
             if script == "get_financial.py":
                 idx = _fin_offset.get(market, 0)
                 _fin_offset[market] = idx + 1
-                cron = {**cron_args, "minute": cron_args.get("minute", 0) + idx * 2}
+                base_min = cron_args.get("minute", 0) + idx * 2
+                cron = {
+                    **cron_args,
+                    "hour": cron_args.get("hour", 9) + base_min // 60,
+                    "minute": base_min % 60,
+                }
                 timeout = 600
             else:
                 cron = cron_args
@@ -316,13 +371,13 @@ def build_scheduler():
             log.info(f"已注册: [{job_name}] {cron.get('hour',0):02d}:{cron.get('minute',0):02d}")
 
     # 4. 全局任务
-    for g_item in GLOBAL_TASKS:
-        g_name, g_script, g_cron = g_item[0], g_item[1], g_item[2]
-        g_codes = g_item[3] if len(g_item) > 3 else None  # 第四元素：全局股票列表（可空）
+    for g_name, g_script, g_cron, g_codes, g_force, g_market, g_timeout in GLOBAL_TASKS:
+        # 脚本字段：单个脚本用字符串，多个脚本用列表（如盘中批量采集）
+        g_modules = g_script if isinstance(g_script, list) else [g_script]
         sched.add_job(
             execute_task,
             trigger=CronTrigger(**g_cron),
-            args=[g_name, [g_script], g_codes, True],
+            args=[g_name, g_modules, g_codes, g_force, g_market, g_timeout],
             id=g_name,
             replace_existing=True,
             misfire_grace_time=300,

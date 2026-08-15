@@ -39,6 +39,7 @@ def get_trade_direction(full_code, quote_ctx, snapshot=None):
     ask_vol = row.get('ask_vol', None)   # 主动性卖盘
 
     return {
+        "stock_code": full_code,
         "update_time": str(update_time)[:19] if update_time else datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         "price": float(price) if price else None,
         "bid_vol": int(bid_vol) if bid_vol else None,

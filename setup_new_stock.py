@@ -3,12 +3,14 @@
 新股接入一键脚本
 
 功能：
-  1. 从富途 API 获取股票基本信息 → 写入 stock_info
-  2. 回填 60 日 daily_quote 历史数据
+  1. 从富途 API 获取股票基本信息 → 写入 stock_info（is_active=TRUE）
+  2. 回填 daily_quote 历史数据
   3. A 股：首次采集融资余额数据
-  4. 自动添加到 market_scheduler.py 的 STOCKS 列表
-  5. 自动添加到 config.conf 的 [ticker] 订阅列表
-  6. 重启 scheduler + ticker-collector 服务
+  4. 重启 scheduler + ticker-collector 服务
+
+注意：股票列表由 market_scheduler / ticker_collector 在启动时从 stock_info
+(is_active=TRUE) 动态加载，本脚本只需写入 stock_info 即可，无需再改 STOCKS
+硬编码列表或 config.conf 的 [ticker] 订阅列表（已弃用）。
 
 用法：
     .venv/bin/python3 setup_new_stock.py SH.520900
@@ -139,59 +141,12 @@ else:
     log.info("港股无需采集融资余额，跳过")
 
 
-# ── 步骤 5: 写入 market_scheduler.py ───────────────────────
-
-scheduler_path = os.path.join(SCRIPTS_DIR, "market_scheduler.py")
-with open(scheduler_path, "r") as f:
-    lines = f.readlines()
-
-# 查找 STOCKS 列表的结束行（"STOCKS = [" 之后的第一个 "]")
-in_stocks = False
-for i, line in enumerate(lines):
-    if line.strip().startswith("STOCKS = ["):
-        in_stocks = True
-        continue
-    if in_stocks and line.strip() == "]":
-        # 检查是否已存在
-        if any(stock_code in l for l in lines):
-            log.info(f"market_scheduler.py 中已存在 {stock_code}，跳过")
-        else:
-            # 在前一行末尾加逗号（如果不是只有一行）
-            prev = lines[i - 1].rstrip()
-            if not prev.endswith(","):
-                lines[i - 1] = prev + ",\n"
-            indent = "    "
-            lines.insert(i, f'{indent}{{"code": "{stock_code}", "market": "{stock_type}"}},\n')
-            with open(scheduler_path, "w") as f:
-                f.writelines(lines)
-            log.info(f"market_scheduler.py STOCKS 已添加 {stock_code}")
-        break
-
-
-# ── 步骤 6: 更新 config.conf 的 [ticker] 订阅列表 ───────────
-import config
-import configparser as _cp_mod
-
-_cp = _cp_mod.ConfigParser()
-if os.path.exists(config.CONFIG_PATH):
-    _cp.read(config.CONFIG_PATH, encoding="utf-8")
-if not _cp.has_section("ticker"):
-    _cp.add_section("ticker")
-_raw = _cp.get("ticker", "stocks", fallback="")
-_stock_list = [s.strip() for s in _raw.split(",") if s.strip()]
-if stock_code not in _stock_list:
-    _stock_list.append(stock_code)
-    _cp.set("ticker", "stocks", ",".join(_stock_list))
-    with open(config.CONFIG_PATH, "w", encoding="utf-8") as f:
-        _cp.write(f)
-    log.info(f"config.conf [ticker] 已添加 {stock_code}")
-else:
-    log.info(f"config.conf [ticker] 中已存在 {stock_code}，跳过")
-
-
-# ── 步骤 7: 重启服务 ───────────────────────────────────────
+# ── 步骤 5: 重启服务（原"写 market_scheduler.py / config.conf"已废弃）──
+# 股票列表已由 market_scheduler / ticker_collector 启动时从 stock_info
+# (is_active=TRUE) 动态加载，进程重启后即自动纳入新接入的股票。
 
 IS_MAC = platform.system() == "Darwin"
+
 SERVICES = {
     "scheduler": {"mac": "com.equity.a-scheduler.plist", "linux": "market-scheduler"},
     "ticker": {"mac": "com.equity.ticker-collector.plist", "linux": "ticker-collector"},

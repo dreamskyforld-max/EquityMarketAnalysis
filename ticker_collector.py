@@ -40,12 +40,47 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("ticker_collector")
 
 
+def load_stocks_from_db():
+    """从 stock_info 表读取活跃股票代码，返回 [code, ...]（is_active 过滤）。
+
+    与 market_scheduler 共用同一张表，避免逐笔订阅列表与分钟级调度列表不一致。
+    读取失败或为空时返回空列表（由调用方回退到 config.conf）。
+    """
+    from db import get_conn
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT stock_code FROM stock_info "
+                    "WHERE is_active = TRUE ORDER BY stock_code"
+                )
+                return [r[0] for r in cur.fetchall()]
+    except Exception as e:
+        log.warning(f"从 stock_info 读取股票列表失败，回退到 config: {e}")
+        return []
+
+
 def load_config():
     """从统一 config.conf 加载配置（[ticker] 段 + [futu] 段）"""
     from config import val
-    stocks_raw = val("ticker", "stocks", fallback="HK.00700")
+    # 股票列表优先从 stock_info 表(is_active)读取；表为空或读取失败才回退 config.conf
+    db_stocks = load_stocks_from_db()
+    if db_stocks:
+        stocks = db_stocks
+        stocks_source = "stock_info"
+    else:
+        stocks_raw = val("ticker", "stocks", fallback="HK.00700")
+        stocks = [s.strip() for s in stocks_raw.split(",") if s.strip()]
+        stocks_source = "config.conf"
+    # QUOTE(LV1 实时报价) 订阅标的：富途免费 LV1 额度通常有限（远小于 100），
+    # 不能像 TICKER 那样一次性订阅全部股票。改为从配置显式指定少量有权限的代码。
+    # 缺省为空 → 不订阅 QUOTE（逐笔主链路不受影响，仅缺失实时报价刷新）。
+    quote_raw = val("ticker", "quote_stocks", fallback="")
+    quote_stocks = [s.strip() for s in quote_raw.split(",") if s.strip()]
     return {
-        "stocks": [s.strip() for s in stocks_raw.split(",") if s.strip()],
+        "stocks": stocks,
+        "stocks_source": stocks_source,
+        "quote_stocks": quote_stocks,
         "buffer_size": int(val("ticker", "buffer_size", fallback="500")),
         "flush_interval_seconds": int(val("ticker", "flush_interval_seconds", fallback="10")),
         "futu_host": val("futu", "host", fallback="127.0.0.1"),
@@ -338,6 +373,7 @@ def _stats_loop(collector: TickerCollector, stop_event: threading.Event):
 def connect_and_subscribe(cfg: dict) -> OpenQuoteContext | None:
     """连接 FutuOpenD 并订阅逐笔数据，返回上下文"""
     stocks = cfg.get("stocks", ["HK.00700"])
+    quote_stocks = cfg.get("quote_stocks", [])
     futu_host = cfg.get("futu_host", "127.0.0.1")
     futu_port = cfg.get("futu_port", 11111)
 
@@ -348,13 +384,25 @@ def connect_and_subscribe(cfg: dict) -> OpenQuoteContext | None:
         log.error(f"连接 FutuOpenD 失败: {e}")
         return None
 
-    ret, msg = quote_ctx.subscribe(stocks, [SubType.TICKER, SubType.QUOTE], subscribe_push=True)
+    # 1) TICKER(逐笔成交, LV2) 订阅全部股票 —— 主链路，失败则整体失败
+    ret, msg = quote_ctx.subscribe(stocks, [SubType.TICKER], subscribe_push=True)
     if ret != RET_OK:
-        log.error(f"订阅失败: {msg}")
+        log.error(f"TICKER 订阅失败: {msg}")
         quote_ctx.close()
         return None
+    log.info(f"TICKER 订阅成功: 共 {len(stocks)} 只")
 
-    log.info(f"订阅成功: {stocks} (TICKER + QUOTE 推送)")
+    # 2) QUOTE(实时报价, LV1) 订阅配置指定的子集 —— 富途 LV1 额度有限，
+    #    不能一次性订阅全部。失败仅告警、不阻断主链路（缺失实时报价刷新而已）。
+    if quote_stocks:
+        ret_q, msg_q = quote_ctx.subscribe(quote_stocks, [SubType.QUOTE], subscribe_push=True)
+        if ret_q != RET_OK:
+            log.warning(f"QUOTE 订阅失败（不影响逐笔主链路）: {msg_q}")
+        else:
+            log.info(f"QUOTE 订阅成功: 共 {len(quote_stocks)} 只")
+    else:
+        log.info("未配置 quote_stocks，跳过 QUOTE 订阅（实时报价刷新将不可用）")
+
     return quote_ctx
 
 
@@ -374,7 +422,7 @@ def main():
     log.info("=" * 50)
 
     cfg = load_config()
-    log.info(f"配置: stocks={cfg.get('stocks')}, "
+    log.info(f"配置: stocks={cfg.get('stocks')} (来源: {cfg.get('stocks_source')}), "
              f"buffer_size={cfg.get('buffer_size')}, "
              f"flush_interval={cfg.get('flush_interval_seconds')}s")
 

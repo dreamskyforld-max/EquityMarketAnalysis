@@ -59,11 +59,14 @@ class TestConfigStructure(unittest.TestCase):
         self.assertGreater(len(self.stocks), 0, "STOCKS 至少需要有1只股票")
 
     def test_each_stock_has_code_and_market(self):
+        # stock_info.market 存交易所代码(SH/SZ/HK)，MARKET_PRESETS 用 A/HK，
+        # 需先归一化再判断（与 build_scheduler 一致）
         for s in self.stocks:
             self.assertIn('code', s, f"缺少 code: {s}")
             self.assertIn('market', s, f"缺少 market: {s}")
-            self.assertIn(s['market'], self.presets,
-                          f"market={s['market']} 不在 MARKET_PRESETS 中")
+            norm = "A" if s['market'] in ("SH", "SZ") else s['market']
+            self.assertIn(norm, self.presets,
+                          f"market={s['market']} 归一化后 {norm} 不在 MARKET_PRESETS 中")
 
     def test_hk_preset_has_all_sections(self):
         hk = self.presets.get("HK", {})
@@ -149,15 +152,23 @@ class TestBuildScheduler(unittest.TestCase):
         sched.shutdown(wait=False)
 
     def test_all_tasks_registered(self):
-        """注册任务数 = 盘中组 + 收盘组 + extras + 全局"""
+        """注册任务数 = 盘中批量全局任务(按市场) + 收盘组 + extras + 全局
+
+        record_trend/get_quote 已从「每只股票每分钟一个任务」改为「每个市场
+        每分钟一个全局批量任务」，故盘中任务数不再按股票逐只累加，而按市场去重。
+        """
         from market_scheduler import build_scheduler, STOCKS, MARKET_PRESETS, GLOBAL_TASKS
 
+        # 归一化市场：stock_info.market 存 SH/SZ/HK，MARKET_PRESETS 用 A/HK
+        def _norm(mkt):
+            return "A" if mkt in ("SH", "SZ") else mkt
+
         # 计算期望任务数
+        # 盘中批量采集任务已作为 GLOBAL_TASKS 项追加（见 market_scheduler.py
+        # INTRADAY_GLOBAL_MODULES 那段），已计入 len(GLOBAL_TASKS)，无需再按市场去重累加。
         expected = len(GLOBAL_TASKS)
         for stock in STOCKS:
-            preset = MARKET_PRESETS.get(stock["market"], {})
-            if preset.get("intraday"):
-                expected += 1
+            preset = MARKET_PRESETS.get(_norm(stock["market"]), {})
             if preset.get("daily"):
                 expected += 1
             expected += len(preset.get("extras", []))

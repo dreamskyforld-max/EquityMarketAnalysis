@@ -6,12 +6,14 @@
 但只在全部处理完后重启一次服务，避免逐只重启 10 次。
 
 每只股票会：
-  1. 从富途 API 获取基本信息 → 写入 stock_info（upsert，幂等）
+  1. 从富途 API 获取基本信息 → 写入 stock_info（upsert，幂等，is_active=TRUE）
   2. 回填 daily_quote 历史日线（默认 3 年，可用 BACKFILL_DAYS 覆盖）
   3. A 股：首次采集融资余额
-  4. 追加到 market_scheduler.py 的 STOCKS 列表（已存在则跳过）
-  5. 追加到 config.conf 的 [ticker] 订阅列表（已存在则跳过）
 全部完成后统一重启 scheduler + ticker-collector 一次。
+
+注意：股票列表由 market_scheduler / ticker_collector 启动时从 stock_info
+(is_active=TRUE) 动态加载，本脚本只需写入 stock_info 即可，无需再改 STOCKS
+硬编码列表或 config.conf 的 [ticker] 订阅列表（已弃用该逻辑）。
 
 用法：
     # 处理内置的 SH.520900 ETF 十大重仓股
@@ -30,26 +32,79 @@ import platform
 import subprocess
 import logging
 
-import config
-import configparser as _cp_mod
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 默认列表：SH.520900（港股通红利ETF广发）十大重仓股（2026Q2，截止 2026-06-30）
+# 默认列表：港股 TOP70 中 stock_info 尚未接入的股票（按 TOP70 排名顺序）
+# 已存在 stock_info 的 HK 股（00700/00857/00941/06869/09660）不在此列；
+# stock_info 中自选但不在 TOP70 的 6 只（00386/00728/01088/01919/03328/03968）亦不动。
 DEFAULT_CODES = [
-    "01088",  # 中国神华
-    "00857",  # 中国石油股份
-    "00883",  # 中国海洋石油
-    "00941",  # 中国移动
-    "00386",  # 中国石油化工股份
-    "01919",  # 中远海控
-    "06869",  # 长飞光纤光缆
-    "00728",  # 中国电信
-    "03328",  # 交通银行
-    "03968",  # 招商银行
+    "02513",  # 智谱
+    "00100",  # MINIMAX-W
+    "00981",  # 中芯国际
+    "01347",  # 华虹宏力
+    "09988",  # 阿里巴巴-W
+    "01888",  # 建滔积层板
+    "00992",  # 联想集团
+    "09992",  # 泡泡玛特
+    "01810",  # 小米集团-W
+    "03308",  # 中际旭创
+    "03986",  # 兆易创新
+    "06166",  # 剑桥科技
+    "01299",  # 友邦保险
+    "02476",  # 胜宏科技
+    "00148",  # 建滔集团
+    "06809",  # 澜起科技
+    "09903",  # 天数智芯
+    "02899",  # 紫金矿业
+    "02318",  # 中国平安
+    "02269",  # 药明生物
+    "01548",  # 金斯瑞生物科技
+    "03690",  # 美团-W
+    "02628",  # 中国人寿
+    "06160",  # 百济神州
+    "01093",  # 石药集团
+    "09999",  # 网易
+    "02359",  # 药明康德
+    "00388",  # 香港交易所
+    "01024",  # 快手-W
+    "01378",  # 中国宏桥
+    "09618",  # 京东集团-SW
+    "03750",  # 宁德时代
+    "03330",  # 灵宝黄金
+    "01801",  # 信达生物
+    "00005",  # 汇丰控股
+    "09926",  # 康方生物
+    "03896",  # 金山云
+    "00939",  # 建设银行
+    "02259",  # 紫金黄金国际
+    "00322",  # 康师傅控股
+    "02600",  # 中国铝业
+    "02099",  # 中国黄金国际
+    "03988",  # 中国银行
+    "06951",  # 三环集团
+    "09888",  # 百度集团-SW
+    "00268",  # 金蝶国际
+    "01211",  # 比亚迪股份
+    "00189",  # 东岳集团
+    "00669",  # 创科实业
+    "03696",  # 英矽智能
+    "01398",  # 工商银行
+    "00175",  # 吉利汽车
+    "03993",  # 洛阳钼业
+    "00522",  # ASMPT
+    "06181",  # 老铺黄金
+    "01772",  # 赣锋锂业
+    "09688",  # 再鼎医药
+    "01208",  # 五矿资源
+    "00027",  # 银河娱乐
+    "09880",  # 优必选
+    "06082",  # 壁仞科技
+    "03939",  # 万国黄金集团
+    "03759",  # 康龙化成
+    "02228",  # 晶泰控股
 ]
 
 BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "1095"))
@@ -136,52 +191,10 @@ def collect_margin(code):
         log.warning(f"  [{code}] 融资余额采集失败: {result.stderr.strip()[-200:]}")
 
 
-# ── 步骤 4: market_scheduler.py STOCKS ──────────────────────
-
-def add_to_scheduler(code, stock_type):
-    scheduler_path = os.path.join(SCRIPTS_DIR, "market_scheduler.py")
-    with open(scheduler_path, "r") as f:
-        lines = f.readlines()
-    in_stocks = False
-    for i, line in enumerate(lines):
-        if line.strip().startswith("STOCKS = ["):
-            in_stocks = True
-            continue
-        if in_stocks and line.strip() == "]":
-            if any(code in l for l in lines):
-                log.info(f"  [{code}] market_scheduler.py 已存在，跳过")
-            else:
-                prev = lines[i - 1].rstrip()
-                if not prev.endswith(","):
-                    lines[i - 1] = prev + ",\n"
-                lines.insert(i, f'    {{"code": "{code}", "market": "{stock_type}"}},\n')
-                with open(scheduler_path, "w") as f:
-                    f.writelines(lines)
-                log.info(f"  [{code}] market_scheduler.py STOCKS 已添加")
-            return
-
-
-# ── 步骤 5: config.conf [ticker] ───────────────────────────
-
-def add_to_ticker_config(code):
-    _cp = _cp_mod.ConfigParser()
-    if os.path.exists(config.CONFIG_PATH):
-        _cp.read(config.CONFIG_PATH, encoding="utf-8")
-    if not _cp.has_section("ticker"):
-        _cp.add_section("ticker")
-    raw = _cp.get("ticker", "stocks", fallback="")
-    lst = [s.strip() for s in raw.split(",") if s.strip()]
-    if code not in lst:
-        lst.append(code)
-        _cp.set("ticker", "stocks", ",".join(lst))
-        with open(config.CONFIG_PATH, "w", encoding="utf-8") as f:
-            _cp.write(f)
-        log.info(f"  [{code}] config.conf [ticker] 已添加")
-    else:
-        log.info(f"  [{code}] config.conf [ticker] 已存在，跳过")
-
-
 # ── 服务重启（仅一次）─────────────────────────────────────
+# 注：股票列表已由 market_scheduler / ticker_collector 启动时从 stock_info
+# (is_active=TRUE) 动态加载，无需再改写 STOCKS 硬编码或 config.conf 的
+# [ticker] 订阅列表。写入 stock_info 后重启进程即自动纳入。
 
 IS_MAC = platform.system() == "Darwin"
 SERVICES = {
@@ -226,8 +239,6 @@ def main():
         backfill_daily(code)
         if stock_type == "A":
             collect_margin(code)
-        add_to_scheduler(code, stock_type)
-        add_to_ticker_config(code)
         results.append((code, name, market))
 
     # 统一重启一次

@@ -34,7 +34,9 @@ log = logging.getLogger("stock_sector")
 HK_INDEX_TARGETS = [
     {"name": "恒生指数",     "sector_code": "HK.800000", "query": "HK.HSI Constituent Stocks"},
     {"name": "恒生科技",     "sector_code": "HK.800700", "query": "HK.800700"},
-    {"name": "恒生中国企业", "sector_code": "HK.800100", "query": "HK.HSCEI Stock"},
+    # 注意：HSCEI 必须用指数代码 HK.800100，不能用描述串 "HK.HSCEI Stock"——
+    # 后者会返回过期的旧成分（缺美团/阿里/京东/网易等新纳入成分，47只而非50只）。
+    {"name": "恒生中国企业", "sector_code": "HK.800100", "query": "HK.800100"},
 ]
 A_INDEX_TARGETS = [
     {"name": "沪深300",  "sector_code": "000300", "source": "csindex"},

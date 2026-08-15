@@ -249,6 +249,10 @@ CREATE TABLE IF NOT EXISTS daily_ggt_hold (
     close_price         NUMERIC(10,3),                      -- 当日收盘价
     change_pct          NUMERIC(8,4),                       -- 当日涨跌幅(%)
     est_net_inflow      NUMERIC(16,2),                      -- 估算净流入（亿港元）= 持股变动 × 收盘价
+    hold_value          NUMERIC(16,2),                      -- 持股市值（港元）
+    hold_value_change_1d NUMERIC(16,2),                     -- 持股市值较1日前变动（港元）
+    hold_value_change_5d NUMERIC(16,2),                     -- 持股市值较5日前变动（港元）
+    hold_value_change_10d NUMERIC(16,2),                    -- 持股市值较10日前变动（港元）
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
 
     UNIQUE (stock_code, trade_date)
@@ -627,6 +631,63 @@ COMMENT ON COLUMN financial_indicator.free_cash_flow           IS '自由现金�
 COMMENT ON COLUMN financial_indicator.created_at               IS '数据写入数据库的时间';
 
 CREATE INDEX idx_financial_indicator_stock_date ON financial_indicator (stock_code, report_date DESC);
+
+-- 21. 港股全市场（主板）总成交额快照
+CREATE TABLE IF NOT EXISTS daily_market_turnover (
+    id              BIGSERIAL       PRIMARY KEY,
+    trade_date      DATE            NOT NULL,           -- 数据日期（交易日，T+1 采集则为前一日）
+    snapshot_time   TIMESTAMPTZ     NOT NULL,           -- 快照时间（采集时刻）
+    total_turnover  NUMERIC(20,2),                      -- 全市场总成交额（港元）
+    total_volume    BIGINT,                             -- 全市场总成交量（股）
+    stock_count     INT,                                -- 参与统计的标的数量
+    created_at      TIMESTAMPTZ     DEFAULT NOW(),
+
+    UNIQUE (trade_date)
+);
+
+COMMENT ON TABLE  daily_market_turnover                     IS '港股全市场总成交额（数据源：新浪 stock_hk_daily 逐只聚合，T+1 全天完整值）';
+COMMENT ON COLUMN daily_market_turnover.snapshot_time       IS '快照时间戳（日频=盘后一次，分钟级=每分钟一次）';
+COMMENT ON COLUMN daily_market_turnover.total_turnover      IS '全市场总成交额（港元），SUM(个股成交额)';
+COMMENT ON COLUMN daily_market_turnover.total_volume        IS '全市场总成交量（股），SUM(个股成交量)';
+COMMENT ON COLUMN daily_market_turnover.stock_count         IS '参与聚合的标的数量（用于校验是否拉全）';
+COMMENT ON COLUMN daily_market_turnover.created_at          IS '数据写入数据库的时间';
+
+CREATE INDEX idx_market_turnover_time ON daily_market_turnover (snapshot_time DESC);
+
+-- 22. 港股全量股票简版日线（数据池）
+CREATE TABLE IF NOT EXISTS hk_daily_quote (
+    id          BIGSERIAL       PRIMARY KEY,
+    stock_code  VARCHAR(20)     NOT NULL,           -- 如 HK.00700
+    trade_date  DATE            NOT NULL,           -- 交易日
+    open        NUMERIC(12,4),                      -- 开盘价
+    high        NUMERIC(12,4),                      -- 最高价
+    low         NUMERIC(12,4),                      -- 最低价
+    close       NUMERIC(12,4),                      -- 收盘价
+    volume      BIGINT,                             -- 成交量（股）
+    amount      NUMERIC(20,2),                      -- 成交额（港元）
+    turnover_rate       NUMERIC(8,4),               -- 换手率(%)
+    volume_ratio        NUMERIC(8,4),               -- 量比
+    high_52w            NUMERIC(12,4),              -- 52周最高价
+    low_52w             NUMERIC(12,4),              -- 52周最低价
+    total_market_val    NUMERIC(20,2),              -- 总市值（港元）
+    circular_market_val NUMERIC(20,2),              -- 流通市值（港元）
+    pe_ratio            NUMERIC(12,4),              -- 市盈率(静态)
+    pe_ttm_ratio        NUMERIC(12,4),              -- 市盈率(TTM)
+    pb_ratio            NUMERIC(12,4),              -- 市净率
+    dividend_ratio_ttm  NUMERIC(8,4),               -- 股息率(TTM, %)
+    update_time         TIMESTAMPTZ,                -- 数据更新时间（富途快照的 update_time）
+    created_at  TIMESTAMPTZ     DEFAULT NOW(),
+
+    UNIQUE (stock_code, trade_date)
+);
+
+COMMENT ON TABLE  hk_daily_quote             IS '港股全量股票简版日线数据池（数据源：富途 get_market_snapshot 快照 / request_history_kline 历史）';
+COMMENT ON COLUMN hk_daily_quote.stock_code  IS '股票代码，如 HK.00700';
+COMMENT ON COLUMN hk_daily_quote.amount      IS '成交额（港元），全天完整值';
+COMMENT ON COLUMN hk_daily_quote.update_time IS '数据更新时间（富途快照的 update_time；历史回溯则为交易日）';
+
+CREATE INDEX idx_hk_daily_quote_date  ON hk_daily_quote (trade_date DESC);
+CREATE INDEX idx_hk_daily_quote_stock ON hk_daily_quote (stock_code, trade_date DESC);
 
 -- ============================================================================
 -- 第十一部分：辅助视图

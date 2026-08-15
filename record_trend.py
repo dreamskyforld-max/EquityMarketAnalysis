@@ -15,17 +15,9 @@ from db import get_conn, upsert
 from collector_runtime import get_shared_ctx
 
 import get_realtime_trade_direction as m_dir
-import get_realtime_order_size as m_flow
 import get_realtime_excess_return as m_excess
-import get_realtime_order_book as m_book
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def _fmt_order(order_list):
-    if not order_list:
-        return "N/A"
-    return " ".join([f"{p:.1f}({v//1000}K)" for p, v in [(b[0], b[1]) for b in order_list]])
 
 
 def run(codes=None, ctx=None):
@@ -51,31 +43,41 @@ def run(codes=None, ctx=None):
     if snap_codes:
         print(f"[记录] 调用 get_market_snapshot({snap_codes}) ...")
         ret, snap = ctx.get_market_snapshot(snap_codes)
+        # 富途 SDK 失败时不抛异常，而是返回 (ret=-1, 错误字符串)。
+        # 必须打印 snap 本体，否则真实错误原因被静默丢弃，无法定位 ret=-1 根因。
         if ret == RET_OK and not snap.empty:
             batch_snapshot = snap
-        print(f"[记录] get_market_snapshot 返回 ret={ret}, batch_snapshot={'有' if batch_snapshot is not None else '无'}")
+            print(f"[记录] get_market_snapshot 返回 ret={ret}, batch_snapshot=有({len(snap)}行)")
+        else:
+            print(f"[记录] get_market_snapshot 返回 ret={ret}, 错误: {snap!r}")
+
+    # 批量调用各实时模块 run() 拿结构化数据（共享 ctx，无 subprocess 冷启动）
+    # trade_direction / excess_return 只需要 snapshot，复用批量快照避免重复调用
+    # 注：get_capital_distribution(m_flow) 与 get_order_book(m_book) 已停用——
+    # 其产出字段(super/big/mid/small_in_net、buy/sell_levels_str)本项目未使用，
+    # 且为逐票调用、无法复用批量快照，是加股票时的主要性能瓶颈，故跳过。
+    # 一次性传入 all_codes，模块内部按 code 逐行筛值，不再逐票调用（API 仍为 1 次）。
+    print(f"[记录] -> m_dir.run (trade_direction, 批量 {len(all_codes)} 只) ...")
+    d_dir_list = m_dir.run(all_codes, ctx, snapshot=batch_snapshot)
+    if not isinstance(d_dir_list, list):
+        d_dir_list = [d_dir_list]
+    print(f"[记录] <- m_dir.run 完成: {len(d_dir_list)} 条")
+    print(f"[记录] -> m_excess.run (excess_return, 批量 {len(all_codes)} 只) ...")
+    d_excess_list = m_excess.run(all_codes, ctx, snapshot=batch_snapshot)
+    if not isinstance(d_excess_list, list):
+        d_excess_list = [d_excess_list]
+    print(f"[记录] <- m_excess.run 完成: {len(d_excess_list)} 条")
+
+    # 按 stock_code 建立索引，便于与 all_codes 对齐（m_excess 对非支持市场会跳过）
+    dir_by_code = {d.get('stock_code'): d for d in d_dir_list if isinstance(d, dict)}
+    excess_by_code = {d.get('stock_code'): d for d in d_excess_list if isinstance(d, dict)}
 
     for full_code in all_codes:
-        market_prefix, symbol = full_code.split(".") if "." in full_code else ("HK", full_code)
-        currency = "港元" if full_code.startswith("HK.") else "元"
-
         now = datetime.now()
         print(f"[记录] 处理 {full_code} 开始")
 
-        # 直接调用各实时模块 run() 拿结构化数据（共享 ctx，无 subprocess 冷启动）
-        # trade_direction / excess_return 只需要 snapshot，复用批量快照避免重复调用
-        print(f"[记录] -> m_dir.run (trade_direction) ...")
-        d_dir = m_dir.run([full_code], ctx, snapshot=batch_snapshot)
-        print(f"[记录] <- m_dir.run 完成: {type(d_dir)}")
-        print(f"[记录] -> m_flow.run (order_size) ...")
-        d_flow = m_flow.run([full_code], ctx)          # 需 get_capital_distribution，无法复用
-        print(f"[记录] <- m_flow.run 完成: {type(d_flow)}")
-        print(f"[记录] -> m_excess.run (excess_return) ...")
-        d_excess = m_excess.run([full_code], ctx, snapshot=batch_snapshot)
-        print(f"[记录] <- m_excess.run 完成: {type(d_excess)}")
-        print(f"[记录] -> m_book.run (order_book) ...")
-        d_book = m_book.run([full_code], ctx)           # 需 subscribe + get_order_book，无法复用
-        print(f"[记录] <- m_book.run 完成: {type(d_book)}")
+        d_dir = dir_by_code.get(full_code)
+        d_excess = excess_by_code.get(full_code)
 
         # 提取数值
         price = d_dir.get('price') if d_dir else None
@@ -84,34 +86,26 @@ def run(codes=None, ctx=None):
         ratio = (bid / ask) if (d_dir and bid and ask and ask > 0) else None
         volume = d_dir.get('volume') if d_dir else None
         turnover = d_dir.get('turnover') if d_dir else None
-        super_in = d_flow.get('super_net') if d_flow else None
-        big_in = d_flow.get('big_net') if d_flow else None
-        mid_in = d_flow.get('mid_net') if d_flow else None
-        small_in = d_flow.get('small_net') if d_flow else None
         excess = d_excess.get('excess') if d_excess else None
-        bids = d_book.get('bids', []) if d_book else []
-        asks = d_book.get('asks', []) if d_book else []
-
-        buy_str = _fmt_order(bids)
-        sell_str = _fmt_order(asks)
 
         # 写入数据库（trend_snapshot 表是唯一落盘目标；企业微信趋势渲染也读此表）
+        # 四档 net 与盘口 str 列保留但置 None（历史数据已禁用，新采集不再填）
         try:
             with get_conn() as conn:
                 upsert(conn, "trend_snapshot", {
                     "stock_code": full_code,
                     "snapshot_time": now,
                     "price": price,
-                    "super_in_net": super_in,
-                    "big_in_net": big_in,
-                    "mid_in_net": mid_in,
-                    "small_in_net": small_in,
+                    "super_in_net": None,
+                    "big_in_net": None,
+                    "mid_in_net": None,
+                    "small_in_net": None,
                     "buy_sell_ratio": ratio,
                     "excess_return_pct": excess,
                     "volume": volume,
                     "turnover": turnover,
-                    "buy_levels_str": buy_str,
-                    "sell_levels_str": sell_str,
+                    "buy_levels_str": None,
+                    "sell_levels_str": None,
                 }, conflict_cols=["stock_code", "snapshot_time"])
             print(f"[记录] {full_code} 已写入 trend_snapshot (price={price})")
         except Exception as e:
