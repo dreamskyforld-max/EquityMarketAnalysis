@@ -8,7 +8,13 @@ psycopg2-binary==2.9.12
 # ── 行情数据源 ──
 futu-api==10.4.6408          # 富途 OpenD（HK/SH 指数、逐笔、实时行情）
 akshare==1.18.60             # 新浪源国际指数(日经/KOSPI/DAX)、美债、南向资金、财务
+yfinance==1.5.1              # 雅虎财经（get_global_benchmarks_minute 日经/KOSPI 分钟）
 pandas-datareader==0.11.1    # FRED 美股指数/VIX/美债/美元指数
+
+# ── 企业微信 AI Bot ──
+Flask==3.1.3                 # trend_cache/qrobot_plugin.py 的 /qrobot HTTP 服务
+wecom-aibot-sdk-python==0.1.7  # trend_cache/qrobot_plugin.py 企微 AI Bot SDK
+wecom-aibot-python-sdk==1.0.2  # wecom_server_collector / wecom_mac_collector 的 aibot 模块
 
 # ── 调度 ──
 APScheduler==3.11.2          # market_scheduler 后台定时任务
@@ -17,6 +23,7 @@ APScheduler==3.11.2          # market_scheduler 后台定时任务
 python-dotenv==1.2.2         # .env 加载 FRED_API_KEY 等
 
 # ── 数据处理 (akshare/pandas-datareader 间接依赖，显式锁定) ──
+pymupdf==1.28.2               # get_stock_sector_weight 解析恒生 factsheet PDF
 pandas==3.0.2
 numpy==2.4.4
 requests==2.33.1
