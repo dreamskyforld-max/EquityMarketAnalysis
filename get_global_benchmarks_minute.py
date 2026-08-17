@@ -323,7 +323,11 @@ def _collect_yfinance_one(it: dict, klt: str = "1") -> list:
         return []
     records = []
     last_err = None
-    # 3 次重试；针对 429 限流采用指数退避 30s / 60s（短退避救不回 429）
+    # 重试策略：仅对非限流类瞬时错误重试(30s/60s 退避)。
+    # 429(YFRateLimitError) 是 IP 级限流，短退避救不回；继续重试只会
+    # 增加请求量、加剧限流 → 遇 429 立即放弃本批，交给下个整点/半点批次
+    # (每 30 分钟 1 次)自然恢复。yfinance period="1d" 一旦成功即回补全天，
+    # 单批成功即可补全当天已走过的全部分钟。
     _backoff = [0, 30, 60]
     for attempt in range(3):
         try:
@@ -357,10 +361,11 @@ def _collect_yfinance_one(it: dict, klt: str = "1") -> list:
             # 识别限流类异常，明确提示（便于从日志区分"真无数据"与"被限流"）
             err_name = type(e).__name__
             is_rate = "rate" in err_name.lower() or "429" in str(e).lower()
-            last_err = f"{err_name}: {e}"
             if is_rate:
                 print(f"  [yfinance] ⚠️ {it['name']}({ticker}) 限流({err_name})，"
-                      f"退避 {_backoff[min(attempt + 1, len(_backoff) - 1)]}s 后重试")
+                      f"放弃本批重试，交下个整点/半点批次")
+                break  # 429: 立即放弃本批，不再发请求加重限流
+            last_err = f"{err_name}: {e}"
             _t.sleep(0.5)
     else:
         print(f"  [yfinance] ❌ {it['name']}({ticker}) {last_err}")
