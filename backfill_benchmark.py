@@ -41,6 +41,7 @@ BENCHMARKS = {
     "US.NASDAQCOM":   ("纳斯达克综合指数",   "fred"),
     "US.VIXCLS":      ("VIX恐慌指数",        "fred"),
     "US.DTWEXBGS":    ("美元指数(贸易加权)", "fred"),
+    "US.DXY":         ("美元指数(ICE DXY)",  "yfinance"),
     # 东财全球指数
     "JP.N225":        ("日经225指数",        "eastmoney"),
     "KR.KS11":        ("韩国KOSPI指数",      "eastmoney"),
@@ -211,6 +212,69 @@ def backfill_fred(bench_code, bench_name, days):
         return 0
 
 
+def backfill_yahoo(bench_code, bench_name, days):
+    """Yahoo Finance 回补（ICE 美元指数 DX-Y.NYB 等）。
+
+    大陆 IP 被 Yahoo 风控需 socks5 代理，服务器(香港)直连 —— 复用
+    get_global_benchmarks._yahoo_proxy 的环境探测；yfinance 1.5.1 proxy
+    参数与 curl_cffi 不兼容，故直接构造 curl_cffi.Session 调 v8 chart API。
+    """
+    try:
+        from get_global_benchmarks import _yahoo_proxy
+        from curl_cffi import requests as creq
+    except ImportError as e:
+        print(f"  ❌ 依赖缺失: {e}")
+        return 0
+
+    ycode = {"US.DXY": "DX-Y.NYB"}.get(bench_code, bench_code.split(".")[-1])
+    proxy = _yahoo_proxy()
+    sess_kwargs = {"impersonate": "chrome"}
+    if proxy:
+        sess_kwargs["proxies"] = {"http": proxy, "https": proxy}
+
+    # 拉 10 年全量，按 days 截断（多留 20 天保证 close_20d_ago 可算）
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ycode}?range=10y&interval=1d"
+    try:
+        sess = creq.Session(**sess_kwargs)
+        r = sess.get(url, timeout=30)
+        if r.status_code != 200:
+            print(f"  ❌ HTTP {r.status_code}")
+            return 0
+        d = r.json()["chart"]["result"][0]
+        ts = d["timestamp"]
+        closes = d["indicators"]["quote"][0]["close"]
+        pairs = [(ts[i], closes[i]) for i in range(len(ts)) if closes[i] is not None]
+        if len(pairs) < 2:
+            print(f"  数据不足 ({len(pairs)}行)")
+            return 0
+        if days and len(pairs) > days + 20:
+            pairs = pairs[-(days + 20):]
+        print(f"  获取 {len(pairs)} 行 "
+              f"({datetime.datetime.fromtimestamp(pairs[0][0]).date()} ~ "
+              f"{datetime.datetime.fromtimestamp(pairs[-1][0]).date()})")
+
+        recs = []
+        for i, (t, v) in enumerate(pairs):
+            td = datetime.datetime.fromtimestamp(t, datetime.timezone.utc).date()
+            val = float(v)
+            prev = float(pairs[i-1][1]) if i > 0 else None
+            chg = round((val / prev - 1) * 100, 4) if prev and prev != 0 else None
+            c20 = float(pairs[i-20][1]) if i >= 20 else None
+            recs.append({
+                "bench_code": bench_code, "bench_name": bench_name,
+                "trade_date": td,
+                "update_time": datetime.datetime.combine(td, datetime.time.min),
+                "last_price": val, "prev_close": prev,
+                "change_pct": chg, "close_20d_ago": c20,
+            })
+        ins, skip = write_records(recs)
+        print(f"  写入 {ins} 条, 跳过 {skip} 条")
+        return ins
+    except Exception as e:
+        print(f"  ❌ {type(e).__name__}: {e}")
+        return 0
+
+
 def backfill_eastmoney(bench_code, bench_name, days):
     """东财全球指数回补"""
     import requests as req
@@ -278,6 +342,8 @@ def backfill(bench_code, days):
         backfill_fred(bench_code, name, days)
     elif source == "sina_a":
         backfill_sina_a(bench_code, name, days)
+    elif source == "yfinance":
+        backfill_yahoo(bench_code, name, days)
     elif source == "eastmoney":
         backfill_eastmoney(bench_code, name, days)
 

@@ -59,6 +59,8 @@ ALL_BENCHMARKS: List[Dict] = [
     {"code": "US.NASDAQCOM",   "name": "纳斯达克综合指数",   "source": "fred", "fred_ticker": "NASDAQCOM"},
     {"code": "US.VIXCLS",      "name": "VIX恐慌指数",        "source": "fred", "fred_ticker": "VIXCLS"},
     {"code": "US.DTWEXBGS",    "name": "美元指数(贸易加权)", "source": "fred", "fred_ticker": "DTWEXBGS"},
+    # ── Yahoo Finance（ICE DXY；大陆 IP 被风控需代理，服务器香港直连，见 _yahoo_proxy）──
+    {"code": "US.DXY",         "name": "美元指数(ICE DXY)", "source": "yfinance", "yf_code": "DX-Y.NYB"},
     # ── AKShare ──
     {"code": "US.DGS10",       "name": "美国10年期国债收益率", "source": "akshare", "ak_func": "bond"},
     {"code": "US.DGS2",        "name": "美国2年期国债收益率",  "source": "akshare", "ak_func": "bond"},
@@ -69,6 +71,32 @@ ALL_BENCHMARKS: List[Dict] = [
     {"code": "KR.KS11",       "name": "韩国KOSPI指数",     "source": "sina", "sina_name": "首尔综合指数"},
     {"code": "DE.GDAXI",      "name": "德国DAX指数",       "source": "sina", "sina_name": "德国DAX 30种股价指数"},
 ]
+
+
+# ── 网络环境探测 ──
+_SERVER_PATH = "/home/hermes-agent/hermes-skills"
+
+
+def _is_server_env() -> bool:
+    """是否部署在服务器（路径约定与 market_scheduler.py / wecom_server_collector.py 一致）。
+
+    服务器在香港 → Yahoo 直连；本机(macOS 大陆 IP) 被 Yahoo 风控 → 需 socks5 代理。
+    """
+    return os.path.exists(_SERVER_PATH)
+
+
+def _yahoo_proxy() -> Optional[str]:
+    """Yahoo 数据源代理配置。
+
+    优先级: 环境变量 YAHOO_PROXY（显式覆盖，空字符串=强制直连）> 环境探测。
+    本机返回 socks5h://127.0.0.1:1080，服务器(香港)返回 None(直连)。
+    """
+    env = os.environ.get("YAHOO_PROXY")
+    if env is not None:
+        return env or None
+    if _is_server_env():
+        return None
+    return "socks5h://127.0.0.1:1080"
 
 
 # ── 工具 ──
@@ -453,6 +481,79 @@ def _collect_sina_a(items: list) -> list:
     return records
 
 
+# ── Yahoo Finance 采集 ──
+def _collect_yahoo(items: list) -> list:
+    """采集 Yahoo Finance 指数（当前为 ICE 美元指数 DX-Y.NYB）。
+
+    大陆 IP 被 Yahoo 风控（403/429），本机需走 socks5 代理（见 _yahoo_proxy），
+    服务器（香港）直连。yfinance 1.5.1 的 proxy 参数与 curl_cffi 不兼容
+    （报 Could not resolve proxy），故直接构造 curl_cffi.Session 调 v8 chart API。
+    此处只取最新一天做增量写入，全历史回填见 backfill_benchmark.py（US.DXY 分支）。
+    """
+    from curl_cffi import requests as creq
+    from datetime import timezone
+    import time as _time
+
+    proxy = _yahoo_proxy()
+    sess_kwargs = {"impersonate": "chrome"}
+    if proxy:
+        sess_kwargs["proxies"] = {"http": proxy, "https": proxy}
+
+    records = []
+    for it in items:
+        ycode = it.get("yf_code", it["code"].split(".")[-1])
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ycode}?range=3mo&interval=1d"
+        last_err = None
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    _time.sleep(3 * attempt)
+                sess = creq.Session(**sess_kwargs)
+                r = sess.get(url, timeout=25)
+                if r.status_code != 200:
+                    last_err = f"HTTP {r.status_code}"
+                    if r.status_code in (403, 429):
+                        _time.sleep(5 * (attempt + 1))  # 风控/限流，退避更长
+                    continue
+                d = r.json()["chart"]["result"][0]
+                meta = d["meta"]
+                ts = d["timestamp"]
+                quote = d["indicators"]["quote"][0]
+                closes = quote["close"]
+                if not ts or len(ts) < 2:
+                    last_err = "数据不足"
+                    continue
+                td = datetime.fromtimestamp(ts[-1], timezone.utc).date()
+                # 盘中最新 bar 的 close 可能为 None，用 regularMarketPrice 兜底
+                last_val = closes[-1] if closes[-1] is not None else meta.get("regularMarketPrice")
+                prev_val = None
+                for c in reversed(closes[:-1]):
+                    if c is not None:
+                        prev_val = c
+                        break
+                if last_val is None or prev_val is None:
+                    last_err = "close 缺失"
+                    continue
+                change = (last_val / prev_val - 1) * 100 if prev_val != 0 else 0.0
+                valid = [c for c in closes if c is not None]
+                c20 = valid[-21] if len(valid) >= 21 else None
+                records.append({
+                    "bench_code": it["code"], "bench_name": it["name"],
+                    "trade_date": td,
+                    "update_time": datetime.combine(td, datetime.min.time()),
+                    "last_price": _r(last_val), "prev_close": _r(prev_val),
+                    "change_pct": _r(change), "close_20d_ago": _r(c20) if c20 else None,
+                })
+                print(f"  [Yahoo] ✅ {it['name']}({ycode})  {last_val:.2f}  ({change:+.2f}%)  {td}")
+                break
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                _time.sleep(0.5)
+        else:
+            print(f"  [Yahoo] ❌ {it['name']}({ycode})  {last_err}")
+    return records
+
+
 # ── 调度入口 ──
 def collect_all(sources: Optional[set] = None):
     """采集全部或指定数据源的指数。
@@ -474,6 +575,7 @@ def collect_all(sources: Optional[set] = None):
         "sina":      _collect_sina,
         "sina_a":    _collect_sina_a,
         "eastmoney": _collect_eastmoney,
+        "yfinance":  _collect_yahoo,
     }
 
     total_records = []

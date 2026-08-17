@@ -58,13 +58,13 @@ INDICATOR_TEMPLATES: List[Dict] = [
      "momentum": True,  "mom_window": 20, "level_w": 0.6, "mom_w": 0.4},
     {"bench": "US.DGS2",     "name": "美债2Y",      "dim": "liq",  "kind": "zscore", "window": 120,
      "momentum": True,  "mom_window": 20, "level_w": 0.6, "mom_w": 0.4},
-    {"bench": "US.DTWEXBGS", "name": "美元指数",    "dim": "liq",  "kind": "zscore", "window": 120,
+    {"bench": "US.DXY",      "name": "美元指数",    "dim": "liq",  "kind": "zscore", "window": 120,
      "momentum": True,  "mom_window": 20, "level_w": 0.6, "mom_w": 0.4},
     {"bench": "FX.USDCNY",   "name": "离岸人民币",  "dim": "liq",  "kind": "zscore", "window": 120,
      "momentum": True,  "mom_window": 20, "level_w": 0.6, "mom_w": 0.4},
     # 估值分母（折现率 + 美元 + 期限利差）
     {"bench": "US.DGS10",    "name": "美债10Y",     "dim": "val",  "kind": "zscore", "window": 120},
-    {"bench": "US.DTWEXBGS", "name": "美元指数",    "dim": "val",  "kind": "zscore", "window": 120},
+    {"bench": "US.DXY",      "name": "美元指数",    "dim": "val",  "kind": "zscore", "window": 120},
     {"bench": "SPREAD.10Y2Y","name": "10Y-2Y利差",  "dim": "val",  "kind": "zscore", "window": 120},
 ]
 
@@ -72,7 +72,7 @@ INDICATOR_TEMPLATES: List[Dict] = [
 _DEFAULT_DIR = {
     "HK.800000": +1, "HK.800700": +1, "US.SP500": +1, "US.NASDAQCOM": +1,
     "SH.000001": +1, "SZ.399001": +1, "US.VIXCLS": -1,
-    "US.DGS10": -1, "US.DGS2": -1, "US.DTWEXBGS": -1, "FX.USDCNY": -1,
+    "US.DGS10": -1, "US.DGS2": -1, "US.DXY": -1, "FX.USDCNY": -1,
 }
 
 # 相关性弱于此阈值(绝对值)的指标, 权重衰减为 MIN_W, 避免噪声主导评分
