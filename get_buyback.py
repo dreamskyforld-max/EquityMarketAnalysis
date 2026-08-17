@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
 """
-港股公司回购数据 — 东方财富静态页面（常驻调用版）
+港股公司回购数据 — 东方财富（全量版 + 常驻调用）
 
-数据源：https://hk.eastmoney.com/buyback.html?code=00700&sdate=YYYY-MM-DD&edate=YYYY-MM-DD
-常驻调用：run(codes, ctx)。__main__ 保留独立运行。
+数据源：
+- 全量模式：东财数据中心 datacenter-web API（RPT_HK_BUYBACK，全市场回购明细，
+  按 TRADE_DATE 过滤分页拉取最近 FULL_DAYS 天）。
+- 单票模式：hk.eastmoney.com/buyback.html 静态页（兼容 wecom 手动单票触发，输出格式不变）。
+写入表：daily_buyback_event（按 stock_code + buyback_date 去重，ON CONFLICT DO UPDATE）。
 仅支持港股（HK）。
 """
-import sys, re, urllib.request
-from datetime import date
+import sys, re, json, urllib.request, urllib.parse
+from datetime import date, timedelta
 from db import get_conn, bulk_upsert
+
+DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+REPORT_NAME = "RPT_HK_BUYBACK"
+FULL_DAYS = 90      # 全量模式拉取最近 N 天回购明细
+PAGE_SIZE = 500     # 东财 datacenter 单页上限
+
+_DATACENTER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Referer": "https://data.eastmoney.com/",
+}
 
 def fmt_price(val, max_dec=4):
     if val is None: return "N/A"
@@ -19,6 +33,69 @@ def fmt_price(val, max_dec=4):
 
 def get_currency(full_code):
     return "港元" if full_code.upper().startswith("HK") else "元"
+
+def _http_get_json(url):
+    req = urllib.request.Request(url, headers=_DATACENTER_HEADERS)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+def fetch_full_buyback(days=FULL_DAYS):
+    """全市场回购明细分页拉取（最近 days 天，按 TRADE_DATE 倒序）。失败返回 None。"""
+    start = (date.today() - timedelta(days=days)).isoformat()
+    flt = urllib.parse.quote(f"(TRADE_DATE>='{start}')")
+    records = []
+    page = 1
+    while True:
+        url = (f"{DATACENTER_URL}?reportName={REPORT_NAME}&columns=ALL"
+               f"&pageNumber={page}&pageSize={PAGE_SIZE}"
+               f"&sortColumns=TRADE_DATE&sortTypes=-1&filter={flt}")
+        try:
+            data = _http_get_json(url)
+        except Exception as e:
+            print(f"[调试] 全量回购分页失败 p{page}: {e}")
+            break
+        rows = (data or {}).get("result") or {}
+        page_data = rows.get("data") or []
+        records.extend(page_data)
+        count = rows.get("count") or 0
+        if not page_data or page * PAGE_SIZE >= count:
+            break
+        page += 1
+    return records or None
+
+def _records_to_db_rows(records):
+    """东财接口原始记录 → daily_buyback_event 行列表（纯函数，可单测）。
+
+    按 (stock_code, buyback_date) 去重：接口按 TRADE_DATE 倒序返回，
+    同一天多条回购公告取最新一条（与单票模式一天一条口径一致）。
+    注意：接口无最高/最低成交价，high_price/low_price 置 None。
+    """
+    db_rows = []
+    seen = set()
+    for r in records:
+        sec = str(r.get("SECURITY_CODE") or "").strip()
+        if not sec.isdigit():
+            continue
+        code = f"HK.{int(sec):05d}"
+        raw_date = str(r.get("TRADE_DATE") or "")[:10]
+        try:
+            date.fromisoformat(raw_date)
+        except ValueError:
+            continue
+        key = (code, raw_date)
+        if key in seen:
+            continue
+        seen.add(key)
+        db_rows.append({
+            "stock_code": code,
+            "buyback_date": raw_date,
+            "volume": int(r.get("REPO_NUM") or 0),
+            "high_price": None,
+            "low_price": None,
+            "avg_price": r.get("AVG_PRICE"),
+            "amount": r.get("REPO_AMT"),
+        })
+    return db_rows
 
 def get_buyback(symbol, debug=False):
     today = date.today()
@@ -85,9 +162,8 @@ def get_buyback(symbol, debug=False):
         "total_volume": total_volume, "total_amount": total_amount,
     }
 
-def run(codes=None, ctx=None, debug=False):
-    """采集入口（常驻调用）。codes: [股票代码]；ctx 未使用（数据源为东方财富）。"""
-    full_code = codes[0] if (codes and len(codes) > 0) else "HK.00700"
+def _run_single(full_code, debug=False):
+    """单票模式（wecom 手动触发）：原静态页逻辑，输出格式不变。"""
     if "." in full_code:
         market_prefix, symbol = full_code.split(".", 1)
     else:
@@ -136,11 +212,44 @@ def run(codes=None, ctx=None, debug=False):
     else:
         print(f"公司回购数据 ({full_code}): 暂无数据（该股票年内无回购记录）")
 
+def _run_full(debug=False):
+    """全量模式（全局任务）：东财数据中心全市场回购明细分页拉取并全量入库。"""
+    records = fetch_full_buyback()
+    if not records:
+        print("公司回购数据: 全市场获取失败或无数据")
+        return
+    db_rows = _records_to_db_rows(records)
+    if not db_rows:
+        print("公司回购数据: 全市场无有效回购记录")
+        return
+    try:
+        with get_conn() as conn:
+            bulk_upsert(conn, "daily_buyback_event", db_rows, conflict_cols=["stock_code", "buyback_date"])
+    except Exception as e:
+        print(f"[DB] 回购数据入库失败: {e}")
+        return
+    n_stock = len({r["stock_code"] for r in db_rows})
+    print(f"公司回购数据: 全市场入库 {len(db_rows)} 条回购记录"
+          f"（最近{FULL_DAYS}天，{n_stock} 只标的）")
+
+def run(codes=None, ctx=None, debug=False):
+    """采集入口（常驻调用）。
+
+    codes: None/空 = 全量采集全市场回购明细入库（全局任务用法）；
+           给定 = 单票采集（兼容 wecom 手动触发，输出格式不变）。
+    ctx 未使用（数据源为东方财富）。
+    """
+    if codes and len(codes) > 0:
+        _run_single(codes[0], debug=debug)
+    else:
+        _run_full(debug=debug)
+
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("code", nargs="?", default="HK.00700")
+    parser.add_argument("code", nargs="?", default=None,
+                        help="股票代码（如 HK.00700）；不填 = 全量采集全市场回购明细")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-    run([args.code], debug=args.debug)
+    run([args.code] if args.code else None, debug=args.debug)

@@ -60,19 +60,12 @@ MARKET_PRESETS = {
                 "get_quote.py",                          # 行情快照（富途API）→ daily_quote
                 "get_benchmark.py",                      # 恒生等基准指数 → benchmark_daily
                 "get_excess_return.py",                  # 超额收益计算 → excess_return_daily
-                "get_cbbc.py",                           # 牛熊证街货分布（港交所）→ cbbc_daily
-                "get_short_selling.py",                  # 沽空数据（实时）
+                "get_short_selling.py",                  # 沽空数据（实时，东方财富）
                 "get_trend.py",                          # 全日趋势数据
-                "get_realtime_short_selling_fullday.py", # 全日沽空数据
-                "get_buyback.py",                         # 公司回购（港交所）→ buyback_daily
             ],
         },
         "extras": [    # 市场特有定时任务
             ("财务指标", "get_financial.py", {"hour": 9, "minute": 0}),                                # 财务指标（AKShare年度+季度）→ financial_indicator
-            ("全日沽空数据-1", "get_realtime_short_selling_fullday.py", {"hour": 16, "minute": 10}),  # 全日沽空 第1次补采
-            ("全日沽空数据-2", "get_realtime_short_selling_fullday.py", {"hour": 16, "minute": 30}),  # 全日沽空 第2次补采
-            ("全日沽空数据-3", "get_realtime_short_selling_fullday.py", {"hour": 17, "minute": 0}),   # 全日沽空 第3次补采
-            ("公司回购", "get_buyback.py", {"hour": 9, "minute": 0}),                                  # 公司回购（港交所）→ buyback_daily
         ],
     },
     "A": {
@@ -165,6 +158,28 @@ GLOBAL_TASKS: list[GlobalTask] = [
     # 落 daily_ggt_hold。盘前 8:00、盘后 19:00 各跑一次（run 忽略 codes，全局批量，force=True）。
     ("南向资金", "get_south_flow.py",
      {"hour": "8,19", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # 港股全日沽空（全市场全量）：一次抓取港交所全日沽空快照页，解析全部港股
+    # 并全量入库 daily_short_selling（全局任务，不依赖股票列表，run 忽略 codes）。
+    # 港交所约 16:50 发布，17:30、18:30 兜底补采。
+    ("全日沽空数据", "get_realtime_short_selling_fullday.py",
+     {"hour": 16, "minute": 50, "day_of_week": "mon-fri"}, None, True, None, 300),
+     ("全日沽空数据-补采1", "get_realtime_short_selling_fullday.py",
+     {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("全日沽空数据-补采2", "get_realtime_short_selling_fullday.py",
+     {"hour": 18, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # 港股牛熊证街货分布（全市场全量）：一次抓取港交所 CBBC 完整列表 CSV，
+    # 解析全部有牛熊证的标的并全量入库 daily_cbbc（全局任务，run 忽略 codes）。
+    # 日更数据，盘后 16:25 跑一次（避开 16:20 收盘批量高峰）。
+    ("牛熊证街货分布", "get_cbbc.py",
+     {"hour": 16, "minute": 25, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # 港股公司回购（全市场全量）：东财数据中心 RPT_HK_BUYBACK 按 TRADE_DATE 过滤分页，
+    # 全量入库 daily_buyback_event（全局任务，run 忽略 codes）。
+    # 回购公告盘后陆续披露，21:00 跑一次覆盖当日全部。
+    ("公司回购", "get_buyback.py",
+     {"hour": "7,17", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
 ]
 
 # ── 盘中批量采集（按市场拆分）────────────────────────────────

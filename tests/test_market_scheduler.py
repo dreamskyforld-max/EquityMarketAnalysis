@@ -86,12 +86,15 @@ class TestConfigStructure(unittest.TestCase):
         self.assertIsInstance(a.get("extras"), list, "A 缺少 extras")
 
     def test_short_selling_retry_times(self):
-        """全日沽空数据应至少采集 3 次"""
+        """全日沽空数据应为全局任务且至少采集 2 次（18:30 主采 + 19:30 补采）"""
+        short_names = [n for n, *_ in self.globals if "沽空" in n]
+        self.assertGreaterEqual(len(short_names), 2,
+                                f"全日沽空全局任务只找到 {len(short_names)} 次，期望至少2次")
+        # 且不应再作为逐票任务挂在 HK extras 中
         hk = self.presets.get("HK", {})
         extras = hk.get("extras", [])
-        short_names = [n for n, *_ in extras if "沽空" in n]
-        self.assertGreaterEqual(len(short_names), 3,
-                                f"全日沽空数据只找到 {len(short_names)} 次，期望至少3次")
+        extra_short = [n for n, *_ in extras if "沽空" in n]
+        self.assertEqual(extra_short, [], f"全日沽空不应再出现在 HK extras: {extra_short}")
 
     def test_daily_time_field_valid(self):
         """各市场 daily.time 的 hour/minute 合法"""

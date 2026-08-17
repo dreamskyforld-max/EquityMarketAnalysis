@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-港股全日沽空数据 — 港交所官方全日快照（常驻调用版）
+港股全日沽空数据 — 港交所官方全日快照（全市场全量采集版）
 
 数据源：https://www.hkex.com.hk/chi/stat/smstat/ssturnover/ncms/ashtmain_c.htm
 发布时间：每个交易日约 18:00-19:00
-常驻调用：run(codes, ctx)。__main__ 保留独立运行。
+一次请求抓取全市场页面，解析全部港股沽空数据并全量入库 daily_short_selling。
+
+常驻调用：run(codes, ctx)。
+- codes 为 None/空 → 全量入库全部港股（全局任务用法）
+- codes 给定 → 仅按代码过滤入库（兼容 wecom 手动单票触发）
 仅支持港股（HK）。
 """
 import sys, re, urllib.request
@@ -21,7 +25,59 @@ def fmt_price(val, max_dec=4):
 def get_currency(full_code):
     return "港元" if full_code.upper().startswith("HK") else "元"
 
-def get_fullday_short_selling(symbol, debug=False):
+def parse_fullday_page(html, debug=False):
+    """从港交所全日沽空页面 HTML 解析全市场沽空记录。
+
+    返回 [{code, name, volume, amount, date}, ...]；页面解析失败返回 None。
+    - code: 页面原始数字代码（如 "700"）
+    - amount: 亿港元
+    - 排除人民币柜台（5位以 8 开头，如 80700）
+    """
+    pre_match = re.search(r'<pre>(.*?)</pre>', html, re.DOTALL)
+    if not pre_match:
+        if debug:
+            print("[调试] 未找到 <pre> 标签")
+        return None
+
+    text = pre_match.group(1)
+    text = text.replace('\u3000', ' ')
+
+    date_match = re.search(r'日期\s*:\s*(\d{1,2}\s+\w+\s+\d{4})', text)
+    data_date = date_match.group(1) if date_match else date.today().strftime('%d %b %Y')
+
+    pattern = r'^\s*(\d{1,5})\s{2,}(.+?)\s{2,}([\d,]+)\s+([\d,]+)$'
+    lines = text.split('\n')
+
+    records = []
+    for line in lines:
+        # 跳过人民币柜台（行首带 %）
+        if line.lstrip().startswith('%'):
+            continue
+
+        m = re.match(pattern, line.strip())
+        if not m:
+            continue
+
+        code = m.group(1)
+        # 排除 5 位以 8 开头的人民币柜台代码（如 80700）
+        if code.startswith('8'):
+            continue
+
+        name = m.group(2).strip()
+        volume = int(m.group(3).replace(',', ''))
+        amount = float(m.group(4).replace(',', '')) / 1e8   # 亿港元
+        records.append({
+            "code": code,
+            "name": name,
+            "volume": volume,
+            "amount": amount,
+            "date": data_date,
+        })
+
+    return records
+
+def get_fullday_short_selling_all(debug=False):
+    """抓取港交所全日沽空快照页，返回全市场沽空记录列表；失败返回 None。"""
     url = "https://www.hkex.com.hk/chi/stat/smstat/ssturnover/ncms/ashtmain_c.htm"
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
@@ -37,100 +93,77 @@ def get_fullday_short_selling(symbol, debug=False):
             print(f"[调试] 请求页面失败: {e}")
         return None
 
-    pre_match = re.search(r'<pre>(.*?)</pre>', html, re.DOTALL)
-    if not pre_match:
-        if debug:
-            print("[调试] 未找到 <pre> 标签")
-        return None
+    return parse_fullday_page(html, debug)
 
-    text = pre_match.group(1)
-    text = text.replace('\u3000', ' ')
-
-    date_match = re.search(r'日期\s*:\s*(\d{1,2}\s+\w+\s+\d{4})', text)
-    data_date = date_match.group(1) if date_match else date.today().strftime('%d %b %Y')
-
+def _norm_symbol(sym):
+    """把带前导零的代码（00700）归一化为页面格式（700）。"""
     try:
-        normalized_symbol = str(int(symbol))
+        return str(int(sym))
     except ValueError:
-        normalized_symbol = symbol
-
-    if debug:
-        print(f"[调试] 查找代码: {normalized_symbol}")
-
-    pattern = r'^\s*(\d{1,5})\s{2,}(.+?)\s{2,}([\d,]+)\s+([\d,]+)$'
-    lines = text.split('\n')
-
-    for line in lines:
-        if line.lstrip().startswith('%'):
-            continue
-
-        m = re.match(pattern, line.strip())
-        if not m:
-            continue
-
-        code = m.group(1)
-        name = m.group(2).strip()
-        vol_str = m.group(3)
-        amount_str = m.group(4)
-
-        if code == normalized_symbol and not code.startswith('8'):
-            volume = int(vol_str.replace(',', ''))
-            amount = float(amount_str.replace(',', '')) / 1e8
-            return {
-                "date": data_date,
-                "update_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                "volume": volume,
-                "amount": amount,
-                "name": name,
-            }
-
-    if debug:
-        print(f"[调试] 未找到代码 {normalized_symbol} 的数据")
-    return None
+        return sym
 
 def run(codes=None, ctx=None, debug=False):
-    """采集入口（常驻调用）。codes: [股票代码]；ctx 未使用（数据源为港交所）。"""
-    full_code = codes[0] if (codes and len(codes) > 0) else "HK.00700"
-    if "." in full_code:
-        market_prefix, symbol = full_code.split(".", 1)
-    else:
-        market_prefix, symbol = "HK", full_code
+    """采集入口（常驻调用）。
 
-    if market_prefix.upper() != "HK":
-        print(f"全日沽空数据 ({full_code}): 仅支持港股")
+    codes: 股票代码列表；None/空 = 全量采集全港股并入库；给定 = 仅按代码过滤入库。
+    ctx 未使用（数据源为港交所）。
+    """
+    records = get_fullday_short_selling_all(debug=debug)
+    if not records:
+        print("全日沽空数据: 获取失败或页面无数据")
         return
 
-    data = get_fullday_short_selling(symbol, debug=debug)
-    currency = get_currency(full_code)
+    # 过滤：codes 给定则只保留这些票（兼容 wecom 手动单票触发）
+    want = {_norm_symbol(c.partition(".")[2]) for c in (codes or [])
+            if c.partition(".")[0].upper() == "HK"}
+    if want:
+        records = [r for r in records if r["code"] in want]
+        if not records:
+            print("全日沽空数据: 无匹配股票")
+            return
 
-    if data:
-        print(f"全日沽空数据 ({full_code})")
-        print(f"股票名称: {data['name']}")
-        print(f"数据日期: {data['date']}")
-        print(f"更新时间: {data['update_time']}")
-        print(f"全日沽空股数: {data['volume']:,}")
-        print(f"全日沽空金额: {data['amount']:.2f} 亿{currency}")
-
-        try:
-            with get_conn() as conn:
+    # 全量入库
+    inserted = 0
+    failed = 0
+    with get_conn() as conn:
+        for r in records:
+            full_code = f"HK.{int(r['code']):05d}"
+            try:
                 upsert(conn, "daily_short_selling", {
                     "stock_code": full_code,
                     "trade_date": date.today(),
-                    "stock_name": data['name'],
-                    "data_date": data['date'],
-                    "short_selling_vol": data['volume'],
-                    "short_selling_amt": data['amount'],
+                    "stock_name": r["name"],
+                    "data_date": r["date"],
+                    "short_selling_vol": r["volume"],
+                    "short_selling_amt": r["amount"],
                 }, conflict_cols=["stock_code", "trade_date"])
-        except Exception as e:
-            print(f"[DB] 全日沽空入库失败: {e}")
+                inserted += 1
+            except Exception as e:
+                failed += 1
+                print(f"[DB] 全日沽空入库失败 {full_code}: {e}")
+
+    # 输出：单票保持原格式（兼容 wecom 渲染），全量输出汇总
+    if len(records) == 1:
+        r = records[0]
+        full_code = f"HK.{int(r['code']):05d}"
+        print(f"全日沽空数据 ({full_code})")
+        print(f"股票名称: {r['name']}")
+        print(f"数据日期: {r['date']}")
+        print(f"更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"全日沽空股数: {r['volume']:,}")
+        print(f"全日沽空金额: {r['amount']:.2f} 亿港元")
     else:
-        print(f"全日沽空数据 ({full_code}): 暂无数据（今日全日沽空尚未发布或无此标的沽空记录）")
+        total_amt = sum(r["amount"] for r in records)
+        print(f"全日沽空数据: 全市场入库 {inserted}/{len(records)} 只股票"
+              f"（失败 {failed}），数据日期 {records[0]['date']}，"
+              f"全市场沽空金额 {total_amt:.2f} 亿港元")
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("code", nargs="?", default="HK.00700")
+    parser.add_argument("code", nargs="?", default=None,
+                        help="股票代码（如 HK.00700）；不填 = 全量采集全港股")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-    run([args.code], debug=args.debug)
+    run([args.code] if args.code else None, debug=args.debug)
