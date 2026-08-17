@@ -263,10 +263,26 @@ def _collect_tencent_a(items: list, klt: str = "1", days: int = 1) -> list:
             r = req.get(url, params={"code": qcode}, headers=headers, timeout=20)
             data = r.json()
             node = (data.get("data", {}) or {}).get(qcode, {})
-            minute = node.get("data", {}).get("data") if isinstance(node, dict) else None
+            inner = node.get("data", {}) if isinstance(node, dict) else {}
+            minute = inner.get("data") if isinstance(inner, dict) else None
             if not minute:
                 print(f"  [腾讯] ⚠️ {it['name']} 无分钟数据")
                 continue
+            # 校验归属日期：腾讯盘中返回当天序列；开盘前(8:00-9:25)会返回
+            # 上一交易日全天，若误拼当天日期会把旧数据写成"今天"，故非当天丢弃。
+            date_str = inner.get("date") if isinstance(inner, dict) else None
+            if not date_str:
+                print(f"  [腾讯] ⚠️ {it['name']} 返回无日期字段，跳过")
+                continue
+            try:
+                bar_date = datetime.strptime(str(date_str), "%Y%m%d").date()
+            except Exception:
+                print(f"  [腾讯] ⚠️ {it['name']} 日期解析失败: {date_str}，跳过")
+                continue
+            if bar_date != date.today():
+                print(f"  [腾讯] ⚠️ {it['name']} 数据归属 {bar_date}（非今天），跳过避免误写")
+                continue
+            today = bar_date
             kept = 0
             for line in minute:
                 # 腾讯格式: "HHMM  price  avg_price  volume  "
@@ -277,8 +293,7 @@ def _collect_tencent_a(items: list, klt: str = "1", days: int = 1) -> list:
                 price = _r(parts[1])
                 if price is None:
                     continue
-                # 拼成当日本地时间
-                today = date.today()
+                # 用归属日期(==今天)拼本地时间
                 dt = datetime.strptime(f"{today} {hm[:2]}:{hm[2:]}", "%Y-%m-%d %H:%M")
                 utc = _to_utc(dt.strftime("%Y-%m-%d %H:%M:%S"), it["tz"])
                 records.append({
