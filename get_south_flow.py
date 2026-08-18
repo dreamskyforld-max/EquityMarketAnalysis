@@ -15,7 +15,8 @@
   当日涨跌幅 → change_pct
   持股市值 → hold_value（新增）
   持股市值变化-1日/-5日/-10日 → hold_value_change_1d/5d/10d（新增）
-  hold_num_change / est_net_inflow：按股票分组按日期排序后跨日计算
+  hold_num_change / hold_ratio_change / est_net_inflow：入库后由 recalc_from_db()
+  基于表内全量数据窗口重算（单一真相源，防批次缺失）
 
 常驻调用：run(codes, ctx)，codes 忽略（全局一次）；__main__ 保留独立运行。
 """
@@ -57,10 +58,23 @@ def _num(v):
         return None
 
 
-def fetch_market_south_flow(fetch_days=FETCH_DAYS):
-    """批量拉取全市场南向持股，返回按 (stock_code, trade_date) 的明细列表。"""
-    end = date.today()
-    start = end - timedelta(days=fetch_days + 15)  # 留足自然日余量覆盖交易日
+def fetch_market_south_flow(start_date=None, end_date=None, fetch_days=FETCH_DAYS):
+    """批量拉取全市场南向持股，返回按 (stock_code, trade_date) 的明细列表。
+
+    start_date/end_date: date 或 'YYYY-MM-DD' 字符串；None 时默认最近 fetch_days 个自然日。
+    """
+    if end_date is None:
+        end = date.today()
+    elif hasattr(end_date, "isoformat"):
+        end = end_date
+    else:
+        end = date.fromisoformat(str(end_date))
+    if start_date is None:
+        start = end - timedelta(days=fetch_days + 15)  # 留足自然日余量覆盖交易日
+    elif hasattr(start_date, "isoformat"):
+        start = start_date
+    else:
+        start = date.fromisoformat(str(start_date))
     start_s = start.strftime("%Y%m%d")
     end_s = end.strftime("%Y%m%d")
 
@@ -96,28 +110,6 @@ def fetch_market_south_flow(fetch_days=FETCH_DAYS):
     return rows
 
 
-def _calc_cross_day(rows):
-    """按股票分组、按日期排序，跨日计算 hold_num_change 与 est_net_inflow。"""
-    by_stock = {}
-    for r in rows:
-        by_stock.setdefault(r["stock_code"], []).append(r)
-    for code, lst in by_stock.items():
-        lst.sort(key=lambda x: x["trade_date"])
-        prev = None
-        for r in lst:
-            if prev is not None and r["hold_num"] is not None and prev["hold_num"] is not None:
-                r["hold_num_change"] = r["hold_num"] - prev["hold_num"]
-                if r["close_price"] is not None:
-                    r["est_net_inflow"] = round(
-                        r["hold_num_change"] * r["close_price"] / 1e8, 2
-                    )
-            else:
-                r["hold_num_change"] = None
-                r["est_net_inflow"] = None
-            prev = r
-    return rows
-
-
 def save_to_db(rows):
     if not rows:
         return 0
@@ -148,6 +140,41 @@ def save_to_db(rows):
     return len(db_data)
 
 
+def recalc_from_db(table="daily_ggt_hold"):
+    """入库后基于表内全量数据窗口重算差值（单一真相源，防复发）。
+
+    相比 Python 侧跨日计算（只算同批次内相邻日期），窗口函数按
+    (stock_code, trade_date) 全表排序取 LAG，不受「本次批次只覆盖部分日期」
+    影响 —— 历史批次起点、缺日、回填补采后的差值都会自动补齐。
+    table 参数仅供测试注入临时表。
+    """
+    sql = f"""
+        WITH ranked AS (
+            SELECT id, hold_num, hold_ratio, close_price,
+                   LAG(hold_num)  OVER (PARTITION BY stock_code ORDER BY trade_date) AS prev_hold,
+                   LAG(hold_ratio) OVER (PARTITION BY stock_code ORDER BY trade_date) AS prev_ratio
+            FROM {table}
+        )
+        UPDATE {table} g
+        SET hold_num_change = CASE WHEN g.hold_num IS NOT NULL
+                                   THEN ranked.hold_num - ranked.prev_hold ELSE NULL END,
+            hold_ratio_change = CASE WHEN g.hold_ratio IS NOT NULL AND ranked.prev_ratio IS NOT NULL
+                                     THEN round(g.hold_ratio - ranked.prev_ratio, 4) ELSE NULL END,
+            est_net_inflow = CASE WHEN ranked.prev_hold IS NOT NULL AND g.hold_num IS NOT NULL
+                                       AND g.close_price IS NOT NULL
+                                  THEN round((g.hold_num - ranked.prev_hold) * g.close_price / 1e8, 2)
+                                  ELSE NULL END
+        FROM ranked
+        WHERE g.id = ranked.id AND ranked.prev_hold IS NOT NULL
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            n = cur.rowcount
+    log(f"窗口重算差值: 更新 {n} 行（hold_num_change/hold_ratio_change/est_net_inflow）")
+    return n
+
+
 def run(codes=None, ctx=None):
     """采集入口（常驻调用）。批量全市场一次，codes/ctx 忽略。"""
     log("通过 AKShare 批量获取全市场南向持股...")
@@ -156,11 +183,11 @@ def run(codes=None, ctx=None):
         print("南向资金数据获取失败（批量接口无数据）")
         return []
 
-    rows = _calc_cross_day(rows)
     n = save_to_db(rows)
+    m = recalc_from_db()
     stocks = len({r["stock_code"] for r in rows})
-    log(f"入库 {n} 条，覆盖 {stocks} 只港股通标的")
-    print(f"南向资金批量采集完成: 入库 {n} 条，覆盖 {stocks} 只标的")
+    log(f"入库 {n} 条，覆盖 {stocks} 只港股通标的，窗口重算 {m} 行差值")
+    print(f"南向资金批量采集完成: 入库 {n} 条，覆盖 {stocks} 只标的，窗口重算 {m} 行差值")
     return rows
 
 
