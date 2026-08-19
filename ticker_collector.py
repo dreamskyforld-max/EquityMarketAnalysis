@@ -16,6 +16,9 @@
   - 推送→缓冲→批量入库，不丢失数据
   - sequence 去重：断线重连推送的历史数据自动跳过
   - 重连机制：FutuOpenD 未就绪时自动等待重试
+  - 订阅健康检查：FutuOpenD 每天 05:00 自动重启，重启后 futu 库底层重连成功但
+    重订阅可能静默失败（库只 log 不重试），表现为「连接正常、TICKER 无推送」。
+    本进程周期性 query_subscription 校验服务器侧实际订阅，缺失则 close+重建+重订阅。
 
 用法：
     python3 ticker_collector.py              # 前台运行
@@ -29,6 +32,8 @@ import logging
 import threading
 from collections import deque
 from datetime import datetime
+
+from typing import Any
 
 from futu import OpenQuoteContext, SubType, RET_OK, TickerHandlerBase, StockQuoteHandlerBase
 from db import get_conn, bulk_upsert
@@ -86,6 +91,9 @@ def load_config():
         "futu_host": val("futu", "host", fallback="127.0.0.1"),
         "futu_port": int(val("futu", "port", fallback="11111")),
         "reconnect_delay_seconds": int(val("ticker", "reconnect_delay_seconds", fallback="30")),
+        # 订阅健康检查周期（秒）：FutuOpenD 每日重启/断线后，futu 库内部重连成功但
+        # 重订阅可能静默失败（库只 log 不重试），须由本进程周期性校验并重建。
+        "health_check_seconds": int(val("ticker", "health_check_seconds", fallback="60")),
     }
 
 
@@ -168,6 +176,16 @@ class TickerCollector(TickerHandlerBase):
             batch = list(self.buffer)
             self.buffer.clear()
             self.last_flush = time.time()
+
+        # 批内 sequence 去重（保留最后一条）：断线重连后 FutuOpenD 会重推历史数据，
+        # 与缓冲中已有数据同批时会产生重复 sequence。PostgreSQL 的 ON CONFLICT DO UPDATE
+        # 不允许同一命令中同一条冲突键出现两次，否则整批报错 0 成功。
+        # 批间重复仍由 tick_data.sequence UNIQUE + ON CONFLICT DO UPDATE 兜底。
+        if len(batch) > 1:
+            deduped = {r["sequence"]: r for r in batch}
+            if len(deduped) != len(batch):
+                log.info(f"批内去重: {len(batch)}条 → {len(deduped)}条 (重复 sequence)")
+            batch = list(deduped.values())
 
         written = _write_batch_to_db(batch)
         self.total_written += written
@@ -406,6 +424,51 @@ def connect_and_subscribe(cfg: dict) -> OpenQuoteContext | None:
     return quote_ctx
 
 
+def check_subscription_health(quote_ctx: OpenQuoteContext, cfg: dict[str, Any]) -> tuple[bool, str]:
+    """校验 FutuOpenD 侧实际订阅是否完整（TICKER 为主链路）。
+
+    背景：FutuOpenD 每天 05:00 自动重启。重启后 futu 库底层会自动重连
+    （'New connect ready'），但其内部重订阅失败时只 log、不真正 close/retry，
+    造成「连接看似正常、TICKER 推送静默丢失」。因此本进程必须周期性调用
+    query_subscription 校验服务器侧实际订阅，发现缺失即由调用方重建连接。
+
+    返回 (ok: bool, detail: str)
+    """
+    stocks = cfg.get("stocks", [])
+    quote_stocks = cfg.get("quote_stocks", [])
+    try:
+        # is_all_conn=True：查询 FutuOpenD 服务器侧全局订阅，跨连接可靠。
+        # 若用默认 False 只查本连接，当本连接订阅被 OpenD 重启踢掉后可能返回空
+        # 导致误判；全局查询才能准确反映订阅是否真正存活。
+        ret, data = quote_ctx.query_subscription(is_all_conn=True)
+        if ret != RET_OK:
+            return False, f"query_subscription 失败: {data}"
+        sub_list = data.get("sub_list", {}) if isinstance(data, dict) else {}
+
+        # TICKER 主链路：期望订阅的每只股票都必须在服务器侧
+        ticker_codes = set(sub_list.get("TICKER", []))
+        missing_ticker = [c for c in stocks if c not in ticker_codes]
+        if missing_ticker:
+            return False, (f"TICKER 订阅缺失 {len(missing_ticker)} 只: "
+                           f"{missing_ticker[:10]}{'...' if len(missing_ticker) > 10 else ''} "
+                           f"(服务器侧 TICKER 共 {len(ticker_codes)} 只)")
+
+        # QUOTE 从链路：仅告警（配额受限可能本来就缺，重建也无益）
+        missing_quote = []
+        quote_codes = set()
+        if quote_stocks:
+            quote_codes = set(sub_list.get("QUOTE", []))
+            missing_quote = [c for c in quote_stocks if c not in quote_codes]
+        detail = f"订阅健康: TICKER {len(ticker_codes)}/{len(stocks)} 只"
+        if quote_stocks:
+            detail += f", QUOTE {len(quote_codes)}/{len(quote_stocks)} 只"
+        if missing_quote:
+            return True, detail + f" (QUOTE 缺失 {len(missing_quote)} 只, 忽略)"
+        return True, detail
+    except Exception as e:
+        return False, f"订阅健康检查异常: {e}"
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -461,6 +524,8 @@ def main():
     quote_flush_thread.start()
 
     reconnect_delay = cfg.get("reconnect_delay_seconds", 30)
+    health_check_seconds = cfg.get("health_check_seconds", 60)
+    rebuild_count = 0
 
     while not stop_event.is_set():
         quote_ctx = connect_and_subscribe(cfg)
@@ -476,13 +541,32 @@ def main():
 
         log.info("逐笔 + 实时报价采集已就绪，等待推送数据 ...")
 
-        # 保持连接，等待退出信号
+        # 保持连接 + 周期性订阅健康检查：
+        # FutuOpenD 每天 05:00 重启后，futu 库底层会自动重连但重订阅可能静默失败，
+        # 表现为「连接正常、TICKER 无推送」。必须周期性 query_subscription 校验，
+        # 发现缺失立即 close + 重建 + 重新订阅，确保 09:00 盘前推送不丢。
+        last_check = time.time()
         while not stop_event.is_set():
             stop_event.wait(timeout=1.0)
 
+            if time.time() - last_check >= health_check_seconds:
+                last_check = time.time()
+                ok, detail = check_subscription_health(quote_ctx, cfg)
+                if not ok:
+                    rebuild_count += 1
+                    log.warning(f"[重建 #{rebuild_count}] 订阅健康检查失败: {detail}；"
+                                f"关闭连接并重建订阅 ...")
+                    break  # 退出内层循环 → close + 外层重连
+                else:
+                    log.debug(f"订阅健康检查通过: {detail}")
+
         # 退出
         quote_ctx.close()
-        log.info("连接已关闭")
+        if stop_event.is_set():
+            log.info("连接已关闭，进程退出")
+            break
+        log.info("连接已关闭，准备重建 ...")
+        stop_event.wait(timeout=reconnect_delay)
 
     log.info("逐笔成交采集服务已停止")
 

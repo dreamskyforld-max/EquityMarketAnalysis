@@ -150,9 +150,14 @@ GLOBAL_TASKS: list[GlobalTask] = [
     # 港股全市场总成交额：富途 get_market_snapshot 批量（~30秒）聚合全港股成交额，
     # 落 daily_market_turnover 作为「市场总体流动性水位」分母。
     # 富途快照盘中实时更新，交易时段内每 5 分钟跑一次（force=False + market="HK"），
-    # 盘中拿实时累计、盘后拿全天完整值。
+    # 盘中拿实时累计；收市竞价结束后盘后再补采全天完整终值（下一条）。
     ("港股全市场成交额", "get_hk_market_turnover.py",
      {"minute": "*/5", "second": 0}, None, False, "HK", 300),
+
+    # 港股全市场成交额-盘后补采：收市竞价（16:00–16:10）结束后，富途快照结算出
+    # 当天全天完整值，16:30 盘后固定补采一次落库（force=True 不受交易时段门控限制）。
+    ("港股全市场成交额-盘后补采", "get_hk_market_turnover.py",
+     {"hour": 16, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
     
     # 南向资金（港股通持股）：AKShare 批量接口一次拉全市场 ~1200 只港股通标的，
     # 落 daily_ggt_hold。盘前 8:00、盘后 19:00 各跑一次（run 忽略 codes，全局批量，force=True）。
@@ -295,10 +300,10 @@ def is_trading_hours(market: str = "HK") -> bool:
         if 13 <= h < 15 or (h == 15 and m == 0):
             return True
     else:
-        # 港股：周一至五，9:30-12:00 / 13:00-16:00
+        # 港股：周一至五，9:30-12:00 / 13:00-16:00（含 16:00-16:10 收市竞价时段）
         if (h == 9 and m >= 30) or (10 <= h < 12) or (h == 12 and m == 0):
             return True
-        if 13 <= h < 16 or (h == 16 and m == 0):
+        if 13 <= h < 16 or (h == 16 and m <= 10):
             return True
     return False
 
