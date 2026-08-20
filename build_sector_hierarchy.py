@@ -41,7 +41,7 @@ LEVEL1 = {
     "ENERGY": "能源",
     "MATERIALS": "原材料",
     "INDUSTRIALS": "工业",
-    "CONSUMER_DISCRETIONARY": "非必需消费",
+    "CONSUMER_DISCRETIONARY": "可选消费",
     "CONSUMER_STAPLES": "必需消费",
     "HEALTH_CARE": "医疗保健",
     "FINANCIALS": "金融",
@@ -114,30 +114,29 @@ _SECTOR_MAP = {
     "HK.LIST1355": ("INDUSTRIALS", "工业"),       # Transport & Logistics
     "HK.LIST1271": ("INDUSTRIALS", "工业"),       # Environmental Services
     # ── 非必需消费 CONSUMER_DISCRETIONARY ──
-    "HK.LIST1040": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Automobiles
-    "HK.LIST1041": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Auto Parts
-    "HK.LIST1269": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Auto Retailers
-    "HK.LIST23847": ("CONSUMER_DISCRETIONARY", "非必需消费"),  # Motorcycles and others
-    "HK.LIST1277": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Apparel Manufacturing
-    "HK.LIST1270": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Apparel Retailers
-    "HK.LIST1268": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Other Clothing Accessories
-    "HK.LIST1275": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Footwear
-    "HK.LIST1035": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Textiles & Fabrics
-    "HK.LIST1049": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Jewelry & Watches
-    "HK.LIST1021": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # furniture
-    "HK.LIST1022": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Home Appliances
-    "HK.LIST1047": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Toys & Leisure
-    "HK.LIST1278": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Home Improvement Retail
-    "HK.LIST1071": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Hotels & Resorts
-    "HK.LIST1069": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Resorts & Casinos
-    "HK.LIST1032": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Sports & Recreation Facilities
-    "HK.LIST1083": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Catering
-    "HK.LIST1029": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Entertainment
-    "HK.LIST1034": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Travel & Sightseeing
-    "HK.LIST1091": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # education
-    "HK.LIST23361": ("CONSUMER_DISCRETIONARY", "非必需消费"),  # Online Retailers
-    "HK.LIST1056": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Diversified Retailers
-    "HK.LIST1276": ("CONSUMER_DISCRETIONARY", "非必需消费"),   # Other Retailers
+    "HK.LIST1040": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Automobiles
+    "HK.LIST1041": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Auto Parts
+    "HK.LIST1269": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Auto Retailers
+    "HK.LIST23847": ("CONSUMER_DISCRETIONARY", "可选消费"),  # Motorcycles and others
+    "HK.LIST1277": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Apparel Manufacturing
+    "HK.LIST1270": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Apparel Retailers
+    "HK.LIST1268": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Other Clothing Accessories
+    "HK.LIST1275": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Footwear
+    "HK.LIST1035": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Textiles & Fabrics
+    "HK.LIST1049": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Jewelry & Watches
+    "HK.LIST1021": ("CONSUMER_DISCRETIONARY", "可选消费"),   # furniture
+    "HK.LIST1022": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Home Appliances
+    "HK.LIST1047": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Toys & Leisure
+    "HK.LIST1278": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Home Improvement Retail
+    "HK.LIST1071": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Hotels & Resorts
+    "HK.LIST1069": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Resorts & Casinos
+    "HK.LIST1032": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Sports & Recreation Facilities
+    "HK.LIST1083": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Catering
+    "HK.LIST1029": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Entertainment
+    "HK.LIST1034": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Travel & Sightseeing
+    "HK.LIST1091": ("CONSUMER_DISCRETIONARY", "可选消费"),   # education
+    "HK.LIST1056": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Diversified Retailers
+    "HK.LIST1276": ("CONSUMER_DISCRETIONARY", "可选消费"),   # Other Retailers
     # ── 必需消费 CONSUMER_STAPLES ──
     "HK.LIST1001": ("CONSUMER_STAPLES", "必需消费"),           # Dairy
     "HK.LIST1010": ("CONSUMER_STAPLES", "必需消费"),           # packaged food
@@ -178,6 +177,7 @@ _SECTOR_MAP = {
     "HK.LIST1360": ("INFORMATION_TECHNOLOGY", "信息技术"),      # Semiconductor Equipment & Materials
     "HK.LIST23363": ("INFORMATION_TECHNOLOGY", "信息技术"),     # Digital Solution Services
     "HK.LIST23364": ("INFORMATION_TECHNOLOGY", "信息技术"),     # Internet services and infrastructure
+    "HK.LIST23361": ("INFORMATION_TECHNOLOGY", "信息技术"),     # Online Retailers
     "HK.LIST1055": ("INFORMATION_TECHNOLOGY", "信息技术"),      # Consumer Telecommunication Equipment
     # ── 通信服务 COMMUNICATION（电信 + 传媒/游戏/广告/出版，GICS 口径）──
     "HK.LIST1054": ("COMMUNICATION", "通信服务"),               # Telecom Services
