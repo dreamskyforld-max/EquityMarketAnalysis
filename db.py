@@ -93,10 +93,12 @@ def upsert(conn, table, data, conflict_cols):
         cur.execute(query, values)
 
 
-def bulk_upsert(conn, table, data_list, conflict_cols):
+def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False):
     """
-    批量 INSERT ... ON CONFLICT DO UPDATE
+    批量 INSERT ... ON CONFLICT DO UPDATE / DO NOTHING
     data_list: dict 列表
+    do_nothing: True → 冲突时跳过(ON CONFLICT DO NOTHING)；
+                False(默认) → 冲突时更新(ON CONFLICT DO UPDATE SET ...)
 
     自动对齐所有 record 的 keys：不同数据源构造的 record 可能字段不一致
     （如富途带 volume/turnover，FRED 不带），用 data_list[0].keys() 取列名
@@ -120,7 +122,18 @@ def bulk_upsert(conn, table, data_list, conflict_cols):
     col_identifiers = sql.SQL(", ").join([sql.Identifier(c) for c in columns])
     conflict_target = sql.SQL(", ").join([sql.Identifier(c) for c in conflict_cols])
 
-    if not update_cols:
+    if do_nothing:
+        # 仅跳过已存在行：用于 tick_data(sequence 全表唯一)。断线重连后 FutuOpenD 重推
+        # 的历史数据与其余批次同批时会产生重复 sequence，DO NOTHING 直接跳过即可，
+        # 既不会因同批重复 key 报错，也不会像 DO UPDATE 那样覆盖掉先到的盘前数据。
+        query = sql.SQL(
+            "INSERT INTO {table} ({cols}) VALUES %s ON CONFLICT ({conflict}) DO NOTHING"
+        ).format(
+            table=sql.Identifier(table),
+            cols=col_identifiers,
+            conflict=conflict_target,
+        )
+    elif not update_cols:
         query = sql.SQL(
             "INSERT INTO {table} ({cols}) VALUES %s ON CONFLICT ({conflict}) DO NOTHING"
         ).format(

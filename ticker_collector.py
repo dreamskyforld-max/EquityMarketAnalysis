@@ -110,6 +110,7 @@ def _write_batch_to_db(batch: list) -> int:
                 "tick_data",
                 batch,
                 conflict_cols=["sequence"],
+                do_nothing=True,   # sequence 全表唯一，重复则跳过（含盘前重推数据）
             )
         return len(batch)
     except Exception as e:
@@ -177,16 +178,9 @@ class TickerCollector(TickerHandlerBase):
             self.buffer.clear()
             self.last_flush = time.time()
 
-        # 批内 sequence 去重（保留最后一条）：断线重连后 FutuOpenD 会重推历史数据，
-        # 与缓冲中已有数据同批时会产生重复 sequence。PostgreSQL 的 ON CONFLICT DO UPDATE
-        # 不允许同一命令中同一条冲突键出现两次，否则整批报错 0 成功。
-        # 批间重复仍由 tick_data.sequence UNIQUE + ON CONFLICT DO UPDATE 兜底。
-        if len(batch) > 1:
-            deduped = {r["sequence"]: r for r in batch}
-            if len(deduped) != len(batch):
-                log.info(f"批内去重: {len(batch)}条 → {len(deduped)}条 (重复 sequence)")
-            batch = list(deduped.values())
-
+        # 不再做批内 sequence 去重：批内完全重复的 sequence 由 tick_data.sequence UNIQUE
+        # + ON CONFLICT DO NOTHING 直接跳过（PG 允许同一条冲突键多次出现，仅跳过已存在的）。
+        # 之前按 sequence 覆盖会误删盘前 LATE/AUCTION 数据（与连续竞价 sequence 同区间被后者覆盖）。
         written = _write_batch_to_db(batch)
         self.total_written += written
         if len(batch) > 10:  # 只对较大批次打印日志
@@ -470,15 +464,8 @@ def check_subscription_health(quote_ctx: OpenQuoteContext, cfg: dict[str, Any]) 
 
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(
-                os.path.join(_SCRIPT_DIR, "ticker_collector.log")
-            ),
-        ],
-    )
+    from log_utils import setup_logger
+    setup_logger("ticker_collector")   # 统一日志: ./log 目录 + 按天滚动 + 保留 10 天
 
     log.info("=" * 50)
     log.info("逐笔成交采集服务启动")

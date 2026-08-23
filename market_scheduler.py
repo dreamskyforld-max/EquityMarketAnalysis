@@ -18,15 +18,9 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.executors.pool import ThreadPoolExecutor as APSchedThreadPool
 
-# ── 日志配置 ────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(os.path.join(os.path.dirname(__file__), "scheduler.log")),
-    ],
-)
-log = logging.getLogger("scheduler")
+# ── 日志配置 (统一: ./log 目录 + 按天滚动 + 保留 10 天) ──────
+from log_utils import setup_logger
+log = setup_logger("scheduler")
 
 # ── 路径配置（与 wecom_server_collector 保持一致）───────────
 # 服务器部署时用 /home/hermes-agent/hermes-skills
@@ -185,6 +179,10 @@ GLOBAL_TASKS: list[GlobalTask] = [
     # 回购公告盘后陆续披露，21:00 跑一次覆盖当日全部。
     ("公司回购", "get_buyback.py",
      {"hour": "7,17", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # 注意：采集层故障监控已由独立服务 monitor_collector.py（常驻进程，
+    # systemd: monitor-collector.service）负责，不再挂在调度器里，
+    # 以免「调度器挂掉→监控也失效」的同源单点故障。
 ]
 
 # ── 盘中批量采集（按市场拆分）────────────────────────────────
@@ -271,6 +269,12 @@ def execute_task(name: str, modules: list, codes=None,
 
     start = datetime.now()
     log.info(f"[{name}] 开始 ...")
+    _rid: int | None = None
+    try:
+        from monitor_collector import record_task_start, record_task_end
+        _rid = record_task_start(name, market)
+    except Exception:
+        _rid = None
 
     fail = 0
     for script in modules:
@@ -282,6 +286,17 @@ def execute_task(name: str, modules: list, codes=None,
     total = len(modules)
     status = "成功" if fail == 0 else f"部分失败({fail}/{total})"
     log.info(f"[{name}] 完成 ({elapsed:.1f}s) — {status}")
+
+    if _rid is not None:
+        try:
+            if fail == 0:
+                _st = "ok"
+            else:
+                # 部分失败：若有超时才算 timeout，否则 error
+                _st = "timeout" if elapsed >= timeout else "error"
+            record_task_end(_rid, _st, duration_s=round(elapsed, 2))
+        except Exception:
+            pass
 
 
 # ── 调度器 ───────────────────────────────────────────────────

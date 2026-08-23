@@ -15,6 +15,7 @@ import os
 import sys
 import importlib
 import threading
+import time
 import logging
 
 log = logging.getLogger("collector")
@@ -48,20 +49,35 @@ class _LockedCtx:
 
         def _wrapper(*args, **kwargs):
             with _call_lock:
+                _t0 = _mono()
+                _ok = True
+                _err = None
                 try:
-                    return attr(*args, **kwargs)
-                except Exception:
-                    pass  # 第一次调用失败，尝试重连
-                # 重连并重试一次
-                try:
+                    try:
+                        return attr(*args, **kwargs)
+                    except Exception:
+                        pass  # 第一次调用失败，尝试重连
+                    # 重连并重试一次
                     _reconnect()
                     return getattr(_raw_ctx(), name)(*args, **kwargs)
                 except Exception as e:
+                    _ok = False
+                    _err = f"{type(e).__name__}: {e}"
                     raise RuntimeError(
-                        f"futu 调用 {name} 失败（重连后仍不可用）: "
-                        f"{type(e).__name__}: {e}"
+                        f"futu 调用 {name} 失败（重连后仍不可用）: {_err}"
                     ) from e
+                finally:
+                    try:
+                        from monitor_collector import record_api_call
+                        _lat = _mono() - _t0
+                        record_api_call(name, _ok, round(_lat, 3), _err)
+                    except Exception:
+                        pass  # 监控埋点失败不影响采集主流程
         return _wrapper
+
+
+def _mono():
+    return time.monotonic()
 
 
 def _raw_ctx():

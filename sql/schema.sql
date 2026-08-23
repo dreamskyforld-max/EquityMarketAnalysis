@@ -423,6 +423,10 @@ COMMENT ON COLUMN trend_snapshot.created_at           IS '数据写入数据库�
 CREATE INDEX idx_trend_snapshot_stock_time ON trend_snapshot (stock_code, snapshot_time DESC);
 CREATE INDEX idx_trend_snapshot_date ON trend_snapshot (snapshot_date);
 CREATE INDEX idx_trend_snapshot_stock_updated ON trend_snapshot (stock_code, updated_at DESC);
+-- 监控 monitor_collector 的 MAX(snapshot_time) WHERE snapshot_time>=窗口 查询用：
+-- 复合索引 (stock_code, snapshot_time) 中 snapshot_time 非前导列，无法用于单独范围查询，
+-- 故加单列索引，使该查询走 Index Only Scan Backward（~1ms）而非全表扫。
+CREATE INDEX idx_trend_snapshot_time ON trend_snapshot (snapshot_time);
 
 -- ============================================================================
 -- 第五部分：采集运行日志
