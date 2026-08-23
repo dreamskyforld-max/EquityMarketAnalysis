@@ -1,5 +1,5 @@
 #!/bin/bash
-cd ~/PycharmProjects/EquityMarketAnalysis || exit
+cd ~/mkt/EquityMarketAnalysis || exit
 source .venv/bin/activate
 
 # 可传入股票代码，默认 HK.00700

@@ -24,6 +24,7 @@ money_flow_data.txt
 trend_cache/*.json
 trend_cache/*.txt
 south_cache_*.json
+margin_cache_*.json
 *.csv
 
 # ── 开发临时脚本（不传 GitHub）──
