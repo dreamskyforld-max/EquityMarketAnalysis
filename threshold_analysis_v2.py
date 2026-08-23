@@ -31,6 +31,7 @@
 """
 
 import argparse
+from typing import Any
 import numpy as np
 import time
 import json
@@ -753,7 +754,7 @@ def run_analysis_v2(times, dates, prices, turnovers, dir_v, ttypes, unique_dates
 
     # ── v1 ──
     print("\n  [v1] tick-based + 原始 Welch's t")
-    v1 = run_v1_pipeline(times, prices, dir_v, turnovers, dates, unique_dates)
+    v1: dict[str, float | str | dict[str, float | int | None] | dict[str, float | list[float] | int | None] | int | list[float] | Any | None] = run_v1_pipeline(times, prices, dir_v, turnovers, dates, unique_dates)
     print(f"    T0={v1['T0']/1e4:.0f}万  T1={v1['T1']/1e4:.0f}万  T2={v1['T2']/1e4:.0f}万")
     print(f"    T1方法={v1['t1_method']}  T1_CV={v1['t1_cv']:.0f}%  T2_CV={v1['t2_cv']:.0f}%"
           if v1['t1_cv'] else f"    T1方法={v1['t1_method']}")

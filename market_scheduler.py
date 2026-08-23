@@ -152,6 +152,17 @@ GLOBAL_TASKS: list[GlobalTask] = [
     # 当天全天完整值，16:30 盘后固定补采一次落库（force=True 不受交易时段门控限制）。
     ("港股全市场成交额-盘后补采", "get_hk_market_turnover.py",
      {"hour": 16, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # A股全市场成交额：富途 get_market_snapshot 批量（~3秒）聚合全 A 股（SH+SZ）成交额，
+    # 落 a_daily_market_turnover + a_daily_quote，作为 A 股市场总体流动性水位分母。
+    # 盘中实时累计：交易时段内每 5 分钟跑一次（force=False + market="A"，受 A 股时段门控）。
+    ("A股全市场成交额", "get_a_market_turnover.py",
+     {"minute": "*/5", "second": 0}, None, False, "A", 120),
+
+    # A股全市场成交额-盘后补采：A股收市竞价（15:00–15:30）结束后，富途快照结算出
+    # 当天全天完整值，15:50 盘后固定补采一次落库（force=True 不受交易时段门控限制）。
+    ("A股全市场成交额-盘后补采", "get_a_market_turnover.py",
+     {"hour": 15, "minute": 50, "day_of_week": "mon-fri"}, None, True, None, 120),
     
     # 南向资金（港股通持股）：AKShare 批量接口一次拉全市场 ~1200 只港股通标的，
     # 落 daily_ggt_hold。盘前 8:00、盘后 19:00 各跑一次（run 忽略 codes，全局批量，force=True）。
