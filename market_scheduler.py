@@ -71,13 +71,10 @@ MARKET_PRESETS = {
                 "get_benchmark.py",      # 上证等基准指数 → benchmark_daily
                 "get_excess_return.py",  # 超额收益计算 → excess_return_daily
                 "get_trend.py",          # 全日趋势数据
-                "get_margin_balance.py", # 融资融券余额 → margin_balance
             ],
         },
         "extras": [
             ("财务指标", "get_financial.py", {"hour": 9, "minute": 0}),       # 财务指标（AKShare年度+季度）→ financial_indicator
-            ("融资余额-早盘", "get_margin_balance.py", {"hour": 9, "minute": 10}),   # 上交所次日8:00后公布
-            ("融资余额-晚间", "get_margin_balance.py", {"hour": 20, "minute": 10}),   # 深交所18:30-20:00公布
         ],
     },
 }
@@ -124,7 +121,7 @@ GLOBAL_TASKS: list[GlobalTask] = [
     # 全球指数分钟级采集：覆盖亚太(08:00–16:00 HK)+欧美盘至凌晨，避开低频 04:00–08:00
     # 每5分钟一次，仅交易日；run 忽略 codes，全局只跑一次
     ("全球指数分钟采集", "get_global_benchmarks_minute.py",
-     {"minute": "*/5", "hour": "8-11,13-16,17-23,0-3", "day_of_week": "mon-fri"}, None, True, None, 180),
+     {"minute": "*/5", "hour": "8-11,13-16,17-23,0-3", "day_of_week": "mon-fri"}, None, True, None, 300),
 
     # 股票-指数成分归属（参考数据，每周二 18:00 刷新；run 忽略 codes，全局只跑一次）
     ("指数成分归属", "get_stock_sector.py", {"day_of_week": 2, "hour": 18, "minute": 0}, None, True, None, 180),
@@ -160,14 +157,20 @@ GLOBAL_TASKS: list[GlobalTask] = [
      {"minute": "*/5", "second": 0}, None, False, "A", 120),
 
     # A股全市场成交额-盘后补采：A股收市竞价（15:00–15:30）结束后，富途快照结算出
-    # 当天全天完整值，15:50 盘后固定补采一次落库（force=True 不受交易时段门控限制）。
+    # 当天全天完整值，16:10 盘后固定补采一次落库（force=True 不受交易时段门控限制）。
     ("A股全市场成交额-盘后补采", "get_a_market_turnover.py",
-     {"hour": 15, "minute": 50, "day_of_week": "mon-fri"}, None, True, None, 120),
+     {"hour": 16, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 120),
     
     # 南向资金（港股通持股）：AKShare 批量接口一次拉全市场 ~1200 只港股通标的，
     # 落 daily_ggt_hold。盘前 8:00、盘后 19:00 各跑一次（run 忽略 codes，全局批量，force=True）。
     ("南向资金", "get_south_flow.py",
      {"hour": "8,19", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # 融资融券全量明细（A股沪深两市）：AKShare 拉取交易所逐日公布的融资融券明细，
+    # 全市场全标的 + 融资融券双向全字段，落 daily_margin_balance（全局任务，run 忽略 codes）。
+    # 交易所约盘后披露当日数据，9 + 18 兜底补采两次（周一至周五，force=True）。
+    ("融资融券全量", "get_margin_balance.py",
+     {"hour": "9,18", "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
 
     # 港股全日沽空（全市场全量）：一次抓取港交所全日沽空快照页，解析全部港股
     # 并全量入库 daily_short_selling（全局任务，不依赖股票列表，run 忽略 codes）。

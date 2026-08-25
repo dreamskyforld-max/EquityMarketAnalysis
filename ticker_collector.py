@@ -36,7 +36,7 @@ from datetime import datetime
 from typing import Any
 
 from futu import OpenQuoteContext, SubType, RET_OK, TickerHandlerBase, StockQuoteHandlerBase
-from db import get_conn, bulk_upsert
+from db import get_conn, bulk_upsert, write_full_tick
 
 
 # ── 路径 ──────────────────────────────────────────────────────
@@ -94,6 +94,9 @@ def load_config():
         # 订阅健康检查周期（秒）：FutuOpenD 每日重启/断线后，futu 库内部重连成功但
         # 重订阅可能静默失败（库只 log 不重试），须由本进程周期性校验并重建。
         "health_check_seconds": int(val("ticker", "health_check_seconds", fallback="60")),
+        # 全量逐笔旁路落盘开关（诊断用，默认关闭）：开启后富途推送的每一笔都无去重写入
+        # full_tick_data 表，用于定位"推了但 tick_data 没落"的问题。
+        "full_tick_capture": val("ticker", "full_tick_capture", fallback="false").lower() in ("1", "true", "yes", "on"),
     }
 
 
@@ -105,6 +108,11 @@ def _write_batch_to_db(batch: list) -> int:
         return 0
     try:
         with get_conn() as conn:
+            if load_config().get("full_tick_capture"):
+                # 诊断旁路：富途推送的每一笔都无去重写入 full_tick_data，
+                # 用于事后比对"推了什么 / tick_data 实际落了什么"。默认关闭。
+                columns = list(batch[0].keys())
+                write_full_tick(conn, batch, columns)
             bulk_upsert(
                 conn,
                 "tick_data",

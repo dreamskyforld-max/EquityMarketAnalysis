@@ -15,6 +15,7 @@ system/
 
 # ── 日志 ──
 *.log
+log/
 
 # ── 数据与缓存产物 ──
 benchmark_data.txt
@@ -33,6 +34,8 @@ test_ticker.py
 
 # ── AI 生成的 Markdown 文档（不传 GitHub）──
 *.md
+# README 是项目正式文档，需要入库（其余 AI 生成的 md 仍忽略）
+!README.md
 
 # ── 测试缓存 ──
 .pytest_cache/

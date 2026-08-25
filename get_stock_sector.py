@@ -11,6 +11,14 @@
           板块 code，再逐个 get_plate_stock(板块code) 拉成分。返回 DataFrame 无板块类型列，
           故类型由枚举时的 plate_class 决定，单独记一列 sector_type。
   A 股指数：AKShare index_stock_cons_csindex / index_stock_cons_sina（本机可直接跑）
+  A 股行业板块(INDUSTRY)：BaoStock 证监会行业分类（免费/不限流/稳定）
+  A 股概念板块(CONCEPT)：AKShare 东方财富(em) stock_board_concept_*（偶发连接重置已加退避重试）
+
+用法：
+  python3 get_stock_sector.py                 # 默认跑全部（港股 + A股）
+  python3 get_stock_sector.py --market A      # 仅跑 A股（含指数/行业/概念）
+  python3 get_stock_sector.py --market HK     # 仅跑港股（需 futu OpenD）
+  python3 get_stock_sector.py --list-hk       # 调试：枚举并打印港股全部板块
 
 写入表：stock_sector（PK stock_code + sector_code，每只成分股一行；sector_type 区分 INDEX/INDUSTRY/CONCEPT/REGION）
   查询「腾讯属于哪些板块」：
@@ -30,6 +38,7 @@
 常驻调用：run(codes, ctx) —— 由 market_scheduler 通过 collector_runtime 调用。
 """
 import sys
+import os
 import time
 import logging
 from datetime import datetime
@@ -67,6 +76,162 @@ _EXCH_PREFIX = {
     "深圳证券交易所": "SZ",
     "北京证券交易所": "BJ",
 }
+
+# ── A股代码前缀（纯数字代码 → 交易所前缀）─────────────────────────────────
+#   60xxxx/68xxxx(科创板) → SH；00xxxx/30xxxx(创业板)/20xxxx(B股) → SZ；
+#   8xxxxx/92xxxx(北交所)/4xxxxx/9xxxxx → BJ
+def _a_exch_prefix(raw: str) -> str | None:
+    if not raw:
+        return None
+    if raw.startswith(("60", "68", "90", "5", "11", "113", "110")):  # 沪市（含沪市转债/B股）
+        return "SH"
+    if raw.startswith(("00", "30", "20", "12", "15", "16", "123", "127", "128")):  # 深市
+        return "SZ"
+    if raw.startswith(("8", "92", "4", "9")):  # 北交所 / 老三板
+        return "BJ"
+    return None
+
+
+# ── A股：东方财富(em) 行业/概念板块（含成分）──────────────────────────────
+#   本机网络对 em 源偶发 RemoteDisconnected，需退避重试。ths 源虽稳定但无成分股明细，
+#   故行业/概念成分统一用 em 源 + 重试。
+def _ak_retry(fn, n=5, wait=4, label="akshare", max_total=None):
+    """AKShare em 源偶发连接重置，退避重试。
+
+    max_total: 重试累计耗时上限（秒）；超过则放弃并抛出最后一次异常，避免限流时无限阻塞。
+    """
+    import time as _time
+    last: Exception | None = None
+    start = _time.time()
+    for i in range(n):
+        try:
+            return fn()
+        except Exception as e:  # RemoteDisconnected / ConnectionError 等
+            last = e
+            log.warning("%s 第 %d/%d 次失败: %s", label, i + 1, n, repr(e)[:120])
+            if max_total is not None and (_time.time() - start) >= max_total:
+                log.warning("%s 重试累计超 %.0fs，放弃", label, max_total)
+                break
+            if i < n - 1:
+                _time.sleep(wait)
+    if last is None:
+        raise RuntimeError(f"{label} 重试循环未执行（n={n}）")
+    raise last
+
+
+def _fetch_a_board(plate_type):
+    """采集 A股 行业(INDUSTRY)/概念(CONCEPT) 全市场板块及成分。
+
+    返回 [(stock_code, sector_code, sector_name, sector_type), ...]
+    sector_code 用东财板块代码（如 BK1616），sector_type = 'INDUSTRY' / 'CONCEPT'。
+    """
+    import akshare as ak
+    if plate_type == "INDUSTRY":
+        list_fn = lambda: ak.stock_board_industry_name_em()
+        cons_fn = lambda sym: ak.stock_board_industry_cons_em(symbol=sym)
+        stype = "INDUSTRY"
+    else:
+        list_fn = lambda: ak.stock_board_concept_name_em()
+        cons_fn = lambda sym: ak.stock_board_concept_cons_em(symbol=sym)
+        stype = "CONCEPT"
+
+    try:
+        board_list = _ak_retry(list_fn, label=f"a_{plate_type}_list", max_total=90)
+    except Exception as e:
+        log.warning("A股 %s 板块列表采集失败: %s", plate_type, repr(e)[:200])
+        return []
+    if board_list is None or board_list.empty:
+        return []
+
+    rows = []
+    names = board_list.get("板块名称")
+    codes = board_list.get("板块代码")
+    if names is None or codes is None:
+        log.warning("A股 %s 板块列表字段异常: %s", plate_type, list(board_list.columns))
+        return []
+    total = len(board_list)
+    for i, (bname, bcode) in enumerate(zip(names, codes), 1):
+        try:
+            # 东财偶发限流：单板块重试累计不超过 60s 即跳过，避免整体阻塞
+            cons = _ak_retry(lambda: cons_fn(bname), label=f"a_{plate_type}_cons:{bname}", max_total=60)
+        except Exception as e:
+            log.warning("A股 %s 成分(%s)失败: %s", plate_type, bname, repr(e)[:120])
+            continue
+        if cons is None or cons.empty:
+            continue
+        for _, r in cons.iterrows():
+            raw = str(r.get("代码", "")).strip()
+            prefix = _a_exch_prefix(raw)
+            if not raw or not prefix:
+                continue
+            rows.append((f"{prefix}.{raw}", str(bcode), str(bname), stype))
+        if i % 25 == 0 or i == total:
+            log.info("A股 %s 板块进度 %d/%d", plate_type, i, total)
+    log.info("A股 %s 板块共 %d 个，成分 %d 只", plate_type, total, len(rows))
+    return rows
+
+
+# ── A股：证监会行业分类（BaoStock，免费、不限流、稳定）──────────────────────
+#   返回每只股票的证监会细分行业（如 C36汽车制造业）。代码已是 sh./sz./bj. 标准格式，
+#   无需补前缀。行业分类体系 = 证监会行业分类（19 个一级大类字母 A-S）。
+#   注：BaoStock 仅提供行业分类，不提供概念板块；概念板块仍走东财(em) _fetch_a_board。
+def _fetch_a_industry_baostock():
+    """采集 A股 证监会行业分类（股票 → 细分行业）。
+
+    返回 [(stock_code, sector_code, sector_name, 'INDUSTRY'), ...]
+    sector_code = 证监会行业代码（如 C36），sector_name = 行业名称（如 汽车制造业）。
+    无行业标注的股票（B股/退市等）跳过。
+    """
+    import baostock as bs
+    import re
+    import contextlib
+
+    rows = []
+    # BaoStock 的 login/logout 用 print 直接打 stdout，重定向到 devnull 避免干扰进度日志
+    _null = open(os.devnull, "w")
+    try:
+        lg = None
+        for _attempt in range(3):
+            with contextlib.redirect_stdout(_null):
+                lg = bs.login()
+            if lg.error_code == "0":
+                break
+            log.warning("[A股行业] BaoStock 登录第 %d/3 次失败: %s %s，重试…",
+                        _attempt + 1, lg.error_code, lg.error_msg)
+            time.sleep(2)
+        if lg is None or lg.error_code != "0":
+            log.warning("BaoStock 登录失败（已重试）: %s %s",
+                        getattr(lg, "error_code", "?"), getattr(lg, "error_msg", ""))
+            return []
+        log.info("[A股行业] BaoStock 登录成功，开始拉取证监会行业分类…")
+        with contextlib.redirect_stdout(_null):
+            rs = bs.query_stock_industry()
+        if rs.error_code != "0":
+            log.warning("BaoStock 行业查询失败: %s %s", rs.error_code, rs.error_msg)
+            return []
+        total_rows = 0
+        while (rs.error_code == "0") and rs.next():
+            code, name, industry = rs.get_row_data()[1:4]  # code, code_name, industry
+            total_rows += 1
+            if not industry:  # 无行业标注（B股等）
+                continue
+            # industry 格式为「代码+中文」连写，如 'C37铁路、船舶、航空航天...制造业'
+            # sector_code 取开头字母数字段（证监会行业代码，如 C37）；sector_name 用全称
+            m = re.match(r"^([A-Za-z]\d+)", industry)
+            sec_code = m.group(1) if m else industry[:10]
+            rows.append((code.lower(), sec_code, industry, "INDUSTRY"))
+            if len(rows) % 1000 == 0:
+                log.info("[A股行业] 已解析 %d 只…", len(rows))
+        with contextlib.redirect_stdout(_null):
+            bs.logout()
+    finally:
+        try:
+            _null.close()
+        except Exception:
+            pass
+    log.info("[A股行业] 采集完成：共 %d 只 A股，其中 %d 只有证监会行业标注", total_rows, len(rows))
+    return rows
+
 
 # ── 富途限速：每 30 秒最多 10 次 get_plate_stock / get_plate_list 调用 ──────
 #   用固定间隔节流：每次调用保证距上一次 ≥ _RATE_INTERVAL 秒（留余量，不攒满再等）。
@@ -282,9 +447,16 @@ def _futu_available():
         return False
 
 
-def run(codes=None, ctx=None):
-    """采集入口（常驻调用）。codes 未使用；ctx 为共享行情上下文（港股部分需要）。"""
+def run(codes=None, ctx=None, market="ALL"):
+    """采集入口（常驻调用）。
+
+    codes  未使用；ctx 为共享行情上下文（港股部分需要）。
+    market 'ALL'(默认) 跑港股+A股；'HK' 仅港股；'A' 仅 A股。
+    """
     from futu import OpenQuoteContext
+    market = (market or "ALL").upper()
+    if market not in ("ALL", "HK", "A"):
+        raise ValueError(f"未知 market={market!r}，仅支持 ALL/HK/A")
     _ensure_sector_table()
     own_ctx = False
     if ctx is None and _futu_available():
@@ -297,35 +469,56 @@ def run(codes=None, ctx=None):
 
     total = 0
     # 港股（需要 futu）
-    if ctx is not None:
-        # 1) 宽基/行业指数成分（恒生指数/恒生科技/恒生国企等）
-        print(f"[stock_sector] 开始采集 {len(HK_INDEX_TARGETS)} 个港股宽基指数…")
-        for t in HK_INDEX_TARGETS:
-            rows = _fetch_hk_index(ctx, t)
-            total += _save_sector_rows(rows, "futu")
-        # 2) 全市场板块（行业/概念/地域）——枚举后逐板块拉成分
-        plates = _enum_hk_plates(ctx)
-        print(f"[stock_sector] 港股共枚举到 {len(plates)} 个板块，开始逐板块拉成分…")
-        for i, (pcode, pname, ptype) in enumerate(plates, 1):
-            rows = _fetch_hk_plate(ctx, pcode, pname, ptype)
-            total += _save_sector_rows(rows, "futu")
-            if i % 25 == 0 or i == len(plates):
-                print(f"[stock_sector] 板块进度 {i}/{len(plates)}，累计写入 {total} 行")
+    if market in ("ALL", "HK"):
+        if ctx is not None:
+            # 1) 宽基/行业指数成分（恒生指数/恒生科技/恒生国企等）
+            log.info("开始采集 %d 个港股宽基指数…", len(HK_INDEX_TARGETS))
+            for t in HK_INDEX_TARGETS:
+                rows = _fetch_hk_index(ctx, t)
+                total += _save_sector_rows(rows, "futu")
+            # 2) 全市场板块（行业/概念/地域）——枚举后逐板块拉成分
+            plates = _enum_hk_plates(ctx)
+            log.info("港股共枚举到 %d 个板块，开始逐板块拉成分…", len(plates))
+            for i, (pcode, pname, ptype) in enumerate(plates, 1):
+                rows = _fetch_hk_plate(ctx, pcode, pname, ptype)
+                total += _save_sector_rows(rows, "futu")
+                if i % 25 == 0 or i == len(plates):
+                    log.info("港股板块进度 %d/%d，累计写入 %d 行", i, len(plates), total)
+        else:
+            log.warning("未提供 futu ctx，跳过港股采集")
     else:
-        log.warning("未提供 futu ctx，跳过港股采集（A股指数仍会采集）")
+        log.info("market=%s，跳过港股采集", market)
 
-    # A股（akshare，本机可跑）
-    print(f"[stock_sector] 开始采集 {len(A_INDEX_TARGETS)} 个 A股指数…")
-    for t in A_INDEX_TARGETS:
-        rows = _fetch_a_index(t)
-        total += _save_sector_rows(rows, "akshare")
+    # A股（akshare / baostock，本机可跑）
+    if market in ("ALL", "A"):
+        log.info("开始采集 %d 个 A股指数…", len(A_INDEX_TARGETS))
+        for t in A_INDEX_TARGETS:
+            rows = _fetch_a_index(t)
+            total += _save_sector_rows(rows, "akshare")
+
+        # A股 行业板块（INDUSTRY）：证监会行业分类，BaoStock（免费/不限流/稳定）
+        log.info("开始采集 A股 证监会行业分类(INDUSTRY)…")
+        try:
+            a_ind = _fetch_a_industry_baostock()
+            if a_ind:
+                total += _save_sector_rows(a_ind, "baostock", default_type="INDUSTRY")
+            else:
+                log.warning("A股 证监会行业分类采集为空（BaoStock 不可用或无数据），跳过该段")
+        except Exception as e:
+            log.warning("A股 证监会行业分类采集异常，跳过该段: %s", e)
+        # A股 全市场概念板块（CONCEPT）：东财(em)，偶发限流已带退避重试
+        log.info("开始采集 A股 概念板块(CONCEPT)…")
+        a_con = _fetch_a_board("CONCEPT")
+        total += _save_sector_rows(a_con, "akshare", default_type="CONCEPT")
+    else:
+        log.info("market=%s，跳过 A股采集", market)
 
     if own_ctx and ctx is not None:
         try:
             ctx.close()
         except Exception:
             pass
-    print(f"[stock_sector] 完成：本次写入/更新 {total} 行")
+    log.info("完成（market=%s）：本次写入/更新 %d 行", market, total)
 
 
 def _list_hk_plates():
@@ -351,7 +544,19 @@ def _list_hk_plates():
 
 
 if __name__ == "__main__":
-    if "--list-hk" in sys.argv:
+    import argparse
+
+    _parser = argparse.ArgumentParser(description="股票-板块归属采集")
+    _parser.add_argument(
+        "--market", "-m", default="ALL", choices=["ALL", "HK", "A"],
+        help="指定市场：ALL(默认)=港股+A股；HK=仅港股；A=仅 A股",
+    )
+    _parser.add_argument(
+        "--list-hk", action="store_true", help="调试：枚举并打印港股全部板块",
+    )
+    _args = _parser.parse_args()
+
+    if _args.list_hk:
         _list_hk_plates()
     else:
-        run()
+        run(market=_args.market)

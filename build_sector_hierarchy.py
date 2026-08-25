@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-行业层级映射构建 — 把富途细粒度行业板块(INDUSTRY)聚合到 GICS 一级部门。
+行业层级映射构建 — 把细粒度行业板块(INDUSTRY)聚合到 GICS 一级部门。
 
 背景：
-  富途 get_plate_list(Plate.INDUSTRY) 返回 ~111 个细粒度行业板块（粒度接近 GICS 三级/四级），
-  直接平铺做资金流板块分析会非常凌乱。业界标准做法是聚合到 GICS 一级部门（11 类）或
-  恒生行业分类（12 类）后再分析。本脚本建立「细粒度板块 → 一级部门」的静态映射。
+  港股：富途 get_plate_list(Plate.INDUSTRY) 返回 ~111 个细粒度行业板块（粒度接近 GICS 三级/四级），
+       stock_sector.sector_code 形如 HK.xxxx，按 _SECTOR_MAP 静态映射。
+  A股：东方财富(em) 行业板块（代码形如 BKxxxx，名称如「半导体」「白酒」），
+       sector_code 非 HK.* 前缀，按板块【名称】经 _A_INDUSTRY_MAP / _A_INDUSTRY_PREFIX 映射。
+  直接平铺做资金流板块分析会非常凌乱。业界标准做法是聚合到 GICS 一级部门（11 类）后再分析。
+   本脚本对两类板块统一聚合到 GICS 一级部门。
 
 流程：
   1) 建表 sector_hierarchy（缺失时 CREATE TABLE IF NOT EXISTS，幂等）；
@@ -204,6 +207,92 @@ _SECTOR_MAP = {
 
 _OTHER = ("OTHER", "其他")
 
+# ── A股东财行业名 → GICS 一级部门（名称映射，因东财板块 code 无稳定含义）────
+#   覆盖东财一级行业主类；未列出的细分行业按名称模糊命中，仍缺失归 OTHER。
+#   仅对 sector_type='INDUSTRY' 且 sector_code 非 HK.* 前缀的板块生效。
+_A_INDUSTRY_MAP = {
+    "煤炭": "MATERIALS", "石油": "ENERGY", "石油石化": "ENERGY", "石化": "ENERGY",
+    "有色金属": "MATERIALS", "钢铁": "MATERIALS", "化工": "MATERIALS", "化学制品": "MATERIALS",
+    "建筑材料": "MATERIALS", "建筑装饰": "INDUSTRIALS", "建筑": "INDUSTRIALS",
+    "机械设备": "INDUSTRIALS", "通用设备": "INDUSTRIALS", "专用设备": "INDUSTRIALS",
+    "电力设备": "INDUSTRIALS", "新能源": "ENERGY", "电气设备": "INDUSTRIALS",
+    "国防军工": "INDUSTRIALS", "航空航天": "INDUSTRIALS", "汽车": "CONSUMER_DISCRETIONARY",
+    "汽车零部件": "CONSUMER_DISCRETIONARY", "商贸零售": "CONSUMER_DISCRETIONARY",
+    "零售": "CONSUMER_DISCRETIONARY", "社会服务": "CONSUMER_DISCRETIONARY", "旅游": "CONSUMER_DISCRETIONARY",
+    "酒店": "CONSUMER_DISCRETIONARY", "餐饮": "CONSUMER_DISCRETIONARY",
+    "纺织服饰": "CONSUMER_DISCRETIONARY", "服装": "CONSUMER_DISCRETIONARY",
+    "轻工制造": "CONSUMER_DISCRETIONARY", "家居": "CONSUMER_DISCRETIONARY",
+    "家电": "CONSUMER_DISCRETIONARY", "家用电器": "CONSUMER_DISCRETIONARY",
+    "农林牧渔": "CONSUMER_STAPLES", "食品饮料": "CONSUMER_STAPLES", "食品": "CONSUMER_STAPLES",
+    "酿酒": "CONSUMER_STAPLES", "白酒": "CONSUMER_STAPLES", "医药生物": "HEALTH_CARE",
+    "医药": "HEALTH_CARE", "医疗器械": "HEALTH_CARE", "生物制品": "HEALTH_CARE",
+    "中药": "HEALTH_CARE", "化学制药": "HEALTH_CARE", "银行": "FINANCIALS",
+    "非银金融": "FINANCIALS", "证券": "FINANCIALS", "保险": "FINANCIALS",
+    "多元金融": "FINANCIALS", "房地产": "REAL_ESTATE", "电子": "INFORMATION_TECHNOLOGY",
+    "半导体": "INFORMATION_TECHNOLOGY", "计算机": "INFORMATION_TECHNOLOGY",
+    "通信设备": "INFORMATION_TECHNOLOGY", "通信": "COMMUNICATION", "传媒": "COMMUNICATION",
+    "互联网": "COMMUNICATION", "公用事业": "UTILITIES", "电力": "UTILITIES",
+    "燃气": "UTILITIES", "环保": "INDUSTRIALS", "综合": "CONGLOMERATES",
+    "交通运输": "INDUSTRIALS", "物流": "INDUSTRIALS", "港口": "INDUSTRIALS",
+}
+
+# A股行业名 → GICS 前缀模糊匹配（处理带修饰的行业名，如「半导体及元件」）
+_A_INDUSTRY_PREFIX = [
+    ("煤炭", "MATERIALS"), ("石油", "ENERGY"), ("有色", "MATERIALS"), ("钢铁", "MATERIALS"),
+    ("化工", "MATERIALS"), ("建材", "MATERIALS"), ("建筑", "INDUSTRIALS"), ("机械", "INDUSTRIALS"),
+    ("电力设备", "INDUSTRIALS"), ("军工", "INDUSTRIALS"), ("汽车", "CONSUMER_DISCRETIONARY"),
+    ("零售", "CONSUMER_DISCRETIONARY"), ("社服", "CONSUMER_DISCRETIONARY"), ("纺织", "CONSUMER_DISCRETIONARY"),
+    ("轻工", "CONSUMER_DISCRETIONARY"), ("家电", "CONSUMER_DISCRETIONARY"), ("农林", "CONSUMER_STAPLES"),
+    ("食品", "CONSUMER_STAPLES"), ("酿酒", "CONSUMER_STAPLES"), ("医药", "HEALTH_CARE"),
+    ("银行", "FINANCIALS"), ("证券", "FINANCIALS"), ("保险", "FINANCIALS"), ("金融", "FINANCIALS"),
+    ("房地产", "REAL_ESTATE"), ("电子", "INFORMATION_TECHNOLOGY"), ("半导体", "INFORMATION_TECHNOLOGY"),
+    ("计算机", "INFORMATION_TECHNOLOGY"), ("通信", "COMMUNICATION"), ("传媒", "COMMUNICATION"),
+    ("公用事业", "UTILITIES"), ("环保", "INDUSTRIALS"), ("综合", "CONGLOMERATES"),
+    ("交通", "INDUSTRIALS"), ("物流", "INDUSTRIALS"),
+]
+
+# A股行业名 → GICS 子串包含匹配（兼容证监会全称，如「酒、饮料和精制茶制造业」含「饮料/酒」）
+#   顺序敏感：更具体的子串放前面（如「饮料」「白酒」优先于泛「酒」）。
+_A_INDUSTRY_SUBSTR = [
+    ("饮料", "CONSUMER_STAPLES"), ("白酒", "CONSUMER_STAPLES"), ("酒", "CONSUMER_STAPLES"),
+    ("食品", "CONSUMER_STAPLES"), ("农", "CONSUMER_STAPLES"), ("牧", "CONSUMER_STAPLES"),
+    ("汽车", "CONSUMER_DISCRETIONARY"), ("家电", "CONSUMER_DISCRETIONARY"),
+    ("服装", "CONSUMER_DISCRETIONARY"), ("纺织", "CONSUMER_DISCRETIONARY"),
+    ("零售", "CONSUMER_DISCRETIONARY"), ("商贸", "CONSUMER_DISCRETIONARY"),
+    ("家居", "CONSUMER_DISCRETIONARY"), ("家具", "CONSUMER_DISCRETIONARY"),
+    ("化学制药", "HEALTH_CARE"), ("生物制品", "HEALTH_CARE"), ("医疗器械", "HEALTH_CARE"),
+    ("医药", "HEALTH_CARE"), ("中药", "HEALTH_CARE"), ("医疗", "HEALTH_CARE"),
+    ("半导体", "INFORMATION_TECHNOLOGY"), ("电子", "INFORMATION_TECHNOLOGY"),
+    ("计算机", "INFORMATION_TECHNOLOGY"), ("软件", "INFORMATION_TECHNOLOGY"),
+    ("通信", "COMMUNICATION"), ("传媒", "COMMUNICATION"), ("互联网", "COMMUNICATION"),
+    ("银行", "FINANCIALS"), ("证券", "FINANCIALS"), ("保险", "FINANCIALS"),
+    ("房地产", "REAL_ESTATE"), ("电力", "UTILITIES"), ("燃气", "UTILITIES"),
+    ("煤炭", "MATERIALS"), ("钢铁", "MATERIALS"), ("有色", "MATERIALS"), ("化工", "MATERIALS"),
+    ("建筑", "INDUSTRIALS"), ("机械", "INDUSTRIALS"), ("设备", "INDUSTRIALS"),
+    ("军工", "INDUSTRIALS"), ("交通", "INDUSTRIALS"), ("运输", "INDUSTRIALS"),
+    ("物流", "INDUSTRIALS"), ("金属", "MATERIALS"), ("石油", "ENERGY"),
+]
+
+
+def _classify_a_industry(sector_name):
+    """A股行业板块名 → (parent_code, parent_name)。
+
+    匹配顺序：精确 → 前缀 → 子串包含（兼容证监会全称如「酒、饮料和精制茶制造业」含「饮料」）。
+    仍缺失归 OTHER。
+    """
+    name = (sector_name or "").strip()
+    if name in _A_INDUSTRY_MAP:
+        pc = _A_INDUSTRY_MAP[name]
+        return pc, LEVEL1[pc]
+    for pref, pc in _A_INDUSTRY_PREFIX:
+        if name.startswith(pref):
+            return pc, LEVEL1[pc]
+    for key, pc in _A_INDUSTRY_SUBSTR:
+        if key in name:
+            return pc, LEVEL1[pc]
+    log.warning("A股行业板块 %s 无 GICS 映射，归入 OTHER", name)
+    return _OTHER
+
 
 def _ensure_table():
     """确保 sector_hierarchy 表存在（CREATE TABLE IF NOT EXISTS，幂等）。"""
@@ -232,13 +321,72 @@ def _load_industry_sectors():
             return cur.fetchall()
 
 
-def _classify(sector_code, sector_name):
-    """返回 (parent_code, parent_name)；映射缺失时归 OTHER 并打 warning。"""
-    mapped = _SECTOR_MAP.get(sector_code)
-    if mapped is None:
-        log.warning("板块 %s(%s) 无映射，归入 OTHER", sector_name, sector_code)
+# ── 证监会行业代码首字母 → GICS 一级部门（BaoStock 行业分类用）─────────────
+#   证监会一级大类（A-S）与 GICS 一级部门对应；制造业 C 整体偏 INDUSTRIALS，
+#   其下的汽车/食品等 CONSUMER 子类由 _classify_a_industry(名称) 二次修正。
+_CSRC_LETTER_MAP = {
+    "A": "CONSUMER_STAPLES",    # 农林牧渔
+    "B": "MATERIALS",           # 采矿业
+    "C": "INDUSTRIALS",         # 制造业（整体偏工业，子类见名称修正）
+    "D": "UTILITIES",           # 电力、热力、燃气及水生产供应
+    "E": "INDUSTRIALS",         # 建筑业
+    "F": "CONSUMER_DISCRETIONARY",  # 批发和零售业
+    "G": "INDUSTRIALS",         # 交通运输、仓储和邮政
+    "H": "CONSUMER_DISCRETIONARY",  # 住宿和餐饮业
+    "I": "INFORMATION_TECHNOLOGY",  # 信息传输、软件和信息技术服务
+    "J": "FINANCIALS",          # 金融业
+    "K": "REAL_ESTATE",         # 房地产业
+    "L": "INDUSTRIALS",         # 租赁和商务服务业
+    "M": "INDUSTRIALS",         # 科学研究和技术服务业
+    "N": "UTILITIES",           # 水利、环境和公共设施管理
+    "O": "CONGLOMERATES",       # 居民服务、修理和其他服务
+    "P": "CONSUMER_DISCRETIONARY",  # 教育
+    "Q": "HEALTH_CARE",         # 卫生和社会工作
+    "R": "COMMUNICATION",       # 文化、体育和娱乐
+    "S": "OTHER",               # 公共管理、社会保障和社会组织
+}
+
+
+def _classify_csrc(sector_code, sector_name):
+    """证监会行业代码（如 C36）→ GICS 一级部门。
+
+    优先按代码首字母映射；对制造业 C 下偏消费/材料的子类（汽车/食品/酒等）
+    再用名称经 _A_INDUSTRY_MAP 二次修正，提升 GICS 聚合精度。
+    """
+    code = str(sector_code).strip()
+    letter = code[0].upper() if code else ""
+    base = _CSRC_LETTER_MAP.get(letter)
+    if base is None:
+        log.warning("证监会行业代码 %s 首字母 %s 无映射，归入 OTHER", sector_code, letter)
         return _OTHER
-    return mapped
+    # 制造业子类名称修正（汽车/食品饮料/酒等归消费；化工/金属等归材料）
+    if letter == "C" and sector_name:
+        refined = _classify_a_industry(sector_name)
+        if refined != _OTHER:
+            return refined
+    return base, LEVEL1[base]
+
+
+def _classify(sector_code, sector_name):
+    """返回 (parent_code, parent_name)。
+
+    港股富途板块：sector_code 形如 HK.xxxx，按 _SECTOR_MAP 查。
+    A股 BaoStock 证监会行业：sector_code 为纯字母数字（如 C36），按首字母经 _CSRC_LETTER_MAP。
+    A股东财行业板块：sector_code 形如 BKxxxx，按名称经 _A_INDUSTRY_MAP。
+    均缺失时归 OTHER 并打 warning。
+    """
+    code = str(sector_code)
+    if code.startswith("HK."):
+        mapped = _SECTOR_MAP.get(code)
+        if mapped is None:
+            log.warning("港股板块 %s(%s) 无映射，归入 OTHER", sector_name, sector_code)
+            return _OTHER
+        return mapped
+    if code[:1].isalpha() and not code.startswith("BK"):
+        # 证监会行业代码（字母开头，非东财 BK）：BaoStock 来源
+        return _classify_csrc(code, sector_name)
+    # A股东财行业板块（code 形如 BKxxxx）
+    return _classify_a_industry(sector_name)
 
 
 def _build_rows():

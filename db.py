@@ -93,6 +93,24 @@ def upsert(conn, table, data, conflict_cols):
         cur.execute(query, values)
 
 
+def write_full_tick(conn, data_list, columns):
+    """
+    旁路全量落盘（诊断用）：富途推送的每一笔逐笔都无去重写入 full_tick_data。
+    与 tick_data 不同，本表没有 sequence 唯一约束，重复推送的原样保留，
+    用于事后比对"推了什么 / tick_data 实际落了什么"以定位去重或缺失问题。
+    columns: 列名列表（与 data_list 中 dict 的 keys 对齐）。
+    """
+    if not data_list:
+        return
+    col_identifiers = sql.SQL(", ").join([sql.Identifier(c) for c in columns])
+    query = sql.SQL(
+        "INSERT INTO full_tick_data ({cols}) VALUES %s"
+    ).format(cols=col_identifiers)
+    values_list = [tuple(d.get(c) for c in columns) for d in data_list]
+    with conn.cursor() as cur:
+        extras.execute_values(cur, query.as_string(conn), values_list, page_size=1000)
+
+
 def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False):
     """
     批量 INSERT ... ON CONFLICT DO UPDATE / DO NOTHING

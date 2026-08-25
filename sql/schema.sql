@@ -269,23 +269,36 @@ COMMENT ON COLUMN daily_ggt_hold.created_at            IS '数据写入数据库
 
 CREATE INDEX idx_ggt_hold_stock_date ON daily_ggt_hold (stock_code, trade_date DESC);
 
--- 10. 融资余额（A股专用）
+-- 10. 融资融券全量明细（A股沪深两市专用）
+-- 数据来自沪深交易所逐日公布的「融资融券明细」，覆盖全市场全部标的，含融资+融券双向。
 CREATE TABLE IF NOT EXISTS daily_margin_balance (
-    id              BIGSERIAL       PRIMARY KEY,
-    stock_code      VARCHAR(20)     NOT NULL,               -- A股代码
-    trade_date      DATE            NOT NULL,
-    margin_balance  NUMERIC(16,2),                          -- 融资余额(亿元)
-    change_pct      NUMERIC(8,4),                           -- 环比变化(%)
-    created_at      TIMESTAMPTZ     DEFAULT NOW(),
+    id               BIGSERIAL       PRIMARY KEY,
+    stock_code       VARCHAR(20)     NOT NULL,               -- A股代码（SH.xxxxxx / SZ.xxxxxx）
+    trade_date       DATE            NOT NULL,
+    rz_balance       NUMERIC(18,2),                          -- 融资余额（元）
+    rz_buy           NUMERIC(18,2),                          -- 融资买入额（元）
+    rz_repay         NUMERIC(18,2),                          -- 融资偿还额（元）
+    rz_net           NUMERIC(18,2),                          -- 融资净买入（元）= 融资买入 - 融资偿还
+    rq_balance       NUMERIC(18,2),                          -- 融券余额（元）
+    rq_sell          NUMERIC(18,2),                          -- 融券卖出量（股）
+    rq_repay         NUMERIC(18,2),                          -- 融券偿还量（股）
+    rzrq_balance     NUMERIC(18,2),                          -- 融资融券余额合计（元）
+    created_at       TIMESTAMPTZ     DEFAULT NOW(),
 
     UNIQUE (stock_code, trade_date)
 );
 
-COMMENT ON TABLE  daily_margin_balance                IS '融资余额日度变化（仅支持A股，数据源：AKShare沪深交易所融资融券明细）';
+COMMENT ON TABLE  daily_margin_balance                IS '融资融券全量日度明细（仅支持A股沪深两市，数据源：AKShare沪深交易所融资融券明细）';
 COMMENT ON COLUMN daily_margin_balance.stock_code     IS 'A股完整代码，如 SH.600519 / SZ.000001';
 COMMENT ON COLUMN daily_margin_balance.trade_date     IS '交易日期 (YYYY-MM-DD)';
-COMMENT ON COLUMN daily_margin_balance.margin_balance IS '当日融资余额（亿元），即投资者通过融资买入持有的该股票市值';
-COMMENT ON COLUMN daily_margin_balance.change_pct     IS '融资余额较上一交易日环比变化(%)，正数=增加(看多)，负数=减少(看空)';
+COMMENT ON COLUMN daily_margin_balance.rz_balance     IS '当日融资余额（元）';
+COMMENT ON COLUMN daily_margin_balance.rz_buy         IS '当日融资买入额（元）';
+COMMENT ON COLUMN daily_margin_balance.rz_repay       IS '当日融资偿还额（元）';
+COMMENT ON COLUMN daily_margin_balance.rz_net         IS '融资净买入（元）= 融资买入额 - 融资偿还额，正数=净增加(看多)';
+COMMENT ON COLUMN daily_margin_balance.rq_balance     IS '当日融券余额（元）';
+COMMENT ON COLUMN daily_margin_balance.rq_sell        IS '当日融券卖出量（股）';
+COMMENT ON COLUMN daily_margin_balance.rq_repay       IS '当日融券偿还量（股）';
+COMMENT ON COLUMN daily_margin_balance.rzrq_balance   IS '融资融券余额合计（元）= 融资余额 + 融券余额';
 COMMENT ON COLUMN daily_margin_balance.created_at     IS '数据写入数据库的时间';
 
 CREATE INDEX idx_margin_stock_date ON daily_margin_balance (stock_code, trade_date DESC);
@@ -497,6 +510,32 @@ CREATE INDEX idx_tick_data_time       ON tick_data (tick_time);
 CREATE INDEX idx_tick_data_stock_time_dir
   ON tick_data (stock_code, tick_time, ticker_direction)
   INCLUDE (turnover, volume, price);
+
+-- 16.1 全量逐笔旁路落盘表（诊断用，默认不写入）
+-- 富途推送的每一笔逐笔都无去重原样写入本表（由配置 full_tick_capture 控制开关），
+-- 没有 sequence 唯一约束，重复推送全部保留。事后可与 tick_data 比对，定位
+-- "推送了但 tick_data 没入库"（被去重跳过 / 缺失）的问题。开启会产生大量写入与磁盘占用，
+-- 仅排查时临时打开，定位完即关闭并 truncate。
+CREATE TABLE IF NOT EXISTS full_tick_data (
+    id              BIGSERIAL       PRIMARY KEY,
+    stock_code      VARCHAR(20)     NOT NULL,
+    tick_time       TIMESTAMPTZ     NOT NULL,
+    price           NUMERIC(12,4),
+    volume          BIGINT,
+    turnover        NUMERIC(20,2),
+    ticker_direction VARCHAR(10),
+    sequence        BIGINT          NOT NULL,               -- 富途逐笔序号（与 tick_data.sequence 同义，本表不约束唯一）
+    tick_type       VARCHAR(20),
+    received_at     TIMESTAMPTZ     DEFAULT NOW()           -- 本批落盘时间，用于还原推送时刻
+);
+
+COMMENT ON TABLE  full_tick_data           IS '富途逐笔全量旁路落盘（无去重），诊断"推了但 tick_data 没落"问题用，平时为空';
+COMMENT ON COLUMN full_tick_data.sequence   IS '富途逐笔序号，与 tick_data.sequence 同义，本表不唯一';
+COMMENT ON COLUMN full_tick_data.received_at IS '落盘时间，约等价收到批次时刻';
+
+CREATE INDEX idx_full_tick_seq        ON full_tick_data (sequence);
+CREATE INDEX idx_full_tick_stock_time ON full_tick_data (stock_code, tick_time);
+CREATE INDEX idx_full_tick_received   ON full_tick_data (received_at);
 
 
 -- ============================================================================
