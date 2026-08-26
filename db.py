@@ -141,9 +141,11 @@ def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False):
     conflict_target = sql.SQL(", ").join([sql.Identifier(c) for c in conflict_cols])
 
     if do_nothing:
-        # 仅跳过已存在行：用于 tick_data(sequence 全表唯一)。断线重连后 FutuOpenD 重推
-        # 的历史数据与其余批次同批时会产生重复 sequence，DO NOTHING 直接跳过即可，
-        # 既不会因同批重复 key 报错，也不会像 DO UPDATE 那样覆盖掉先到的盘前数据。
+        # 仅跳过已存在行：用于 tick_data，冲突键为 (stock_code, sequence) 复合键。
+        # 注意富途 sequence 是"同一时刻跨股票共享的包序号"，并非 per-stock 唯一，
+        # 故必须用复合键，否则会被其他股票抢键导致本票数据被 DO NOTHING 静默丢弃。
+        # 断线重连后 FutuOpenD 重推的历史数据与其余批次同批时会产生重复 sequence，
+        # DO NOTHING 直接跳过即可，不会像 DO UPDATE 那样覆盖掉先到的盘前数据。
         query = sql.SQL(
             "INSERT INTO {table} ({cols}) VALUES %s ON CONFLICT ({conflict}) DO NOTHING"
         ).format(

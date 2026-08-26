@@ -2,11 +2,11 @@
 """
 融资融券全量历史补录 — 按日期区间批量采集沪深两市融资融券明细分日入库
 
-数据源：AKShare 沪深交易所融资融券明细（与 get_margin_balance.py 同源，复用其
-        fetch_market / collect 底层逻辑）。
+数据源：东方财富 datacenter-web 接口 RPTA_WEB_RZRQ_GGMX（与 get_margin_balance.py 同源，
+        复用其 collect 底层逻辑，按日翻页拉全市场两融明细）。
 
 用途：补齐 daily_margin_balance 历史段。交易所接口按单日披露，需逐日拉取；
-      跨度太大/限流时按 --chunk 天分段（默认 5 天一段）。upsert 幂等
+      跨度太大时按 --chunk 天分段（默认 5 天一段）。upsert 幂等
       （UNIQUE(stock_code, trade_date)），可重复执行。
 
 用法：
@@ -99,7 +99,7 @@ def run():
         got += n_day
         log.info(f"  本轮入库 {n_day} 条，累计 {got}")
         seg = seg_end + timedelta(days=1)
-        time.sleep(0.2)  # 段间轻量节流，避免 AKShare 限流
+        time.sleep(0.05)  # 段间轻量节流（东财较稳，仅防频率过高）
 
     if failed_days:
         log.warning(f"以下 {len(failed_days)} 个交易日采集为 0 条（多为周末/休市/接口异常）：{failed_days[:20]}{'...' if len(failed_days) > 20 else ''}")

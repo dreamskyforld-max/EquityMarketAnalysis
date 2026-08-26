@@ -219,7 +219,10 @@ def _fetch_a_industry_baostock():
             # sector_code 取开头字母数字段（证监会行业代码，如 C37）；sector_name 用全称
             m = re.match(r"^([A-Za-z]\d+)", industry)
             sec_code = m.group(1) if m else industry[:10]
-            rows.append((code.lower(), sec_code, industry, "INDUSTRY"))
+            # BaoStock 返回的 code 形如 sh.600000 / sz.000001（本身小写 + 自带 sh/sz 前缀）。
+            # 统一转大写(UPPER)，对齐港股 HK.00700 及其它 A 股路径(SH./SZ./BJ.)，
+            # 避免 stock_code 主键因大小写敏感出现 sh.600000 / SH.600000 两套、下游漏匹配。
+            rows.append((code.upper(), sec_code, industry, "INDUSTRY"))
             if len(rows) % 1000 == 0:
                 log.info("[A股行业] 已解析 %d 只…", len(rows))
         with contextlib.redirect_stdout(_null):
@@ -403,6 +406,33 @@ def _ensure_sector_table():
     log.info("stock_sector 表已确认存在")
 
 
+def _normalize_lowercase_codes():
+    """订正历史脏数据：stock_code 前缀 sh./sz./bj. 小写 → 大写 SH./SZ./BJ.。
+
+    根因：旧版 _fetch_a_industry_baostock 用 code.lower() 入库，导致 A 股证监会行业
+    分类行的 stock_code 为小写前缀，与港股 HK.00700 及其它 A 股路径(SH./SZ./BJ.) 不一致。
+    stock_code 是大小写敏感字符串主键，会造成同一只 A 股出现两套主键、下游按 stock_code
+    精确 join/聚合时漏匹配。本函数幂等，可每次 run 前安全调用。
+    """
+    from db import get_conn
+    _MAP = {"sh": "SH", "sz": "SZ", "bj": "BJ"}
+    fixed = 0
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for low, up in _MAP.items():
+                cur.execute(
+                    "UPDATE stock_sector "
+                    "SET stock_code = %s || SUBSTRING(stock_code FROM 3), "
+                    "    updated_at = updated_at "
+                    "WHERE stock_code LIKE %s || '.%%'",
+                    (up, low),
+                )
+                fixed += cur.rowcount
+    if fixed:
+        log.info("订正历史小写前缀 stock_code 共 %d 行（sh/sz/bj → SH/SZ/BJ）", fixed)
+    return fixed
+
+
 # ── 写入 ───────────────────────────────────────────────────────────────────
 def _save_sector_rows(rows, source, default_type="INDEX"):
     """先按 sector_code 删除旧行，再 bulk 写入（保证调出成分被清理）。
@@ -458,6 +488,8 @@ def run(codes=None, ctx=None, market="ALL"):
     if market not in ("ALL", "HK", "A"):
         raise ValueError(f"未知 market={market!r}，仅支持 ALL/HK/A")
     _ensure_sector_table()
+    # 幂等订正历史小写前缀脏数据（sh./sz./bj. → SH./SZ./BJ.）
+    _normalize_lowercase_codes()
     own_ctx = False
     if ctx is None and _futu_available():
         try:

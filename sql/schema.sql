@@ -237,6 +237,43 @@ COMMENT ON COLUMN daily_buyback_event.created_at    IS '数据写入数据库的
 
 CREATE INDEX idx_buyback_event_stock_date ON daily_buyback_event (stock_code, buyback_date DESC);
 
+-- 9. A股回购方案（方案维度进度快照，数据源：AKShare stock_repurchase_em）
+--    与港股 daily_buyback_event（逐日明细）粒度不同，故独立成表。
+--    A股不强制每日披露回购，仅有「回购方案 + 累计已回购」口径，无逐日明细。
+CREATE TABLE IF NOT EXISTS a_stock_repurchase_plan (
+    id                      BIGSERIAL       PRIMARY KEY,
+    stock_code              VARCHAR(20)     NOT NULL,   -- 如 SH.600519 / SZ.000333
+    stock_name              VARCHAR(40),
+    plan_id                 VARCHAR(120)    NOT NULL,   -- 合成业务键: code|start_date|plan_amt_lo|plan_amt_hi
+    progress                VARCHAR(20),                -- 实施进度: 董事会预案/股东大会通过/实施中/完成实施/停止实施
+    plan_price_min          NUMERIC(12,4),             -- 计划回购价格区间-下限
+    plan_price_max          NUMERIC(12,4),             -- 计划回购价格区间-上限
+    plan_qty_min            BIGINT,                    -- 计划回购数量区间-下限(股)
+    plan_qty_max            BIGINT,                    -- 计划回购数量区间-上限(股)
+    plan_amt_min            NUMERIC(20,2),             -- 计划回购金额区间-下限(元)
+    plan_amt_max            NUMERIC(20,2),             -- 计划回购金额区间-上限(元)
+    start_date              DATE,                      -- 回购起始时间
+    repurchased_price_min   NUMERIC(12,4),             -- 已回购股份价格区间-下限
+    repurchased_price_max   NUMERIC(12,4),             -- 已回购股份价格区间-上限
+    repurchased_qty         BIGINT,                    -- 已回购股份数量(累计,股)
+    repurchased_amt         NUMERIC(20,2),             -- 已回购金额(累计,元)
+    latest_ann_date         DATE,                      -- 最新公告日期(该快照对应日)
+    created_at              TIMESTAMPTZ     DEFAULT NOW(),
+
+    UNIQUE (stock_code, plan_id)
+);
+
+COMMENT ON TABLE  a_stock_repurchase_plan          IS 'A股回购方案进度快照（数据源：AKShare stock_repurchase_em，方案维度，无逐日明细）';
+COMMENT ON COLUMN a_stock_repurchase_plan.stock_code    IS '股票完整代码，如 SH.600519';
+COMMENT ON COLUMN a_stock_repurchase_plan.plan_id       IS '合成业务键 code|start_date|plan_amt_lo|plan_amt_hi，唯一标识一个回购方案';
+COMMENT ON COLUMN a_stock_repurchase_plan.progress      IS '实施进度: 董事会预案/股东大会通过/实施中/完成实施/停止实施';
+COMMENT ON COLUMN a_stock_repurchase_plan.plan_amt_max  IS '计划回购金额区间-上限(元)，代表方案拟回购力度上限';
+COMMENT ON COLUMN a_stock_repurchase_plan.repurchased_amt IS '已回购金额(累计,元)，代表方案已落地力度';
+COMMENT ON COLUMN a_stock_repurchase_plan.latest_ann_date IS '最新公告日期，该进度快照对应的披露日';
+
+CREATE INDEX idx_repurchase_plan_stock ON a_stock_repurchase_plan (stock_code);
+CREATE INDEX idx_repurchase_plan_ann_date ON a_stock_repurchase_plan (latest_ann_date DESC);
+
 -- 9. 港股通持股
 CREATE TABLE IF NOT EXISTS daily_ggt_hold (
     id                  BIGSERIAL       PRIMARY KEY,
@@ -487,7 +524,10 @@ CREATE TABLE IF NOT EXISTS tick_data (
     volume          BIGINT,                                 -- 成交量（股）
     turnover        NUMERIC(20,2),                          -- 成交额（港元）
     ticker_direction VARCHAR(10),                           -- 买卖方向：BUY/SELL/NEUTRAL
-    sequence        BIGINT          NOT NULL UNIQUE,        -- 全局唯一序号，用于去重
+    sequence        BIGINT          NOT NULL,               -- 富途逐笔序号（同一时刻跨股票共享，非 per-stock 唯一）
+    -- 复合唯一键 (stock_code, sequence)：富途 sequence 是"同一时刻跨股票共享的包序号"，
+    -- 并非单票唯一，若仅以 sequence 单列 UNIQUE 会因其他股票抢键导致本票数据被静默丢弃。
+    CONSTRAINT tick_data_stock_seq_unique UNIQUE (stock_code, sequence),
     tick_type       VARCHAR(20),                            -- 成交类型：AUTO_MATCH/AUCTION/...
     created_at      TIMESTAMPTZ     DEFAULT NOW()
 );
@@ -857,3 +897,233 @@ FROM ordered
 ORDER BY stock_code, report_date;
 
 COMMENT ON VIEW v_financial_quarterly IS '单季财务指标视图：将 financial_indicator 中累计值(Q1/H1/Q3/annual)拆解为 Q1/Q2/Q3/Q4 单季数据。revenue/net_profit/ocf 通过同年 LAG() 相减得到；free_cash_flow 因数据源 Q1/Q3 季报缺失 capex 明细，Q2/Q4 单季无法计算设 NULL；比率指标(ROE/毛利率等)保持原值。';
+
+-- ============================================================================
+-- 第三部分：扩展采集 / 监控 / 分析中间表
+-- （以下表在采集/分析脚本中以 CREATE TABLE IF NOT EXISTS 自建，未纳入原 schema，
+--   此处集中补录，保证 schema.sql 为库的完整真相源）
+-- ============================================================================
+
+-- 3.1 A股市场成交额 / 行情（get_a_market_turnover.py）
+CREATE TABLE IF NOT EXISTS a_daily_market_turnover (
+    id              BIGSERIAL       PRIMARY KEY,
+    trade_date      DATE            NOT NULL,
+    snapshot_time   TIMESTAMPTZ     NOT NULL,
+    total_turnover  NUMERIC(22,2),
+    total_volume    BIGINT,
+    stock_count     INT,
+    created_at      TIMESTAMPTZ     DEFAULT NOW(),
+    UNIQUE (trade_date)
+);
+
+COMMENT ON TABLE  a_daily_market_turnover            IS 'A股全市场每日成交额/成交量快照（盘后采集）';
+COMMENT ON COLUMN a_daily_market_turnover.trade_date IS '交易日';
+COMMENT ON COLUMN a_daily_market_turnover.snapshot_time IS '快照时刻(已转 UTC)';
+
+CREATE TABLE IF NOT EXISTS a_daily_quote (
+    id                  BIGSERIAL       PRIMARY KEY,
+    stock_code          VARCHAR(20)     NOT NULL,
+    trade_date          DATE            NOT NULL,
+    open                NUMERIC(12,4),
+    high                NUMERIC(12,4),
+    low                 NUMERIC(12,4),
+    close               NUMERIC(12,4),
+    volume              BIGINT,
+    amount              NUMERIC(22,2),
+    turnover_rate       NUMERIC(8,4),
+    volume_ratio        NUMERIC(8,4),
+    high_52w            NUMERIC(12,4),
+    low_52w             NUMERIC(12,4),
+    total_market_val    NUMERIC(22,2),
+    circular_market_val NUMERIC(22,2),
+    pe_ratio            NUMERIC(12,4),
+    pe_ttm_ratio        NUMERIC(12,4),
+    pb_ratio            NUMERIC(12,4),
+    dividend_ratio_ttm  NUMERIC(8,4),
+    update_time         TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ     DEFAULT NOW(),
+    UNIQUE (stock_code, trade_date)
+);
+
+COMMENT ON TABLE  a_daily_quote                  IS 'A股个股每日行情/估值快照（盘后采集）';
+COMMENT ON COLUMN a_daily_quote.stock_code       IS '股票完整代码，如 SH.600519';
+COMMENT ON COLUMN a_daily_quote.trade_date       IS '交易日';
+
+-- 3.2 全球基准指数分钟行情（get_global_benchmarks_minute.py）
+CREATE TABLE IF NOT EXISTS benchmark_minute (
+    id          BIGSERIAL       PRIMARY KEY,
+    bench_code  VARCHAR(20)     NOT NULL,
+    bench_name  VARCHAR(50),
+    ts          TIMESTAMPTZ     NOT NULL,   -- 已转 UTC
+    mkt_time    TIMESTAMPTZ,                -- 市场本地时间(便于核对)
+    open        NUMERIC(14,4),
+    high        NUMERIC(14,4),
+    low         NUMERIC(14,4),
+    close       NUMERIC(14,4),
+    source      VARCHAR(20),
+    created_at  TIMESTAMPTZ     DEFAULT NOW(),
+    UNIQUE (bench_code, ts)
+);
+
+COMMENT ON TABLE  benchmark_minute           IS '全球基准指数分钟级行情（盘中采集）';
+COMMENT ON COLUMN benchmark_minute.bench_code IS '基准代码，如 HK.800000 / SPX';
+COMMENT ON COLUMN benchmark_minute.ts         IS '时间戳(UTC)';
+
+-- 3.3 行业层级映射（build_sector_hierarchy.py）
+-- 富途细粒度 INDUSTRY → GICS 一级部门（参考数据，低频刷新）
+CREATE TABLE IF NOT EXISTS sector_hierarchy (
+    sector_code   VARCHAR(20)   NOT NULL,        -- 细粒度行业板块 code（= stock_sector.sector_code，如 HK.LIST1019）
+    sector_name   VARCHAR(100),                   -- 细粒度行业板块英文名（冗余自 stock_sector，方便查询）
+    parent_code   VARCHAR(30)   NOT NULL,        -- 一级部门 code（GICS：ENERGY/MATERIALS/...）
+    parent_name   VARCHAR(50),                    -- 一级部门中文名（如 能源/金融）
+    sector_type   VARCHAR(20)   DEFAULT 'INDUSTRY',
+    updated_at    TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (sector_code)
+);
+
+COMMENT ON TABLE  sector_hierarchy              IS '行业层级映射：富途细粒度 INDUSTRY → GICS 一级部门（参考数据，低频刷新）';
+COMMENT ON COLUMN sector_hierarchy.parent_code  IS '一级部门 code：GICS 11 部门 + CONGLOMERATES(综合企业) + OTHER(兜底)';
+COMMENT ON COLUMN sector_hierarchy.parent_name  IS '一级部门中文名';
+
+-- 3.4 个股-基准相关性（benchmark_correlation_daily.py）
+CREATE TABLE IF NOT EXISTS benchmark_correlation (
+    stock_code      TEXT    NOT NULL,
+    bench_code      TEXT    NOT NULL,
+    bench_name      TEXT    NOT NULL,
+    calc_date       DATE    NOT NULL,
+    days            INTEGER,
+    pearson         DOUBLE PRECISION,
+    spearman        DOUBLE PRECISION,
+    lead_lag_neg1   DOUBLE PRECISION,
+    gap_r           DOUBLE PRECISION,
+    window5_r       DOUBLE PRECISION,
+    window10_r      DOUBLE PRECISION,
+    window20_r      DOUBLE PRECISION,
+    siphon5_r       DOUBLE PRECISION,
+    siphon10_r      DOUBLE PRECISION,
+    siphon20_r      DOUBLE PRECISION,
+    regime_up_r     DOUBLE PRECISION,
+    regime_down_r   DOUBLE PRECISION,
+    shock_r_normal      DOUBLE PRECISION,
+    shock_r_volatile   DOUBLE PRECISION,
+    extreme_signal  TEXT,
+    verdict         TEXT,
+    signals         TEXT,
+    data_start      DATE,
+    data_end        DATE,
+    detail_json     JSONB,
+    updated_at      TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (stock_code, bench_code, calc_date)
+);
+
+COMMENT ON TABLE  benchmark_correlation          IS '个股与各基准指数相关性指标（日级重算）';
+COMMENT ON COLUMN benchmark_correlation.stock_code IS '股票完整代码';
+COMMENT ON COLUMN benchmark_correlation.bench_code IS '基准代码';
+
+-- 3.5 宏观环境评分（macro_environment_score.py）
+CREATE TABLE IF NOT EXISTS macro_environment_score (
+    stock_code       TEXT    NOT NULL,
+    trade_date       DATE    NOT NULL,
+    total_score      DOUBLE PRECISION,
+    risk_score       DOUBLE PRECISION,
+    liquidity_score  DOUBLE PRECISION,
+    valuation_score  DOUBLE PRECISION,
+    label            TEXT,
+    summary          TEXT,
+    risk_note        TEXT,
+    liquidity_note   TEXT,
+    valuation_note   TEXT,
+    detail_json      JSONB,
+    updated_at       TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (stock_code, trade_date)
+);
+
+COMMENT ON TABLE  macro_environment_score         IS '个股宏观环境综合评分（风险/流动性/估值维度）';
+COMMENT ON COLUMN macro_environment_score.stock_code IS '股票完整代码';
+COMMENT ON COLUMN macro_environment_score.trade_date IS '评分对应交易日';
+
+-- 3.6 采集监控（monitor_collector.py）
+-- 任务运行日志
+CREATE TABLE IF NOT EXISTS collection_task_log (
+    id            BIGSERIAL PRIMARY KEY,
+    task_name     VARCHAR(80)  NOT NULL,
+    market        VARCHAR(8),
+    started_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    finished_at   TIMESTAMPTZ,
+    status        VARCHAR(16)  NOT NULL,   -- running/ok/timeout/error
+    duration_s    NUMERIC(8,2),
+    error_msg     TEXT,
+    created_at    TIMESTAMPTZ  DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_tasklog_name_time
+    ON collection_task_log (task_name, started_at DESC);
+
+COMMENT ON TABLE  collection_task_log          IS '采集任务运行日志';
+COMMENT ON COLUMN collection_task_log.status   IS 'running/ok/timeout/error';
+
+-- 接口调用日志
+CREATE TABLE IF NOT EXISTS collection_api_log (
+    id            BIGSERIAL PRIMARY KEY,
+    api_name      VARCHAR(40)  NOT NULL,   -- get_market_snapshot/request_history_kline/...
+    success       BOOLEAN      NOT NULL,
+    latency_s     NUMERIC(8,3),
+    error_msg     TEXT,
+    called_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    created_at    TIMESTAMPTZ  DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_apilog_name_time
+    ON collection_api_log (api_name, called_at DESC);
+
+COMMENT ON TABLE  collection_api_log         IS '富途/东财等接口调用日志（成功率/延迟监控）';
+COMMENT ON COLUMN collection_api_log.api_name IS '接口名，如 get_market_snapshot';
+
+-- 告警
+CREATE TABLE IF NOT EXISTS collection_alert (
+    id            BIGSERIAL PRIMARY KEY,
+    category      VARCHAR(24)  NOT NULL,   -- task_stall/task_fail/api_fail/api_slow/data_stale
+    severity      VARCHAR(8)   NOT NULL,   -- warn/crit
+    source        VARCHAR(80),            -- 关联任务名 / 表名 / 接口名
+    message       TEXT         NOT NULL,
+    first_seen    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    last_seen     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    occurrences   INT          NOT NULL DEFAULT 1,
+    resolved      BOOLEAN      NOT NULL DEFAULT FALSE,
+    resolved_at   TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ  DEFAULT NOW(),
+    UNIQUE (category, source, severity, resolved)
+);
+CREATE INDEX IF NOT EXISTS idx_alert_open
+    ON collection_alert (resolved, last_seen DESC);
+
+COMMENT ON TABLE  collection_alert          IS '采集健康度告警（去重聚合：同 category+source+severity+resolved 合并计数）';
+COMMENT ON COLUMN collection_alert.category IS 'task_stall/task_fail/api_fail/api_slow/data_stale';
+COMMENT ON COLUMN collection_alert.severity IS 'warn/crit';
+
+-- 监控元数据：需要监控的表
+CREATE TABLE IF NOT EXISTS monitor_table_config (
+    id            BIGSERIAL   PRIMARY KEY,
+    db_name       VARCHAR(32) NOT NULL DEFAULT 'public',
+    table_name    VARCHAR(64) NOT NULL,
+    time_column   VARCHAR(32) NOT NULL,
+    period        VARCHAR(12) NOT NULL DEFAULT 'day',
+    expect_lag    INT         NOT NULL DEFAULT 0,
+    refresh_weekday INT       NOT NULL DEFAULT 0,  -- period='week' 时生效：刷新日星期几(0=Mon..6=Sun)
+    active        BOOLEAN     NOT NULL DEFAULT TRUE,
+    remark        VARCHAR(120),
+    UNIQUE (db_name, table_name)
+);
+
+COMMENT ON TABLE  monitor_table_config       IS '采集监控配置：被监控表及其刷新周期/期望滞后（运营配置表）';
+COMMENT ON COLUMN monitor_table_config.period IS 'minute(盘中高频)/day(日更)/week(周更)/lowfreq(低频)';
+COMMENT ON COLUMN monitor_table_config.expect_lag IS '允许滞后：minute→分钟，day/week/lowfreq→天';
+
+-- 监控元数据：高频任务 stall 阈值
+CREATE TABLE IF NOT EXISTS monitor_task_config (
+    task_name         VARCHAR(80) PRIMARY KEY,
+    max_interval_min  INT NOT NULL,
+    active            BOOLEAN NOT NULL DEFAULT TRUE,
+    remark            VARCHAR(120)
+);
+
+COMMENT ON TABLE  monitor_task_config        IS '采集监控配置：高频任务两次触发最大允许间隔（分钟）';
+COMMENT ON COLUMN monitor_task_config.max_interval_min IS '该任务两次触发的最大允许间隔（分钟）';

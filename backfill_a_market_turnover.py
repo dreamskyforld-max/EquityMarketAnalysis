@@ -218,6 +218,12 @@ def fetch_history(start, code=None, quote_sink=None, resume=False, limit=None):
                 td = d["trade_date"]
                 amt = float(d["amount"]) if d.get("amount") is not None else 0.0
                 vol = int(d["volume"]) if d.get("volume") is not None else 0
+                # 过滤无成交占位行：新浪源在非交易日/停牌日会吐 amount=0 的占位日线，
+                # 直接落库会污染 a_daily_quote 并被 aggregate_from_db 计入总额表
+                # （表现为 trade_date 当天 stock_count=1、total_turnover=0 的脏行）。
+                if amt <= 0:
+                    log.info(f"  [{i}/{len(codes)}] {full} {td} amount<=0，跳过（无成交占位行）")
+                    continue
                 a = agg.setdefault(td, {"stocks": 0})
                 a["stocks"] += 1
                 rows.append(_map_quote_row(full, td, d))

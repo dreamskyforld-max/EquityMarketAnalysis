@@ -117,8 +117,10 @@ def _write_batch_to_db(batch: list) -> int:
                 conn,
                 "tick_data",
                 batch,
-                conflict_cols=["sequence"],
-                do_nothing=True,   # sequence 全表唯一，重复则跳过（含盘前重推数据）
+                conflict_cols=["stock_code", "sequence"],
+                do_nothing=True,   # (stock_code, sequence) 复合唯一，重复则跳过。
+                                  # 注意：富途 sequence 是"同一时刻跨股票共享的包序号"，
+                                  # 并非 per-stock 唯一，故必须用复合键，否则会被其他股票抢键丢弃。
             )
         return len(batch)
     except Exception as e:
