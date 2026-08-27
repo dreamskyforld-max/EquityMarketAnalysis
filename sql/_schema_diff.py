@@ -62,6 +62,56 @@ def psql_query(db, sql):
 
 
 # ── 类型规范化：让 schema.sql 的类型写法与 information_schema 对齐 ─────────────
+def parse_index_signature(def_text):
+    """从 CREATE INDEX / UNIQUE 约束文本提取内容指纹，用于"同名不同名但内容一致则不算差异"。
+
+    返回 (tablename_lower, [(col_lower, direction), ...], is_unique)。
+    direction 为 'asc' / 'desc'，保留方向是因为 PG 中 (a, b DESC) 与 (a, b) 是不同索引。
+    解析失败返回 None。
+    """
+    def_text = def_text.strip()
+    if not def_text:
+        return None
+    is_unique = bool(re.search(r"\bUNIQUE\b", def_text, re.I))
+    # 表名: ON [schema.]tbl （后面可能跟 USING btree 等，不直接是 '('）
+    mon = re.search(r"\bON\s+(?:[A-Za-z_][\w]*\.)?([A-Za-z_][\w]*)", def_text, re.I)
+    if not mon:
+        return None
+    tbl = mon.group(1).lower()
+    # 列定义: 取文本中第一个 '(' 到匹配的右括号
+    open_p = def_text.find("(")
+    if open_p < 0:
+        return None
+    depth = 0
+    close_p = -1
+    for k in range(open_p, len(def_text)):
+        if def_text[k] == "(":
+            depth += 1
+        elif def_text[k] == ")":
+            depth -= 1
+            if depth == 0:
+                close_p = k
+                break
+    if close_p < 0:
+        return None
+    cols_body = def_text[open_p + 1:close_p]
+    cols = []
+    for part in cols_body.split(","):
+        part = part.strip()
+        if not part or part.upper().startswith("INCLUDE"):
+            continue
+        # 取列名（第一个 token），方向取 DESC（若有）
+        cm = re.match(r"([A-Za-z_][\w]*)\s*(DESC|ASC)?", part, re.I)
+        if not cm:
+            continue
+        col = cm.group(1).lower()
+        direction = "desc" if cm.group(2) and cm.group(2).upper() == "DESC" else "asc"
+        cols.append((col, direction))
+    if not cols:
+        return None
+    return (tbl, tuple(cols), is_unique)
+
+
 def norm_type(t):
     if not t:
         return ""
@@ -128,11 +178,21 @@ def parse_schema(text):
             else:
                 i += 1
                 continue
-        # 索引
-        m = re.match(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w]*)\s+ON\s+([A-Za-z_][\w]*)", line, re.I)
+        # 索引（CREATE INDEX 可能跨行：名字在一行，ON 在下一行，或带 INCLUDE 子句）
+        m = re.match(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w]*)", line, re.I)
         if m:
-            indexes[m.group(1).lower()] = m.group(2).lower()
-            i += 1
+            # 若本行没有 ON，向后拼接后续行直到出现 ON（或语句结束）
+            buf = line
+            j = i
+            while " ON " not in re.sub(r"\([^)]*\)", "", buf) and j + 1 < len(lines):
+                j += 1
+                buf = buf + " " + lines[j]
+            m2 = re.search(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w]*)\s+ON\s+(?:[A-Za-z_][\w]*\.)?([A-Za-z_][\w]*)", buf, re.I)
+            if m2:
+                name = m2.group(1).lower()
+                tbl = m2.group(2).lower()
+                indexes[name] = {"tbl": tbl, "sig": parse_index_signature(buf)}
+            i = j + 1
             continue
         # 在建表块内解析列
         if cur_table and line:
@@ -157,11 +217,15 @@ def parse_columns(lines, idx, first_rest, tables, indexes, tname):
             buf = buf[:buf.index(")")]
             if buf.strip():
                 parse_column_line(buf.strip(), tname, tables)
-                collect_inline_indexes(buf.strip(), indexes, tname)
+                colm = re.match(r"^([A-Za-z_][\w]*)", buf.strip())
+                collect_inline_indexes(buf.strip(), indexes, tname,
+                                       colm.group(1) if colm else None)
             return i + 1
         # 还没结束，继续读行
         parse_column_line(buf.strip(), tname, tables)
-        collect_inline_indexes(buf.strip(), indexes, tname)
+        colm = re.match(r"^([A-Za-z_][\w]*)", buf.strip())
+        collect_inline_indexes(buf.strip(), indexes, tname,
+                               colm.group(1) if colm else None)
         i += 1
         if i >= len(lines):
             return i
@@ -175,24 +239,51 @@ def parse_columns(lines, idx, first_rest, tables, indexes, tname):
 #   - CONSTRAINT name UNIQUE/PRIMARY KEY -> name
 #   - 匿名 UNIQUE (a, b)          -> {table}_{首列}_key （PG 实际命名规则）
 # 这样期望侧能和实际侧 pg_indexes 返回的主键/唯一索引对齐，避免把它们误判为"要删"。
-def collect_inline_indexes(line, indexes, tname):
+def collect_inline_indexes(line, indexes, tname, current_col=None):
     line = line.strip()
     if not line:
         return
     # 显式命名约束: CONSTRAINT xxx PRIMARY KEY / UNIQUE (...)
     m = re.match(r"CONSTRAINT\s+([A-Za-z_][\w]*)\s+(PRIMARY\s+KEY|UNIQUE)", line, re.I)
     if m:
-        indexes[m.group(1).lower()] = tname
+        name = m.group(1).lower()
+        unique = bool(re.search(r"UNIQUE", m.group(2), re.I))
+        cols = _extract_constraint_cols(line, current_col)
+        indexes[name] = {"tbl": tname, "sig": parse_index_signature(
+            f"CREATE {'UNIQUE ' if unique else ''}INDEX {name} ON {tname} ({cols})")}
         return
-    # 内联 PRIMARY KEY (...)
+    # 内联 PRIMARY KEY（表级带括号，或列级无括号）
     if re.search(r"\bPRIMARY\s+KEY\b", line, re.I):
-        indexes[f"{tname}_pkey"] = tname
+        name = f"{tname}_pkey"
+        cols = _extract_constraint_cols(line, current_col, primary=True)
+        indexes[name] = {"tbl": tname, "sig": parse_index_signature(
+            f"CREATE UNIQUE INDEX {name} ON {tname} ({cols})")}
         return
     # 匿名 UNIQUE (a, b, ...)  -> {table}_{首列}_key
     m = re.match(r"UNIQUE\s*\(\s*([A-Za-z_][\w]*)", line, re.I)
     if m:
-        indexes[f"{tname}_{m.group(1).lower()}_key"] = tname
+        name = f"{tname}_{m.group(1).lower()}_key"
+        cols = _extract_constraint_cols(line, current_col)
+        indexes[name] = {"tbl": tname, "sig": parse_index_signature(
+            f"CREATE UNIQUE INDEX {name} ON {tname} ({cols})")}
         return
+
+
+def _extract_constraint_cols(line, current_col, primary=False):
+    """从约束行提取列名列表（逗号分隔）。列级约束（PRIMARY KEY/UNIQUE 后无括号）
+    回退到当前正在解析的列名 current_col。"""
+    if primary:
+        colm = re.search(r"PRIMARY\s+KEY\s*\((.*?)\)", line, re.I)
+    else:
+        colm = re.search(r"\(\s*(.*?)\s*\)", line, re.I)
+    if colm:
+        cols = [c.strip().split()[0] for c in colm.group(1).split(",") if c.strip()]
+        if cols:
+            return ",".join(cols)
+    # 列级约束（无括号）：用当前列名
+    if current_col:
+        return current_col
+    return ""
 
 
 # 匹配"表级约束行"（非列定义），用于在解析建表块时跳过。
@@ -259,17 +350,21 @@ def read_actual(db):
         tables[t]["cols"][c] = norm_type(typ)
         tables[t]["order"].append(c)
 
-    # 索引
+    # 索引（含 indexdef，用于按"内容指纹"比对，避免同名不同名误报）
+    # 返回结构: indexes[name] = {tbl, sig}
     indexes = {}
-    sql = "SELECT indexname, tablename FROM pg_indexes WHERE schemaname = 'public';"
+    sql = ("SELECT indexname, tablename, indexdef "
+           "FROM pg_indexes WHERE schemaname = 'public';")
     out = psql_query(db, sql)
     for row in out.splitlines():
         if not row.strip():
             continue
         parts = row.split("|")
-        if len(parts) < 2:
+        if len(parts) < 3:
             continue
-        indexes[parts[0]] = parts[1]
+        iname, tbl, indexdef = parts[0], parts[1], parts[2]
+        sig = parse_index_signature(indexdef)
+        indexes[iname] = {"tbl": tbl, "sig": sig}
 
     # 视图
     views = set()
@@ -353,12 +448,37 @@ def main():
             if col not in exp_c:
                 drop_cols.append((t, col))
 
-    new_indexes = [idx for idx, t in exp_indexes.items()
-                   if idx not in act_indexes and t in exp_tables]
-    # drop_indexes: 同样限定在本项目已声明表内。其他项目建的索引（关联表不在
-    # exp_tables）一律跳过，不提议删除。
-    drop_indexes = [idx for idx in act_indexes
-                    if idx not in exp_indexes and act_indexes[idx] in exp_tables]
+    # 索引按"内容指纹"比对：同名不同名只要列/方向/唯一性一致就互相抵消，
+    # 不算差异（例如旧约束索引 daily_quote_stock_code_trade_date_key 与
+    # 新索引 idx_daily_quote_stock_date 内容一致，仅名字不同，无需改动）。
+    # exp_indexes / act_indexes 的值为 {tbl, sig}
+    from collections import defaultdict
+    act_sigs = defaultdict(set)   # tbl -> set(sig)
+    for info in act_indexes.values():
+        if info.get("sig"):
+            act_sigs[info["tbl"]].add(info["sig"])
+    exp_sigs = defaultdict(set)
+    for info in exp_indexes.values():
+        if info.get("sig"):
+            exp_sigs[info["tbl"]].add(info["sig"])
+
+    new_indexes = []   # 期望有、实际没有相同指纹 -> 真新增
+    for idx, info in exp_indexes.items():
+        tbl = info["tbl"]
+        if tbl not in exp_tables:
+            continue
+        if info.get("sig") and info["sig"] in act_sigs.get(tbl, set()):
+            continue  # 实际库已有相同内容的索引（可能名字不同），跳过
+        new_indexes.append(idx)
+
+    drop_indexes = []  # 实际有、期望没有相同指纹 -> 真多余（仍限定本项目表）
+    for idx, info in act_indexes.items():
+        tbl = info["tbl"]
+        if tbl not in exp_tables:
+            continue  # 其他项目的表/索引，不提议删除
+        if info.get("sig") and info["sig"] in exp_sigs.get(tbl, set()):
+            continue  # 期望侧已有相同内容的索引（可能名字不同），跳过
+        drop_indexes.append(idx)
     new_views = [v for v in exp_views if v not in act_views]
     changed_views = [v for v in exp_views if v in act_views]
 
@@ -378,7 +498,8 @@ def main():
         print(f"  + 表      {t}  ({len(exp_tables[t]['cols'])} 列)")
     for t, col, typ in add_cols:
         print(f"  + 列      {t}.{col}  {typ}")
-    for idx, t in [(k, v) for k, v in exp_indexes.items() if k in new_indexes]:
+    for idx in new_indexes:
+        t = exp_indexes[idx]["tbl"]
         print(f"  + 索引    {idx} ON {t}")
     for v in new_views:
         print(f"  + 视图    {v}")
@@ -399,7 +520,8 @@ def main():
         print("\n── 破坏性 / 高风险 ──")
         for t, col in drop_cols:
             print(f"  - 列(删)  {t}.{col}  ← 将丢失该列数据!")
-        for idx, t in [(k, v) for k, v in act_indexes.items() if k in drop_indexes]:
+        for idx in drop_indexes:
+            t = act_indexes[idx]["tbl"]
             print(f"  - 索引(删){idx} ON {t}")
         for t, col, old, new in alter_cols:
             print(f"  ~ 列(改)  {t}.{col}: {old} → {new}")
@@ -429,7 +551,7 @@ def main():
             sql_lines.append(gen_ddl_create_table(t, exp_tables[t]["cols"]))
         for t, col, typ in add_cols:
             sql_lines.append(gen_ddl_add_column(t, col, typ))
-        for idx, t in [(k, v) for k, v in exp_indexes.items() if k in new_indexes]:
+        for idx in new_indexes:
             ddl = extract_index_ddl(schema_text, idx)
             if ddl:
                 sql_lines.append(ddl)
