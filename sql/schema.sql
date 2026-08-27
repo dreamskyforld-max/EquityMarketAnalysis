@@ -795,7 +795,7 @@ SELECT
     AVG(price)                                      AS avg_price
 FROM tick_data
 GROUP BY stock_code, tick_time::DATE
-ORDER BY stock_code, trade_date DESC;
+ORDER BY stock_code, tick_time::DATE DESC;
 
 COMMENT ON VIEW v_tick_daily_agg IS '逐笔成交按日聚合视图：按日汇总逐笔数据，可对比例行 daily_kline 验证数据完整性';
 
@@ -851,7 +851,11 @@ WITH base AS (
     FROM financial_indicator
 ),
 ordered AS (
-    SELECT *,
+    SELECT
+        stock_code, report_date, report_type,
+        revenue, net_profit, operating_cash_flow, free_cash_flow,
+        gross_profit_rate, net_profit_rate, roe, debt_ratio,
+        revenue_yoy, net_profit_yoy, report_year,
         LAG(revenue)             OVER w AS prev_revenue,
         LAG(net_profit)          OVER w AS prev_net_profit,
         LAG(operating_cash_flow) OVER w AS prev_ocf,

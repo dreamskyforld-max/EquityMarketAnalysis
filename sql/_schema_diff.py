@@ -139,11 +139,62 @@ def norm_type(t):
     return t
 
 
+def norm_view_def(s):
+    """视图定义语义归一化：把 schema.sql 手写体 与 pg_get_viewdef 反解析体
+    映射到同一形态，使"语义等价"的视图判为相等（不报差异）。
+
+    抹平的主要差异来源（均来自 PG 反解析的固定套路，手写体不会出现）：
+      - 大小写、空白、换行
+      - ~~ / !~~  ↔  LIKE / NOT LIKE
+      - PG 插入的显式类型转换 ::text / ::bigint 等
+      - PG 把 in(...) 展开成 = any(array[...][])
+      - 去 ::type 后可能丢的空格（'x'then → 'x' then）
+      - 表别名前缀（别名.列）
+      - 双引号标识符、尾分号
+
+    注意：本函数【只读、纯文本】，不连接数据库、不执行任何 DDL，
+    符合脚本"只读不写"的安全契约。误判方向保守——漏归一时只会
+    "多报差异"（可执行幂等的 CREATE OR REPLACE），不会漏掉真实结构差异。
+    """
+    if not s:
+        return ""
+    s = s.lower()
+    # PG 反解析：~~ / !~~  ↔ LIKE / NOT LIKE
+    s = s.replace("~~", " like ").replace("!~~", " not like ")
+    # PG 插入的显式类型转换 ::text / ::bigint / ::timestamp 等
+    s = re.sub(r"::[a-z][\w]*", "", s)
+    # PG 把 in(...) 展开成 = any(array[...]) 或 = any(array[...][])（数组后可能带 ::text[]）
+    # schema.sql 手写体则直接是 = any(array[...])。两者统一还原成 in(...)。
+    s = re.sub(r"=\s*any\s*\(\s*array\[(.*?)\](?:\s*\[\s*\])?\s*\)", r"in(\1)", s)
+    # 注：PG 反解析后字符串与关键字之间本就保留空格（如 'a'::text then → 'a' then），
+    # 去 ::type 不会造成粘连，故无需额外补空格。曾经的补空格正则会误伤
+    # in('q1', 'q3') 这类字符串列表（把逗号后空格当成"丢失的空格"补上，导致
+    # 期望侧 in('q1',' q3') 与实际侧 in('q1','q3') 不一致而误报），已移除。
+    # 去表别名_prefix（别名.列）
+    s = re.sub(r"\b[a-z_][\w]*\.", "", s)
+    # PG 反解析的固定套路（手写体不会出现），统一抹平：
+    s = s.replace("<>", "!=")                       # PG 把 != 改写成 <>
+    s = re.sub(r"\bvarying\b", "", s)               # PG 给字符字面量加 'x' varying 后缀
+    s = re.sub(r"else null", "", s)                 # PG 自动补全 case 末尾 else null
+    # group by / order by 中单列被 PG 包裹成 (col) -> col（不伤 over(partition by ...)）
+    s = re.sub(r"\(\s*([a-z_][\w]*)\s*\)", r" \1 ", s)
+    s = re.sub(r",\s+", ",", s)                     # 逗号后多余空格统一
+    s = re.sub(r"\s*,\s*", ",", s)                   # 逗号前后空格统一去掉（含 in('q1', 'q3') ↔ in('q1' ,'q3')）
+    # 双引号标识符
+    s = re.sub(r'"', "", s)
+    # 空白归一
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace(" (", "(").replace("( ", "(")
+    s = s.replace(" )", ")").replace(") ", ")")
+    s = s.strip().rstrip(";").strip()
+    return s
+
+
 # ── 解析本地 schema.sql → 期望结构 ───────────────────────────────────────────
 def parse_schema(text):
     tables = {}      # name -> {cols: {col: type}, order: [col,...]}
     indexes = {}     # indexname -> tablename
-    views = set()
+    views = {}       # name -> 归一化后的 SELECT 主体（用于语义比对）
     cur_table = None
 
     # 预处理：去掉注释行
@@ -157,11 +208,29 @@ def parse_schema(text):
     n = len(lines)
     while i < n:
         line = lines[i].strip()
-        # 视图
+        # 视图：提取 AS 之后的 SELECT 主体，整体拼接后归一化存储。
+        # 视图定义以 "CREATE OR REPLACE VIEW name AS <select>;" 形式出现，
+        # 其后可能紧跟独立的 "COMMENT ON VIEW ...;"（不属于视图 DDL 主体）。
+        # 判定结束的可靠信号：某行以 ';' 结尾（且该行单引号配对，避开字符串内分号）。
+        # 视图 SELECT 主体内部不会出现"行尾 ;"（子查询的 ");" 即视图结束）。
         m = re.match(r"CREATE\s+OR\s+REPLACE\s+VIEW\s+([A-Za-z_][\w]*)", line, re.I)
         if m:
-            views.add(m.group(1).lower())
-            i += 1
+            vname = m.group(1).lower()
+            buf = line
+            j = i
+            while True:
+                # 行尾 ';' 且单引号配对（偶数个 '）→ 视图定义结束
+                if buf.rstrip().endswith(";") and (buf.count("'") % 2 == 0):
+                    buf = buf.rstrip()[:-1]  # 去掉行尾分号
+                    break
+                j += 1
+                if j >= len(lines):
+                    break
+                buf = buf + " " + lines[j]
+            asm = re.search(r"\bAS\b\s*(.*)$", buf, re.I | re.S)
+            body = asm.group(1).strip() if asm else buf.strip()
+            views[vname] = norm_view_def(body)
+            i = j + 1
             continue
         # 建表开始
         m = re.match(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w]*)", line, re.I)
@@ -213,13 +282,16 @@ def parse_columns(lines, idx, first_rest, tables, indexes, tname):
     # 处理第一行剩余
     while True:
         if ")" in buf and depth <= 0:
-            # 表定义结束（取 ) 之前部分）
-            buf = buf[:buf.index(")")]
+            raw = buf.strip()
+            # 先把【完整行】交给约束提取：结束行形如
+            #   "created_at TIMESTAMP, UNIQUE (bench_code, trade_date));"
+            # 若先按首个 ')' 截断会破坏内联 UNIQUE 的括号，导致列提取失败。
+            # 故先以完整行提取约束（含完整 UNIQUE (...)），再去掉表级闭合括号。
+            collect_inline_indexes(raw, indexes, tname, None)
+            # 去掉表级最外层闭合括号及行尾分号，保留内部约束完整
+            buf = re.sub(r"\)+\s*;?\s*$", "", raw)
             if buf.strip():
                 parse_column_line(buf.strip(), tname, tables)
-                colm = re.match(r"^([A-Za-z_][\w]*)", buf.strip())
-                collect_inline_indexes(buf.strip(), indexes, tname,
-                                       colm.group(1) if colm else None)
             return i + 1
         # 还没结束，继续读行
         parse_column_line(buf.strip(), tname, tables)
@@ -237,7 +309,7 @@ def parse_columns(lines, idx, first_rest, tables, indexes, tname):
 # 补进期望索引集合。PG 对约束会自动建物理索引：
 #   - PRIMARY KEY                 -> {table}_pkey
 #   - CONSTRAINT name UNIQUE/PRIMARY KEY -> name
-#   - 匿名 UNIQUE (a, b)          -> {table}_{首列}_key （PG 实际命名规则）
+#   - 匿名 UNIQUE (a, b)          -> {table}_{col1}_{col2}_..._key （PG 实际命名规则）
 # 这样期望侧能和实际侧 pg_indexes 返回的主键/唯一索引对齐，避免把它们误判为"要删"。
 def collect_inline_indexes(line, indexes, tname, current_col=None):
     line = line.strip()
@@ -259,11 +331,18 @@ def collect_inline_indexes(line, indexes, tname, current_col=None):
         indexes[name] = {"tbl": tname, "sig": parse_index_signature(
             f"CREATE UNIQUE INDEX {name} ON {tname} ({cols})")}
         return
-    # 匿名 UNIQUE (a, b, ...)  -> {table}_{首列}_key
-    m = re.match(r"UNIQUE\s*\(\s*([A-Za-z_][\w]*)", line, re.I)
+    # 匿名 UNIQUE (a, b, ...)  -> {table}_{col1}_{col2}_..._key
+    # 注意: PG 对匿名 UNIQUE 约束生成的物理索引名是【全列】而非仅首列，
+    # 例如 UNIQUE (bench_code, trade_date) -> daily_benchmark_bench_code_trade_date_key。
+    # 用首列命名会与实际库里的索引名对不上，导致被误判为"新增索引"；
+    # 故此处取全部列拼名，与 PG 实际命名规则一致。
+    m = re.match(r"UNIQUE\s*\(", line, re.I)
     if m:
-        name = f"{tname}_{m.group(1).lower()}_key"
         cols = _extract_constraint_cols(line, current_col)
+        col_list = [c.strip().split()[0].lower() for c in cols.split(",") if c.strip()]
+        if not col_list:
+            return
+        name = f"{tname}_{'_'.join(col_list)}_key"
         indexes[name] = {"tbl": tname, "sig": parse_index_signature(
             f"CREATE UNIQUE INDEX {name} ON {tname} ({cols})")}
         return
@@ -335,7 +414,8 @@ def read_actual(db):
         "FROM pg_class c "
         "JOIN pg_attribute a ON a.attrelid = c.oid "
         "JOIN pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = 'public' AND a.attnum > 0 AND NOT a.attisdropped "
+        "WHERE n.nspname = 'public' AND c.relkind = 'r' "
+        "AND a.attnum > 0 AND NOT a.attisdropped "
         "ORDER BY c.relname, a.attnum;"
     )
     out = psql_query(db, sql)
@@ -366,13 +446,26 @@ def read_actual(db):
         sig = parse_index_signature(indexdef)
         indexes[iname] = {"tbl": tbl, "sig": sig}
 
-    # 视图
-    views = set()
-    sql = "SELECT table_name FROM information_schema.views WHERE table_schema = 'public';"
+    # 视图：同时取库里实际定义（pg_get_viewdef），用于"语义比对"而非"只看名字"。
+    # 旧逻辑只看名字是否存在，导致"存在即算差异"，每次都提示重刷 CREATE OR REPLACE；
+    # 现在存 {name: 归一化后的实际定义}，main() 里和 schema.sql 的定义做对比，
+    # 真正不同才计入差异。
+    views = {}
+    # 取库里视图的真实定义（pg_get_viewdef，多行压成空格避免被 splitlines 截断）。
+    # 这里存"原始定义"，不在 Python 侧做语义归一化——归一化交给 PG 自己完成
+    # （见 view_defs_equal：把 schema.sql 的视图 body 建 TEMP VIEW 后取 viewdef 对比）。
+    sql = ("SELECT c.relname, replace(pg_get_viewdef(c.oid, true), chr(10), ' ') "
+           "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+           "WHERE n.nspname = 'public' AND c.relkind = 'v';")
     out = psql_query(db, sql)
     for row in out.splitlines():
-        if row.strip():
-            views.add(row.strip().lower())
+        if not row.strip():
+            continue
+        parts = row.split("|")
+        if len(parts) < 2:
+            continue
+        vname, vdef = parts[0], parts[1]
+        views[vname.strip().lower()] = norm_view_def(vdef)
 
     return tables, indexes, views
 
@@ -479,8 +572,14 @@ def main():
         if info.get("sig") and info["sig"] in exp_sigs.get(tbl, set()):
             continue  # 期望侧已有相同内容的索引（可能名字不同），跳过
         drop_indexes.append(idx)
+    # 视图语义比对：归一化后定义不同才算 changed，否则忽略。
+    # exp_views / act_views 现在都是 {name: norm_def}。
+    #   - 目标库没有该视图              -> new_views（需创建）
+    #   - 目标库有，但归一化定义不一致  -> changed_views（需 CREATE OR REPLACE）
+    #   - 目标库有，且定义一致          -> 忽略（不再每次刷屏）
     new_views = [v for v in exp_views if v not in act_views]
-    changed_views = [v for v in exp_views if v in act_views]
+    changed_views = [v for v in exp_views
+                     if v in act_views and exp_views[v] != act_views[v]]
 
     total = (len(new_tables) + len(add_cols) + len(alter_cols)
              + len(drop_cols) + len(new_indexes) + len(drop_indexes)
