@@ -124,9 +124,10 @@ CREATE TABLE IF NOT EXISTS daily_benchmark (
     change_pct          NUMERIC(8,4),
     close_20d_ago       NUMERIC(12,4),                      -- 20个交易日前收盘价
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
+    volume        bigint,
+    turnover      numeric,
 
-    UNIQUE (bench_code, trade_date)
-);
+    UNIQUE (bench_code, trade_date));
 
 COMMENT ON TABLE  daily_benchmark                     IS '每日基准指数行情（与 daily_quote 联合计算超额收益）';
 COMMENT ON COLUMN daily_benchmark.bench_code          IS '基准指数代码：HK.800000(恒生) / SH.000001(上证) / SZ.399001(深证)';
@@ -324,6 +325,7 @@ CREATE TABLE IF NOT EXISTS daily_margin_balance (
 
     UNIQUE (stock_code, trade_date)
 );
+CREATE INDEX IF NOT EXISTS idx_margin_trade_date ON public.daily_margin_balance USING btree (trade_date);
 
 COMMENT ON TABLE  daily_margin_balance                IS '融资融券全量日度明细（仅支持A股沪深两市，数据源：AKShare沪深交易所融资融券明细）';
 COMMENT ON COLUMN daily_margin_balance.stock_code     IS 'A股完整代码，如 SH.600519 / SZ.000001';
@@ -603,6 +605,7 @@ CREATE TABLE IF NOT EXISTS tick_quant_detail (
     -- 元数据
     created_at      TIMESTAMPTZ     DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_quant_detail_time ON public.tick_quant_detail USING btree (stock_code, tick_time);
 
 COMMENT ON TABLE  tick_quant_detail                      IS '逐笔量化行为标签表（基于 tick_data + 3 维特征评分），自包含分析表，无需 JOIN tick_data';
 COMMENT ON COLUMN tick_quant_detail.sequence             IS '关联 tick_data.sequence，同一笔成交';
@@ -727,6 +730,7 @@ CREATE TABLE IF NOT EXISTS daily_market_turnover (
 
     UNIQUE (trade_date)
 );
+CREATE UNIQUE INDEX uq_market_turnover_tradedate ON public.daily_market_turnover USING btree (trade_date);
 
 COMMENT ON TABLE  daily_market_turnover                     IS '港股全市场总成交额（数据源：新浪 stock_hk_daily 逐只聚合，T+1 全天完整值）';
 COMMENT ON COLUMN daily_market_turnover.snapshot_time       IS '快照时间戳（日频=盘后一次，分钟级=每分钟一次）';
@@ -944,6 +948,7 @@ CREATE TABLE IF NOT EXISTS a_daily_quote (
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
     UNIQUE (stock_code, trade_date)
 );
+CREATE INDEX IF NOT EXISTS idx_aquote_trade_date ON public.a_daily_quote USING btree (trade_date);
 
 COMMENT ON TABLE  a_daily_quote                  IS 'A股个股每日行情/估值快照（盘后采集）';
 COMMENT ON COLUMN a_daily_quote.stock_code       IS '股票完整代码，如 SH.600519';

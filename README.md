@@ -83,7 +83,7 @@ EquityMarketAnalysis/
 ├── backfill_*.py / gen_backfill.py                  # 历史数据回填
 ├── liquidity/                                       # 三层资金流分析（market / sector / stock / report）
 ├── {analysis}*.py                                   # 量化分析：方向回测 / 多因子 / 支撑阻力 / OFI ...
-├── sql/schema.sql                                   # ~21 张表结构；sql/cleanup.sql 清理过期
+├── sql/schema.sql                                   # 全量表结构（当前 33 张表）；sql/cleanup.sql 清理过期
 ├── system/                                          # systemd 单元(Linux) + macOS launchd plist
 ├── bootstrap.sh                                     # 服务器一键部署（幂等，从官方源安装）
 ├── deploy.sh                                        # 本地 → 生产服务器增量推送（rsync + 重启）
@@ -345,10 +345,29 @@ if __name__ == "__main__":
 - 敏感信息（密钥、密码）**只**进 `config.conf` / 环境变量，**绝不**硬编码或提交。
 - 新增依赖需同时更新 `requirements.txt` 并固定版本。
 
-### 测试
+### 数据库结构变更约定（强制）
 
-- 新增逻辑请补 pytest（参考 `tests/` 现有用例）。
-- 涉及数据库变更的，同步更新 `sql/schema.sql` 与 `bootstrap.sh`（标记需重跑）。
+`sql/schema.sql` 是数据库结构的**唯一真相源（source of truth）**。任何在代码里新增 / 删除 / 修改表、列、索引、视图的操作，**必须**同步更新 `sql/schema.sql`，否则会导致：
+
+- `sync_schema.sh` 在部署时把"代码已建但 schema 漏写"的表误判为差异；
+- 新环境 bootstrap 时缺表、或他人拉库后结构不一致。
+
+适用范围（不限于）：
+
+- Python 中 `CREATE TABLE IF NOT EXISTS ...` 内联建表 → 同步到 `schema.sql`；
+- `df.to_sql(...)` 自动建表 → 在 `schema.sql` 补对应 `CREATE TABLE`；
+- 新增 / 删除列、修改列类型、新增 / 删除索引、新增视图。
+
+自查（提交前建议执行，只读、不修改数据库）：
+
+```bash
+# 本地连 market_db 检测 schema.sql 与本地库的差异，仅生成修复 SQL 不执行
+APP_DIR=$(pwd) python3 sql/_schema_diff.py
+# 或针对任意服务器（生成修复 SQL 供人工 review）
+./sql/sync_schema.sh <ROOT_HOST> <SSH_KEY> <APP_DIR>
+```
+
+差异结果只生成 SQL 文本（高风险操作默认注释），由人工确认后手动执行，脚本本身绝不改库。
 
 ### 文档
 

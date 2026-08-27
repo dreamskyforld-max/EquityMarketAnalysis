@@ -78,7 +78,9 @@ in_trading_hours() {
   local dow hhmm
   dow=$(date +%u); hhmm=$(date +%H%M)
   [[ $dow -ge 1 && $dow -le 5 ]] || return 1
-  [[ $hhmm -ge 0900 && $hhmm -le 1630 ]]
+  # 强制十进制（0900 等以 0 开头的会被 bash 误判为八进制而报错）
+  hhmm=$((10#$hhmm))
+  [[ $hhmm -ge 900 && $hhmm -le 1630 ]]
 }
 
 # ── rsync 核心（DRY_RUN=1 时仅预览）；变更清单写入全局 CHANGES ──────────────
@@ -108,9 +110,11 @@ show_changes_summary() {
 }
 
 # 基础设施文件变更检测（这些变更需要重跑 bootstrap）
+# 注意: sql/schema.sql 已不在此列 —— 它由 ./deploy.sh up 的 sync_schema 自动
+# 增量同步，不再需要（也不应该）靠 bootstrap 全量重建。
 infra_changed() {
   [[ -z "$CHANGES" ]] && return 1
-  printf '%s' "$CHANGES" | grep -qE 'requirements\.txt|(^|[^ ]/)system/|sql/schema\.sql|(^|[^ ]/)bootstrap\.sh$' \
+  printf '%s' "$CHANGES" | grep -qE 'requirements\.txt|(^|[^ ]/)system/|(^|[^ ]/)bootstrap\.sh$' \
     || return 1
   return 0
 }
@@ -121,8 +125,8 @@ cmd_check() {
   do_rsync 1 >/dev/null
   show_changes_summary
   if infra_changed; then
-    warn "检测到 requirements.txt / system/ / sql/ / bootstrap.sh 变更"
-    warn "同步后需执行: ./deploy.sh bootstrap （重装依赖/渲染 service）"
+    warn "检测到 requirements.txt / system/ / bootstrap.sh 变更"
+    warn "同步后需执行: ./deploy.sh bootstrap （重装依赖/渲染 service/重载 systemd）"
   fi
 }
 
@@ -134,7 +138,7 @@ cmd_sync() {
   # 仅把运行时需写的目录与密钥文件归还 mkt
   cmd_fix_perms_quiet
   if infra_changed; then
-    warn "检测到 requirements.txt / system/ / sql/ / bootstrap.sh 变更"
+    warn "检测到 requirements.txt / system/ / bootstrap.sh 变更"
     warn "需要执行: ./deploy.sh bootstrap （重装依赖/渲染 service/重载 systemd）"
   else
     log "代码推送完成（服务未重启，用 ./deploy.sh up 可同步并重启）"
@@ -156,6 +160,16 @@ cmd_fix_perms() {
 
 cmd_up() {
   cmd_sync
+  # ── 数据库增量同步（在重启服务之前）──────────────────────────────────────
+  # 把最新 sql/schema.sql 已随 cmd_sync rsync 到服务器；这里交互式比对并应用
+  # 新增表/列/索引/视图，破坏性变更需显式 yes。数据库改完再重启服务，避免
+  # 服务启动时表结构不匹配报错。
+  # 与 deploy.sh 的 root_ssh 通道一致：内置 root 账号 + 默认 deploy_key 密钥。
+  if [[ -f "$PROJECT_DIR/sql/sync_schema.sh" ]]; then
+    bash "$PROJECT_DIR/sql/sync_schema.sh" "$ROOT_HOST" "$SSH_KEY" "$APP_DIR"
+  else
+    warn "未找到 sql/sync_schema.sh，跳过数据库同步；请手动核对 schema.sql 变更"
+  fi
   if in_trading_hours; then
     warn "当前处于交易时段（周一至五 09:00-16:30），重启会中断采集"
     read -r -p "仍然重启? [y/N] " ans

@@ -39,3 +39,6 @@ test_ticker.py
 
 # ── 测试缓存 ──
 .pytest_cache/
+
+# ── schema 反向 dump 临时镜像（review 用，不入库）──
+sql/schema.sql.generated
