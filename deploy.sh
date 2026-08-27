@@ -126,7 +126,7 @@ cmd_check() {
   show_changes_summary
   if infra_changed; then
     warn "检测到 requirements.txt / system/ / bootstrap.sh 变更"
-    warn "同步后需执行: ./deploy.sh bootstrap （重装依赖/渲染 service/重载 systemd）"
+    warn "同步后 ./deploy.sh up 会自动重装依赖；如仅用 sync 需手动: ./deploy.sh bootstrap"
   fi
 }
 
@@ -139,7 +139,7 @@ cmd_sync() {
   cmd_fix_perms_quiet
   if infra_changed; then
     warn "检测到 requirements.txt / system/ / bootstrap.sh 变更"
-    warn "需要执行: ./deploy.sh bootstrap （重装依赖/渲染 service/重载 systemd）"
+    warn "用 ./deploy.sh up 会自动重装依赖；如仅 sync 需手动 ./deploy.sh bootstrap"
   else
     log "代码推送完成（服务未重启，用 ./deploy.sh up 可同步并重启）"
   fi
@@ -158,8 +158,21 @@ cmd_fix_perms() {
   root_ssh "stat -c '%n → %U:%G %a' '$APP_DIR/config.conf' '$APP_DIR/log' '$APP_DIR/trend_cache' 2>/dev/null"
 }
 
+cmd_install_reqs() {
+  # 在目标机只重装 Python 依赖（bootstrap.sh STEP=venv）：跳过下载/交互步骤
+  log "目标机重装依赖: bootstrap.sh STEP=venv（pip install -r requirements.txt）"
+  root_ssh "cd '$APP_DIR' && STEPS=venv bash bootstrap.sh" || \
+    warn "依赖安装失败，请手动在目标机执行: cd $APP_DIR && STEPS=venv bash bootstrap.sh"
+}
+
 cmd_up() {
   cmd_sync
+  # ── 依赖安装：requirements.txt 变更时，sync 后自动在目标机重装 ────────────
+  # 与 bootstrap 全量流程相比只跑 STEP=venv（venv+pip），不触碰 config/服务渲染，
+  # 避免重复交互；幂等（pip 对未变包是 no-op）。
+  if infra_changed; then
+    cmd_install_reqs
+  fi
   # ── 数据库增量同步（在重启服务之前）──────────────────────────────────────
   # 把最新 sql/schema.sql 已随 cmd_sync rsync 到服务器；这里交互式比对并应用
   # 新增表/列/索引/视图，破坏性变更需显式 yes。数据库改完再重启服务，避免

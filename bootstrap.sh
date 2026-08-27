@@ -394,6 +394,26 @@ main(){
   check_root
   collect_paths
   collect_secrets
+  # 仅运行指定步骤：deploy.sh up 用 STEP=venv 只重装依赖，跳过其余交互/下载步骤
+  if [[ -n "${STEPS:-}" ]]; then
+    local IFS=',' step
+    for step in $STEPS; do
+      case "$step" in
+        apt)        step_apt ;;
+        user)       step_user ;;
+        pg)         step_pg ;;
+        restore)    restore_db ;;
+        venv)       step_venv ;;
+        futu)       step_futu || warn "FutuOpenD 安装未完成, 可后续手动补" ;;
+        config)     render_config || warn "config.conf 渲染失败" ;;
+        services)   render_services ;;
+        enable)     enable_services ;;
+        *)          warn "未知步骤: $step (忽略)" ;;
+      esac
+    done
+    summary_skip
+    return 0
+  fi
   step_apt
   step_user
   step_pg
@@ -404,6 +424,11 @@ main(){
   render_services
   enable_services
   summary
+}
+
+# 仅跑部分步骤时的精简结束语（不打印首次部署的迁移提示）
+summary_skip(){
+  log "指定步骤执行完成。"
 }
 
 main "$@"
