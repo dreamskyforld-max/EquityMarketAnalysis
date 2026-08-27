@@ -5,8 +5,10 @@
 功能：
   1. 从富途 API 获取股票基本信息 → 写入 stock_info（is_active=TRUE）
   2. 回填 daily_quote 历史数据
-  3. A 股：首次采集融资余额数据
-  4. 重启 scheduler + ticker-collector 服务
+  3. 重启 scheduler + ticker-collector 服务
+
+注意：A 股融资融券明细由 get_margin_balance.py 常驻定时全量采集（覆盖所有 A 股，
+      含本次新接入的股票），本脚本不再单独触发，避免重复采集。
 
 注意：股票列表由 market_scheduler / ticker_collector 在启动时从 stock_info
 (is_active=TRUE) 动态加载，本脚本只需写入 stock_info 即可，无需再改 STOCKS
@@ -99,6 +101,7 @@ try:
             VALUES (%s, %s, %s, %s, %s, TRUE)
             ON CONFLICT (stock_code) DO UPDATE SET
                 stock_name = EXCLUDED.stock_name,
+                is_active = TRUE,
                 updated_at = NOW()
         """, (stock_code, stock_name, market, symbol, currency))
         conn.commit()
@@ -122,26 +125,7 @@ else:
     log.warning(f"daily_quote 回填失败: {result.stderr.strip()[-200:]}")
 
 
-# ── 步骤 4: A 股首次采集融资余额 ────────────────────────────
-
-if stock_type == "A":
-    log.info("A 股首次采集融资余额...")
-    result = subprocess.run(
-        [sys.executable, os.path.join(SCRIPTS_DIR, "get_margin_balance.py"), stock_code],
-        capture_output=True, text=True, timeout=120, cwd=SCRIPTS_DIR,
-    )
-    if result.returncode == 0:
-        log.info("融资余额采集完成")
-        for line in result.stdout.splitlines():
-            if "融资余额" in line:
-                log.info(f"  {line.strip()}")
-    else:
-        log.warning(f"融资余额采集失败: {result.stderr.strip()[-200:]}")
-else:
-    log.info("港股无需采集融资余额，跳过")
-
-
-# ── 步骤 5: 重启服务（原"写 market_scheduler.py / config.conf"已废弃）──
+# ── 步骤 4: 重启服务（原"写 market_scheduler.py / config.conf"已废弃）──
 # 股票列表已由 market_scheduler / ticker_collector 启动时从 stock_info
 # (is_active=TRUE) 动态加载，进程重启后即自动纳入新接入的股票。
 
@@ -187,7 +171,6 @@ print(f"""
 新股接入完成: {stock_code} ({stock_name})
   ├─ stock_info       ✅
   ├─ daily_quote 回填  ✅ ({BACKFILL_DAYS}日)
-  ├─ 融资余额首采      {'✅' if stock_type == 'A' else '— (港股跳过)'}
   ├─ market_scheduler  ✅
   ├─ ticker_config     ✅
   └─ 服务重启          ✅ ({scheduler_svc} + {ticker_svc})
