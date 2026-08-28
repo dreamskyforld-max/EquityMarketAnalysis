@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
 """
-财务指标采集 — AKShare API（常驻调用版）
+财务指标采集 — AKShare API（常驻调用版，支持港股+A股全量）
 
 数据源：
-  - 港股：stock_financial_hk_analysis_indicator_em（东方财富港股财务分析指标）
-  - A 股：stock_financial_abstract（新浪财经财务摘要）
-覆盖年度+季度报告期。
-常驻调用：run(codes, ctx)。__main__ 保留独立运行。
+  - 港股：stock_financial_hk_analysis_indicator_em（东方财富港股财务分析指标，年度+报告期）
+          + stock_financial_hk_report_em（现金流量表，算自由现金流 FCF）
+  - A 股：stock_financial_abstract（新浪财经财务摘要，年度+季度）
+
+采集范围（两种模式）：
+  - 全量模式 run(codes=None)：拉取港股+A股「全部代码」的财务指标。代码清单通过
+    _list_all_codes() 获取，带本地文件缓存（stock_list_cache.json，TTL 7 天），
+    避免每次都打 AKShare。单只异常隔离，不中断整批。这是调度器全局任务的用法。
+  - 指定模式 run([code,...])：仅采集给定代码（wecom 手动触发 / 调试用）。
+
+落库：bulk_upsert → financial_indicator，唯一键 (stock_code, report_date)。
+常驻调用：run(codes, ctx=None)。
+__main__ 默认全量：`python get_financial.py`（不加参数即采集港股+A股全部代码）；
+给定 code 才单只：`python get_financial.py HK.00700`；`--all` 显式全量（等价于默认）。
 """
 import sys
-from datetime import date
+import os
+import json
+from datetime import date, datetime, timezone
 import akshare as ak
 from db import get_conn, bulk_upsert
 
@@ -204,70 +216,222 @@ def _guess_market(stock_code: str) -> str:
     return "HK"
 
 
+# ---------- 全市场代码清单（全局任务用，本地文件缓存）----------
+
+# 缓存用项目根目录下的本地 JSON 文件（不经共用数据库，避免污染业务表）。
+# 与 get_analyst_targets.py 用 analyst_targets.json 的惯例一致：以本文件目录定位项目根。
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CACHE_FILE = os.path.join(_PROJECT_ROOT, "stock_list_cache.json")
+CACHE_TTL_DAYS = 7  # 缓存有效期（天），与 get_hk_market_turnover 一致
+
+
+def _load_cached_codes() -> tuple[list[str], datetime | None]:
+    """从本地缓存文件读代码清单。返回 (codes, cached_at)；文件不存在/损坏返回 ([], None)。"""
+    if not os.path.exists(CACHE_FILE):
+        return [], None
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        codes = data.get("codes", [])
+        cached_at = datetime.fromisoformat(data["cached_at"]) if data.get("cached_at") else None
+        return codes, cached_at
+    except Exception as e:
+        print(f"[全市场代码] 缓存文件读取失败({CACHE_FILE}): {type(e).__name__}: {e}", file=sys.stderr)
+        return [], None
+
+
+def _save_cache(codes: list[str]):
+    """将完整代码清单写入本地缓存文件（含写入时间戳）。"""
+    now = datetime.now(timezone.utc)
+    payload = {"cached_at": now.isoformat(), "count": len(codes), "codes": codes}
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        print(f"[全市场代码] 更新缓存（{now.date()}，{len(codes)} 只）→ {CACHE_FILE}")
+    except Exception as e:
+        print(f"[全市场代码] 缓存文件写入失败({CACHE_FILE}): {type(e).__name__}: {e}", file=sys.stderr)
+
+
+def _fetch_all_codes_from_akshare() -> list[str]:
+    """直连 AKShare 拉全市场代码（港股 + A 股）。单市场失败不影响另一市场。"""
+    codes: list[str] = []
+    # 港股
+    try:
+        df_hk = ak.stock_hk_spot()
+        for c in df_hk.get("代码", []):
+            s = str(c).strip()
+            if s.isdigit():
+                codes.append(f"HK.{int(s):05d}")
+    except Exception as e:
+        print(f"[全市场代码] 港股 stock_hk_spot 失败: {type(e).__name__}: {e}", file=sys.stderr)
+    # A 股（沪 60/68/9 开头，深其余）
+    try:
+        df_a = ak.stock_info_a_code_name()
+        for c in df_a.get("code", []):
+            s = str(c).strip()
+            if not s.isdigit():
+                continue
+            prefix = "SH" if s[0] in ("6", "9") else "SZ"
+            codes.append(f"{prefix}.{s}")
+    except Exception as e:
+        print(f"[全市场代码] A股 stock_info_a_code_name 失败: {type(e).__name__}: {e}", file=sys.stderr)
+    return codes
+
+
+def _list_all_codes() -> list[str]:
+    """全市场代码清单（港股 + A 股，带本地文件缓存，TTL 7 天）。
+
+    优先读本地缓存文件（未过期直接返回，避免每次全量采集都打 AKShare）；
+    过期/为空才调 AKShare 重新拉取并刷新缓存文件。单市场接口失败不影响整体——
+    若缓存过期且拉取失败，兜底用旧缓存文件（为空则跳过）。
+    """
+    cached, cached_at = _load_cached_codes()
+    now = datetime.now(timezone.utc)
+    if cached_at is not None and cached:
+        from datetime import timedelta
+        if (now - cached_at) < timedelta(days=CACHE_TTL_DAYS):
+            print(f"[全市场代码] 命中缓存（{cached_at.date()}，{len(cached)} 只），跳过 AKShare 拉取")
+            return cached
+    # 缓存过期/为空 → 拉 AKShare
+    codes = _fetch_all_codes_from_akshare()
+    if codes:
+        _save_cache(codes)
+    else:
+        # 拉取失败，兜底用旧缓存（可能为空）
+        print("[全市场代码] AKShare 拉取为空/失败，尝试用旧缓存兜底")
+        codes = cached
+    return codes
+
+
 # ---------- 采集入口（常驻调用）----------
 
-def run(codes=None, ctx=None, verbose=False):
-    """codes: [股票代码]，如 HK.00700 / SH.600519；ctx 未使用（数据源为 AKShare）。"""
-    raw_code = (codes[0] if (codes and len(codes) > 0) else "HK.00700").strip()
-    if "." in raw_code:
-        market, symbol = raw_code.split(".", 1)
+def _fetch_one(full_code: str) -> list[dict]:
+    """单只股票拉取财务指标记录（复用 fetch_hk/fetch_a），返回 record 列表。"""
+    if "." in full_code:
+        market, symbol = full_code.split(".", 1)
         market = market.upper()
     else:
-        market = _guess_market(raw_code)
-        symbol = raw_code
+        market = _guess_market(full_code)
+        symbol = full_code
+    if market == "HK":
+        return fetch_hk(symbol)
+    return fetch_a(symbol)
 
-    full_code = f"{market}.{symbol}"
 
-    print(f"[{full_code}] 正在获取财务指标...")
-    try:
-        if market == "HK":
-            records = fetch_hk(symbol)
-        else:
-            records = fetch_a(symbol)
-    except Exception as e:
-        print(f"[{full_code}] API 调用失败: {type(e).__name__}: {e}", file=sys.stderr)
+def run(codes=None, ctx=None, verbose=False):
+    """采集入口（常驻调用）。
+
+    codes:
+      - None / 空列表 = 全量模式：通过 _list_all_codes()（港股+A股全部代码，本地7天缓存）
+        逐只拉取财务指标并批量入库 financial_indicator。单只异常隔离，不中断整批。
+        调度器全局任务（GLOBAL_TASKS 中的「财务指标全量」）即走此模式。
+      - [单只/多只]，如 ["HK.00700"] / ["SH.600519","SZ.000001"] = 指定代码采集，
+        兼容 wecom 手动触发 / 调试。代码可带或不带市场前缀（不带则按首位数字猜测）。
+
+    本地缓存：全市场代码清单存于项目根 stock_list_cache.json，TTL 7 天；
+    未过期直接复用，过期才重新拉 AKShare（hk_stock_list / stock_info_a_code_name）。
+    ctx 未使用（数据源为 AKShare）。
+    """
+    if not codes:
+        target_codes = _list_all_codes()
+        if not target_codes:
+            print("财务指标全量采集: 无法获取全市场代码清单，跳过")
+            return
+        print(f"财务指标全量采集: 共 {len(target_codes)} 只（港股+A股），开始逐只拉取...")
+
+        total_rows = 0
+        ok = 0
+        fail = 0
+        skip = 0          # 有数据但接口返回空（未入库）
+        _t0 = datetime.now()
+        _total = len(target_codes)
+        for _i, full_code in enumerate(target_codes, 1):
+            try:
+                records = _fetch_one(full_code)
+            except Exception as e:
+                fail += 1
+                print(f"[{_i}/{_total}] {full_code} 拉取失败: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+                # 每 25 只或失败发生时也刷新一次进度，避免只看得到 stderr
+                if _i % 25 == 0:
+                    _elapsed = (datetime.now() - _t0).total_seconds()
+                    print(f"财务指标全量采集进度: {_i}/{_total} (成功 {ok}/失败 {fail}/跳过 {skip}/已入库 {total_rows} 条, 用时 {_elapsed:.0f}s)")
+                continue
+            if not records:
+                skip += 1
+                print(f"[{_i}/{_total}] {full_code} 无财务数据(跳过)")
+                continue
+            db_data = [{"stock_code": full_code, **r} for r in records]
+            try:
+                with get_conn() as conn:
+                    bulk_upsert(conn, "financial_indicator", db_data,
+                                conflict_cols=["stock_code", "report_date"])
+                total_rows += len(db_data)
+                ok += 1
+                print(f"[{_i}/{_total}] {full_code} 入库 {len(db_data)} 期 (累计成功 {ok}/失败 {fail}/跳过 {skip})")
+            except Exception as e:
+                fail += 1
+                print(f"[{_i}/{_total}] {full_code} 数据库写入失败: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+        _elapsed = (datetime.now() - _t0).total_seconds()
+        print(f"财务指标全量采集完成: 成功 {ok} 只 / 失败 {fail} 只 / 跳过 {skip} 只，"
+              f"入库 {total_rows} 条报告期，总用时 {_elapsed:.0f}s")
         return
 
-    if not records:
-        print(f"[{full_code}] 未获取到财务数据")
-        return
+    # 指定代码模式（单只或多只）
+    for raw_code in codes:
+        raw_code = raw_code.strip()
+        full_code = raw_code if "." in raw_code else f"{_guess_market(raw_code)}.{raw_code}"
+        print(f"[{full_code}] 正在获取财务指标...")
+        try:
+            records = _fetch_one(full_code)
+        except Exception as e:
+            print(f"[{full_code}] API 调用失败: {type(e).__name__}: {e}", file=sys.stderr)
+            continue
 
-    print(f"[{full_code}] 获取到 {len(records)} 个报告期:")
-    for r in records:
-        rd = r["report_date"]
-        rt = r.get("report_type", "")
-        rev = f"{(r['revenue']/1e8):.0f}亿" if r["revenue"] else "N/A"
-        np_ = f"{(r['net_profit']/1e8):.0f}亿" if r["net_profit"] else "N/A"
-        ocf = f"{(r['operating_cash_flow']/1e8):.0f}亿" if r['operating_cash_flow'] else "N/A"
-        fcf = f"{(r['free_cash_flow']/1e8):.0f}亿" if r['free_cash_flow'] else "N/A"
-        roe = f"{r['roe']:.1f}%" if r['roe'] is not None else "N/A"
-        print(f"  {rd} [{rt}]  营收:{rev}  净利:{np_}  经营CF:{ocf}  自由CF:{fcf}  ROE:{roe}")
+        if not records:
+            print(f"[{full_code}] 未获取到财务数据")
+            continue
 
-    if verbose:
+        print(f"[{full_code}] 获取到 {len(records)} 个报告期:")
         for r in records:
-            print(f"\n  --- {r['report_date']} ---")
-            for k, v in r.items():
-                print(f"    {k}: {v}")
+            rd = r["report_date"]
+            rt = r.get("report_type", "")
+            rev = f"{(r['revenue']/1e8):.0f}亿" if r["revenue"] else "N/A"
+            np_ = f"{(r['net_profit']/1e8):.0f}亿" if r["net_profit"] else "N/A"
+            ocf = f"{(r['operating_cash_flow']/1e8):.0f}亿" if r['operating_cash_flow'] else "N/A"
+            fcf = f"{(r['free_cash_flow']/1e8):.0f}亿" if r['free_cash_flow'] else "N/A"
+            roe = f"{r['roe']:.1f}%" if r['roe'] is not None else "N/A"
+            print(f"  {rd} [{rt}]  营收:{rev}  净利:{np_}  经营CF:{ocf}  自由CF:{fcf}  ROE:{roe}")
 
-    db_data = []
-    for r in records:
-        row = {"stock_code": full_code}
-        row.update(r)
-        db_data.append(row)
+        if verbose:
+            for r in records:
+                print(f"\n  --- {r['report_date']} ---")
+                for k, v in r.items():
+                    print(f"    {k}: {v}")
 
-    try:
-        with get_conn() as conn:
-            bulk_upsert(conn, "financial_indicator", db_data,
-                        conflict_cols=["stock_code", "report_date"])
-        print(f"[{full_code}] 已写入数据库 ({len(db_data)} 条)")
-    except Exception as e:
-        print(f"[{full_code}] 数据库写入失败: {type(e).__name__}: {e}", file=sys.stderr)
+        db_data = [{"stock_code": full_code, **r} for r in records]
+        try:
+            with get_conn() as conn:
+                bulk_upsert(conn, "financial_indicator", db_data,
+                            conflict_cols=["stock_code", "report_date"])
+            print(f"[{full_code}] 已写入数据库 ({len(db_data)} 条)")
+        except Exception as e:
+            print(f"[{full_code}] 数据库写入失败: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="采集年度财务指标")
-    parser.add_argument("code", nargs="?", default="HK.00700", help="股票代码，如 HK.00700 / SH.600519")
+    parser = argparse.ArgumentParser(
+        description="采集财务指标（港股+A股）。默认全市场全量采集；给定 code 才只采集该只。")
+    parser.add_argument("code", nargs="?", default=None,
+                        help="股票代码，如 HK.00700 / SH.600519。不传则默认全量采集港股+A股全部代码")
+    parser.add_argument("--all", action="store_true",
+                        help="显式全量模式：采集港股+A股全部代码（约8300只）。代码清单走本地7天缓存，"
+                             "过期才重新拉 AKShare。等价于调度器全局任务。")
     parser.add_argument("--verbose", "-v", action="store_true", help="显示详细输出")
     args = parser.parse_args()
-    run([args.code], verbose=args.verbose)
+    if args.code and not args.all:
+        run([args.code], verbose=args.verbose)   # 指定单只（调试/wecom）
+    else:
+        run(None, verbose=args.verbose)          # 默认全量模式

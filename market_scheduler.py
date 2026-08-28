@@ -58,8 +58,7 @@ MARKET_PRESETS = {
                 "get_trend.py",                          # 全日趋势数据
             ],
         },
-        "extras": [    # 市场特有定时任务
-            ("财务指标", "get_financial.py", {"hour": 9, "minute": 0}),                                # 财务指标（AKShare年度+季度）→ financial_indicator
+        "extras": [    # 市场特有定时任务（财务指标已改为全局全量任务，见 GLOBAL_TASKS）
         ],
     },
     "A": {
@@ -73,8 +72,7 @@ MARKET_PRESETS = {
                 "get_trend.py",          # 全日趋势数据
             ],
         },
-        "extras": [
-            ("财务指标", "get_financial.py", {"hour": 9, "minute": 0}),       # 财务指标（AKShare年度+季度）→ financial_indicator
+        "extras": [    # 财务指标已改为全局全量任务，见 GLOBAL_TASKS
         ],
     },
 }
@@ -193,6 +191,15 @@ GLOBAL_TASKS: list[GlobalTask] = [
     # 回购公告盘后陆续披露，21:00 跑一次覆盖当日全部。
     ("公司回购", "get_buyback.py",
      {"hour": "7,17", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # 财务指标全量采集（港股 + A 股全部代码）：run(codes=None) 时忽略 codes，
+    # 内部通过 AKShare 全量代码接口拉港股+全部A股代码，逐只 fetch 后批量入库
+    # financial_indicator（单只异常隔离，不中断整批）。财务数据为低频（年报/季报），
+    # 财务数据为低频（年报/季报），每周一凌晨 2 点跑一次全量即可。全市场约 8300+ 只、
+    # 逐只 HTTP 调用耗时较长；超时设为 2 小时，且 execute_task 超时后后台线程仍会
+    # 续跑直至自然完成（数据照常入库）。
+    ("财务指标全量", "get_financial.py",
+     {"hour": 2, "minute": 0, "day_of_week": "mon"}, None, True, None, 7200),
 
     # 注意：采集层故障监控已由独立服务 monitor_collector.py（常驻进程，
     # systemd: monitor-collector.service）负责，不再挂在调度器里，

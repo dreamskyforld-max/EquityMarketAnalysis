@@ -26,6 +26,7 @@ trend_cache/*.json
 trend_cache/*.txt
 south_cache_*.json
 margin_cache_*.json
+stock_list_cache.json
 *.csv
 
 # ── 开发临时脚本（不传 GitHub）──

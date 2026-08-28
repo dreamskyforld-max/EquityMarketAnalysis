@@ -687,12 +687,12 @@ CREATE TABLE IF NOT EXISTS financial_indicator (
     report_type         VARCHAR(10)     DEFAULT 'annual',   -- 报告类型：annual(年报)
     revenue             NUMERIC(18,2),                      -- 营业收入（元）
     net_profit          NUMERIC(18,2),                      -- 归母净利润（元）
-    gross_profit_rate   NUMERIC(8,4),                       -- 毛利率(%)
-    net_profit_rate     NUMERIC(8,4),                       -- 销售净利率(%)
-    roe                 NUMERIC(8,4),                       -- ROE 加权净资产收益率(%)
-    debt_ratio          NUMERIC(8,4),                       -- 资产负债率(%)
-    revenue_yoy         NUMERIC(8,4),                       -- 营业收入同比增长率(%)
-    net_profit_yoy      NUMERIC(8,4),                       -- 归母净利润同比增长率(%)
+    gross_profit_rate   NUMERIC(12,4),                      -- 毛利率(%)
+    net_profit_rate     NUMERIC(12,4),                      -- 销售净利率(%)
+    roe                 NUMERIC(12,4),                      -- ROE 加权净资产收益率(%)
+    debt_ratio          NUMERIC(12,4),                      -- 资产负债率(%)
+    revenue_yoy         NUMERIC(12,4),                      -- 营业收入同比增长率(%)
+    net_profit_yoy      NUMERIC(12,4),                      -- 归母净利润同比增长率(%)
     operating_cash_flow NUMERIC(18,2),                      -- 经营活动现金流量净额（元）
     free_cash_flow      NUMERIC(18,2),                      -- 自由现金流（元），暂留空，待补充 CAPEX
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
