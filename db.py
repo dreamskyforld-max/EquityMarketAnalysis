@@ -111,12 +111,17 @@ def write_full_tick(conn, data_list, columns):
         extras.execute_values(cur, query.as_string(conn), values_list, page_size=1000)
 
 
-def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False):
+def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False,
+                skip_null_updates=False):
     """
     批量 INSERT ... ON CONFLICT DO UPDATE / DO NOTHING
     data_list: dict 列表
     do_nothing: True → 冲突时跳过(ON CONFLICT DO NOTHING)；
                 False(默认) → 冲突时更新(ON CONFLICT DO UPDATE SET ...)
+    skip_null_updates: 仅当 do_nothing=False 时生效。
+                False(默认) → 冲突时整行覆盖（EXCLUDED.col 无条件覆盖原值）。
+                True → 冲突时仅用有值的字段覆盖：col = COALESCE(EXCLUDED.col, 原值)，
+                       新值为 NULL 的字段保留库中已有值（不回写成 NULL）。
 
     自动对齐所有 record 的 keys：不同数据源构造的 record 可能字段不一致
     （如富途带 volume/turnover，FRED 不带），用 data_list[0].keys() 取列名
@@ -162,10 +167,20 @@ def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False):
             conflict=conflict_target,
         )
     else:
-        update_set = sql.SQL(", ").join([
-            sql.SQL("{col} = EXCLUDED.{col}").format(col=sql.Identifier(c))
-            for c in update_cols
-        ])
+        if skip_null_updates:
+            # 仅覆盖本次有值的字段：新值为 NULL 时保留库中已有值，
+            # 避免历史回溯脚本把已存在的估值字段（市值/PE/PB/52w 等）回写为空。
+            update_set = sql.SQL(", ").join([
+                sql.SQL("{col} = COALESCE(EXCLUDED.{col}, {tbl}.{col})").format(
+                    col=sql.Identifier(c), tbl=sql.Identifier(table)
+                )
+                for c in update_cols
+            ])
+        else:
+            update_set = sql.SQL(", ").join([
+                sql.SQL("{col} = EXCLUDED.{col}").format(col=sql.Identifier(c))
+                for c in update_cols
+            ])
         query = sql.SQL(
             "INSERT INTO {table} ({cols}) VALUES %s "
             "ON CONFLICT ({conflict}) DO UPDATE SET {update_set}"

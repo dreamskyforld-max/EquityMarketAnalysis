@@ -36,6 +36,21 @@ CACHE_TABLE = "a_stock_list_cache"
 CACHE_TTL_DAYS = 7  # 缓存有效期（天）
 
 
+def _as_float(v):
+    """安全转 float：非数字 / NaN / None 返回 None，否则返回数值。
+
+    用于过滤占位行：富途对停牌或异常日可能返回 NaN、空串或其他非数值，
+    直接 float() 会抛错，pd.notna 又识别不了非数值字符串。
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f:  # NaN 不等于自身
+        return None
+    return f
+
+
 def _parse_date(update_time):
     """从 update_time 提取日期。"""
     if not update_time or update_time == "N/A":
@@ -159,13 +174,16 @@ def fetch_market_snapshot_batch(codes, ctx=None):
             td = _parse_date(row.get("update_time"))
             if trade_date is None:
                 trade_date = td
-            turnover = float(row["turnover"]) if row.get("turnover") is not None else 0.0
-            volume = int(row["volume"]) if row.get("volume") is not None else 0
+            # 直接判断「是否为数字且 >0」：富途异常日快照 turnover 可能是 NaN、空串
+            # 或非数值，pd.notna 识别不了非数值字符串，NaN>0 又恒为 False，会把空行
+            # 写进 a_daily_quote。统一用安全转换：非数字/NaN/None 视为无成交跳过。
+            turnover = _as_float(row.get("turnover")) or 0.0
+            volume = int(_as_float(row.get("volume")) or 0)
             if turnover > 0:
                 total_turnover += turnover
                 total_volume += volume
                 stock_count += 1
-            quote_rows.append(_map_quote_row(code, td, row))
+                quote_rows.append(_map_quote_row(code, td, row))
 
     return {
         "trade_date": trade_date,

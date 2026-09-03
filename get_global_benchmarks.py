@@ -4,7 +4,7 @@
 
 数据源:
   - 富途 OpenAPI:       恒生 / 恒生科技 / 上证
-  - FRED (美联储):      标普500 / 道琼斯 / 纳斯达克 / VIX / 美元指数
+  - FRED (美联储):      标普500 / 道琼斯 / 纳斯达克 / VIX / 美元指数 / 有效联邦基金利率(EFFR)
   - AKShare:           美债10Y / 美债2Y / 离岸人民币
   - AKShare(新浪源):    日经225 / KOSPI / DAX  （东财接口不稳，改用新浪源）
 
@@ -59,6 +59,7 @@ ALL_BENCHMARKS: List[Dict] = [
     {"code": "US.NASDAQCOM",   "name": "纳斯达克综合指数",   "source": "fred", "fred_ticker": "NASDAQCOM"},
     {"code": "US.VIXCLS",      "name": "VIX恐慌指数",        "source": "fred", "fred_ticker": "VIXCLS"},
     {"code": "US.DTWEXBGS",    "name": "美元指数(贸易加权)", "source": "fred", "fred_ticker": "DTWEXBGS"},
+    {"code": "US.EFFR",         "name": "有效联邦基金利率",   "source": "fred", "fred_ticker": "EFFR", "is_rate": True},
     # ── Yahoo Finance（ICE DXY；大陆 IP 被风控需代理，服务器香港直连，见 _yahoo_proxy）──
     {"code": "US.DXY",         "name": "美元指数(ICE DXY)", "source": "yfinance", "yf_code": "DX-Y.NYB"},
     # ── AKShare ──
@@ -209,7 +210,9 @@ def _collect_fred(items: list) -> list:
             last_val = float(last.iloc[0])
             prev_val = float(prev.iloc[0])
             td = df.index[-1].date()
-            change = (last_val / prev_val - 1) * 100 if prev_val != 0 else 0.0
+            # 利率/收益率序列用基点(bp)，其余用相对涨跌幅%
+            change = (last_val - prev_val) * 100 if it.get("is_rate") else \
+                ((last_val / prev_val - 1) * 100 if prev_val != 0 else 0.0)
 
             # 20日前
             close_20d = _r(float(df.iloc[-21].iloc[0])) if len(df) >= 21 else None

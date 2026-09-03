@@ -199,9 +199,16 @@ def _fetch_one_day(td: date, session: requests.Session, max_retry=4):
             if not data:
                 return [], 0
             rows = []
+            skipped = 0
+            empty_cols = ("TOTAL_MARKET_CAP", "NOTLIMITED_MARKETCAP_A", "PE_TTM", "PE_LAR", "PB_MRQ")
             for d in data:
                 code = _to_full_code(d.get("SECURITY_CODE"))
                 if not code:
+                    continue
+                # 原则：只把有效数据写入；某只股票所有估值字段都为空 → 视为无效，跳过
+                # （避免把数据库里已有的有效估值覆盖成 NULL）
+                if all(_num(d.get(c)) is None for c in empty_cols):
+                    skipped += 1
                     continue
                 rows.append({
                     "stock_code": code,
@@ -211,10 +218,12 @@ def _fetch_one_day(td: date, session: requests.Session, max_retry=4):
                     "pe_ttm_ratio": _num(d.get("PE_TTM")),
                     "pe_ratio": _num(d.get("PE_LAR")),
                     "pb_ratio": _num(d.get("PB_MRQ")),
-                    # 东财该报表无股息率(TTM)列，置空；PEG_CAR 不是股息率，不写入
+                    # 东财该报表无股息率(TTM)列，置空；字段级 upsert 会保留库里原值，不清空
                     "dividend_ratio_ttm": None,
                     "update_time": datetime(td.year, td.month, td.day),
                 })
+            if skipped:
+                log.info(f"    {td} 跳过 {skipped} 只「全字段为空」的无效记录（不写库）")
             return rows, total
         except Exception as e:
             last_err = e
@@ -246,20 +255,53 @@ def _num(v):
 # ----------------------------------------------------------------------------
 # 落库
 # ----------------------------------------------------------------------------
+# 估值列（用于 upsert 的列）。OHLC/量价列一律不在此出现，绝不触碰。
+VAL_COLS = ["total_market_val", "circular_market_val", "pe_ratio",
+            "pe_ttm_ratio", "pb_ratio", "dividend_ratio_ttm", "update_time"]
+CONFLICT_COLS = ["stock_code", "trade_date"]
+
+
 def _flush(rows, dry):
+    """落库：字段级保护 upsert。
+
+    原则：只把有效数据写入，绝不把库里已有的有效值覆盖成空。
+      - 记录级：调用方已过滤「全部估值字段为空」的无效记录（见 _fetch_one_day）。
+      - 字段级：用 COALESCE(EXCLUDED.col, table.col) ——
+          新值为非空 → 更新；新值为 NULL → 保留库里原值（不清空）。
+        这样即使某字段东财返回空（如亏损股 PE 为空），也不会抹掉库里原有 PE。
+      - 只操作 VAL_COLS，OHLC/量价列完全不进入 UPDATE SET，安全。
+    """
     if not rows:
         return 0
     if dry:
         return len(rows)
-    from db import get_conn, bulk_upsert
+    from db import get_conn
+    from psycopg2 import sql
+    from psycopg2.extras import execute_values
     _ensure_table()
-    # 只含冲突列 + 估值列，bulk_upsert 的 DO UPDATE 不会触碰 OHLC
-    cols = ["stock_code", "trade_date", "total_market_val", "circular_market_val",
-            "pe_ratio", "pe_ttm_ratio", "pb_ratio", "dividend_ratio_ttm", "update_time"]
-    data = [{c: r.get(c) for c in cols} for r in rows]
+
+    all_cols = CONFLICT_COLS + VAL_COLS
+    conflict_target = sql.SQL(", ").join([sql.Identifier(c) for c in CONFLICT_COLS])
+    col_ids = sql.SQL(", ").join([sql.Identifier(c) for c in all_cols])
+    # 字段级 COALESCE：新值非空才覆盖，否则保留原值
+    update_set = sql.SQL(", ").join([
+        sql.SQL("{c} = COALESCE(EXCLUDED.{c}, a_daily_quote.{c})").format(
+            c=sql.Identifier(c))
+        for c in VAL_COLS
+    ])
+    query = sql.SQL(
+        "INSERT INTO {table} ({cols}) VALUES %s "
+        "ON CONFLICT ({conf}) DO UPDATE SET {set}"
+    ).format(
+        table=sql.Identifier("a_daily_quote"),
+        cols=col_ids,
+        conf=conflict_target,
+        set=update_set,
+    )
+    values_list = [tuple(r.get(c) for c in all_cols) for r in rows]
     with get_conn() as conn:
-        bulk_upsert(conn, "a_daily_quote", data,
-                    conflict_cols=["stock_code", "trade_date"], do_nothing=False)
+        with conn.cursor() as cur:
+            execute_values(cur, query, values_list, page_size=2000)
     return len(rows)
 
 

@@ -2,7 +2,7 @@
 # ============================================================================
 # 从服务器同步数据表到本机
 # 用法:
-#   ./sync_from_server.sh                          # 同步所有表（默认 HK.00700）
+#   ./sync_from_server.sh                          # 默认：同步 stock_info.is_active=TRUE 的全部股票的 tick_data + trend_snapshot
 #   ./sync_from_server.sh tick_data                # 只同步 tick_data（默认 HK.00700）
 #   ./sync_from_server.sh -s SH.600900              # 同步所有表（指定股票）
 #   ./sync_from_server.sh -s SH.600900 tick_data    # 只同步 tick_data（指定股票）
@@ -19,18 +19,23 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── 参数解析 ──────────────────────────────────────────────────
 STOCK_FILTER="HK.00700"          # 默认股票
+STOCK_PROVIDED="false"           # 是否显式传入 -s
 TABLE_ARG=""                      # 可选：只同步指定表
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -s)
             STOCK_FILTER="$2"
+            STOCK_PROVIDED="true"
             shift 2
             ;;
         -h|--help)
             echo "Usage: $0 [-s STOCK_CODE] [TABLE_NAME]"
-            echo "  -s STOCK_CODE   stock code, default HK.00700"
+            echo "  -s STOCK_CODE   stock code (default HK.00700)"
             echo "  TABLE_NAME      optional, sync single table (e.g. tick_data / daily_quote)"
+            echo ""
+            echo "  No args: sync tick_data + trend_snapshot for all stocks where"
+            echo "           stock_info.is_active = TRUE (on the remote server)."
             exit 0
             ;;
         *)
@@ -104,6 +109,35 @@ run_local_copy() {
 run_local_exec() {
     local sql="$1"
     PGPASSFILE="$PGPASS_LOCAL" psql -h "$LOCAL_HOST" -p "$LOCAL_PORT" -d "$LOCAL_DB" -U "$LOCAL_USER" -c "$sql" 2>/dev/null
+}
+
+# 若 (table, cols) 存在唯一/主键约束或唯一索引，返回 "ON CONFLICT (cols) DO NOTHING"，否则返回空串。
+# 注意：原脚本硬编码 ON CONFLICT (sequence)，但 tick_data 的真实唯一键是复合 (stock_code, sequence)
+#       （以独立唯一索引 tick_data_stock_seq_unique 形式存在，不在 pg_constraint 中），单列 sequence
+#       匹配不上 → 报 "no unique constraint" 并回滚整笔导入。此处同时检测 pg_constraint 与 pg_index
+#       中的唯一索引，确保冲突列与真实唯一键一致时才用 ON CONFLICT。
+conflict_clause() {
+    local table="$1"
+    local cols="$2"
+    [[ -z "$cols" ]] && { echo ""; return; }
+    local found
+    found=$(run_local_sql "WITH req AS (SELECT string_agg(c, ',' ORDER BY c) AS r FROM (SELECT unnest(string_to_array('${cols}', ',')) AS c) x)
+SELECT 1 FROM req
+WHERE EXISTS (
+  SELECT 1 FROM pg_constraint c
+  WHERE c.conrelid='${table}'::regclass AND c.contype IN ('u','p')
+    AND (SELECT string_agg(attname, ',' ORDER BY attname) FROM pg_attribute a WHERE a.attrelid=c.conrelid AND a.attnum=ANY(c.conkey)) = req.r
+  UNION ALL
+  SELECT 1 FROM pg_index ix JOIN pg_class t ON t.oid=ix.indrelid
+  WHERE t.relname='${table}' AND ix.indisunique AND NOT ix.indisprimary
+    AND (SELECT string_agg(attname, ',' ORDER BY attname) FROM pg_attribute a WHERE a.attrelid=ix.indrelid AND a.attnum = ANY(ix.indkey)) = req.r
+)
+LIMIT 1;" | tr -d ' ')
+    if [[ "$found" == "1" ]]; then
+        echo "ON CONFLICT (${cols}) DO NOTHING"
+    else
+        echo ""
+    fi
 }
 
 # ==================================================================
@@ -205,7 +239,7 @@ sync_small_table_full() {
 #   - trend_snapshot: snapshot_date 是生成列需排除，(stock_code,snapshot_time) 唯一
 # ==================================================================
 LARGE_TABLES=(
-    "tick_data|tick_time::DATE|*|sequence"
+    "tick_data|tick_time::DATE|*|stock_code,sequence"
     "trend_snapshot|snapshot_date|stock_code,snapshot_time,price,super_in_net,big_in_net,small_in_net,buy_sell_ratio,excess_return_pct,buy_levels_str,sell_levels_str,created_at,mid_in_net,volume,turnover|stock_code,snapshot_time"
 )
 
@@ -225,6 +259,10 @@ sync_large_table() {
         copy_cols="$orig_cols"
         col_spec="($copy_cols)"
     fi
+
+    # ON CONFLICT 仅在冲突列存在唯一/主键约束时可用；否则用 plain INSERT（当天已先 DELETE，无重复风险）
+    local cc
+    cc=$(conflict_clause "$table" "$conflict_col")
 
     # 1. remote daily row counts (filtered by stock_code)
     echo "  Querying remote last ${COMPARE_DAYS} days ($STOCK_FILTER) ..."
@@ -308,7 +346,7 @@ BEGIN;
 CREATE TEMP TABLE _sync_tmp (LIKE ${table} INCLUDING DEFAULTS);
 ALTER TABLE _sync_tmp DROP COLUMN id;
 \\COPY _sync_tmp(${copy_cols}) FROM '${csv_file}' CSV HEADER
-INSERT INTO ${table}(${copy_cols}) SELECT ${copy_cols} FROM _sync_tmp ON CONFLICT (${conflict_col}) DO NOTHING;
+INSERT INTO ${table}(${copy_cols}) SELECT ${copy_cols} FROM _sync_tmp ${cc};
 SELECT 'inserted' AS status, COUNT(*) AS cnt FROM _sync_tmp;
 DROP TABLE _sync_tmp;
 COMMIT;
@@ -373,6 +411,52 @@ find_and_sync() {
 }
 
 # ==================================================================
+# 同步所有大表（LARGE_TABLES）当前 $STOCK_FILTER 的数据
+# 供「指定股票全量同步」与「全部活跃股票默认同步」两个分支复用
+# ==================================================================
+sync_all_large_tables() {
+    for entry in "${LARGE_TABLES[@]}"; do
+        local t="${entry%%|*}"
+        local rest="${entry#*|}"
+        local col="${rest%%|*}"
+        rest="${rest#*|}"
+        local maybe_cols="${rest%%|*}"
+        local conflict="${rest#*|}"
+        [[ "$maybe_cols" == "$rest" ]] && maybe_cols="*"
+        [[ "$conflict" == "$rest" ]] && conflict=""
+        sync_large_table "$t" "$col" "$maybe_cols" "$conflict"
+    done
+}
+
+# ==================================================================
+# 默认模式：从远程 stock_info 取 is_active=TRUE 的全部股票，
+# 逐只同步 tick_data + trend_snapshot（LARGE_TABLES 即这两张表）
+# ==================================================================
+sync_active_stocks_large() {
+    echo "  Fetching active stock codes from remote stock_info (is_active = TRUE) ..."
+    local codes
+    codes=$(run_remote_sql "SELECT stock_code FROM stock_info WHERE is_active = TRUE ORDER BY stock_code;" | sed '/^$/d' | tr -d ' ')
+    if [[ -z "$codes" ]]; then
+        echo "  No active stocks found on remote, abort."
+        return 1
+    fi
+
+    local total
+    total=$(echo "$codes" | wc -l | tr -d ' ')
+    echo "  Active stocks total: $total"
+    echo "  (sync tables: ${LARGE_TABLES[@]%%|*})"
+    echo ""
+
+    local idx=0
+    for code in $codes; do
+        idx=$((idx + 1))
+        echo "########## [$idx/$total] Stock: $code ##########"
+        STOCK_FILTER="$code"
+        sync_all_large_tables
+    done
+}
+
+# ==================================================================
 # 主流程
 # ==================================================================
 OVERALL_START=$(date +%s)
@@ -380,11 +464,15 @@ OVERALL_START=$(date +%s)
 # 清理旧残留 temp 文件，避免 mktemp 冲突
 rm -f /tmp/sync_tick_data_*.csv /tmp/sync_trend_snapshot_*.csv /tmp/sync_remote_* /tmp/sync_local_* 2>/dev/null
 
-if [[ -n "$TABLE_ARG" ]]; then
-    # 只同步指定表
+if [[ -z "$TABLE_ARG" && "$STOCK_PROVIDED" == "false" ]]; then
+    # 默认模式：不传股票代码也不传表名 -> 全部活跃股票的 tick_data + trend_snapshot
+    echo "========== Default: tick_data + trend_snapshot for all active stocks =========="
+    sync_active_stocks_large || exit 1
+elif [[ -n "$TABLE_ARG" ]]; then
+    # 只同步指定表（STOCK_FILTER 默认 HK.00700，或 -s 指定）
     find_and_sync "$TABLE_ARG" || exit 1
 else
-    # 全部同步
+    # 仅传 -s（指定股票）未传表名 -> 该股票全量同步
     echo "========== Tables with stock_code ($STOCK_FILTER only) =========="
     for t in "${SMALL_TABLES_FILTERED[@]}"; do
         sync_small_table_filtered "$t"
@@ -396,17 +484,7 @@ else
     done
 
     echo "========== Large tables (by-day diff, $STOCK_FILTER only) =========="
-    for entry in "${LARGE_TABLES[@]}"; do
-        t="${entry%%|*}"
-        rest="${entry#*|}"
-        col="${rest%%|*}"
-        rest="${rest#*|}"
-        maybe_cols="${rest%%|*}"
-        conflict="${rest#*|}"
-        [[ "$maybe_cols" == "$rest" ]] && maybe_cols="*"
-        [[ "$conflict" == "$rest" ]] && conflict=""
-        sync_large_table "$t" "$col" "$maybe_cols" "$conflict"
-    done
+    sync_all_large_tables
 fi
 
 echo "All syncs done (total $(($(date +%s) - OVERALL_START))s)"

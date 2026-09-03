@@ -41,6 +41,7 @@ BENCHMARKS = {
     "US.NASDAQCOM":   ("纳斯达克综合指数",   "fred"),
     "US.VIXCLS":      ("VIX恐慌指数",        "fred"),
     "US.DTWEXBGS":    ("美元指数(贸易加权)", "fred"),
+    "US.EFFR":        ("有效联邦基金利率",   "fred"),
     "US.DXY":         ("美元指数(ICE DXY)",  "yfinance"),
     # 东财全球指数
     "JP.N225":        ("日经225指数",        "eastmoney"),
@@ -58,8 +59,11 @@ SINA_A_CODE = {
 
 FRED_TICKER = {
     "US.SP500": "SP500", "US.DJIA": "DJIA", "US.NASDAQCOM": "NASDAQCOM",
-    "US.VIXCLS": "VIXCLS", "US.DTWEXBGS": "DTWEXBGS",
+    "US.VIXCLS": "VIXCLS", "US.DTWEXBGS": "DTWEXBGS", "US.EFFR": "EFFR",
 }
+
+# FRED 中以"利率/收益率(%)"口径的序列：change_pct 用基点(bp)而非相对涨跌幅
+_FRED_RATE_TICKERS = {"US.EFFR"}
 
 
 def build_records(kl_data, bench_code, bench_name):
@@ -195,7 +199,10 @@ def backfill_fred(bench_code, bench_name, days):
             td = df.index[i].date()
             val = float(df.iloc[i].iloc[0])
             prev = float(df.iloc[i-1].iloc[0]) if i > 0 else None
-            chg = round((val / prev - 1) * 100, 4) if prev and prev != 0 else None
+            if bench_code in _FRED_RATE_TICKERS:
+                chg = round((val - prev) * 100, 4) if prev is not None else None
+            else:
+                chg = round((val / prev - 1) * 100, 4) if prev and prev != 0 else None
             c20 = float(df.iloc[i-20].iloc[0]) if i >= 20 else None
             recs.append({
                 "bench_code": bench_code, "bench_name": bench_name,
