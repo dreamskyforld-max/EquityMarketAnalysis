@@ -201,6 +201,13 @@ GLOBAL_TASKS: list[GlobalTask] = [
     ("财务指标全量", "get_financial.py",
      {"hour": 2, "minute": 0, "day_of_week": "mon"}, None, True, None, 7200),
 
+    # 分红送配明细全量（A股 + 港股全市场）：A股东财 RPT_SHAREBONUS_DET 分页全量 +
+    # 港股同花顺 F10 逐票全历史，落 dividend_history（run 忽略 codes，全局任务）。
+    # 分红为低频事件（预案→实施进度推进时原地 upsert），全市场回填约 20-40 分钟；
+    # 周六 09:00 跑一次（A股分红公告多为周五盘后披露），超时同财务任务设 2 小时。
+    ("分红明细全量", "get_dividend_history.py",
+     {"hour": 9, "minute": 0, "day_of_week": "sat"}, None, True, None, 7200),
+
     # 注意：采集层故障监控已由独立服务 monitor_collector.py（常驻进程，
     # systemd: monitor-collector.service）负责，不再挂在调度器里，
     # 以免「调度器挂掉→监控也失效」的同源单点故障。

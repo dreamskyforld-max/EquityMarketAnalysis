@@ -123,6 +123,105 @@ def fetch_a(symbol: str) -> list[dict]:
     return records
 
 
+# ---------- A股披露日（业绩报表「最新公告日期」）----------
+
+def _parse_date(val) -> date | None:
+    """把 '2026-03-19' / '20260319' 等解析为 date；非法返回 None。"""
+    if val is None:
+        return None
+    s = str(val).strip().replace("-", "").replace("/", "")
+    if len(s) >= 8 and s.isdigit():
+        try:
+            return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+        except (ValueError, KeyError):
+            return None
+    return None
+
+
+def fetch_a_announce_dates(period: str) -> dict[str, date]:
+    """拉取指定报告期(date='YYYYMMDD')全市场 A 股业绩报表，返回 {完整代码: 最新公告日期}。
+
+    数据源：AKShare stock_yjbb_em（东方财富业绩报表），含「最新公告日期」列。
+    该接口按报告期返回全市场（非按单只），故用于批量回填披露日；港股无对应列，不在此处理。
+
+    健壮性：东方财富对极早期报告期（如 1994 年）可能返回 None 或内部解析报错
+    （TypeError: 'NoneType' object is not subscriptable）。两种情况都视为「该期无披露数据」，
+    安全跳过，不中断整批回填。
+    """
+    try:
+        df = ak.stock_yjbb_em(date=period)
+    except Exception as e:
+        # 接口内部报错（极早期/无数据期常见）→ 该期跳过，不影响其他期
+        print(f"[A股披露日] stock_yjbb_em({period}) 接口异常，跳过该期: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return {}
+    if df is None or len(df) == 0:
+        # 接口返回空（无数据）→ 该期跳过，不刷 error
+        return {}
+    result: dict[str, date] = {}
+    for _, row in df.iterrows():
+        code6 = str(row.get("股票代码", "")).strip()
+        if not code6.isdigit():
+            continue
+        full = f"{_guess_market(code6)}.{code6}"
+        ad = _parse_date(row.get("最新公告日期"))
+        if ad is not None:
+            result[full] = ad
+    return result
+
+
+def run_announce_date(codes=None, ctx=None):
+    """回填 financial_indicator.announce_date（仅 A 股；港股无数据源，恒留 NULL）。
+
+    流程：取库内已有的 A 股 (stock_code, report_date) → 按报告期逐一调 stock_yjbb_em
+    拿全市场「最新公告日期」→ 仅更新已存在行的 announce_date（skip_null_updates，
+    既不把已有值覆盖成 NULL，也不会插入财务指标尚未存在的脏行）。
+
+    调用：python get_financial.py --announce-date
+    """
+    from collections import defaultdict
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT stock_code, report_date FROM financial_indicator "
+                "WHERE stock_code LIKE 'SH.%%' OR stock_code LIKE 'SZ.%%'"
+            )
+            existing = {(r[0], r[1]) for r in cur.fetchall()}
+    if not existing:
+        print("[A股披露日] financial_indicator 内无 A 股行，跳过")
+        return
+
+    by_period: dict[date, list] = defaultdict(list)
+    for c, rd in existing:
+        by_period[rd].append(c)
+
+    periods = sorted(by_period.keys())
+    print(f"[A股披露日] 需回填 {len(periods)} 个报告期，覆盖 {len(existing)} 行 A 股财务记录")
+    total_updated = 0
+    for rd in periods:
+        period = rd.strftime("%Y%m%d")
+        mapping = fetch_a_announce_dates(period)
+        if not mapping:
+            continue
+        rows = [
+            {"stock_code": c, "report_date": rd, "announce_date": mapping[c]}
+            for c in by_period[rd] if c in mapping
+        ]
+        if not rows:
+            continue
+        try:
+            with get_conn() as conn:
+                bulk_upsert(conn, "financial_indicator", rows,
+                            conflict_cols=["stock_code", "report_date"],
+                            skip_null_updates=True)
+            total_updated += len(rows)
+            print(f"[A股披露日] {period} 更新 {len(rows)} 行")
+        except Exception as e:
+            print(f"[A股披露日] {period} 写入失败: {type(e).__name__}: {e}", file=sys.stderr)
+    print(f"[A股披露日] 回填完成，共更新 {total_updated} 行")
+
+
 # ---------- 工具函数 ----------
 
 def _fetch_hk_cash_flow(symbol: str) -> dict[str, dict]:
@@ -430,8 +529,13 @@ if __name__ == "__main__":
                         help="显式全量模式：采集港股+A股全部代码（约8300只）。代码清单走本地7天缓存，"
                              "过期才重新拉 AKShare。等价于调度器全局任务。")
     parser.add_argument("--verbose", "-v", action="store_true", help="显示详细输出")
+    parser.add_argument("--announce-date", action="store_true",
+                        help="回填 A 股财报披露日 announce_date（港股无数据源留空）；"
+                             "配合 --all 仍走默认财务指标全量，本开关单独触发披露日回填")
     args = parser.parse_args()
-    if args.code and not args.all:
+    if args.announce_date:
+        run_announce_date()                       # 回填 A 股披露日
+    elif args.code and not args.all:
         run([args.code], verbose=args.verbose)   # 指定单只（调试/wecom）
     else:
         run(None, verbose=args.verbose)          # 默认全量模式

@@ -12,7 +12,7 @@
   - 富途快照的 turnover 与新浪 stock_hk_daily 的 amount 逐字段一致（已验证），
     且批量 400 只/次，全市场 2800 只仅需约 7 次调用，远快于逐只拉取。
   - 盘后调用（如 17:00）拿到的就是当天全天完整值。
-  - 历史回溯由 backfill_market_turnover.py 负责（同样走富途批量）。
+  - 历史回溯由 backfill_hk_market_turnover.py 负责（同样走富途批量）。
   - 分层：全市场 → hk_daily_quote；重点深采 → daily_quote（不变）。
 
 字段映射（富途快照 → hk_daily_quote）：

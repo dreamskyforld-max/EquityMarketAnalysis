@@ -16,19 +16,19 @@
   这些字段由日常采集（get_hk_market_turnover.py 富途快照）当天补上。
 
 用法：
-    python3 backfill_market_turnover.py --years 3                 # 全港股回溯近 3 年
-    python3 backfill_market_turnover.py --start 2023-01-01        # 全港股，指定起始日期
-    python3 backfill_market_turnover.py --code HK.01857           # 仅采集单只股票（可省略 HK. 前缀）
-    python3 backfill_market_turnover.py --code 01857 --start 2023-01-01  # 单只 + 起始日期
-    python3 backfill_market_turnover.py --code HK.01857 --dry-run # 只看不落库
+    python3 backfill_hk_market_turnover.py --years 3                 # 全港股回溯近 3 年
+    python3 backfill_hk_market_turnover.py --start 2023-01-01        # 全港股，指定起始日期
+    python3 backfill_hk_market_turnover.py --code HK.01857           # 仅采集单只股票（可省略 HK. 前缀）
+    python3 backfill_hk_market_turnover.py --code 01857 --start 2023-01-01  # 单只 + 起始日期
+    python3 backfill_hk_market_turnover.py --code HK.01857 --dry-run # 只看不落库
 
 分批采集（小内存服务器推荐）：
     # 每轮只采 300 只，跑完自动记录进度；重复执行直到提示「全部采集完成」
-    python3 backfill_market_turnover.py --years 3 --resume --limit 300
+    python3 backfill_hk_market_turnover.py --years 3 --resume --limit 300
     # 查看进度 / 采完后校正总成交额（不采集，秒级）
-    python3 backfill_market_turnover.py --years 3 --aggregate-only
+    python3 backfill_hk_market_turnover.py --years 3 --aggregate-only
     # 只要全市场总额、不要个股日线明细（内存与 PG 写入最省）
-    python3 backfill_market_turnover.py --years 3 --no-quotes
+    python3 backfill_hk_market_turnover.py --years 3 --no-quotes
 
 断点续采说明：
     --resume 的进度来源是 hk_daily_quote 表本身（不用进度文件），
@@ -49,7 +49,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("backfill_market_turnover")
+log = logging.getLogger("backfill_hk_market_turnover")
 
 
 def parse_args() -> "dict[str, object]":

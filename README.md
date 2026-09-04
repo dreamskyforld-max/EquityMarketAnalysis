@@ -228,7 +228,7 @@ python3 get_margin_balance.py            # 融资融券余额
 python3 backfill_daily_quote.py               # 默认 SH.600900，近 60 天
 python3 backfill_daily_quote.py HK.00700 365  # 指定股票 + 天数（自动分页）
 python3 backfill_south_flow.py                # 南向资金历史回填
-python3 backfill_market_turnover.py           # 市场成交额历史回填
+python3 backfill_hk_market_turnover.py           # 市场成交额历史回填
 ```
 
 ### 三层资金流分析

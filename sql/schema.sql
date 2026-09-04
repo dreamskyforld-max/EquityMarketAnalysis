@@ -17,7 +17,10 @@ CREATE TABLE IF NOT EXISTS stock_info (
     currency        VARCHAR(10)     DEFAULT '港元',      -- 货币单位
     is_active       BOOLEAN         DEFAULT TRUE,       -- 是否活跃
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ     DEFAULT NOW()
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+    list_date       DATE,                               -- 上市日期（富途 listing_date；1970-01-01 占位值记为 NULL）
+    exchange_type   VARCHAR(20),                        -- 交易所/板块类型（CN_SH/CN_SZ/CN_STIB/CN_BJ/HK_MAINBOARD/HK_GEMBOARD）
+    delisting       BOOLEAN                             -- 是否已退市（富途 delisting）
 );
 
 COMMENT ON TABLE  stock_info                     IS '股票基本信息（参考数据）';
@@ -29,6 +32,9 @@ COMMENT ON COLUMN stock_info.currency             IS '交易货币单位，港�
 COMMENT ON COLUMN stock_info.is_active            IS '是否仍在活跃采集，FALSE 时跳过该股票';
 COMMENT ON COLUMN stock_info.created_at           IS '记录创建时间';
 COMMENT ON COLUMN stock_info.updated_at           IS '记录最后更新时间';
+COMMENT ON COLUMN stock_info.list_date            IS '上市日期（富途 listing_date；1970-01-01 占位值记为 NULL）';
+COMMENT ON COLUMN stock_info.exchange_type        IS '交易所/板块类型（富途：CN_SH / CN_SZ / CN_STIB / CN_BJ / HK_MAINBOARD / HK_GEMBOARD）';
+COMMENT ON COLUMN stock_info.delisting            IS '是否已退市（富途 delisting）。补采脚本写入，新增股票一律 is_active=FALSE，不进入现有采集池';
 
 -- 1.1 股票-指数成分归属表（参考数据，低频刷新）
 -- 反向建表：遍历「已知指数 → 全成分」，每只成分股落一行。
@@ -110,7 +116,7 @@ COMMENT ON COLUMN daily_quote.pb_ratio            IS '市净率（来自富途�
 COMMENT ON COLUMN daily_quote.dividend_ratio_ttm  IS '股息率TTM(%)（来自富途快照 dividend_ratio_ttm）';
 COMMENT ON COLUMN daily_quote.created_at          IS '数据写入数据库的时间';
 
-CREATE INDEX idx_daily_quote_stock_date ON daily_quote (stock_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_daily_quote_stock_date ON daily_quote (stock_code, trade_date DESC);
 
 -- 3. 每日基准指数行情
 CREATE TABLE IF NOT EXISTS daily_benchmark (
@@ -140,7 +146,7 @@ COMMENT ON COLUMN daily_benchmark.change_pct          IS '基准指数涨跌幅(
 COMMENT ON COLUMN daily_benchmark.close_20d_ago       IS '20个交易日前的收盘价，用于计算中期趋势';
 COMMENT ON COLUMN daily_benchmark.created_at          IS '数据写入数据库的时间';
 
-CREATE INDEX idx_daily_bench_code_date ON daily_benchmark (bench_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_daily_bench_code_date ON daily_benchmark (bench_code, trade_date DESC);
 
 -- 4. 北向资金（市场级别，非个股）
 CREATE TABLE IF NOT EXISTS daily_northbound_flow (
@@ -157,7 +163,7 @@ COMMENT ON COLUMN daily_northbound_flow.trade_date   IS '交易日期 (YYYY-MM-D
 COMMENT ON COLUMN daily_northbound_flow.net_inflow   IS '北向资金当日合计净流入金额（亿元），正数=净买入，负数=净卖出，0=无数据(网站未更新或节假日)';
 COMMENT ON COLUMN daily_northbound_flow.created_at   IS '数据写入数据库的时间';
 
-CREATE INDEX idx_northbound_date ON daily_northbound_flow (trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_northbound_date ON daily_northbound_flow (trade_date DESC);
 
 -- 5. 南向资金 → 已合并到 daily_ggt_hold（见下方），daily_south_flow 已废弃
 
@@ -184,7 +190,7 @@ COMMENT ON COLUMN daily_cbbc.bear_call_level         IS '街货量最大的熊�
 COMMENT ON COLUMN daily_cbbc.bear_street_volume      IS '街货量最大的熊证对应街货量（张），代表散户看空力量';
 COMMENT ON COLUMN daily_cbbc.created_at              IS '数据写入数据库的时间';
 
-CREATE INDEX idx_cbbc_stock_date ON daily_cbbc (stock_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_cbbc_stock_date ON daily_cbbc (stock_code, trade_date DESC);
 
 -- 7. 全日沽空数据
 CREATE TABLE IF NOT EXISTS daily_short_selling (
@@ -209,7 +215,7 @@ COMMENT ON COLUMN daily_short_selling.short_selling_vol   IS '当日全日沽空
 COMMENT ON COLUMN daily_short_selling.short_selling_amt   IS '当日全日沽空金额（亿港元）';
 COMMENT ON COLUMN daily_short_selling.created_at          IS '数据写入数据库的时间';
 
-CREATE INDEX idx_short_selling_stock_date ON daily_short_selling (stock_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_short_selling_stock_date ON daily_short_selling (stock_code, trade_date DESC);
 
 -- 8. 公司回购记录（单次回购明细，累计汇总可动态计算）
 CREATE TABLE IF NOT EXISTS daily_buyback_event (
@@ -236,7 +242,7 @@ COMMENT ON COLUMN daily_buyback_event.avg_price     IS '该次回购均价（成
 COMMENT ON COLUMN daily_buyback_event.amount        IS '该次回购总金额（元/港元）';
 COMMENT ON COLUMN daily_buyback_event.created_at    IS '数据写入数据库的时间';
 
-CREATE INDEX idx_buyback_event_stock_date ON daily_buyback_event (stock_code, buyback_date DESC);
+CREATE INDEX IF NOT EXISTS idx_buyback_event_stock_date ON daily_buyback_event (stock_code, buyback_date DESC);
 
 -- 9. A股回购方案（方案维度进度快照，数据源：AKShare stock_repurchase_em）
 --    与港股 daily_buyback_event（逐日明细）粒度不同，故独立成表。
@@ -272,8 +278,8 @@ COMMENT ON COLUMN a_stock_repurchase_plan.plan_amt_max  IS '计划回购金额�
 COMMENT ON COLUMN a_stock_repurchase_plan.repurchased_amt IS '已回购金额(累计,元)，代表方案已落地力度';
 COMMENT ON COLUMN a_stock_repurchase_plan.latest_ann_date IS '最新公告日期，该进度快照对应的披露日';
 
-CREATE INDEX idx_repurchase_plan_stock ON a_stock_repurchase_plan (stock_code);
-CREATE INDEX idx_repurchase_plan_ann_date ON a_stock_repurchase_plan (latest_ann_date DESC);
+CREATE INDEX IF NOT EXISTS idx_repurchase_plan_stock ON a_stock_repurchase_plan (stock_code);
+CREATE INDEX IF NOT EXISTS idx_repurchase_plan_ann_date ON a_stock_repurchase_plan (latest_ann_date DESC);
 
 -- 9. 港股通持股
 CREATE TABLE IF NOT EXISTS daily_ggt_hold (
@@ -305,7 +311,7 @@ COMMENT ON COLUMN daily_ggt_hold.hold_num_change       IS '持股数量较上一
 COMMENT ON COLUMN daily_ggt_hold.hold_ratio_change     IS '持股比例较上一交易日变动(%)，正数=增加，负数=减少';
 COMMENT ON COLUMN daily_ggt_hold.created_at            IS '数据写入数据库的时间';
 
-CREATE INDEX idx_ggt_hold_stock_date ON daily_ggt_hold (stock_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_ggt_hold_stock_date ON daily_ggt_hold (stock_code, trade_date DESC);
 
 -- 10. 融资融券全量明细（A股沪深两市专用）
 -- 数据来自沪深交易所逐日公布的「融资融券明细」，覆盖全市场全部标的，含融资+融券双向。
@@ -340,7 +346,7 @@ COMMENT ON COLUMN daily_margin_balance.rq_repay       IS '当日融券偿还量�
 COMMENT ON COLUMN daily_margin_balance.rzrq_balance   IS '融资融券余额合计（元）= 融资余额 + 融券余额';
 COMMENT ON COLUMN daily_margin_balance.created_at     IS '数据写入数据库的时间';
 
-CREATE INDEX idx_margin_stock_date ON daily_margin_balance (stock_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_margin_stock_date ON daily_margin_balance (stock_code, trade_date DESC);
 
 -- 11. 趋势技术指标（均线/MACD/RSI）
 CREATE TABLE IF NOT EXISTS daily_trend (
@@ -373,7 +379,7 @@ COMMENT ON COLUMN daily_trend.macd_hist         IS 'MACD柱状线 = 2*(DIF-DEA)�
 COMMENT ON COLUMN daily_trend.rsi14             IS '14日相对强弱指标(0-100)，>70超买，<30超卖';
 COMMENT ON COLUMN daily_trend.created_at        IS '数据写入数据库的时间';
 
-CREATE INDEX idx_trend_stock_date ON daily_trend (stock_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_trend_stock_date ON daily_trend (stock_code, trade_date DESC);
 
 -- ============================================================================
 -- 第三部分：盘中实时数据表（交易时段多次采集）
@@ -426,7 +432,7 @@ COMMENT ON COLUMN realtime_order_size.small_net        IS '小单净流入（亿
 COMMENT ON COLUMN realtime_order_size.direction        IS '资金方向文字描述，如"大单与中小单均为净流入"/"大单净流入，中小单净流出"等';
 COMMENT ON COLUMN realtime_order_size.created_at       IS '数据写入数据库的时间';
 
-CREATE INDEX idx_order_size_stock_time ON realtime_order_size (stock_code, snapshot_time DESC);
+CREATE INDEX IF NOT EXISTS idx_order_size_stock_time ON realtime_order_size (stock_code, snapshot_time DESC);
 
 -- ============================================================================
 -- 第四部分：趋势快照表（每3分钟采样，多维度聚合）
@@ -472,13 +478,13 @@ COMMENT ON COLUMN trend_snapshot.buy_levels_str       IS '买盘前5档摘要字
 COMMENT ON COLUMN trend_snapshot.sell_levels_str      IS '卖盘前5档摘要字符串，格式: "473.0(13K) 473.2(32K) ..."，可据此分析盘口挂单压力';
 COMMENT ON COLUMN trend_snapshot.created_at           IS '数据写入数据库的时间';
 
-CREATE INDEX idx_trend_snapshot_stock_time ON trend_snapshot (stock_code, snapshot_time DESC);
-CREATE INDEX idx_trend_snapshot_date ON trend_snapshot (snapshot_date);
-CREATE INDEX idx_trend_snapshot_stock_updated ON trend_snapshot (stock_code, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trend_snapshot_stock_time ON trend_snapshot (stock_code, snapshot_time DESC);
+CREATE INDEX IF NOT EXISTS idx_trend_snapshot_date ON trend_snapshot (snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_trend_snapshot_stock_updated ON trend_snapshot (stock_code, updated_at DESC);
 -- 监控 monitor_collector 的 MAX(snapshot_time) WHERE snapshot_time>=窗口 查询用：
 -- 复合索引 (stock_code, snapshot_time) 中 snapshot_time 非前导列，无法用于单独范围查询，
 -- 故加单列索引，使该查询走 Index Only Scan Backward（~1ms）而非全表扫。
-CREATE INDEX idx_trend_snapshot_time ON trend_snapshot (snapshot_time);
+CREATE INDEX IF NOT EXISTS idx_trend_snapshot_time ON trend_snapshot (snapshot_time);
 
 -- ============================================================================
 -- 第五部分：采集运行日志
@@ -511,7 +517,7 @@ COMMENT ON COLUMN collection_run_log.error_detail     IS '失败模块的错误�
 COMMENT ON COLUMN collection_run_log.trigger_type     IS '触发方式：manual(手动) / scheduled(定时器) / wecom_cmd(企业微信指令)';
 COMMENT ON COLUMN collection_run_log.created_at       IS '记录创建时间';
 
-CREATE INDEX idx_collection_run_stock_time ON collection_run_log (stock_code, run_time DESC);
+CREATE INDEX IF NOT EXISTS idx_collection_run_stock_time ON collection_run_log (stock_code, run_time DESC);
 
 -- ============================================================================
 -- 第六部分：逐笔成交数据
@@ -545,11 +551,11 @@ COMMENT ON COLUMN tick_data.sequence               IS '富途全局唯一逐笔�
 COMMENT ON COLUMN tick_data.tick_type               IS '成交类型：AUTO_MATCH(自动对盘), AUCTION(竞价), ODD_LOT(碎股) 等';
 COMMENT ON COLUMN tick_data.created_at             IS '数据写入数据库的时间';
 
-CREATE INDEX idx_tick_data_stock_time ON tick_data (stock_code, tick_time DESC);
-CREATE INDEX idx_tick_data_time       ON tick_data (tick_time);
+CREATE INDEX IF NOT EXISTS idx_tick_data_stock_time ON tick_data (stock_code, tick_time DESC);
+CREATE INDEX IF NOT EXISTS idx_tick_data_time       ON tick_data (tick_time);
 -- stock-realtime 高频聚合查询加速：覆盖分钟聚合 / 日粒度指纹 / 四档大单统计 / 量能统计，
 -- WHERE 均为 stock_code + tick_time 范围 + ticker_direction 过滤。INCLUDE 使其成为 Index Only Scan。
-CREATE INDEX idx_tick_data_stock_time_dir
+CREATE INDEX IF NOT EXISTS idx_tick_data_stock_time_dir
   ON tick_data (stock_code, tick_time, ticker_direction)
   INCLUDE (turnover, volume, price);
 
@@ -575,9 +581,9 @@ COMMENT ON TABLE  full_tick_data           IS '富途逐笔全量旁路落盘（
 COMMENT ON COLUMN full_tick_data.sequence   IS '富途逐笔序号，与 tick_data.sequence 同义，本表不唯一';
 COMMENT ON COLUMN full_tick_data.received_at IS '落盘时间，约等价收到批次时刻';
 
-CREATE INDEX idx_full_tick_seq        ON full_tick_data (sequence);
-CREATE INDEX idx_full_tick_stock_time ON full_tick_data (stock_code, tick_time);
-CREATE INDEX idx_full_tick_received   ON full_tick_data (received_at);
+CREATE INDEX IF NOT EXISTS idx_full_tick_seq        ON full_tick_data (sequence);
+CREATE INDEX IF NOT EXISTS idx_full_tick_stock_time ON full_tick_data (stock_code, tick_time);
+CREATE INDEX IF NOT EXISTS idx_full_tick_received   ON full_tick_data (received_at);
 
 
 -- ============================================================================
@@ -615,9 +621,9 @@ COMMENT ON COLUMN tick_quant_detail.f2_burst             IS 'F2 爆发密度：�
 COMMENT ON COLUMN tick_quant_detail.f4_slice             IS 'F4 拆单切片：连续同向同股数 burst 长度，指数衰减映射';
 COMMENT ON COLUMN tick_quant_detail.is_quant             IS '是否疑似量化（quant_score >= 0.5）';
 
-CREATE INDEX idx_quant_detail_stock_time ON tick_quant_detail (stock_code, tick_time);
-CREATE INDEX idx_quant_detail_score     ON tick_quant_detail (stock_code, quant_score);
-CREATE INDEX idx_quant_detail_is_quant  ON tick_quant_detail (stock_code, is_quant);
+CREATE INDEX IF NOT EXISTS idx_quant_detail_stock_time ON tick_quant_detail (stock_code, tick_time);
+CREATE INDEX IF NOT EXISTS idx_quant_detail_score     ON tick_quant_detail (stock_code, quant_score);
+CREATE INDEX IF NOT EXISTS idx_quant_detail_is_quant  ON tick_quant_detail (stock_code, is_quant);
 
 -- ============================================================================
 -- 第九部分：趋势分段
@@ -670,9 +676,9 @@ COMMENT ON COLUMN trend_segment.low_price            IS '段内最低价';
 COMMENT ON COLUMN trend_segment.change_pct           IS '段涨跌幅(%)';
 COMMENT ON COLUMN trend_segment.slope_pct_min        IS '段内价格斜率(%/分钟)';
 
-CREATE INDEX idx_trend_seg_stock_date ON trend_segment(stock_code, trade_date);
-CREATE INDEX idx_trend_seg_time      ON trend_segment(start_time, end_time);
-CREATE INDEX idx_trend_seg_rhythm    ON trend_segment(stock_code, trade_date, l2_rhythm);
+CREATE INDEX IF NOT EXISTS idx_trend_seg_stock_date ON trend_segment(stock_code, trade_date);
+CREATE INDEX IF NOT EXISTS idx_trend_seg_time      ON trend_segment(start_time, end_time);
+CREATE INDEX IF NOT EXISTS idx_trend_seg_rhythm    ON trend_segment(stock_code, trade_date, l2_rhythm);
 
 
 -- ============================================================================
@@ -695,6 +701,7 @@ CREATE TABLE IF NOT EXISTS financial_indicator (
     net_profit_yoy      NUMERIC(12,4),                      -- 归母净利润同比增长率(%)
     operating_cash_flow NUMERIC(18,2),                      -- 经营活动现金流量净额（元）
     free_cash_flow      NUMERIC(18,2),                      -- 自由现金流（元），暂留空，待补充 CAPEX
+    announce_date       DATE,                               -- 财报实际披露/公告日（A股取东方财富业绩报表「最新公告日期」；港股暂无数据源，恒为 NULL）
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
 
     UNIQUE (stock_code, report_date)
@@ -714,9 +721,10 @@ COMMENT ON COLUMN financial_indicator.revenue_yoy              IS '营业收入�
 COMMENT ON COLUMN financial_indicator.net_profit_yoy           IS '归母净利润同比增长率(%)';
 COMMENT ON COLUMN financial_indicator.operating_cash_flow      IS '经营活动现金流量净额（元）。港股由 OCF_SALES% × OPERATE_INCOME 推算，A股直接取自抽象表';
 COMMENT ON COLUMN financial_indicator.free_cash_flow           IS '自由现金流（元），暂留空 NULL，后续补充 CAPEX 数据后计算（FCF = OCF - CAPEX）';
+COMMENT ON COLUMN financial_indicator.announce_date            IS '财报实际披露/公告日（A股来自东方财富业绩报表「最新公告日期」；港股暂无数据源，恒为 NULL）';
 COMMENT ON COLUMN financial_indicator.created_at               IS '数据写入数据库的时间';
 
-CREATE INDEX idx_financial_indicator_stock_date ON financial_indicator (stock_code, report_date DESC);
+CREATE INDEX IF NOT EXISTS idx_financial_indicator_stock_date ON financial_indicator (stock_code, report_date DESC);
 
 -- 21. 港股全市场（主板）总成交额快照
 CREATE TABLE IF NOT EXISTS daily_market_turnover (
@@ -730,7 +738,7 @@ CREATE TABLE IF NOT EXISTS daily_market_turnover (
 
     UNIQUE (trade_date)
 );
-CREATE UNIQUE INDEX uq_market_turnover_tradedate ON public.daily_market_turnover USING btree (trade_date);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_market_turnover_tradedate ON public.daily_market_turnover USING btree (trade_date);
 
 COMMENT ON TABLE  daily_market_turnover                     IS '港股全市场总成交额（数据源：新浪 stock_hk_daily 逐只聚合，T+1 全天完整值）';
 COMMENT ON COLUMN daily_market_turnover.snapshot_time       IS '快照时间戳（日频=盘后一次，分钟级=每分钟一次）';
@@ -739,7 +747,7 @@ COMMENT ON COLUMN daily_market_turnover.total_volume        IS '全市场总成�
 COMMENT ON COLUMN daily_market_turnover.stock_count         IS '参与聚合的标的数量（用于校验是否拉全）';
 COMMENT ON COLUMN daily_market_turnover.created_at          IS '数据写入数据库的时间';
 
-CREATE INDEX idx_market_turnover_time ON daily_market_turnover (snapshot_time DESC);
+CREATE INDEX IF NOT EXISTS idx_market_turnover_time ON daily_market_turnover (snapshot_time DESC);
 
 -- 22. 港股全量股票简版日线（数据池）
 CREATE TABLE IF NOT EXISTS hk_daily_quote (
@@ -761,6 +769,8 @@ CREATE TABLE IF NOT EXISTS hk_daily_quote (
     pe_ratio            NUMERIC(12,4),              -- 市盈率(静态)
     pe_ttm_ratio        NUMERIC(12,4),              -- 市盈率(TTM)
     pb_ratio            NUMERIC(12,4),              -- 市净率
+    ps_ttm_ratio        NUMERIC(12,4),              -- 市销率(TTM) = 总市值/营收TTM（由 financial_indicator 营收TTM 推算，非富途快照）
+    pcf_ttm_ratio       NUMERIC(12,4),              -- 市现率(TTM) = 总市值/经营活动现金流TTM（由 financial_indicator 经营现金流TTM 推算）
     dividend_ratio_ttm  NUMERIC(8,4),               -- 股息率(TTM, %)
     update_time         TIMESTAMPTZ,                -- 数据更新时间（富途快照的 update_time）
     created_at  TIMESTAMPTZ     DEFAULT NOW(),
@@ -768,13 +778,15 @@ CREATE TABLE IF NOT EXISTS hk_daily_quote (
     UNIQUE (stock_code, trade_date)
 );
 
-COMMENT ON TABLE  hk_daily_quote             IS '港股全量股票简版日线数据池（数据源：富途 get_market_snapshot 快照 / request_history_kline 历史）';
+COMMENT ON TABLE  hk_daily_quote             IS '港股全量股票简版日线数据池（数据源：富途 get_market_snapshot 快照 / request_history_kline 历史；PS/PCF 由 financial_indicator 推算）';
+COMMENT ON COLUMN hk_daily_quote.ps_ttm_ratio  IS '市销率(TTM)=总市值/营收TTM（financial_indicator 近4季营收滚动求和推算）';
+COMMENT ON COLUMN hk_daily_quote.pcf_ttm_ratio IS '市现率(TTM)=总市值/经营活动现金流TTM（financial_indicator 近4季经营现金流滚动求和推算）';
 COMMENT ON COLUMN hk_daily_quote.stock_code  IS '股票代码，如 HK.00700';
 COMMENT ON COLUMN hk_daily_quote.amount      IS '成交额（港元），全天完整值';
 COMMENT ON COLUMN hk_daily_quote.update_time IS '数据更新时间（富途快照的 update_time；历史回溯则为交易日）';
 
-CREATE INDEX idx_hk_daily_quote_date  ON hk_daily_quote (trade_date DESC);
-CREATE INDEX idx_hk_daily_quote_stock ON hk_daily_quote (stock_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_hk_daily_quote_date  ON hk_daily_quote (trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_hk_daily_quote_stock ON hk_daily_quote (stock_code, trade_date DESC);
 
 -- ============================================================================
 -- 第十一部分：辅助视图
@@ -947,6 +959,8 @@ CREATE TABLE IF NOT EXISTS a_daily_quote (
     pe_ratio            NUMERIC(12,4),
     pe_ttm_ratio        NUMERIC(12,4),
     pb_ratio            NUMERIC(12,4),
+    ps_ttm_ratio        NUMERIC(12,4),                      -- 市销率(TTM) = 总市值/营收TTM（东财 RPT_VALUEANALYSIS_DET PS_TTM）
+    pcf_ttm_ratio       NUMERIC(12,4),                      -- 市现率(TTM) = 总市值/经营现金流TTM（东财 RPT_VALUEANALYSIS_DET PCF_OCF_TTM）
     dividend_ratio_ttm  NUMERIC(8,4),
     update_time         TIMESTAMPTZ,
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
@@ -954,9 +968,11 @@ CREATE TABLE IF NOT EXISTS a_daily_quote (
 );
 CREATE INDEX IF NOT EXISTS idx_aquote_trade_date ON public.a_daily_quote USING btree (trade_date);
 
-COMMENT ON TABLE  a_daily_quote                  IS 'A股个股每日行情/估值快照（盘后采集）';
+COMMENT ON TABLE  a_daily_quote                  IS 'A股个股每日行情/估值快照（盘后采集；PS/PCF 来自东财 RPT_VALUEANALYSIS_DET）';
 COMMENT ON COLUMN a_daily_quote.stock_code       IS '股票完整代码，如 SH.600519';
 COMMENT ON COLUMN a_daily_quote.trade_date       IS '交易日';
+COMMENT ON COLUMN a_daily_quote.ps_ttm_ratio     IS '市销率(TTM)=总市值/营收TTM（东财 RPT_VALUEANALYSIS_DET PS_TTM，已按 QFQ 复权因子平移）';
+COMMENT ON COLUMN a_daily_quote.pcf_ttm_ratio    IS '市现率(TTM)=总市值/经营现金流TTM（东财 RPT_VALUEANALYSIS_DET PCF_OCF_TTM，已按 QFQ 复权因子平移）';
 
 -- 3.2 全球基准指数分钟行情（get_global_benchmarks_minute.py）
 CREATE TABLE IF NOT EXISTS benchmark_minute (
@@ -1136,3 +1152,155 @@ CREATE TABLE IF NOT EXISTS monitor_task_config (
 
 COMMENT ON TABLE  monitor_task_config        IS '采集监控配置：高频任务两次触发最大允许间隔（分钟）';
 COMMENT ON COLUMN monitor_task_config.max_interval_min IS '该任务两次触发的最大允许间隔（分钟）';
+
+-- ============================================================================
+-- 第十二部分：股票画像系统（profiling 模块，独立 schema: profile）
+-- ----------------------------------------------------------------------------
+-- 建表 DDL 由 profiling/schema.py 的 ensure_schema() 幂等执行（含按年分区的自动创建），
+-- 此处仅作为结构真相源登记，供新服务器部署与结构比对使用。
+-- 设计说明见 profiling/__init__.py 与 profiling/schema.py 的文档字符串。
+-- ============================================================================
+
+CREATE SCHEMA IF NOT EXISTS profile;
+
+-- 1. 标签字典：每个标签的元数据（口径/来源/频率/版本/状态）
+CREATE TABLE IF NOT EXISTS profile.tag_registry (
+    tag_code        TEXT    PRIMARY KEY,       -- 唯一标识，如 idt_market
+    tag_name        TEXT    NOT NULL,          -- 中文名
+    domain          TEXT    NOT NULL,          -- 所属域，如「证券属性」（不带设计文档里的域序号）
+    parent_tag      TEXT,                      -- 父标签（层级）
+    value_type      TEXT    NOT NULL,          -- enum / bool / tier / float
+    value_range     JSONB,                     -- 取值说明：tier/float 用 {code: label}；enum 的规范值域见 profile.enum_value
+    value_ref       TEXT,                      -- 值域来源：'enum:<enum_type>' 引用 enum_value 表，
+                                               -- 或 'table:<表>.<列>[过滤]' 引用已有权威表（行业/指数/概念）
+    num_unit        TEXT,                      -- num_value 的计量单位（受控枚举）：x=倍数 / pct=百分比 /
+                                               -- pp=百分点 / percentile_0_100=分位 / CNY|HKD=按市场原币 /
+                                               -- years=年 / count=计数 / rank=排名；enum/bool 标签为空
+    source_type     TEXT    NOT NULL,          -- rule / stat / model / external / manual
+    compute_logic   TEXT,                      -- 计算口径描述
+    update_freq     TEXT    NOT NULL,          -- daily / weekly / monthly / quarterly / event / static
+    data_sources    TEXT[],                    -- 依赖的数据表（血缘用）
+    multi_value     BOOLEAN DEFAULT FALSE,     -- 多重归属（如指数成分、概念板块）
+    is_exclusive    BOOLEAN DEFAULT FALSE,     -- 同时点互斥（仅 ⑩ 趋势状态为 true）
+    confidence_req  BOOLEAN DEFAULT FALSE,     -- 是否必须带置信度（模型类标签为 true）
+    pit_capable     BOOLEAN DEFAULT FALSE,     -- 能否回溯历史（依赖数据是否自带生效时点）
+    version         TEXT    NOT NULL DEFAULT 'v1',
+    status          TEXT    NOT NULL DEFAULT 'active',   -- active / planned_no_data / deprecated
+    blocked_reason  TEXT,                      -- status != active 时的原因
+    owner           TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+COMMENT ON TABLE  profile.tag_registry     IS '标签字典：由 profiling.registry 从代码 @tag 装饰器同步写入，代码即字典，避免口径与实现漂移';
+COMMENT ON COLUMN profile.tag_registry.pit_capable IS '能否回溯历史 as_of。stock_sector 等只有当前快照的数据源，其派生标签为 false';
+COMMENT ON COLUMN profile.tag_registry.status IS 'active=已实现 / planned_no_data=口径已定但数据源缺失，暂不计算';
+COMMENT ON COLUMN profile.tag_registry.value_ref IS 'enum 标签的值域来源声明；引用已有权威表的（行业/指数/概念）不复制值域，避免两套真相';
+COMMENT ON COLUMN profile.tag_registry.num_unit IS 'num_value 的计量单位（受控枚举）：x=倍数 / pct=百分比 / pp=百分点 / percentile_0_100=分位 / CNY|HKD=按市场原币 / years=年 / count=计数 / rank=排名。前端格式化展示与跨标签比较依赖此列';
+
+-- 2. 枚举值域字典：enum 类型标签的规范取值
+--    核心约束「一个概念 = 一个 code」：key_value 存 code，中文只作 label，
+--    杜绝「上交所 / 上海证券交易所 / SSE」同义异名变成多个概念。
+CREATE TABLE IF NOT EXISTS profile.enum_value (
+    enum_type    TEXT        NOT NULL,      -- 值域类型（如 exchange / board / market），可被多个标签复用
+    code         TEXT        NOT NULL,      -- 规范代码：唯一标识，enum 标签落库的就是它
+    label        TEXT        NOT NULL,      -- 中文正式名称（同一 enum_type 内与 short_label 一并全局唯一）
+    short_label  TEXT,                      -- 中文简称（仅展示用，不参与比较与关联）
+    parent_code  TEXT,                      -- 层级父项（如板块 → 所属交易所）
+    sort_order   INT         DEFAULT 0,
+    is_active    BOOLEAN     DEFAULT TRUE,
+    updated_at   TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (enum_type, code)
+);
+
+COMMENT ON TABLE  profile.enum_value         IS '枚举值域字典：enum 标签的规范取值。一个概念 = 一个 code，中文名只作 label';
+COMMENT ON COLUMN profile.enum_value.code    IS '规范代码：优先采用外部权威代码（交易所用 ISO 10383 MIC：XSHG/XSHE/XBEI/XHKG）';
+COMMENT ON COLUMN profile.enum_value.label   IS '中文正式名称，同一 enum_type 内唯一；简称放 short_label，不另立 code';
+COMMENT ON COLUMN profile.enum_value.parent_code IS '层级父项 code，用于板块归属交易所等上下级关系';
+
+-- 3. 标签值：EAV + 版本化，按 eff_from 按年分区
+CREATE TABLE IF NOT EXISTS profile.tag_value (
+    id           BIGSERIAL,
+    stock_code   TEXT             NOT NULL,
+    tag_code     TEXT             NOT NULL,
+    key_value    TEXT             NOT NULL,   -- 离散取值：组合筛选与位图索引的键（enum 存规范 code）
+    num_value    DOUBLE PRECISION,            -- 连续取值：研究回测用，保留分档损失的信息量
+    confidence   REAL             NOT NULL DEFAULT 1.0,
+    eff_from     DATE             NOT NULL,   -- 生效日（含）
+    eff_to       DATE             NOT NULL DEFAULT '9999-12-31',  -- 失效日（含），当前有效=9999-12-31
+    version      TEXT             NOT NULL DEFAULT 'v1',
+    created_at   TIMESTAMPTZ      DEFAULT NOW(),
+    update_time  TIMESTAMPTZ      DEFAULT NOW(),   -- 本行最后一次被修改的时间（同日原地修正时刷新）
+    PRIMARY KEY (id, eff_from),               -- 分区表主键必须包含分区键
+    UNIQUE (stock_code, tag_code, key_value, eff_from)
+) PARTITION BY RANGE (eff_from);
+
+COMMENT ON TABLE  profile.tag_value         IS '股票标签值（EAV + 版本化）。标签变更不覆盖旧值而是关闭旧版本，天然支持 as_of_date 时间旅行';
+COMMENT ON COLUMN profile.tag_value.key_value  IS '离散取值，组合筛选与位图索引的键。enum 类型存规范 code（如 XSHG）而非中文名，中文显示名查 profile.enum_value';
+COMMENT ON COLUMN profile.tag_value.num_value  IS '连续取值（如真实 PE=87.3）。分档会损失边界信息，此列保留原始数值供回测/排序/重标定';
+COMMENT ON COLUMN profile.tag_value.confidence IS '置信度 0-1：规则/统计类恒为 1.0，模型类为校准后的预测概率，筛选时用于阈值过滤';
+COMMENT ON COLUMN profile.tag_value.eff_from   IS '生效日（含）。值变化时关闭旧行并新增一行，不覆盖历史';
+COMMENT ON COLUMN profile.tag_value.eff_to     IS '失效日（含），当前有效行为 9999-12-31';
+COMMENT ON COLUMN profile.tag_value.update_time IS '本行最后一次被修改的时间；产生新版本时新行的 update_time = 写入时间';
+
+-- 兜底分区：未预建年份的数据落此处，避免插入时因无匹配分区而报错。
+-- 各年份分区（profile.tag_value_YYYY）由 profiling/schema.py 的 ensure_partition() 按需自动创建。
+CREATE TABLE IF NOT EXISTS profile.tag_value_default PARTITION OF profile.tag_value DEFAULT;
+
+-- 按标签取值取股票集合（组合筛选主访问路径）
+CREATE INDEX IF NOT EXISTS idx_tag_value_lookup
+    ON profile.tag_value (tag_code, key_value, eff_from, eff_to, stock_code);
+-- 按股票查其全部标签（个股档案主访问路径）
+CREATE INDEX IF NOT EXISTS idx_tag_value_stock
+    ON profile.tag_value (stock_code, tag_code, eff_from DESC);
+
+-- 4. 标签计算运行日志
+CREATE TABLE IF NOT EXISTS profile.tag_run_log (
+    id           BIGSERIAL PRIMARY KEY,
+    tag_code     TEXT        NOT NULL,
+    as_of        DATE        NOT NULL,
+    rows_total   INT,                          -- 本次计算产出的 (股票, 取值) 行数
+    rows_new     INT,                          -- 新增行数
+    rows_closed  INT,                          -- 关闭的旧版本行数
+    duration_ms  INT,
+    version      TEXT,
+    status       TEXT,                         -- ok / skipped / error
+    message      TEXT,
+    created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+COMMENT ON TABLE profile.tag_run_log IS '标签计算运行日志：行数变化与耗时。新增/关闭行数异常通常意味着口径变动或上游数据异常';
+
+-- ============================================================================
+-- 分红送配明细（全市场：A股 + 港股）
+-- 数据源: A股=东方财富 RPT_SHAREBONUS_DET(source='em')；港股=同花顺F10(source='ths')
+-- 采集: get_dividend_history.py（全市场全历史回填 = 每周刷新同入口，幂等 upsert）
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS dividend_history (
+    id            BIGSERIAL       PRIMARY KEY,
+    stock_code    VARCHAR(20)     NOT NULL,               -- 如 HK.00700 / SH.600900 / BJ.830799
+    announce_date DATE,                                   -- 预案/方案公告日
+    record_date   DATE,                                   -- 股权登记日(A股)/过户起始日(港股)
+    ex_date       DATE,                                   -- 除净日/除权除息日
+    pay_date      DATE,                                   -- 派息日（仅港股有，A股报表无此列）
+    dps           NUMERIC(12,6),                          -- 每股税前现金派息（送转股不计入）
+    currency      VARCHAR(8),                             -- 币种: CNY/HKD/USD（按方案文本识别）
+    progress      VARCHAR(32),                            -- 进度: 实施分配/实施完成/预案...
+    report_period VARCHAR(32),                            -- 报告期: A股=报告期日期(YYYY-MM-DD)；港股=年报/中报/一季报
+    is_dividend   BOOLEAN         NOT NULL DEFAULT TRUE,  -- FALSE=「不分红」显式预案行（连续分红年数判定依据）
+    source        VARCHAR(16)     NOT NULL,               -- 来源: em(A股东财) / ths(港股同花顺)
+    dedup_key     VARCHAR(64)     NOT NULL,               -- 业务键: A股=公告日|报告期；港股=公告日|报告类型
+    created_at    TIMESTAMPTZ     DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ     DEFAULT NOW(),
+
+    UNIQUE (stock_code, source, dedup_key)
+);
+
+COMMENT ON TABLE  dividend_history             IS '分红送配明细（原始事件层，不聚合）。计算层据此推分红率/连续分红年数/历史TTM回放';
+COMMENT ON COLUMN dividend_history.stock_code    IS '股票完整代码（SECUCODE 直转，含 SH/SZ/BJ/HK）';
+COMMENT ON COLUMN dividend_history.dps           IS '每股税前现金派息：A股=PRETAX_BONUS_RMB/10；港股=方案文本解析（默认港元）';
+COMMENT ON COLUMN dividend_history.is_dividend   IS '港股「不分红」公告行=False 且 ex_date/pay_date/dps 为空；A股报表只列分红方案，恒为 TRUE';
+COMMENT ON COLUMN dividend_history.dedup_key     IS '同一方案进度推进（预案→实施）时业务键不变 → upsert 原地更新，不产生重复行';
+
+CREATE INDEX IF NOT EXISTS idx_dividend_history_code ON dividend_history (stock_code, ex_date DESC);
+CREATE INDEX IF NOT EXISTS idx_dividend_history_ex_date ON dividend_history (ex_date);

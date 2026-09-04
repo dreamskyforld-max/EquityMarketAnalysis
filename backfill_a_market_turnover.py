@@ -15,7 +15,7 @@ A股全市场总成交额 · 历史回溯（akshare stock_zh_a_daily / 新浪源
     全 A 5000+ 需 50+ 轮 × 7天 ≈ 1 年才能采完，无法做全量回溯。
   - akshare stock_zh_a_hist（东财源）实测网络不稳定（ConnectionError 频发），不采用。
   - akshare stock_zh_a_daily（新浪源）无该额度限制、实测稳定，能一次拿完整历史，
-    与港股版 backfill_market_turnover.py 用新浪（stock_hk_daily）思路一致。
+    与港股版 backfill_hk_market_turnover.py 用新浪（stock_hk_daily）思路一致。
 
 采集范围：
   - 默认「全量、无时间窗」：每只股票直接取新浪返回的完整上市以来日线（多多益善）。
@@ -45,6 +45,8 @@ A股全市场总成交额 · 历史回溯（akshare stock_zh_a_daily / 新浪源
 import sys
 import time
 import socket
+import json
+import os
 import logging
 from datetime import datetime, date
 
@@ -64,6 +66,7 @@ def parse_args():
     dry = "--dry-run" in sys.argv
     resume = "--resume" in sys.argv
     no_quotes = "--no-quotes" in sys.argv
+    force = "--force" in sys.argv
     aggregate_only = "--aggregate-only" in sys.argv
     start = None
     code = None
@@ -92,6 +95,7 @@ def parse_args():
     return {
         "dry": dry, "start": start, "end": end, "code": code, "resume": resume,
         "no_quotes": no_quotes, "aggregate_only": aggregate_only, "limit": limit,
+        "force": force,
     }
 
 
@@ -103,51 +107,44 @@ def _a_code_list():
     return _cached()
 
 
-def _ensure_progress_table():
-    """进度表 a_backfill_progress：与采集窗口无关，记录每只代码的回补结果。
+# 进度记录改为本地临时文件（不建库表）：{stock_code: 'done'|'empty'|'error'}
+_PROGRESS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "a_backfill_progress.json")
 
-    旧版靠 a_daily_quote 落库行反推「已完成」，但全量（无窗口）采集下不再适用；
-    改为显式进度表，断点续采更稳妥，且能区分 done / empty（源无数据）/ error。
-    """
-    from db import get_conn
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS a_backfill_progress (
-                    stock_code VARCHAR(20) PRIMARY KEY,
-                    status     VARCHAR(8)  NOT NULL,   -- done / empty / error
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                )
-            """)
-        conn.commit()
+
+def _load_progress():
+    """读取进度文件；文件缺失/损坏时返回空 dict（视为无进度）。"""
+    if not os.path.exists(_PROGRESS_FILE):
+        return {}
+    try:
+        with open(_PROGRESS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning(f"读进度文件失败（视为空）: {e}")
+        return {}
+
+
+def _save_progress(progress):
+    try:
+        with open(_PROGRESS_FILE, "w", encoding="utf-8") as f:
+            json.dump(progress, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning(f"写进度文件失败: {e}")
 
 
 def _mark_progress(code, status):
-    """写入/更新单只代码的回补结果（upsert）。"""
-    from db import get_conn
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO a_backfill_progress (stock_code, status, updated_at) "
-                "VALUES (%s, %s, NOW()) "
-                "ON CONFLICT (stock_code) DO UPDATE SET status=EXCLUDED.status, updated_at=NOW()",
-                (code, status))
-        conn.commit()
+    """写入/更新单只代码的回补结果到本地进度文件（done / empty / error）。"""
+    p = _load_progress()
+    p[code] = status
+    _save_progress(p)
 
 
 def _done_codes():
-    """已采集完成 / 确认无数据的代码集合（来自 a_backfill_progress，与窗口无关）。
+    """已采集完成 / 确认无数据的代码集合（来自进度文件，与窗口无关）。
 
     断点续采时跳过这些代码；error 状态的代码不在跳过之列，下次 --resume 会重试。
     """
-    from db import get_conn
-    _ensure_progress_table()
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT stock_code FROM a_backfill_progress "
-                "WHERE status IN ('done', 'empty')")
-            return {r[0] for r in cur.fetchall()}
+    p = _load_progress()
+    return {c for c, s in p.items() if s in ("done", "empty")}
 
 
 # ----------------------------------------------------------------------------
@@ -182,7 +179,9 @@ def _fetch_kline(full, start=None, end=None):
     try:
         for attempt in range(5):
             try:
-                df = ak.stock_zh_a_daily(symbol=sina_sym, adjust="")
+                # adjust="qfq"：前复权价，消除送股/配股/派息日的除权跳空
+                # （原 adjust="" 为未复权价，是 a_daily_quote.close 除权跳变的根因）
+                df = ak.stock_zh_a_daily(symbol=sina_sym, adjust="qfq")
                 if df is not None and not df.empty:
                     break
             except Exception:
@@ -223,7 +222,7 @@ def _as_float(v):
     return f
 
 
-def fetch_history(start, code=None, quote_sink=None, resume=False, limit=None, end=None):
+def fetch_history(start, code=None, quote_sink=None, resume=False, limit=None, end=None, force=False):
     if code:
         codes = [code]
     else:
@@ -232,15 +231,21 @@ def fetch_history(start, code=None, quote_sink=None, resume=False, limit=None, e
         log.warning("获取 A 股代码列表失败")
         return pd.DataFrame()
 
-    if resume and not code:
-        # 进度来自 a_backfill_progress（与窗口无关）：已 done/empty 的代码直接跳过。
-        done = _done_codes()
-        if done:
-            before = len(codes)
-            codes = [c for c in codes if c not in done]
-            log.info(f"续采：已完成/跳过 {len(done)} 只，剩 {len(codes)}/{before} 只")
+    if not code and (resume or force):
+        if force:
+            # --force：忽略 a_backfill_progress，全部代码重跑并覆盖已有数据
+            # （含未复权→QFQ 的 close 覆盖；估值列因本脚本产出为 NULL，
+            #  bulk_upsert(skip_null_updates=True) 不会回写清空 valuation 脚本的值）
+            log.info("强制重采（--force）：忽略已完成进度，全部代码重跑并覆盖")
         else:
-            log.info("续采：无已完成记录，从头开始")
+            # 进度来自 a_backfill_progress（与窗口无关）：已 done/empty 的代码直接跳过。
+            done = _done_codes()
+            if done:
+                before = len(codes)
+                codes = [c for c in codes if c not in done]
+                log.info(f"续采：已完成/跳过 {len(done)} 只，剩 {len(codes)}/{before} 只")
+            else:
+                log.info("续采：无已完成记录，从头开始")
 
     if limit and len(codes) > limit:
         log.info(f"本轮限量 {limit} 只（剩余 {len(codes) - limit} 只下次 --resume）")
@@ -313,6 +318,9 @@ def _map_quote_row(code, td, row):
         except (TypeError, ValueError):
             return None
 
+    _tr = _f(row.get("turnover"))
+    _turnover_rate = round(_tr, 4) if (_tr is not None and 0 <= _tr < 10000) else None
+
     return {
         "stock_code": code,
         "trade_date": td,
@@ -322,9 +330,9 @@ def _map_quote_row(code, td, row):
         "close": _f(row.get("close")),
         "volume": int(row["volume"]) if row.get("volume") is not None else 0,
         "amount": _f(row.get("amount")),
-        # 新浪 turnover 是换手率（小数，如 0.003 → 0.3%）
-        "turnover_rate": round(_f(row.get("turnover")) * 100, 4)
-                          if _f(row.get("turnover")) is not None else None,
+        # akshare turnover 已是换手率百分比数值（如 148.32 表示 148.32%），直接采信。
+        # 切勿再 ×100：旧逻辑放大 100 倍会超出 numeric(8,4) 上限 → numeric overflow。
+        "turnover_rate": _turnover_rate,
         # 新浪不提供量比/52w/总市值/PE/PB/股息，置空；
         # 这些字段由日常富途快照（get_a_market_turnover.py）当天补上。
         # 注：流通市值可由 close × outstanding_share 估算，但为与港股版字段口径一致，
@@ -450,6 +458,7 @@ def run():
     end = a["end"]
     code = a["code"]
     resume = bool(a["resume"])
+    force = bool(a.get("force"))
     limit = a["limit"]
 
     if a["aggregate_only"]:
@@ -466,7 +475,7 @@ def run():
     writer = None if (dry or a["no_quotes"]) else _QuoteWriter()
     interrupted = False
     try:
-        fetch_history(start, code, quote_sink=writer, resume=resume, limit=limit, end=end)
+        fetch_history(start, code, quote_sink=writer, resume=resume, limit=limit, end=end, force=force)
     except KeyboardInterrupt:
         interrupted = True
         log.warning("收到中断信号，已采集部分已落库，可用 --resume 继续")

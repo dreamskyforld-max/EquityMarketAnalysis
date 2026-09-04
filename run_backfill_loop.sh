@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# backfill_market_turnover.py 的「自动断点续采循环」包装脚本。
+# backfill_hk_market_turnover.py 的「自动断点续采循环」包装脚本。
 #
 # 作用：
-#   用小内存友好的 --resume --limit 分批跑 backfill_market_turnover.py，
+#   用小内存友好的 --resume --limit 分批跑 backfill_hk_market_turnover.py，
 #   每轮结束自动重算全市场总成交额并打印进度，进度达到 100% 即停止。
 #   进程被 OOM kill / 网络抖动导致中断都没关系：下一轮 --resume 会跳过
 #   已完成股票、并从中断处那只重采（upsert 幂等），因此可放心重复执行。
@@ -39,14 +39,14 @@ fi
 # 进度解析：从日志行 "进度：n/total 只已采集（pct%）"
 parse_progress() {
   # 返回 "n total pct" 三个值
-  "$PY" backfill_market_turnover.py "${BASE_ARGS[@]}" --aggregate-only 2>&1 \
+  "$PY" backfill_hk_market_turnover.py "${BASE_ARGS[@]}" --aggregate-only 2>&1 \
     | grep -E "进度：" \
     | tail -1 \
     | sed -E 's/.*进度：([0-9]+)\/([0-9]+) 只已采集（([0-9.]+)%）。*/\1 \2 \3/'
 }
 
 run_one_round() {
-  local args=(backfill_market_turnover.py "${BASE_ARGS[@]}" --resume --limit "$BATCH")
+  local args=(backfill_hk_market_turnover.py "${BASE_ARGS[@]}" --resume --limit "$BATCH")
   if [ -n "$MEM_LIMIT" ]; then
     # 限制内存 + 禁 swap，避免拖死同机常驻进程（ticker_collector / postgres）
     systemd-run --scope -p MemoryMax="${MEM_LIMIT}M" -p MemorySwapMax=0 \
