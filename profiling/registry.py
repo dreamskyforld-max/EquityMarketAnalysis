@@ -113,8 +113,10 @@ class TagMeta:
             )
         if self.num_unit is not None and self.num_unit not in _VALID_UNITS:
             raise ValueError(f"[{self.code}] num_unit 非法: {self.num_unit}（允许 {_VALID_UNITS}）")
-        if self.value_type in (ENUM, BOOL) and self.num_unit not in (None, UNIT_PCTL):
-            raise ValueError(f"[{self.code}] enum/bool 标签的 num_value 无连续含义，num_unit 应留空")
+        # enum 允许带 num_unit：趋势类枚举（rise/flat/fall）的 num_value 承载
+        # 辅助连续值（如余额变动率 -8.3%），与 tier 的双轨设计同理
+        if self.value_type == BOOL and self.num_unit is not None:
+            raise ValueError(f"[{self.code}] bool 标签的 num_value（0/1 标记）无计量含义，num_unit 应留空")
 
     def to_row(self) -> dict[str, Any]:
         d = asdict(self)
@@ -169,46 +171,68 @@ def domains() -> list[str]:
     return sorted({m.domain for m in _REGISTRY.values()})
 
 
-def validate_enum_uniqueness() -> None:
-    """校验同一 enum_type 内，label 与 short_label 合并后全局唯一。
+def _merged_enum_values() -> dict[tuple[str, str], tuple[str, str, None]]:
+    """合并所有标签声明的枚举值域，按 (enum_type, code) 归一。
 
-    这是「一个概念只能有一个名称」的硬约束：若某个中文名同时是 A 码的 label
-    和 B 码的简称（如「上交所」与「上海证券交易所」各立一码），直接报错。
+    同一 (enum_type, code) 被多个标签声明时必须完全一致（视为共用同一值域，
+    如多个趋势类标签共用 trend），否则报错。返回 {(enum_type, code): (label, short, parent)}。
     """
-    seen: dict[tuple[str, str], str] = {}
+    by_code: dict[tuple[str, str], tuple] = {}
     for meta in all_tags():
         if not meta.enum_values:
             continue
+        et = meta.enum_type or meta.code
         for code, names in meta.enum_values.items():
-            for name in (n for n in names[:2] if n):  # 只查 label / short_label
-                key = (meta.enum_type or meta.code, name)
-                prev = seen.get(key)
-                if prev:
-                    raise ValueError(
-                        f"枚举概念冲突：enum_type={key[0]} 中名称 {name!r} 同时出现在 "
-                        f"{prev} 与 {meta.code}（一个概念只能有一个名称、一个 code）"
-                    )
-                seen[key] = meta.code
+            key = (et, code)
+            prev = by_code.get(key)
+            if prev is not None and prev != names:
+                raise ValueError(
+                    f"枚举定义冲突：{et}.{code} 在 {meta.code} 中声明为 {names}，"
+                    f"与先前声明 {prev} 不一致（同一 code 的含义必须唯一）"
+                )
+            by_code[key] = names
+    return by_code
+
+
+def validate_enum_uniqueness() -> None:
+    """校验枚举值域声明的一致性。
+
+    第一遍（_merged_enum_values）：同一 (enum_type, code) 的重复声明必须完全一致；
+    第二遍：合并完成后做 name 唯一性检查——
+    若边遍历边查重，「同一值域的合法重复声明」会被误判为 name 冲突
+    （实测踩过：att_margin_trend 与 att_southbound_trend 共用 trend，rise 的 label 相同即报错）。
+    """
+    by_code = _merged_enum_values()
+    name_owner: dict[tuple[str, str], str] = {}
+    for (et, code), names in by_code.items():
+        for name in (n for n in names[:2] if n):  # 只查 label / short_label
+            nkey = (et, name)
+            owner = name_owner.get(nkey)
+            if owner:
+                raise ValueError(
+                    f"枚举概念冲突：enum_type={et} 中名称 {name!r} 同时被 "
+                    f"{owner} 与 {code} 使用（一个概念只能有一个名称、一个 code）"
+                )
+            name_owner[nkey] = code
 
 
 def _sync_enum_values(conn) -> int:
     """把代码里声明的 enum_values 同步到 profile.enum_value（幂等）。"""
     from psycopg2 import extras
 
-    rows = []
-    for meta in all_tags():
-        if not meta.enum_values:
-            continue
-        enum_type = meta.enum_type or meta.code
-        for sort_order, (code, names) in enumerate(meta.enum_values.items()):
-            rows.append((
-                enum_type, code, names[0],
-                names[1] if len(names) > 1 else None,
-                names[2] if len(names) > 2 else None,
-                sort_order,
-            ))
-    if not rows:
+    by_code = _merged_enum_values()
+    if not by_code:
         return 0
+
+    # 排序保证 deterministic；rows 按 (enum_type, code) 唯一，避免
+    # ON CONFLICT「cannot affect row a second time」（同批重复键，实测踩过）
+    rows = [
+        (et, code, names[0],
+         names[1] if len(names) > 1 else None,
+         names[2] if len(names) > 2 else None,
+         i)
+        for i, ((et, code), names) in enumerate(sorted(by_code.items()))
+    ]
 
     with conn.cursor() as cur:
         extras.execute_values(

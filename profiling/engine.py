@@ -230,6 +230,23 @@ def compute_tag(conn: Any, tag_code: str, as_of: date | None = None,
         return result
 
     result["rows_total"] = len(df)
+
+    # 枚举落库校验：key 必须在声明的值域内，否则字典与数据漂移
+    # （实测踩过：att_southbound_trend 字典声明 increase/decrease，函数却落 rise/fall）
+    # 引用型值域（table:xxx）来自外部表，无法静态校验，跳过
+    if meta.enum_values:
+        valid_keys = set(meta.enum_values.keys())
+        bad = sorted(set(df["key_value"]) - valid_keys)
+        if bad:
+            result["status"] = "error"
+            result["message"] = (
+                f"落库 key 不在 enum_values 内: {bad}（合法: {sorted(valid_keys)}）——"
+                f"修正计算函数或字典后再算"
+            )
+            log.error("[%s] %s", tag_code, result["message"])
+            _write_log(conn, meta, result, int((time.monotonic() - t0) * 1000))
+            return result
+
     ensure_partition(conn, as_of.year)
 
     cur_map = _load_current(conn, tag_code, as_of)

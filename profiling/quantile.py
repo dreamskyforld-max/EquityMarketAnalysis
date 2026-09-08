@@ -66,7 +66,8 @@ def load_quote_snapshot(conn, as_of: date, use_cache: bool = True) -> pd.DataFra
                    total_market_val, circular_market_val,
                    pe_ttm_ratio AS pe_ttm, pb_ratio AS pb,
                    ps_ttm_ratio AS ps_ttm, pcf_ttm_ratio AS pcf_ttm,
-                   dividend_ratio_ttm AS dividend_yield, close
+                   dividend_ratio_ttm AS dividend_yield, close,
+                   volume::float8 AS volume, turnover_rate::float8 AS turnover_rate
             FROM {table}
             WHERE trade_date = %s
             """,
@@ -80,11 +81,11 @@ def load_quote_snapshot(conn, as_of: date, use_cache: bool = True) -> pd.DataFra
         else pd.DataFrame(
             columns=["stock_code", "market", "trade_date", "total_market_val",
                      "circular_market_val", "pe_ttm", "pb", "ps_ttm", "pcf_ttm",
-                     "dividend_yield", "close"]
+                     "dividend_yield", "close", "volume", "turnover_rate"]
         )
     )
     for c in ("total_market_val", "circular_market_val", "pe_ttm", "pb",
-              "ps_ttm", "pcf_ttm", "dividend_yield", "close"):
+              "ps_ttm", "pcf_ttm", "dividend_yield", "close", "volume", "turnover_rate"):
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
     # 只缓存最近一个 as_of：常驻进程里长期累积会吃内存

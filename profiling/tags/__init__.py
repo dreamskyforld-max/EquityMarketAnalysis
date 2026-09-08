@@ -8,6 +8,8 @@
     ④ 盈利质量  →  tags/quality.py       10 个标签
     ⑤ 成长特征  →  tags/growth.py         8 个标签
     ⑥ 股东回报  →  tags/shareholder.py    6 个标签
+    ⑦ 交易特征  →  tags/technical.py      9 个标签
+    ⑨ 资金关注度 →  tags/attention.py     14 个标签
 
 新增域时：在 tags/ 下新建模块，并在本文件 import，标签字典自动同步。
 """
@@ -17,3 +19,5 @@ from . import valuation    # noqa: F401
 from . import quality      # noqa: F401
 from . import growth       # noqa: F401
 from . import shareholder  # noqa: F401
+from . import technical    # noqa: F401
+from . import attention    # noqa: F401

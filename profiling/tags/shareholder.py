@@ -295,14 +295,20 @@ def shr_buyback_tier(as_of: date) -> pd.DataFrame:
     num_unit="pct",
     value_type=TIER,
     value_range={
-        "1": "总回报率最低 20%", "2": "次低", "3": "中间", "4": "次高",
+        "NONE": "无分红且无回购（零回报），不参与分档",
+        "1": "有回报但最低 20%", "2": "次低", "3": "中间", "4": "次高",
         "5": "总回报率最高 20%（分红+回购回报最厚）",
     },
     source_type="stat", update_freq="daily",
     data_sources=["dividend_history", "daily_buyback_event", "a_stock_repurchase_plan",
                   "a_daily_quote", "hk_daily_quote"],
-    compute_logic="股东回报率 = TTM 股息率 + TTM 回购率（分子：近一年 ex 的 DPS 合计 + 近一年回购金额），"
-                  "在市场内五等分。A 股回购部分为方案累计近似（见 shr_buyback_tier），港股两项均精确",
+    compute_logic="股东回报率 = TTM 股息率 + TTM 回购率（近一年 ex 的 DPS 合计 + 近一年回购金额）。"
+                  "**零回报（既无分红又无回购）单独标 NONE**：实测 ≥25% 的股票为零，"
+                  "它们既不是「低回报」也不是「高回报」，混进档 1 会让档 1 失去语义（与回报 0.3% 的股票同档）。"
+                  "有回报的股票在市场内五等分。A 股回购部分为方案累计近似（见 shr_buyback_tier），港股两项均精确。"
+                  "已知缺陷：分子（近一年派息）用**当前价**折算，股价在派息后暴跌时股息率会虚高——"
+                  "实测存在 500%+ 的仙股样本（如派息 0.462 而现价 0.086）。等频分档对极值免疫，"
+                  "但筛选高回报档时建议结合 num_value 设上限（如 <20%）剔除噪声",
     pit_capable=True, owner="profiling",
 )
 def shr_total_yield_tier(as_of: date) -> pd.DataFrame:
@@ -324,5 +330,9 @@ def shr_total_yield_tier(as_of: date) -> pd.DataFrame:
     total = div_yld + bb_rate
 
     df = df.assign(total=total)
-    tier = assign_tier(df["total"], 5, by=df["market"])
+    tier = pd.Series(pd.NA, index=df.index, dtype="object")
+    paying = df["total"] > 0
+    if paying.any():
+        tier[paying] = assign_tier(df.loc[paying, "total"], 5, by=df.loc[paying, "market"])
+    tier[~paying] = "NONE"
     return _frame(df["stock_code"], tier, total.round(4))

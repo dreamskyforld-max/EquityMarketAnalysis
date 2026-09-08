@@ -319,7 +319,16 @@ def _map_quote_row(code, td, row):
             return None
 
     _tr = _f(row.get("turnover"))
-    _turnover_rate = round(_tr, 4) if (_tr is not None and 0 <= _tr < 10000) else None
+    # 单位统一（2026-09-07 双源实测）：
+    #   新浪 turnover 为【小数】—— akshare 1.18.60，sh600900 全天 0.00279 = 0.279%；
+    #   富途快照 turnover_rate 为【百分数】—— SH.600900 快照 0.391，
+    #   volume/总股本 = 0.00391，比值恰为 100（get_a_market_turnover.py 直采口径）。
+    # a_daily_quote.turnover_rate 全表统一为百分数（与富途一致）→ 此处 ×100。
+    # 守卫：A股 T+1 日换手不可能 ≥200%，_tr ≥ 2 或负数/NaN 一律置 None
+    # （skip_null_updates 保留库内原值，不落脏数据），并保证 ×100 后不超
+    # numeric(8,4) 上限 999.9999。注：守卫拦不住 0~2 区间的小数/百分数歧义，
+    # 单位漂移靠 requirements.txt 锁定 akshare 版本兜底。
+    _turnover_rate = round(_tr * 100, 4) if (_tr is not None and 0 <= _tr < 2) else None
 
     return {
         "stock_code": code,
@@ -330,8 +339,8 @@ def _map_quote_row(code, td, row):
         "close": _f(row.get("close")),
         "volume": int(row["volume"]) if row.get("volume") is not None else 0,
         "amount": _f(row.get("amount")),
-        # akshare turnover 已是换手率百分比数值（如 148.32 表示 148.32%），直接采信。
-        # 切勿再 ×100：旧逻辑放大 100 倍会超出 numeric(8,4) 上限 → numeric overflow。
+        # 新浪小数 ×100 → 百分数（换算与守卫见上方 _turnover_rate），
+        # 与日常富途快照（get_a_market_turnover.py）写入的 turnover_rate 同口径。
         "turnover_rate": _turnover_rate,
         # 新浪不提供量比/52w/总市值/PE/PB/股息，置空；
         # 这些字段由日常富途快照（get_a_market_turnover.py）当天补上。
