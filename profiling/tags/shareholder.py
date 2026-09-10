@@ -39,11 +39,18 @@ from ._base import _conn, _read_sql, _frame
 
 DOMAIN = "股东回报"
 
+# 共享五等分档位说明（1=最低20% … 5=最高20%），带 20% 锚点，避免各标签零散写丢
+_TIER_RANGE = {
+    "1": "最低 20%", "2": "次低 20%", "3": "中间 20%", "4": "次高 20%", "5": "最高 20%",
+}
+
 _YIELD_RANGE = {
-    "1": "股息率最低 20%", "2": "次低", "3": "中间", "4": "次高", "5": "股息率最高 20%（高股息组）",
+    **_TIER_RANGE,
+    "1": "股息率最低 20%", "5": "股息率最高 20%（高股息组）",
 }
 _PAYOUT_RANGE = {
-    "1": "派息率最低 20%", "2": "次低", "3": "中间", "4": "次高", "5": "派息率最高 20%",
+    **_TIER_RANGE,
+    "1": "派息率最低 20%", "5": "派息率最高 20%",
 }
 _CONSEC_RANGE = {
     "0": "最近完整年度未分红", "1": "连续 1-2 年", "2": "连续 3-5 年",
@@ -268,8 +275,8 @@ def _buyback_ttm(conn, as_of: date) -> pd.Series:
     num_unit="pct",
     value_type=TIER,
     value_range={
-        "1": "无/回购率最低 20%", "2": "次低", "3": "中间", "4": "次高",
-        "5": "回购率最高 20%（回购力度最大）",
+        **_TIER_RANGE,
+        "1": "无/回购率最低 20%", "5": "回购率最高 20%（回购力度最大）",
     },
     source_type="stat", update_freq="daily",
     data_sources=["daily_buyback_event", "a_stock_repurchase_plan", "a_daily_quote", "hk_daily_quote"],
@@ -296,8 +303,8 @@ def shr_buyback_tier(as_of: date) -> pd.DataFrame:
     value_type=TIER,
     value_range={
         "NONE": "无分红且无回购（零回报），不参与分档",
-        "1": "有回报但最低 20%", "2": "次低", "3": "中间", "4": "次高",
-        "5": "总回报率最高 20%（分红+回购回报最厚）",
+        **_TIER_RANGE,
+        "1": "有回报但最低 20%", "5": "总回报率最高 20%（分红+回购回报最厚）",
     },
     source_type="stat", update_freq="daily",
     data_sources=["dividend_history", "daily_buyback_event", "a_stock_repurchase_plan",

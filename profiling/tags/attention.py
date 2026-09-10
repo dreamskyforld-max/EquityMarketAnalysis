@@ -100,7 +100,8 @@ def att_margin_balance_tier(as_of: date) -> pd.DataFrame:
     num_unit="pct",
     value_type=TIER,
     value_range={
-        "1": "近 1 月融资净偿还最多 20%（杠杆资金撤离）", "2": "次低", "3": "中间", "4": "次高",
+        **_TIER_RANGE,
+        "1": "近 1 月融资净偿还最多 20%（杠杆资金撤离）",
         "5": "近 1 月融资净买入最多 20%（杠杆资金流入）",
     },
     source_type="stat", update_freq="daily",
@@ -153,8 +154,8 @@ def att_margin_trend(as_of: date) -> pd.DataFrame:
     num_unit="pct",
     value_type=TIER,
     value_range={
-        "1": "沽空占比最低 20%", "2": "次低", "3": "中间", "4": "次高",
-        "5": "沽空占比最高 20%（空头压力最大）",
+        **_TIER_RANGE,
+        "1": "沽空占比最低 20%", "5": "沽空占比最高 20%（空头压力最大）",
     },
     source_type="stat", update_freq="daily",
     data_sources=["daily_short_selling", "hk_daily_quote"],
@@ -327,7 +328,8 @@ def att_volume_surge(as_of: date) -> pd.DataFrame:
     num_unit="x",
     value_type=TIER,
     value_range={
-        "1": "换手相对自身历史最低 20%（关注度降温）", "2": "次低", "3": "中间", "4": "次高",
+        **_TIER_RANGE,
+        "1": "换手相对自身历史最低 20%（关注度降温）",
         "5": "换手相对自身历史最高 20%（关注度升温）",
     },
     source_type="stat", update_freq="daily", data_sources=["a_daily_quote", "hk_daily_quote"],

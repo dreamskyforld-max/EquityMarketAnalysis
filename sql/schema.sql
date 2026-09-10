@@ -559,31 +559,7 @@ CREATE INDEX IF NOT EXISTS idx_tick_data_stock_time_dir
   ON tick_data (stock_code, tick_time, ticker_direction)
   INCLUDE (turnover, volume, price);
 
--- 16.1 全量逐笔旁路落盘表（诊断用，默认不写入）
--- 富途推送的每一笔逐笔都无去重原样写入本表（由配置 full_tick_capture 控制开关），
--- 没有 sequence 唯一约束，重复推送全部保留。事后可与 tick_data 比对，定位
--- "推送了但 tick_data 没入库"（被去重跳过 / 缺失）的问题。开启会产生大量写入与磁盘占用，
--- 仅排查时临时打开，定位完即关闭并 truncate。
-CREATE TABLE IF NOT EXISTS full_tick_data (
-    id              BIGSERIAL       PRIMARY KEY,
-    stock_code      VARCHAR(20)     NOT NULL,
-    tick_time       TIMESTAMPTZ     NOT NULL,
-    price           NUMERIC(12,4),
-    volume          BIGINT,
-    turnover        NUMERIC(20,2),
-    ticker_direction VARCHAR(10),
-    sequence        BIGINT          NOT NULL,               -- 富途逐笔序号（与 tick_data.sequence 同义，本表不约束唯一）
-    tick_type       VARCHAR(20),
-    received_at     TIMESTAMPTZ     DEFAULT NOW()           -- 本批落盘时间，用于还原推送时刻
-);
 
-COMMENT ON TABLE  full_tick_data           IS '富途逐笔全量旁路落盘（无去重），诊断"推了但 tick_data 没落"问题用，平时为空';
-COMMENT ON COLUMN full_tick_data.sequence   IS '富途逐笔序号，与 tick_data.sequence 同义，本表不唯一';
-COMMENT ON COLUMN full_tick_data.received_at IS '落盘时间，约等价收到批次时刻';
-
-CREATE INDEX IF NOT EXISTS idx_full_tick_seq        ON full_tick_data (sequence);
-CREATE INDEX IF NOT EXISTS idx_full_tick_stock_time ON full_tick_data (stock_code, tick_time);
-CREATE INDEX IF NOT EXISTS idx_full_tick_received   ON full_tick_data (received_at);
 
 
 -- ============================================================================

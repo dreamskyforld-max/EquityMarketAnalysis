@@ -149,8 +149,8 @@ def qal_net_margin_tier(as_of: date) -> pd.DataFrame:
     num_unit="pct",
     value_type=TIER,
     value_range={
-        "1": "负债率最低 20%（组内最稳健）", "2": "次低", "3": "中间",
-        "4": "次高", "5": "负债率最高 20%（组内杠杆最重）",
+        **_TIER_RANGE,
+        "1": "负债率最低 20%（组内最稳健）", "5": "负债率最高 20%（组内杠杆最重）",
     },
     source_type="stat", update_freq="quarterly",
     data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
@@ -176,8 +176,8 @@ def qal_leverage_tier(as_of: date) -> pd.DataFrame:
     num_unit="pct",
     value_type=TIER,
     value_range={
-        "1": "波动最小 20%（盈利最稳定）", "2": "次稳", "3": "中间",
-        "4": "次不稳定", "5": "波动最大 20%（盈利大起大落）",
+        "1": "波动最小 20%（盈利最稳定）", "2": "次稳 20%", "3": "中间 20%",
+        "4": "次不稳定 20%", "5": "波动最大 20%（盈利大起大落）",
     },
     source_type="stat", update_freq="quarterly",
     data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
@@ -203,8 +203,8 @@ def qal_roe_stability(as_of: date) -> pd.DataFrame:
     num_unit="pct",
     value_type=TIER,
     value_range={
-        "1": "OCF/净利 最低 20%（纸面利润风险最高）", "2": "次低", "3": "中间",
-        "4": "次高", "5": "最高 20%（利润有充足现金流支撑）",
+        **_TIER_RANGE,
+        "1": "OCF/净利 最低 20%（纸面利润风险最高）", "5": "最高 20%（利润有充足现金流支撑）",
         "LOSS": "当年亏损，无法评估盈利真实性",
     },
     source_type="stat", update_freq="quarterly",

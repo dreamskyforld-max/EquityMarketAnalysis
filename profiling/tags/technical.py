@@ -202,7 +202,7 @@ def trd_momentum_12_1(as_of: date) -> pd.DataFrame:
     code="trd_reversal_1m", name="反转档(1月)", domain=DOMAIN,
     num_unit="pct",
     value_type=TIER,
-    value_range={"1": "近 1 月跌幅最大 20%（超跌）", "2": "次低", "3": "中间", "4": "次高", "5": "近 1 月涨幅最大 20%（超涨）"},
+    value_range={**_TIER_RANGE, "1": "近 1 月跌幅最大 20%（超跌）", "5": "近 1 月涨幅最大 20%（超涨）"},
     source_type="stat", update_freq="daily",
     data_sources=["a_daily_quote", "hk_daily_quote"],
     compute_logic="近 21 个交易日涨跌幅，市场内五等分。与动量方向相反使用："
@@ -317,7 +317,7 @@ def trd_turnover(as_of: date) -> pd.DataFrame:
     code="trd_max_drawdown", name="最大回撤档", domain=DOMAIN,
     num_unit="pct",
     value_type=TIER,
-    value_range={"1": "回撤最小 20%", "2": "次小", "3": "中间", "4": "次大", "5": "回撤最大 20%"},
+    value_range={"1": "回撤最小 20%", "2": "次小 20%", "3": "中间 20%", "4": "次大 20%", "5": "回撤最大 20%"},
     source_type="stat", update_freq="daily",
     data_sources=["a_daily_quote", "hk_daily_quote"],
     compute_logic="近 252 个交易日内的最大回撤 = max(1 − close/历史峰值)×100，市场内五等分。"
