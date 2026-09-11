@@ -37,15 +37,17 @@
       做成横截面就退化成 ⑦ 的口径了；也不做市场分组，A 股与港股位置值可直接横向比较
     · 区间宽度取 20 个百分点等宽，与 6 阶段内部锚点相容：30% 落在档 2，80% 恰为档 5 下沿
     · 边界左闭右开：[0,20)→1 … [80,100]→5，pos 先 clip 到 [0,100] 兜住数据滞后造成的越界
-    · **窗口不足 1 年不打标签**（次新股没有真正的「52 周」区间，标了名不副实；
-      与 ⑦ 动量档要求 n>252 的门槛保持一致）
-    · 剔除区间退化（high ≤ low）与空值样本
+    · **窗口内交易日覆盖率不足 90% 不打标签**（次新股没有真正的「52 周」区间，标了名不副实）。
+      用**覆盖率**而非硬行数：窗口按 A 股日历取 252 交易日，港股窗口内天然少若干交易日，
+      硬卡 252 会把大量正常港股（如 HK.01938 仅 239 行）误杀；改用「占该市场窗口应有天数的 90%」更稳妥。
+    · 先剔除坏快照行（high/low/close≤0 或 high<low，港股常见 high=0,low=0 脏数据，
+      占比约 2.2%、波及半数港股）再做区间极值计算，否则单条 high=0 让 min(low)=0 毒化整只股票
 
-MIN_OBS 门槛的三重作用（2026-09-09 实测）：同时过滤掉了三类不该打标签的标的
+MIN_COV 门槛（覆盖率 ≥90%）的三重作用：同时过滤掉三类不该打标签的标的
     ① 次新股（港股窝轮/牛熊证最典型：如 HK.02900 全生命周期仅 24 行，天然无 52 周区间）
     ② 长期停牌后复牌者（如 HK.00374 窗口内仅 48 行）
-    ③ 已停止交易者——停牌/退市后不再累积行数，很快跌破 252
-    ⇒ 实测通关的 6215 只里 6214 只在 as_of 当日有成交、无一只滞后超过 20 天，
+    ③ 已停止交易者——停牌/退市后不再累积行数，覆盖率很快跌破 90%
+    ⇒ 覆盖率门槛本身不强制当日有成交（停牌几天仍保留），但长期停者自然被排除，
       故本标签无需额外的「新鲜度」过滤逻辑
 
 数据来源：a_daily_quote / hk_daily_quote（high / low / close）
@@ -63,7 +65,8 @@ from ._base import _conn, _read_sql, _frame
 DOMAIN = "趋势状态"
 
 W_1Y = 252          # 1 年窗口（交易日），与 ⑦ technical.py 同约定
-MIN_OBS = W_1Y      # 窗口完整度门槛：不足 1 年不打标签
+MIN_COV = 0.9       # 窗口内交易日覆盖率门槛：该市场窗口应有天数的 90% 才算「有真实 52 周区间」
+                    # 用覆盖率而非硬行数，避免 A 股日历卡掉港股（港股窗口内天然少若干交易日）
 _W = 20             # 位置区间宽度（百分点）：0-20 / 20-40 / 40-60 / 60-80 / 80-100
 
 _QUOTE_TABLES = (("A", "a_daily_quote"), ("HK", "hk_daily_quote"))
@@ -114,16 +117,25 @@ def _positions(as_of: date) -> pd.DataFrame:
     if q.empty:
         return pd.DataFrame(columns=["stock_code", "market", "pos"])
 
-    q = q.sort_values(["stock_code", "trade_date"])
+    # 窗口内各市场的真实交易日数（用「全部行」算，坏快照行不扣减期望天数）
+    # —— 这是覆盖率门槛的分母，避免用 A 股日历硬性卡掉港股（港股窗口内行数天然略少）
+    exp = q.groupby("market")["trade_date"].nunique().to_dict()
+
+    # 先剔除坏快照行：high/low/close<=0 或 high<low（如 HK 某日 high=0,low=0 的脏数据）。
+    # 否则单条 high=0 会让 min(low)=0，毒化整只股票的区间把它整只丢掉。
+    valid = (q["high"] > 0) & (q["low"] > 0) & (q["close"] > 0) & (q["high"] >= q["low"])
+    q = q[valid].sort_values(["stock_code", "trade_date"])
+
     g = q.groupby("stock_code", sort=False)
     agg = g.agg(n=("close", "size"), hi=("high", "max"), lo=("low", "min"))
     # 末行即 as_of 当日收盘（已按日期升序，tail(1) 取最后一笔）
     agg["close"] = g["close"].last()
     agg["market"] = g["market"].last()
+    agg["cov"] = agg["n"] / agg["market"].map(exp)  # 窗口内交易日覆盖率
 
     ok = (
         agg["hi"].notna() & agg["lo"].notna() & agg["close"].notna()
-        & (agg["n"] >= MIN_OBS) & (agg["hi"] > agg["lo"]) & (agg["lo"] > 0) & (agg["close"] > 0)
+        & (agg["cov"] >= MIN_COV) & (agg["hi"] > agg["lo"]) & (agg["lo"] > 0) & (agg["close"] > 0)
     )
     agg = agg[ok]
     if agg.empty:
