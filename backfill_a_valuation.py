@@ -453,6 +453,32 @@ def run():
     log.info(f"回填完成：{len(dates)-fail_days} 天成功，{fail_days} 天失败，估值记录 {total_rows} 条")
 
 
+def run_valuation_one_day(td, dry=False):
+    """单日 A 股估值回填（供日常采集 get_a_market_turnover.run 调用）。
+
+    拉取东财当日全 A 估值快照 → QFQ 复权换算 → 字段级 upsert 进 a_daily_quote。
+    与 run() 单日模式等价，但封装为可被其它模块 import 的入口；
+    抓取/换算失败仅返回 False，不抛异常（避免连累成交额主流程）。
+    依赖 a_daily_quote 当日行已由日常采集写就（close 用于复权因子）。
+    """
+    _ensure_table()
+    session = requests.Session()
+    session.headers.update(EM_HEADERS)
+    try:
+        rows, total = _fetch_one_day(td, session)
+    except Exception as e:
+        log.warning(f"  {td} 东财估值抓取异常，跳过当日 PS/PCF 回填: {e}")
+        return False
+    if rows is None:
+        log.warning(f"  {td} 东财估值抓取失败（重试耗尽），跳过当日 PS/PCF 回填")
+        return False
+    if not dry:
+        rows = _apply_qfq_factor(rows, td)
+    n = _flush(rows, dry)
+    log.info(f"  {td} 当日估值回填 {n}/{total} 只" + ("（dry-run 未落库）" if dry else "已落库"))
+    return True
+
+
 if __name__ == "__main__":
     import os
     run()

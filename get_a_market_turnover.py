@@ -204,10 +204,10 @@ def _map_quote_row(code, trade_date, row):
             return None
 
     last_price = _f(row.get("last_price"))
-    prev_close = _f(row.get("prev_close_price"))
+    prev_close = _f(row.get("prev_close_price"))  # 富途官方昨收，当"前交易日收盘价"最权威
     change_pct = None
     if last_price is not None and prev_close:
-        change_pct = round((last_price - prev_close) / prev_close * 100, 4)
+        change_pct = round((last_price - prev_close) / prev_close * 100, 2)
 
     ut = row.get("update_time")
     update_time = None
@@ -236,6 +236,8 @@ def _map_quote_row(code, trade_date, row):
         "pe_ttm_ratio": _f(row.get("pe_ttm_ratio")),
         "pb_ratio": _f(row.get("pb_ratio")),
         "dividend_ratio_ttm": _f(row.get("dividend_ratio_ttm")),
+        "prev_close": prev_close,
+        "change_pct": change_pct,
         "update_time": update_time,
     }
 
@@ -265,6 +267,8 @@ _DDL = {
             high NUMERIC(12,4),
             low NUMERIC(12,4),
             close NUMERIC(12,4),
+            prev_close NUMERIC(12,4),
+            change_pct NUMERIC(8,2),
             volume BIGINT,
             amount NUMERIC(22,2),
             turnover_rate NUMERIC(8,4),
@@ -292,6 +296,10 @@ def _ensure_table(table):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(ddl)
+            # 补齐 prev_close / change_pct（旧库可能缺；CREATE TABLE IF NOT EXISTS 不补列）
+            if table in ("a_daily_quote",):
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS prev_close NUMERIC(12,4);")
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS change_pct NUMERIC(8,2);")
         conn.commit()
 
 
@@ -336,6 +344,21 @@ def _print(rec):
     print(f"标的数量 : {rec['stock_count']} 只")
 
 
+def _fill_today_valuation(rec, dry=False):
+    """当日 A 股估值（市值/PE/PB/PS/PCF）顺带回填，失败不影响成交额主流程。
+
+    复用 backfill_a_valuation.run_valuation_one_day（东财 RPT_VALUEANALYSIS_DET
+    当日快照 + QFQ 换算）。依赖 a_daily_quote 当日行已由本脚本写就（close 用于复权因子）。
+    """
+    if not rec or not rec.get("trade_date"):
+        return
+    try:
+        from backfill_a_valuation import run_valuation_one_day
+        run_valuation_one_day(rec["trade_date"], dry=dry)
+    except Exception as e:
+        log.warning(f"当日 A 股估值回填失败（不影响成交额主流程）: {e}")
+
+
 def run(codes=None, ctx=None):
     """采集入口（常驻调用兼容）。codes 可为代码列表，空则全 A 股。"""
     if not codes:
@@ -344,6 +367,7 @@ def run(codes=None, ctx=None):
     if rec.get("trade_date"):
         save_to_db(rec)
         _save_quotes(rec.get("quote_rows", []))
+        _fill_today_valuation(rec)
     _print(rec)
     return rec
 
@@ -356,4 +380,5 @@ if __name__ == "__main__":
     if rec.get("trade_date") and not dry:
         save_to_db(rec)
         _save_quotes(rec.get("quote_rows", []))
+        _fill_today_valuation(rec, dry=dry)
     os._exit(0)
