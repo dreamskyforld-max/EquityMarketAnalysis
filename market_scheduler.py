@@ -52,9 +52,6 @@ MARKET_PRESETS = {
             "time": {"hour": 16, "minute": 20},
             "modules": [
                 "get_quote.py",                          # 行情快照（富途API）→ daily_quote
-                "get_benchmark.py",                      # 恒生等基准指数 → benchmark_daily
-                "get_excess_return.py",                  # 超额收益计算 → excess_return_daily
-                "get_short_selling.py",                  # 沽空数据（实时，东方财富）
                 "get_trend.py",                          # 全日趋势数据
             ],
         },
@@ -67,8 +64,6 @@ MARKET_PRESETS = {
             "time": {"hour": 15, "minute": 10},  # A股 15:00 收盘
             "modules": [
                 "get_quote.py",          # 行情快照（富途API）→ daily_quote
-                "get_benchmark.py",      # 上证等基准指数 → benchmark_daily
-                "get_excess_return.py",  # 超额收益计算 → excess_return_daily
                 "get_trend.py",          # 全日趋势数据
             ],
         },
@@ -207,6 +202,13 @@ GLOBAL_TASKS: list[GlobalTask] = [
     # 周六 09:00 跑一次（A股分红公告多为周五盘后披露），超时同财务任务设 2 小时。
     ("分红明细全量", "get_dividend_history.py",
      {"hour": 9, "minute": 0, "day_of_week": "sat"}, None, True, None, 7200),
+
+    # 全量画像每日计算：每个工作日 16:30 计算当日全量画像，写入 profile.tag_value。
+    # 依赖当日行情快照（A股 15:10 / 港股 16:20 收盘采集已完成）。
+    # run(codes, ctx) 全局任务，codes=None 由 profiling 自行决定全标签范围；
+    # force=True 跳过各标签 update_freq 更新门禁，未变标签不产生冗余版本。
+    ("全量画像计算", "compute_profile.py",
+     {"hour": 16, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 1800),
 
     # 注意：采集层故障监控已由独立服务 monitor_collector.py（常驻进程，
     # systemd: monitor-collector.service）负责，不再挂在调度器里，

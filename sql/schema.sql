@@ -734,6 +734,8 @@ CREATE TABLE IF NOT EXISTS hk_daily_quote (
     high        NUMERIC(12,4),                      -- 最高价
     low         NUMERIC(12,4),                      -- 最低价
     close       NUMERIC(12,4),                      -- 收盘价
+    prev_close  NUMERIC(12,4),                      -- 昨收（前交易日收盘价；由同表 LAG(close) 推算/回填，与 daily_quote.prev_close 对齐）
+    change_pct  NUMERIC(8,2),                       -- 涨跌幅(%) = (close-prev_close)/prev_close*100（与 daily_quote.change_pct 对齐；港股仙股 合股/拆股 异常日可达上万%，8,4 仅 4 位整数会溢出，故用 8,2 留 6 位整数且降低小数精度）
     volume      BIGINT,                             -- 成交量（股）
     amount      NUMERIC(20,2),                      -- 成交额（港元）
     turnover_rate       NUMERIC(8,4),               -- 换手率(%)
@@ -760,6 +762,8 @@ COMMENT ON COLUMN hk_daily_quote.pcf_ttm_ratio IS '市现率(TTM)=总市值/经�
 COMMENT ON COLUMN hk_daily_quote.stock_code  IS '股票代码，如 HK.00700';
 COMMENT ON COLUMN hk_daily_quote.amount      IS '成交额（港元），全天完整值';
 COMMENT ON COLUMN hk_daily_quote.update_time IS '数据更新时间（富途快照的 update_time；历史回溯则为交易日）';
+COMMENT ON COLUMN hk_daily_quote.prev_close  IS '昨收（前交易日收盘价）；由同表 LAG(close) 推算/回填，与 daily_quote.prev_close 对齐';
+COMMENT ON COLUMN hk_daily_quote.change_pct  IS '涨跌幅(%) = (close-prev_close)/prev_close*100，与 daily_quote.change_pct 对齐';
 
 CREATE INDEX IF NOT EXISTS idx_hk_daily_quote_date  ON hk_daily_quote (trade_date DESC);
 CREATE INDEX IF NOT EXISTS idx_hk_daily_quote_stock ON hk_daily_quote (stock_code, trade_date DESC);
@@ -924,6 +928,8 @@ CREATE TABLE IF NOT EXISTS a_daily_quote (
     high                NUMERIC(12,4),
     low                 NUMERIC(12,4),
     close               NUMERIC(12,4),
+    prev_close          NUMERIC(12,4),              -- 昨收（前交易日收盘价；由同表 LAG(close) 推算/回填，与 daily_quote.prev_close 对齐）
+    change_pct          NUMERIC(8,2),               -- 涨跌幅(%) = (close-prev_close)/prev_close*100（与 daily_quote.change_pct 对齐；历史借壳/重组跳变可达上千%，8,4 仅 4 位整数会溢出，故用 8,2 留 6 位整数且降低小数精度）
     volume              BIGINT,
     amount              NUMERIC(22,2),
     turnover_rate       NUMERIC(8,4),
@@ -949,6 +955,8 @@ COMMENT ON COLUMN a_daily_quote.stock_code       IS '股票完整代码，如 SH
 COMMENT ON COLUMN a_daily_quote.trade_date       IS '交易日';
 COMMENT ON COLUMN a_daily_quote.ps_ttm_ratio     IS '市销率(TTM)=总市值/营收TTM（东财 RPT_VALUEANALYSIS_DET PS_TTM，已按 QFQ 复权因子平移）';
 COMMENT ON COLUMN a_daily_quote.pcf_ttm_ratio    IS '市现率(TTM)=总市值/经营现金流TTM（东财 RPT_VALUEANALYSIS_DET PCF_OCF_TTM，已按 QFQ 复权因子平移）';
+COMMENT ON COLUMN a_daily_quote.prev_close  IS '昨收（前交易日收盘价）；由同表 LAG(close) 推算/回填，与 daily_quote.prev_close 对齐';
+COMMENT ON COLUMN a_daily_quote.change_pct  IS '涨跌幅(%) = (close-prev_close)/prev_close*100，与 daily_quote.change_pct 对齐';
 
 -- 3.2 全球基准指数分钟行情（get_global_benchmarks_minute.py）
 CREATE TABLE IF NOT EXISTS benchmark_minute (

@@ -37,6 +37,13 @@
     upsert 幂等，重采不会产生重复行。
 
 耗时：全港股 2800+ 只 × 逐只拉历史，约 40-60 分钟（分批则按轮次摊开）。
+
+prev_close / change_pct：
+  采集时按每只股票的历史日线顺序递推（前交易日 close 即 prev_close），
+  change_pct = (close-prev_close)/prev_close*100，与 daily_quote 对齐；首个交易日为 NULL。
+  全量跑完后会库内再按 LAG 补齐「之前已落库但缺这两列」的历史行；亦可单独用
+  --fill-prev-close 仅做库内补齐（不采集）。change_pct 精度 NUMERIC(8,2)：
+  个别仙股 合股/拆股 异常日可达上万%（脏数据，源数据 discontinuity）原样落库，下游按需识别。
 """
 import sys
 import time
@@ -57,6 +64,7 @@ def parse_args() -> "dict[str, object]":
     resume = "--resume" in sys.argv
     no_quotes = "--no-quotes" in sys.argv
     aggregate_only = "--aggregate-only" in sys.argv
+    fill_prev_close = "--fill-prev-close" in sys.argv
     start = None
     code = None
     limit = None
@@ -85,6 +93,7 @@ def parse_args() -> "dict[str, object]":
         "no_quotes": no_quotes,
         "aggregate_only": aggregate_only,
         "limit": limit,
+        "fill_prev_close": fill_prev_close,
     }
 
 
@@ -134,6 +143,15 @@ def _fetch_daily(sym):
     df = df.copy()
     df["trade_date"] = pd.to_datetime(df["date"]).dt.date
     return df
+
+
+def _as_float(v):
+    """安全转 float：非数字 / NaN / None 返回 None，否则返回数值。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
 
 
 def fetch_history(start: date, code: str | None = None, quote_sink=None,
@@ -195,20 +213,33 @@ def fetch_history(start: date, code: str | None = None, quote_sink=None,
                 fail += 1
                 log.info(f"  [{i}/{len(codes)}] {full} 无数据")
                 continue
-            df = df[df["trade_date"] >= start]
+            # 按交易日升序，沿全历史递推 prev_close（不受窗口截断影响）
+            df = df.sort_values("trade_date").reset_index(drop=True)
             rows = []
+            prev_close = None
             # itertuples 比 iterrows 省内存/更快（不为每行构造 Series）
             for r in df.itertuples(index=False):
                 d = r._asdict()
                 td = d["trade_date"]
-                amt = float(d["amount"]) if d.get("amount") is not None else 0.0
-                vol = int(d["volume"]) if d.get("volume") is not None else 0
-                a = agg.setdefault(td, {"turnover": 0.0, "volume": 0, "stocks": 0})
-                a["turnover"] += amt
-                a["volume"] += vol
-                # 同一只股票同一交易日仅一行，直接计数即可（无需 set 去重）
-                a["stocks"] += 1
-                rows.append(_map_quote_row(full, td, d))
+                close = _as_float(d.get("close"))
+                # 涨跌幅 = (close - prev_close) / prev_close * 100（prev_close 为前交易日 close）
+                if close is not None and prev_close is not None and prev_close != 0:
+                    change_pct = round((close - prev_close) / prev_close * 100, 2)
+                else:
+                    change_pct = None
+                # 窗口过滤：仅决定是否落库；窗口外行仍用于递推 prev_close
+                if td >= start:
+                    amt = _as_float(d.get("amount"))
+                    vol = int(d["volume"]) if d.get("volume") is not None else 0
+                    a = agg.setdefault(td, {"turnover": 0.0, "volume": 0, "stocks": 0})
+                    a["turnover"] += (amt or 0.0)
+                    a["volume"] += vol
+                    # 同一只股票同一交易日仅一行，直接计数即可（无需 set 去重）
+                    a["stocks"] += 1
+                    rows.append(_map_quote_row(full, td, d, prev_close, change_pct))
+                # 递推 prev_close（用本行 close；close 为 None 时沿用上一交易日）
+                if close is not None:
+                    prev_close = close
             n = len(rows)
             total_quotes += n
             if quote_sink and rows:
@@ -238,7 +269,7 @@ def fetch_history(start: date, code: str | None = None, quote_sink=None,
     return pd.DataFrame(rows)
 
 
-def _map_quote_row(code, td, row):
+def _map_quote_row(code, td, row, prev_close=None, change_pct=None):
     """新浪 stock_hk_daily 行 → hk_daily_quote 字段（估值字段置空）。"""
     def _f(v):
         try:
@@ -255,6 +286,10 @@ def _map_quote_row(code, td, row):
         "close": _f(row.get("close")),
         "volume": int(row["volume"]) if row.get("volume") is not None else 0,
         "amount": _f(row.get("amount")),
+        # prev_close / change_pct 由采集时按 LAG(close) 同表推算（见 fetch_history 的递推逻辑），
+        # 与 daily_quote.change_pct 对齐；首个交易日为 None（无前收盘价）。
+        "prev_close": prev_close,
+        "change_pct": change_pct,
         # 新浪不提供估值/换手率/量比，置空；由日常富途快照补上
         "turnover_rate": None,
         "volume_ratio": None,
@@ -269,6 +304,86 @@ def _map_quote_row(code, td, row):
         # 历史日线无实时更新时间，用交易日作为数据更新时间
         "update_time": str(td),
     }
+
+
+# ----------------------------------------------------------------------------
+# prev_close / change_pct 列确保 + 库内 LAG 回填
+# ----------------------------------------------------------------------------
+# change_pct 精度 NUMERIC(8,2)：港股仙股 合股/拆股 异常日可达上万%（脏数据），8,4 仅 4 位
+# 整数会溢出；8,2 留 6 位整数足以容纳且降低小数精度，与 daily_quote 对齐。
+_PREV_CLOSE_TYPE = "NUMERIC(12,4)"
+_CHANGE_PCT_TYPE = "NUMERIC(8,2)"
+
+
+def ensure_prev_close_columns(cur, tbl: str):
+    """确保 prev_close / change_pct 两列存在且 change_pct 为 8,2（与 schema.sql 对齐；幂等、不丢数据）。
+
+    change_pct 精度 8,2：港股仙股 合股/拆股 异常日可达上万%（脏数据），8,4 仅 4 位整数会溢出；
+    8,2 留 6 位整数足以容纳且降低小数精度，与 daily_quote 对齐。
+    """
+    cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS prev_close {_PREV_CLOSE_TYPE};")
+    cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS change_pct {_CHANGE_PCT_TYPE};")
+    # 若列已存在但类型非目标（如早前残留 12,4 / 8,4），无损转换为 8,2
+    try:
+        cur.execute(
+            f"ALTER TABLE {tbl} ALTER COLUMN change_pct TYPE {_CHANGE_PCT_TYPE} "
+            f"USING change_pct::{_CHANGE_PCT_TYPE};"
+        )
+    except Exception:
+        pass  # 已是目标类型
+
+
+def fill_prev_close_from_db(start: date | None = None):
+    """库内按 LAG(close) 回填 prev_close / change_pct 所有仍为 NULL 的行（幂等）。
+
+    用于覆盖「本次/之前已落库但尚缺这两列」的历史数据；采集时按股票递推写入已能覆盖
+    新采部分，本函数补齐其余。
+    """
+    tbl = "hk_daily_quote"
+    from db import get_conn
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            ensure_prev_close_columns(cur, tbl)
+            # 提前判空：若两列已全部就绪，直接跳过（避免重复跑全表 LAG 扫描）
+            cur.execute(f"SELECT COUNT(*) FROM {tbl} WHERE prev_close IS NULL OR change_pct IS NULL;")
+            if cur.fetchone()[0] == 0:
+                log.info(f"[{tbl}] prev_close/change_pct 已全部就绪，无需回填，跳过")
+                return
+            cur.execute("SET LOCAL work_mem = '2GB';")
+            cur.execute(
+                f"""
+                WITH prev AS (
+                    SELECT id,
+                           LAG(close) OVER (PARTITION BY stock_code ORDER BY trade_date) AS pc
+                    FROM {tbl}
+                )
+                UPDATE {tbl} t
+                SET prev_close = p.pc,
+                    change_pct = CASE
+                        WHEN p.pc IS NOT NULL AND p.pc <> 0
+                        THEN round((t.close - p.pc) / p.pc * 100, 2)
+                    END
+                FROM prev p
+                WHERE t.id = p.id
+                  AND (t.prev_close IS NULL OR t.change_pct IS NULL);
+                """
+            )
+            n = cur.rowcount
+            cur.execute(
+                f"SELECT COUNT(*) FROM {tbl} "
+                f"WHERE prev_close IS NULL OR change_pct IS NULL;"
+            )
+            remain = cur.fetchone()[0]
+            cur.execute(
+                f"""
+                SELECT COUNT(*) FILTER (WHERE prev_close <> 0
+                        AND abs((close - prev_close) / prev_close * 100) > 100)
+                FROM {tbl};
+                """
+            )
+            dirty = cur.fetchone()[0]
+    log.info(f"[hk_daily_quote] prev_close/change_pct 回填 {n} 行，剩余 NULL {remain} 行，"
+             f"|chg|>100% 脏数据 {dirty} 行（源数据 合股/拆股 discontinuity，原样落库）")
 
 
 def aggregate_from_db(start: date):
@@ -350,6 +465,9 @@ class _QuoteWriter:
         from db import get_conn, bulk_upsert
         from get_hk_market_turnover import _ensure_table
         _ensure_table("hk_daily_quote")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                ensure_prev_close_columns(cur, "hk_daily_quote")
         self._get_conn = get_conn
         self._bulk_upsert = bulk_upsert
         self._buf = []
@@ -383,6 +501,12 @@ def run():
     resume: bool = bool(a["resume"])
     limit: int | None = a["limit"]  # type: ignore[assignment]
 
+    # 仅库内按 LAG 回填 prev_close / change_pct（不采集），补齐历史已落库但缺这两列的行
+    if a["fill_prev_close"]:
+        log.info("仅回填 prev_close / change_pct（库内 LAG，不采集）")
+        fill_prev_close_from_db(start)
+        return
+
     # 只重算总成交额（不采集）——分批采完后补算，或任何时候校正
     if a["aggregate_only"]:
         log.info(f"仅重算总成交额（起始 {start}）")
@@ -414,6 +538,9 @@ def run():
         #  - 单只模式下 agg 只含这一只（原实现会把全市场总额覆盖成单只，是 bug）。
         # 库内 GROUP BY 重算在两种模式下都得到正确的全市场口径。
         aggregate_from_db(start)
+        # 补齐「之前已落库但缺 prev_close/change_pct」的历史行（采集递推只覆盖本次新采部分）
+        if not code:
+            fill_prev_close_from_db(start)
         if not code:
             progress_report(start)
 
