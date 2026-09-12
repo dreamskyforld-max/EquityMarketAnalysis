@@ -117,6 +117,7 @@ _DDL = {
             period       VARCHAR(12) NOT NULL DEFAULT 'day',
             expect_lag   INT         NOT NULL DEFAULT 0,
             refresh_weekday INT      NOT NULL DEFAULT 0,  -- period='week' 时生效：刷新日星期几(0=Mon..6=Sun)
+            group_by     VARCHAR(64),                     -- 非空时按该列 GROUP BY 逐分组判停滞（如 benchmark_minute 的 bench_code）
             active       BOOLEAN     NOT NULL DEFAULT TRUE,
             remark       VARCHAR(120),
             UNIQUE (db_name, table_name)
@@ -142,9 +143,15 @@ def ensure_tables():
         with conn.cursor() as cur:
             for ddl in _DDL.values():
                 cur.execute(ddl)
+            # 兼容存量库：monitor_table_config 在建表后可能尚无 group_by 列
+            cur.execute(
+                "ALTER TABLE monitor_table_config "
+                "ADD COLUMN IF NOT EXISTS group_by VARCHAR(64)"
+            )
         conn.commit()
     _seed_table_config()
     _seed_task_config()
+    _migrate_monitor_config()
 
 
 # 当前真正在采集的表的种子配置（仅在配置表为空时写入）。
@@ -212,6 +219,22 @@ def _seed_table_config():
                     "ON CONFLICT (db_name, table_name) DO NOTHING",
                     (name, col, period, lag, wd, remark),
                 )
+        conn.commit()
+
+
+def _migrate_monitor_config():
+    """存量配置迁移（幂等）：把需要按分组监控的表补上 group_by。
+
+    仅 benchmark_minute 需要逐 bench_code 判停滞（避免单序列停采被整表 MAX 掩盖）。
+    配置驱动的兜底：既覆盖已运行的存量库，也覆盖全新库（seed 未含 group_by 时）。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE monitor_table_config SET group_by='bench_code' "
+                "WHERE table_name='benchmark_minute' "
+                "AND (group_by IS NULL OR group_by='')"
+            )
         conn.commit()
 
 
@@ -581,6 +604,8 @@ def _check_data_stale():
       - week   : 周更，MAX(col) >= 最近周一 - expect_lag 周
       - lowfreq: 低频维度，MAX(col) >= now - expect_lag 天
     同时检测「表无数据」和「无法读取」两种情况。
+    若配置了 group_by 列，则按该列 GROUP BY 逐子分组判停滞（仅 minute 已支持），
+    避免单序列停采被整表 MAX 掩盖（如 benchmark_minute 的 JP.N225/KR.KS11 单独停更）。
     扩展新表只需往 monitor_table_config 插一行，无需改代码/重启。
     """
     now = datetime.now(timezone.utc)
@@ -592,7 +617,7 @@ def _check_data_stale():
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT table_name, time_column, period, expect_lag, refresh_weekday "
+                    "SELECT table_name, time_column, period, expect_lag, refresh_weekday, group_by "
                     "FROM monitor_table_config WHERE active=true ORDER BY table_name"
                 )
                 rows = cur.fetchall()
@@ -602,7 +627,21 @@ def _check_data_stale():
 
     # 清理孤儿告警：配置已不再监控的 source，其遗留未解决告警直接收尾，
     # 避免前端读到已失效的监控目标告警（配置驱动：改配置即生效）。
-    monitored = {r[0] for r in rows}
+    # 含分组子源（table/group）：仅分组表已消失的分组/整表级旧告警才会被当孤儿清理。
+    monitored = set()
+    for r in rows:
+        tname, gby = r[0], r[5]
+        if gby:
+            try:
+                with get_conn() as c2:
+                    with c2.cursor() as cur2:
+                        cur2.execute(f"SELECT DISTINCT {gby} FROM {tname}")
+                        for (g,) in cur2.fetchall():
+                            monitored.add(f"{tname}/{g}")
+            except Exception as e:
+                log.warning(f"统计 {tname} 分组失败: {e}")
+        else:
+            monitored.add(tname)
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -623,9 +662,16 @@ def _check_data_stale():
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                for table, col, period, lag, wd in rows:
+                for table, col, period, lag, wd, group_by_col in rows:
                     start = window_start.get((period, lag, wd))
                     try:
+                        if group_by_col:
+                            # 按分组逐序列判停滞（如 benchmark_minute 的 bench_code）：
+                            # 整表 MAX 会被其它活跃序列顶起，单序列停采需逐组独立告警。
+                            _check_grouped_stale(
+                                table, col, group_by_col, period, lag, wd,
+                                now, today, active, start)
+                            continue
                         if start is not None:
                             cur.execute(
                                 f"SELECT MAX({col}) FROM {table} WHERE {col} >= %s",
@@ -753,6 +799,64 @@ def _evaluate_stale(table, col, period, lag, wd, last, now, today, active, windo
             _resolve_alert("data_stale", table)
     else:
         log.warning(f"未知 period={period} 于表 {table}，跳过")
+
+
+def _check_grouped_stale(table, col, group_col, period, lag, wd, now, today, active, window_start):
+    """逐分组停滞判定（目前仅实现 minute 分支，供 benchmark_minute 等按 bench_code 分组的表）。
+
+    整表 MAX(col) 会被其它仍在写的序列顶起，导致单序列停采被掩盖
+    （如 JP.N225/KR.KS11 停更但 HK/A 股序列照写）。改为按 group_col GROUP BY，
+    每组独立判「超 N 分钟未更新」，任一序列停滞都能单独告警
+    （source 形如 table/group_val，互不干扰）。
+
+    非活跃期（周末/节假日/盘后）与单表分钟逻辑一致：不新发也不 resolve，保守保持。
+    """
+    if period != "minute":
+        log.warning(f"group_by 目前仅支持 minute 分支，表 {table} 跳过分组检查")
+        return
+    if not active:
+        return
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 窗口内每组最新时间（窗口下界对齐最近交易日，停更序列落入「窗口内无数据」）
+                if window_start is not None:
+                    cur.execute(
+                        f"SELECT {group_col}, MAX({col}) FROM {table} "
+                        f"WHERE {col} >= %s GROUP BY {group_col}",
+                        (window_start,),
+                    )
+                else:
+                    cur.execute(
+                        f"SELECT {group_col}, MAX({col}) FROM {table} GROUP BY {group_col}"
+                    )
+                present = {g: ts for g, ts in cur.fetchall()}
+                # 该表当前所有分组（含窗口外的历史分组），避免漏判已停采序列
+                cur.execute(f"SELECT DISTINCT {group_col} FROM {table}")
+                all_groups = [r[0] for r in cur.fetchall()]
+    except Exception as e:
+        _raise_alert("data_stale", "warn", table, f"无法读取 {table}(分组 {group_col}): {e}")
+        return
+
+    for g in all_groups:
+        source = f"{table}/{g}"
+        last = present.get(g)
+        if last is None:
+            _raise_alert("data_stale", "crit", source,
+                         f"{table} 分组 {g} 最近窗口内无数据"
+                         f"（{col} >= {window_start} 为空），该序列可能已停采")
+            continue
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        idle = (now - last).total_seconds() / 60.0
+        if idle >= STALE_CRIT_MIN:
+            _raise_alert("data_stale", "crit", source,
+                         f"{table}/{g} 最新记录 {last}，已 {idle:.0f} 分钟未更新（该序列停采？）")
+        elif idle >= STALE_WARN_MIN:
+            _raise_alert("data_stale", "warn", source,
+                         f"{table}/{g} 最新记录 {last}，已 {idle:.0f} 分钟未更新")
+        else:
+            _resolve_alert("data_stale", source)
 
 
 def run(codes=None, ctx=None):

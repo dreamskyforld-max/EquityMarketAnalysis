@@ -1109,6 +1109,7 @@ CREATE TABLE IF NOT EXISTS monitor_table_config (
     period        VARCHAR(12) NOT NULL DEFAULT 'day',
     expect_lag    INT         NOT NULL DEFAULT 0,
     refresh_weekday INT       NOT NULL DEFAULT 0,  -- period='week' 时生效：刷新日星期几(0=Mon..6=Sun)
+    group_by      VARCHAR(64),                     -- 非空时按该列 GROUP BY 逐分组判停滞（如 benchmark_minute 的 bench_code）
     active        BOOLEAN     NOT NULL DEFAULT TRUE,
     remark        VARCHAR(120),
     UNIQUE (db_name, table_name)

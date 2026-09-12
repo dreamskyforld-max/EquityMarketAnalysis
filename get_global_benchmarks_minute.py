@@ -5,7 +5,7 @@
 数据源:
   - 富途 OpenAPI K_1M:     恒生指数 / 恒生科技
   - 腾讯分钟接口:           上证指数 / 深证成指
-  - yfinance:              日经225 / KOSPI
+  - 东方财富全球指数分钟:    日经225 / KOSPI  （2026-09-12 起替代 yfinance：雅虎自 2026-08-21 起持续 429 限流，yfinance 不可靠）
   - 东财直调 klt=1:        DAX / 道琼斯 / 纳斯达克 / 标普500
 
 说明:
@@ -66,9 +66,9 @@ MINUTE_BENCHMARKS: List[Dict] = [
     # 腾讯分钟接口（A股指数）
     {"code": "SH.000001", "name": "上证指数",     "source": "tencent_a", "tz": "Asia/Hong_Kong"},
     {"code": "SZ.399001", "name": "深证成指",     "source": "tencent_a", "tz": "Asia/Hong_Kong"},
-    # yfinance（日经 / KOSPI）
-    {"code": "JP.N225",   "name": "日经225指数",   "source": "yfinance", "yf_ticker": "^N225", "tz": "Asia/Tokyo"},
-    {"code": "KR.KS11",   "name": "韩国KOSPI指数", "source": "yfinance", "yf_ticker": "^KS11", "tz": "Asia/Seoul"},
+    # 东方财富全球指数分钟 k 线（日经 / KOSPI）—— 替代 yfinance（雅虎 2026-08-21 起持续 429 限流，不可靠）
+    {"code": "JP.N225",   "name": "日经225指数",   "source": "eastmoney", "em_secid": "100.N225", "tz": "Asia/Tokyo"},
+    {"code": "KR.KS11",   "name": "韩国KOSPI指数", "source": "eastmoney", "em_secid": "100.KS11", "tz": "Asia/Seoul"},
     # 东财全球指数 — 反爬拦截严重，暂不采集
     # {"code": "DE.GDAXI",  "name": "德国DAX指数",   "source": "eastmoney", "em_secid": "100.GDAXI",  "tz": "Europe/Berlin"},
     # {"code": "US.DJIA",   "name": "道琼斯工业指数", "source": "eastmoney", "em_secid": "100.DJIA",  "tz": "America/New_York"},
@@ -183,7 +183,9 @@ def _collect_eastmoney(items: list, klt: str = "1", days: int = 1) -> list:
     import requests as req
     import time as _t
 
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    # 注：日线版 get_global_benchmarks.py 实测 push2his 在当前网络不可达，
+    # 改用 push2.eastmoney.com（同款 kline 接口）稳定可用。
+    url = "https://push2.eastmoney.com/api/qt/stock/kline/get"
     base = {
         "klt": klt, "fqt": "1", "lmt": str(min(days * 400, 50000)),
         "end": "20500000", "iscca": "1",
@@ -215,15 +217,27 @@ def _collect_eastmoney(items: list, klt: str = "1", days: int = 1) -> list:
                 kept = 0
                 for line in kls:
                     row = line.split(",")
-                    mkt = row[0]  # 市场本地时间
-                    dt = datetime.strptime(mkt[:16], "%Y-%m-%d %H:%M:%S")
+                    mkt = row[0].strip()  # 东财 1 分钟 k 线时间格式为 "YYYY-MM-DD HH:MM"（无秒）
+                    # 统一补齐秒为 "YYYY-MM-DD HH:MM:SS"（与其他源 time_key 格式一致）
+                    if len(mkt) >= 19:
+                        mkt_full = mkt[:19]
+                    elif len(mkt) >= 16:
+                        mkt_full = mkt[:16] + ":00"
+                    else:
+                        continue
+                    try:
+                        dt = datetime.strptime(mkt_full, "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        continue
                     if (date.today() - dt.date()).days > days:
                         continue
-                    utc = _to_utc(mkt[:16], it["tz"])
+                    utc = _to_utc(mkt_full, it["tz"])
+                    if utc is None:
+                        continue
                     # 东财字段: f51时间 f52开 f53收 f54高 f55低
                     records.append({
                         "bench_code": it["code"], "bench_name": it["name"],
-                        "ts": utc, "mkt_time": mkt[:16],
+                        "ts": utc, "mkt_time": mkt_full,
                         "open": _r(row[1]), "high": _r(row[3]),
                         "low": _r(row[4]), "close": _r(row[2]),
                         "source": "eastmoney",
