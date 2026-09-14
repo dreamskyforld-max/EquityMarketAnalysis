@@ -18,7 +18,7 @@ import logging
 from datetime import date
 logging.basicConfig(level=logging.WARNING)
 from futu import RET_OK
-from db import get_conn, upsert
+from db import get_conn, upsert, write_quote_dual
 from collector_runtime import get_shared_ctx
 
 def fmt_price(val, max_dec=4):
@@ -101,6 +101,9 @@ def save_quote_to_db(stock_code, row):
 
         with get_conn() as conn:
             upsert(conn, "daily_quote", data, conflict_cols=["stock_code", "trade_date"])
+            # 阶段 1 双写：同步写入池表（a_daily_quote / hk_daily_quote，按代码前缀路由）。
+            # 内部 SAVEPOINT 隔离：池表写失败只回滚子事务并告警，不影响上面的 daily_quote 写入。
+            write_quote_dual(conn, data)
     except Exception as e:
         # 数据库写入失败不中断控制台输出
         print(f"[DB] 行情快照入库失败 ({stock_code}): {e}")

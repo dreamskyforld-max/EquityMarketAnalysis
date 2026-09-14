@@ -36,7 +36,52 @@ COMMENT ON COLUMN stock_info.list_date            IS '上市日期（富途 list
 COMMENT ON COLUMN stock_info.exchange_type        IS '交易所/板块类型（富途：CN_SH / CN_SZ / CN_STIB / CN_BJ / HK_MAINBOARD / HK_GEMBOARD）';
 COMMENT ON COLUMN stock_info.delisting            IS '是否已退市（富途 delisting）。补采脚本写入，新增股票一律 is_active=FALSE，不进入现有采集池';
 
--- 1.1 股票-指数成分归属表（参考数据，低频刷新）
+-- 1.1 全市场采集清单（quote_universe；sync_quote_universe.py 每日 08:30 刷新）
+-- 定位：全市场「采集范围 + 口径」的真相源，与 stock_info（code→名称字典 + 人工深采开关）职责分离。
+--   · 采集器只读本表（is_collectable）决定采什么；stock_info.is_active 仍只管实时深采池（人工维护，二者语义不同）。
+--   · 刷新器用富途 get_stock_basicinfo 全量拉取（无额度限制），带计数护栏 + 软删（30 天未在源出现才停用）。
+--   · 新增代码同步 INSERT 进 stock_info（is_active=FALSE），保证名称字典同步。
+CREATE TABLE IF NOT EXISTS quote_universe (
+    stock_code      VARCHAR(20)     PRIMARY KEY,        -- 如 HK.00700 / SH.600519 / SZ.000001
+    stock_name      VARCHAR(100),                       -- 名称快照（权威映射以 stock_info 为准）
+    market          CHAR(2),                            -- HK / SH / SZ
+    seg             VARCHAR(6),                         -- 代码段号（前 3 位），如 600 / 688 / 300 / 810
+    sec_type        VARCHAR(10)     DEFAULT 'STOCK',    -- 富途 get_stock_basicinfo 类型（STOCK/ETF/…）
+    is_primary      BOOLEAN         DEFAULT FALSE,      -- 是否计入「全市场成交额」正股口径
+    is_collectable  BOOLEAN         DEFAULT TRUE,       -- 采集范围开关（自动软删，可自愈）
+    listing_date    DATE,                               -- 上市日期（富途 listing_date；1970-01-01 占位记 NULL）
+    exchange_type   VARCHAR(20),                        -- CN_SH / CN_SZ / CN_STIB / CN_BJ / HK_MAINBOARD / HK_GEMBOARD
+    source          VARCHAR(20),                        -- 数据来源：futu_basicinfo / seed
+    first_seen      TIMESTAMPTZ     DEFAULT NOW(),      -- 首次进入清单时间
+    last_seen       TIMESTAMPTZ,                        -- 最近一次在源中出现时间（软删判定依据）
+    updated_at      TIMESTAMPTZ     DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_quote_universe_scope ON quote_universe (market) WHERE is_collectable;
+
+COMMENT ON TABLE  quote_universe                 IS '全市场采集清单：采集范围(is_collectable)与口径(is_primary)的真相源；sync_quote_universe.py 每日 08:30 刷新';
+COMMENT ON COLUMN quote_universe.seg             IS '代码段号（前 3 位），用于口径判定与分布审计，如 600/601/603/605/688/000/300/810';
+COMMENT ON COLUMN quote_universe.is_primary      IS '是否计入「全市场成交额」正股口径：A 股=正股段(600/601/603/605/688/000/001/002/003/300/301)；港股=全部 STOCK';
+COMMENT ON COLUMN quote_universe.is_collectable  IS '是否在采集范围。自动软删：last_seen 超 30 天未在源出现 → FALSE；再次出现自动恢复。⚠ 与 stock_info.is_active（人工深采开关）语义不同';
+COMMENT ON COLUMN quote_universe.last_seen       IS '最近一次在源（富途 basicinfo）中出现的时间；软删判定依据';
+
+-- 1.1.1 全市场采集范围视图（采集器的唯一入口）
+-- = union：全市场清单可采集 + 实时深采池（人工）。
+--   并集的原因：富途 ("SH","STOCK") 不含 5xx ETF，深采池里的 SH.520900 这类品种
+--   只能靠 stock_info.is_active 补齐；反之深采池未覆盖的品种由 universe 提供。
+--   src 列用于审计来源（universe 优先于 watchlist）。
+CREATE OR REPLACE VIEW v_quote_scope AS
+SELECT DISTINCT ON (stock_code) stock_code, market, src
+FROM (
+    SELECT stock_code, market, 'universe'  AS src FROM quote_universe WHERE is_collectable
+    UNION ALL
+    SELECT stock_code, market, 'watchlist' AS src FROM stock_info     WHERE is_active
+) u
+ORDER BY stock_code, src;
+
+COMMENT ON VIEW v_quote_scope IS '全市场采集范围：quote_universe.is_collectable ∪ stock_info.is_active（含 src 来源审计；供采集器读清单用）';
+
+-- 1.2 股票-指数成分归属表（参考数据，低频刷新）
 -- 反向建表：遍历「已知指数 → 全成分」，每只成分股落一行。
 -- 查询某股票所属指数：SELECT sector_code, sector_name FROM stock_sector WHERE stock_code = 'HK.00700'
 CREATE TABLE IF NOT EXISTS stock_sector (
@@ -716,11 +761,11 @@ CREATE TABLE IF NOT EXISTS daily_market_turnover (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_market_turnover_tradedate ON public.daily_market_turnover USING btree (trade_date);
 
-COMMENT ON TABLE  daily_market_turnover                     IS '港股全市场总成交额（数据源：新浪 stock_hk_daily 逐只聚合，T+1 全天完整值）';
+COMMENT ON TABLE  daily_market_turnover                     IS '港股全市场每日成交额快照（日常=富途 get_market_snapshot 批量快照；历史=新浪 stock_hk_daily 逐只聚合；清单=v_quote_scope）';
 COMMENT ON COLUMN daily_market_turnover.snapshot_time       IS '快照时间戳（日频=盘后一次，分钟级=每分钟一次）';
 COMMENT ON COLUMN daily_market_turnover.total_turnover      IS '全市场总成交额（港元），SUM(个股成交额)';
 COMMENT ON COLUMN daily_market_turnover.total_volume        IS '全市场总成交量（股），SUM(个股成交量)';
-COMMENT ON COLUMN daily_market_turnover.stock_count         IS '参与聚合的标的数量（用于校验是否拉全）';
+COMMENT ON COLUMN daily_market_turnover.stock_count         IS '当日有成交（成交额>0）的标的数量。日常采集按内存口径写入；历史回填 aggregate_from_db 按表内行数 COUNT(DISTINCT) 计，故 2026-09-14 之前的日期可能偏大（含零成交行），之后随「只落有成交行」自然趋同';
 COMMENT ON COLUMN daily_market_turnover.created_at          IS '数据写入数据库的时间';
 
 CREATE INDEX IF NOT EXISTS idx_market_turnover_time ON daily_market_turnover (snapshot_time DESC);
@@ -730,12 +775,12 @@ CREATE TABLE IF NOT EXISTS hk_daily_quote (
     id          BIGSERIAL       PRIMARY KEY,
     stock_code  VARCHAR(20)     NOT NULL,           -- 如 HK.00700
     trade_date  DATE            NOT NULL,           -- 交易日
-    open        NUMERIC(12,4),                      -- 开盘价
-    high        NUMERIC(12,4),                      -- 最高价
-    low         NUMERIC(12,4),                      -- 最低价
-    close       NUMERIC(12,4),                      -- 收盘价
-    prev_close  NUMERIC(12,4),                      -- 昨收（前交易日收盘价；由同表 LAG(close) 推算/回填，与 daily_quote.prev_close 对齐）
-    change_pct  NUMERIC(8,2),                       -- 涨跌幅(%) = (close-prev_close)/prev_close*100（与 daily_quote.change_pct 对齐；港股仙股 合股/拆股 异常日可达上万%，8,4 仅 4 位整数会溢出，故用 8,2 留 6 位整数且降低小数精度）
+    open        NUMERIC(12,4),                      -- 开盘价（QFQ 前复权）
+    high        NUMERIC(12,4),                      -- 最高价（QFQ 前复权）
+    low         NUMERIC(12,4),                      -- 最低价（QFQ 前复权）
+    close       NUMERIC(12,4),                      -- 收盘价（QFQ 前复权）
+    prev_close  NUMERIC(12,4),                      -- 昨收（前交易日收盘价，QFQ 前复权；同表 LAG(close) 推算/回填）
+    change_pct  NUMERIC(12,4),                      -- 涨跌幅(%) = (close-prev_close)/prev_close*100（基于 QFQ 口径，已消除除权跳空；仙股 合股/拆股 异常日可达上万%，实测 max|chg|≈4738，故用 12,4 留 8 位整数余量）
     volume      BIGINT,                             -- 成交量（股）
     amount      NUMERIC(20,2),                      -- 成交额（港元）
     turnover_rate       NUMERIC(8,4),               -- 换手率(%)
@@ -756,17 +801,20 @@ CREATE TABLE IF NOT EXISTS hk_daily_quote (
     UNIQUE (stock_code, trade_date)
 );
 
-COMMENT ON TABLE  hk_daily_quote             IS '港股全量股票简版日线数据池（数据源：富途 get_market_snapshot 快照 / request_history_kline 历史；PS/PCF 由 financial_indicator 推算）';
+COMMENT ON TABLE  hk_daily_quote             IS '港股全量股票简版日线数据池（日常=富途 get_market_snapshot 快照；历史=新浪 stock_hk_daily(adjust=qfq)；清单=v_quote_scope；价格列统一 QFQ 前复权，与 a_daily_quote 口径一致；仅落当日有成交（amount>0）的行；PS/PCF 由 financial_indicator 推算）';
 COMMENT ON COLUMN hk_daily_quote.ps_ttm_ratio  IS '市销率(TTM)=总市值/营收TTM（financial_indicator 近4季营收滚动求和推算）';
 COMMENT ON COLUMN hk_daily_quote.pcf_ttm_ratio IS '市现率(TTM)=总市值/经营活动现金流TTM（financial_indicator 近4季经营现金流滚动求和推算）';
 COMMENT ON COLUMN hk_daily_quote.stock_code  IS '股票代码，如 HK.00700';
 COMMENT ON COLUMN hk_daily_quote.amount      IS '成交额（港元），全天完整值';
 COMMENT ON COLUMN hk_daily_quote.update_time IS '数据更新时间（富途快照的 update_time；历史回溯则为交易日）';
-COMMENT ON COLUMN hk_daily_quote.prev_close  IS '昨收（前交易日收盘价）；由同表 LAG(close) 推算/回填，与 daily_quote.prev_close 对齐';
-COMMENT ON COLUMN hk_daily_quote.change_pct  IS '涨跌幅(%) = (close-prev_close)/prev_close*100，与 daily_quote.change_pct 对齐';
+COMMENT ON COLUMN hk_daily_quote.prev_close  IS '昨收（前交易日收盘价，QFQ 前复权）；同表 LAG(close) 推算/回填';
+COMMENT ON COLUMN hk_daily_quote.change_pct  IS '涨跌幅(%) = (close-prev_close)/prev_close*100（基于 QFQ 口径，已消除除权跳空）';
+COMMENT ON COLUMN hk_daily_quote.close       IS '收盘价（QFQ 前复权，锚定最新交易日）；每次除息事件后需重跑 backfill_hk_market_turnover.py 再锚定历史';
 
 CREATE INDEX IF NOT EXISTS idx_hk_daily_quote_date  ON hk_daily_quote (trade_date DESC);
 CREATE INDEX IF NOT EXISTS idx_hk_daily_quote_stock ON hk_daily_quote (stock_code, trade_date DESC);
+-- 前端检索：按股票取最新行情（WHERE stock_code=? ORDER BY update_time DESC LIMIT n）
+CREATE INDEX IF NOT EXISTS idx_hk_daily_quote_stock_update_time ON hk_daily_quote (stock_code, update_time);
 
 -- ============================================================================
 -- 第十一部分：辅助视图
@@ -803,23 +851,9 @@ ORDER BY stock_code, trade_date DESC;
 
 COMMENT ON VIEW v_latest_quote IS '各股票最新交易日行情快照，取 daily_quote 中每只股票 trade_date 最大的一行';
 
--- 视图：单日超额收益（基于 daily_quote + daily_benchmark 动态计算）
-CREATE OR REPLACE VIEW v_daily_excess_return AS
-SELECT
-    q.stock_code,
-    q.trade_date,
-    q.change_pct                        AS stock_change_pct,
-    b.change_pct                        AS bench_change_pct,
-    q.change_pct - b.change_pct         AS excess_return_pct
-FROM daily_quote q
-JOIN daily_benchmark b ON b.trade_date = q.trade_date
-WHERE b.bench_code = CASE
-    WHEN q.stock_code LIKE 'HK.%' THEN 'HK.800000'
-    WHEN q.stock_code LIKE 'SH.%' THEN 'SH.000001'
-    WHEN q.stock_code LIKE 'SZ.%' THEN 'SZ.399001'
-END;
-
-COMMENT ON VIEW v_daily_excess_return IS '单日超额收益 = 个股涨跌幅 - 对应市场基准指数涨跌幅，自动根据股票代码前缀匹配基准';
+-- 视图 v_daily_excess_return：已下移至 3.1.2 段（在 v_daily_quote 之后）。
+-- 原因：该视图现已改为基于 v_daily_quote（全市场），而 schema.sql 是按顺序执行的
+-- （全新部署从头跑），若仍定义在此处会引用到尚未创建的 v_daily_quote 而报错。
 
 -- 视图：股票最新趋势快照
 CREATE OR REPLACE VIEW v_latest_trend_snapshot AS
@@ -916,9 +950,12 @@ CREATE TABLE IF NOT EXISTS a_daily_market_turnover (
     UNIQUE (trade_date)
 );
 
-COMMENT ON TABLE  a_daily_market_turnover            IS 'A股全市场每日成交额/成交量快照（盘后采集）';
+COMMENT ON TABLE  a_daily_market_turnover            IS 'A股全市场每日成交额/成交量快照（日常=富途 get_market_snapshot 批量快照；清单=v_quote_scope）';
 COMMENT ON COLUMN a_daily_market_turnover.trade_date IS '交易日';
 COMMENT ON COLUMN a_daily_market_turnover.snapshot_time IS '快照时刻(已转 UTC)';
+COMMENT ON COLUMN a_daily_market_turnover.total_turnover IS '全市场总成交额（元），SUM(个股成交额)';
+COMMENT ON COLUMN a_daily_market_turnover.total_volume   IS '全市场总成交量（股），SUM(个股成交量)';
+COMMENT ON COLUMN a_daily_market_turnover.stock_count    IS '当日有成交（成交额>0）的标的数量。⚠ 口径：2026-09-14 起采集清单扩到 v_quote_scope 全集（含 B股/REIT/CDR 等非正股），合计口径随之扩大；如需「仅 A 股正股」请按 quote_universe.is_primary 过滤';
 
 CREATE TABLE IF NOT EXISTS a_daily_quote (
     id                  BIGSERIAL       PRIMARY KEY,
@@ -929,7 +966,7 @@ CREATE TABLE IF NOT EXISTS a_daily_quote (
     low                 NUMERIC(12,4),
     close               NUMERIC(12,4),
     prev_close          NUMERIC(12,4),              -- 昨收（前交易日收盘价；由同表 LAG(close) 推算/回填，与 daily_quote.prev_close 对齐）
-    change_pct          NUMERIC(8,2),               -- 涨跌幅(%) = (close-prev_close)/prev_close*100（与 daily_quote.change_pct 对齐；历史借壳/重组跳变可达上千%，8,4 仅 4 位整数会溢出，故用 8,2 留 6 位整数且降低小数精度）
+    change_pct          NUMERIC(12,4),              -- 涨跌幅(%) = (close-prev_close)/prev_close*100（历史借壳/重组跳变可达上千%，用 12,4 留 8 位整数余量）
     volume              BIGINT,
     amount              NUMERIC(22,2),
     turnover_rate       NUMERIC(8,4),
@@ -949,14 +986,114 @@ CREATE TABLE IF NOT EXISTS a_daily_quote (
     UNIQUE (stock_code, trade_date)
 );
 CREATE INDEX IF NOT EXISTS idx_aquote_trade_date ON public.a_daily_quote USING btree (trade_date);
+-- 前端检索：按股票取最新行情（WHERE stock_code=? ORDER BY update_time DESC LIMIT n）。
+-- 与 UNIQUE(stock_code, trade_date) 的区别：本索引服务于「按更新时间排序」的取最新快照场景。
+CREATE INDEX IF NOT EXISTS idx_aquote_stock_update_time ON a_daily_quote (stock_code, update_time);
 
-COMMENT ON TABLE  a_daily_quote                  IS 'A股个股每日行情/估值快照（盘后采集；PS/PCF 来自东财 RPT_VALUEANALYSIS_DET）';
+COMMENT ON TABLE  a_daily_quote                  IS 'A股个股每日行情/估值快照（日常=富途 get_market_snapshot 批量快照；清单=v_quote_scope；仅落当日有成交（amount>0）的行；PS/PCF 来自东财 RPT_VALUEANALYSIS_DET / backfill_a_valuation）';
 COMMENT ON COLUMN a_daily_quote.stock_code       IS '股票完整代码，如 SH.600519';
 COMMENT ON COLUMN a_daily_quote.trade_date       IS '交易日';
 COMMENT ON COLUMN a_daily_quote.ps_ttm_ratio     IS '市销率(TTM)=总市值/营收TTM（东财 RPT_VALUEANALYSIS_DET PS_TTM，已按 QFQ 复权因子平移）';
 COMMENT ON COLUMN a_daily_quote.pcf_ttm_ratio    IS '市现率(TTM)=总市值/经营现金流TTM（东财 RPT_VALUEANALYSIS_DET PCF_OCF_TTM，已按 QFQ 复权因子平移）';
 COMMENT ON COLUMN a_daily_quote.prev_close  IS '昨收（前交易日收盘价）；由同表 LAG(close) 推算/回填，与 daily_quote.prev_close 对齐';
 COMMENT ON COLUMN a_daily_quote.change_pct  IS '涨跌幅(%) = (close-prev_close)/prev_close*100，与 daily_quote.change_pct 对齐';
+
+-- 3.1.1 统一日线视图 v_daily_quote（a_daily_quote ∪ hk_daily_quote）
+-- 用途：daily_quote 合并迁移的「统一替代读接口」（渐进式改造 · 阶段 0）。
+-- ⚠ 位置要求：必须定义在 hk_daily_quote / a_daily_quote 两张池表之后，否则全新部署按序执行会引用不存在的表。
+-- 设计要点：
+--   · 物理存储仍是 a_daily_quote / hk_daily_quote 两张表（天然市场分区，无数据迁移）；
+--     两张表列集完全一致，仅 amount / total_market_val / circular_market_val 精度不同
+--     （A 22,2 / HK 20,2），UNION ALL 视图自动取宽精度。
+--   · 兼容期同时暴露两套命名：池表口径 close/open/high/low/amount 与旧 daily_quote 口径
+--     last_price/open_price/high_price/low_price/turnover，读方（脚本/前端）可逐个迁移。
+--   · 新增 market 列（'A' / 'HK'）便于按市场聚合。
+--   · 视图不可写：写方（INSERT ... ON CONFLICT）必须直接写实体表（见迁移阶段 1）。
+CREATE OR REPLACE VIEW v_daily_quote AS
+SELECT
+    stock_code,
+    trade_date,
+    CASE WHEN LEFT(stock_code, 2) = 'HK' THEN 'HK' ELSE 'A' END AS market,
+    update_time,
+    open,        open        AS open_price,
+    high,        high        AS high_price,
+    low,         low         AS low_price,
+    close,       close       AS last_price,
+    prev_close,
+    change_pct,
+    volume,
+    amount,      amount      AS turnover,
+    turnover_rate,
+    volume_ratio,
+    high_52w,
+    low_52w,
+    total_market_val,
+    circular_market_val,
+    pe_ratio,
+    pe_ttm_ratio,
+    pb_ratio,
+    ps_ttm_ratio,
+    pcf_ttm_ratio,
+    dividend_ratio_ttm,
+    created_at
+FROM a_daily_quote
+UNION ALL
+SELECT
+    stock_code,
+    trade_date,
+    'HK' AS market,
+    update_time,
+    open,        open        AS open_price,
+    high,        high        AS high_price,
+    low,         low         AS low_price,
+    close,       close       AS last_price,
+    prev_close,
+    change_pct,
+    volume,
+    amount,      amount      AS turnover,
+    turnover_rate,
+    volume_ratio,
+    high_52w,
+    low_52w,
+    total_market_val,
+    circular_market_val,
+    pe_ratio,
+    pe_ttm_ratio,
+    pb_ratio,
+    ps_ttm_ratio,
+    pcf_ttm_ratio,
+    dividend_ratio_ttm,
+    created_at
+FROM hk_daily_quote;
+
+COMMENT ON VIEW v_daily_quote IS '统一日线视图：a_daily_quote ∪ hk_daily_quote（daily_quote 的统一替代读接口；兼容期双命名，含 market 列；两市场价格列均为 QFQ 前复权）';
+
+-- 3.1.2 单日超额收益视图（基于 v_daily_quote + daily_benchmark 动态计算，全市场）
+-- 变更（2026-09-14）：数据源由 daily_quote（active 池，约 6 万行）切换为 v_daily_quote（全市场）：
+--   覆盖升到千万级，个股历史回溯到上市首日；读方按 stock_code 过滤可走索引（勿无条件全表聚合）。
+-- 精度：stock_change_pct = 池表 change_pct NUMERIC(12,4)（加宽自旧视图的 (8,4)，防极端涨跌幅溢出），
+--   bench_change_pct = daily_benchmark.change_pct NUMERIC(8,4)；池表日常写入按 2 位小数取整，
+--   故与旧视图（daily_quote，4 位）相比存在 ≤0.01pp 的舍入差（仅精度差，非口径差异）。
+-- 口径安全性：本视图只取 change_pct（官方单日涨跌幅），不涉及价格列，故不受复权口径影响。
+-- ⚠ 位置要求：依赖 v_daily_quote，必须定义在其后（上方 3.1.1 段）。
+-- ⚠ 类型变更：列类型由 (8,4) 加宽到 (12,4)。CREATE OR REPLACE VIEW 不允许改列类型，
+--   故首次切换需 DROP + CREATE —— 已在库上用单事务原子执行；此后重刷仍可用 CREATE OR REPLACE。
+CREATE OR REPLACE VIEW v_daily_excess_return AS
+SELECT
+    q.stock_code,
+    q.trade_date,
+    q.change_pct                        AS stock_change_pct,
+    b.change_pct                        AS bench_change_pct,
+    q.change_pct - b.change_pct         AS excess_return_pct
+FROM v_daily_quote q
+JOIN daily_benchmark b ON b.trade_date = q.trade_date
+WHERE b.bench_code = CASE
+    WHEN q.stock_code LIKE 'HK.%' THEN 'HK.800000'
+    WHEN q.stock_code LIKE 'SH.%' THEN 'SH.000001'
+    WHEN q.stock_code LIKE 'SZ.%' THEN 'SZ.399001'
+END;
+
+COMMENT ON VIEW v_daily_excess_return IS '单日超额收益 = 个股涨跌幅 - 对应市场基准指数涨跌幅，自动按代码前缀匹配基准；数据源 v_daily_quote（全市场），按 stock_code 过滤可走索引';
 
 -- 3.2 全球基准指数分钟行情（get_global_benchmarks_minute.py）
 CREATE TABLE IF NOT EXISTS benchmark_minute (
@@ -1289,3 +1426,83 @@ COMMENT ON COLUMN dividend_history.dedup_key     IS '同一方案进度推进（
 
 CREATE INDEX IF NOT EXISTS idx_dividend_history_code ON dividend_history (stock_code, ex_date DESC);
 CREATE INDEX IF NOT EXISTS idx_dividend_history_ex_date ON dividend_history (ex_date);
+
+-- ============================================================================
+-- 公司资料（静态参考数据，一行一票）
+-- 数据源: 富途 get_company_profile（A股 24 字段 / 港股 22 字段并集）
+-- 采集: get_company_profile.py（全市场回填 + 周级刷新；覆盖式 upsert，空值不覆盖已有值）
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS company_profile (
+    stock_code          VARCHAR(20)  PRIMARY KEY,      -- 如 HK.00700 / SH.600900
+    company_name        VARCHAR(200),                  -- 公司全称（区别于 stock_info.stock_name 简称）
+    company_name_en     VARCHAR(200),                  -- 英文名（富途无此字段，AKShare 巨潮/东财可补）
+    isin                VARCHAR(20),                   -- ISIN（港股有，A股空）
+    founded_date        DATE,                          -- 成立日期
+    issue_price         NUMERIC(12,4),                 -- 发行价
+    issue_qty           BIGINT,                        -- 发行数量（股，"4.20亿股"解析后）
+    registered_address  TEXT,                          -- 注册地址（A股详细地址；港股为注册地地区如"开曼群岛"）
+    registered_office   TEXT,                          -- 注册办事处（港股详细地址，A股空）
+    office_address      TEXT,                          -- 办公地址 / 总办事处及主要营业地点
+    office_postcode     VARCHAR(16),                   -- 办公地邮编（A股）
+    chairman            VARCHAR(100),                  -- 董事长（港股）
+    legal_rep           VARCHAR(100),                  -- 法定代表人（A股）
+    general_manager     VARCHAR(100),                  -- 总经理（A股）
+    company_secretary   VARCHAR(100),                  -- 公司秘书
+    sec_rep             VARCHAR(100),                  -- 证券/股证事务代表（A股）
+    auditor             VARCHAR(200),                  -- 审计机构 / 会计师事务所
+    legal_advisor       VARCHAR(200),                  -- 法律顾问（A股）
+    business_license_no VARCHAR(64),                   -- 企业法人营业执照注册号（A股）
+    company_category    VARCHAR(100),                  -- 公司类别（港股，如"境外注册内地个人控制"）
+    fiscal_year_end     VARCHAR(8),                    -- 年结日，如 '12-31'
+    employee_count      INTEGER,                       -- 员工数量
+    phone               VARCHAR(120),                  -- 联系电话
+    fax                 VARCHAR(120),                  -- 传真
+    email               VARCHAR(200),                  -- 电子邮箱
+    website             VARCHAR(200),                  -- 公司网址
+    main_business       TEXT,                          -- 主营业务描述（富途「公司业务」）
+    company_intro       TEXT,                          -- 公司简介长文（富途「公司简介」）
+    business_scope      TEXT,                          -- 经营范围（A股独有，AKShare 巨潮/同花顺可补）
+    source              VARCHAR(16)  NOT NULL,         -- 主源: futu / cninfo / em
+    created_at          TIMESTAMPTZ  DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  DEFAULT NOW()
+);
+
+COMMENT ON TABLE  company_profile                    IS '公司资料（静态参考数据，一行一票；数据源：富途 get_company_profile）。覆盖式 upsert 且空值不覆盖已有值';
+COMMENT ON COLUMN company_profile.stock_code         IS '股票完整代码，如 HK.00700 / SH.600900';
+COMMENT ON COLUMN company_profile.company_name       IS '公司全称（与 stock_info.stock_name 简称不同）';
+COMMENT ON COLUMN company_profile.registered_address IS '注册地址：A股=详细地址；港股=注册地地区（如"开曼群岛"），港股详细地址在 registered_office';
+COMMENT ON COLUMN company_profile.main_business      IS '主营业务描述（富途「公司业务」字段原文）';
+COMMENT ON COLUMN company_profile.company_intro      IS '公司简介长文（富途「公司简介」字段原文）';
+COMMENT ON COLUMN company_profile.source             IS '当前值来源：futu(富途) / cninfo(巨潮) / em(东财)；补缺源仅在目标列为空时写入';
+
+-- ============================================================================
+-- 主营构成（一票 × 报告期 × 口径 × 条目）
+-- 数据源: 富途 get_financials_revenue_breakdown（1 票 1 期 1 次调用）
+-- 采集: get_company_profile.py（默认仅关注池 is_active + 最近 4 期，全历史 40+ 期调用量过大）
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS company_revenue_breakdown (
+    id             BIGSERIAL      PRIMARY KEY,
+    stock_code     VARCHAR(20)    NOT NULL,            -- 如 HK.00700 / SH.600900
+    period         VARCHAR(16)    NOT NULL,            -- 报告期文本：'2026/H1' / '2025/FY'（富途 period_text 原样）
+    period_end     DATE,                              -- 报告期截止日（screen_date 换算，排序/筛选用）
+    breakdown_type VARCHAR(16)    NOT NULL,            -- 口径：PRODUCT(产品) / BUSINESS(业务) / REGION(地区)
+    item_name      VARCHAR(200)   NOT NULL,            -- 构成条目名（如"增值服务"）
+    revenue        NUMERIC(20,2),                      -- 主营收入（原币）
+    ratio          NUMERIC(10,4),                      -- 收入占比（%，实测值如 48.4803）
+    cost           NUMERIC(20,2),                      -- 主营成本（东财源才有，富途留空）
+    gross_margin   NUMERIC(10,4),                      -- 毛利率%（东财源才有）
+    currency       VARCHAR(8),                         -- 币种: CNY / HKD / USD
+    source         VARCHAR(16)    NOT NULL,            -- futu / em
+    created_at     TIMESTAMPTZ    DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ    DEFAULT NOW(),
+
+    UNIQUE (stock_code, period, breakdown_type, item_name, source)
+);
+
+COMMENT ON TABLE  company_revenue_breakdown             IS '主营构成（按报告期与分类口径的营收拆分）。同一报告期重述时原地更新，不产生重复行';
+COMMENT ON COLUMN company_revenue_breakdown.period      IS '报告期文本（富途 period_text 原样，如 2026/H1、2025/FY）';
+COMMENT ON COLUMN company_revenue_breakdown.period_end  IS '报告期截止日（由富途 screen_date 秒级时间戳按 UTC 换算）';
+COMMENT ON COLUMN company_revenue_breakdown.ratio       IS '收入占比（百分数，如 48.4803 表示 48.4803%）';
+
+CREATE INDEX IF NOT EXISTS idx_company_rev_break_stock
+    ON company_revenue_breakdown (stock_code, period DESC);

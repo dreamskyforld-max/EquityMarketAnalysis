@@ -45,92 +45,28 @@ def _parse_date(update_time):
         return date.today()
 
 
-CACHE_TABLE = "hk_stock_list_cache"
-CACHE_TTL_DAYS = 7  # 缓存有效期（天）
-
-
+# ----------------------------------------------------------------------------
+# 港股采集清单（读 v_quote_scope）
+# ----------------------------------------------------------------------------
 def _hk_code_list():
-    """全港股正股代码列表（带数据库缓存，7 天有效）。
+    """全港股采集清单：读 v_quote_scope（quote_universe.is_collectable ∪ stock_info.is_active）。
 
-    优先读缓存表（未过期直接用），过期则调新浪 stock_hk_spot 重新拉取并更新缓存。
+    替代原「akshare stock_hk_spot 现货快照 + 7 天 DB 缓存」实现：
+      · 现货快照只返回「当日有报价」的股票（约 2,800 只），会漏掉停牌/长期无成交/GEM 等
+        （阶段 0 就踩过：21 只库内 HK 代码不在清单内）；
+      · 现由 sync_quote_universe.py 用富途 get_stock_basicinfo 维护全集（3,787 只），
+        「僵尸股」由入库侧「只落成交额>0 的行」自然过滤，无需清单侧裁剪；
+      · 并集 stock_info.is_active，覆盖深采池品种。
     """
-    from datetime import timedelta
-    from db import get_conn
-
-    # 建缓存表（若不存在）
-    _ensure_cache_table()
-
-    now = datetime.now(timezone.utc)  # aware，与 PG TIMESTAMPTZ 对齐
-
-    # 1) 读缓存，未过期直接返回
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT MAX(cache_date) FROM {CACHE_TABLE}")
-            row = cur.fetchone()
-            cache_date = row[0] if row and row[0] else None
-    if cache_date is not None:
-        age = now - cache_date
-        if age < timedelta(days=CACHE_TTL_DAYS):
-            codes = _load_cached_codes()
-            if codes:
-                log.info(f"命中股票列表缓存（{cache_date.date()}，{len(codes)} 只）")
-                return codes
-
-    # 2) 缓存过期/为空，调接口拉取
-    import akshare as ak
-    df = ak.stock_hk_spot()
-    if df is None or df.empty:
-        log.warning("stock_hk_spot 返回空，尝试用旧缓存兜底")
-        return _load_cached_codes()
-    codes = []
-    for c in df["代码"].astype(str):
-        c = c.strip()
-        if c.isdigit() and len(c) == 5:
-            codes.append(c)
-
-    # 3) 更新缓存
-    if codes:
-        _save_cache(codes, now)
-    log.info(f"更新股票列表缓存（{now.date()}，{len(codes)} 只）")
+            cur.execute("SELECT stock_code FROM v_quote_scope WHERE market = 'HK' ORDER BY stock_code")
+            codes = [r[0] for r in cur.fetchall()]
+    if not codes:
+        log.warning("v_quote_scope 返回空（清单未初始化？），本次不采集")
+    else:
+        log.info(f"港股采集清单（v_quote_scope）: {len(codes)} 只")
     return codes
-
-
-def _ensure_cache_table():
-    from db import get_conn
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {CACHE_TABLE} (
-                    stock_code  VARCHAR(20) NOT NULL,
-                    cache_date  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (stock_code)
-                )
-            """)
-        conn.commit()
-
-
-def _load_cached_codes():
-    from db import get_conn
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT stock_code FROM {CACHE_TABLE} ORDER BY stock_code")
-            return [r[0] for r in cur.fetchall()]
-
-
-def _save_cache(codes, now):
-    from db import get_conn
-    # 缓存统一存「纯数字代码」（如 00001），消费方自行加 HK. 前缀
-    data = [{"stock_code": c.split(".")[-1], "cache_date": now} for c in codes]
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # 清空旧缓存，写入新缓存
-            cur.execute(f"DELETE FROM {CACHE_TABLE}")
-            for d in data:
-                cur.execute(
-                    f"INSERT INTO {CACHE_TABLE} (stock_code, cache_date) VALUES (%s, %s)",
-                    (d["stock_code"], d["cache_date"]),
-                )
-        conn.commit()
 
 
 def fetch_market_snapshot_batch(codes, ctx=None):
@@ -163,8 +99,11 @@ def fetch_market_snapshot_batch(codes, ctx=None):
                 total_turnover += turnover
                 total_volume += volume
                 stock_count += 1
-            # 收集个股日线（供 hk_daily_quote）
-            quote_rows.append(_map_quote_row(code, td, row))
+                # 只落「有成交」的个股日线（对齐 A 股口径）：
+                # 全集里的僵尸/停牌代码 turnover<=0（含 NaN，NaN>0 为 False）→ 不落行，
+                # 既不膨胀行数、不影响 daily_market_turnover 合计口径；
+                # 复活/新上市一旦有成交即自动开始落行（天然自愈，无 bootstrap 问题）。
+                quote_rows.append(_map_quote_row(code, td, row))
 
     return {
         "trade_date": trade_date,
@@ -247,7 +186,7 @@ _DDL = {
             low NUMERIC(12,4),
             close NUMERIC(12,4),
             prev_close NUMERIC(12,4),
-            change_pct NUMERIC(8,2),
+            change_pct NUMERIC(12,4),
             volume BIGINT,
             amount NUMERIC(20,2),
             turnover_rate NUMERIC(8,4),
@@ -279,7 +218,7 @@ def _ensure_table(table):
             # 补齐 prev_close / change_pct（旧库可能缺；CREATE TABLE IF NOT EXISTS 不补列）
             if table in ("hk_daily_quote",):
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS prev_close NUMERIC(12,4);")
-                cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS change_pct NUMERIC(8,2);")
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS change_pct NUMERIC(12,4);")
         conn.commit()
 
 

@@ -47,7 +47,7 @@ prev_close / change_pct：
   采集时按每只股票的历史日线顺序递推（前交易日 close 即 prev_close），
   change_pct = (close-prev_close)/prev_close*100，与 daily_quote 对齐；首个交易日为 NULL。
   全量跑完后会库内再按 LAG 补齐「之前已落库但缺这两列」的历史行；亦可单独用
-  --fill-prev-close 仅做库内补齐（不采集）。change_pct 精度 NUMERIC(8,2)：
+  --fill-prev-close 仅做库内补齐（不采集）。change_pct 精度 NUMERIC(12,4)（以真实库为准）：
   个别仙股/重组日涨跌幅异常（脏数据，源数据 discontinuity）原样落库，下游按需识别。
 """
 import sys
@@ -385,28 +385,66 @@ def _map_quote_row(code, td, row, prev_close=None, change_pct=None):
 # ----------------------------------------------------------------------------
 # prev_close / change_pct 列确保 + 库内 LAG 回填
 # ----------------------------------------------------------------------------
-# change_pct 精度 NUMERIC(8,2)：港股仙股 合股/拆股 异常日可达上万%（脏数据），8,4 仅 4 位
-# 整数会溢出；8,2 留 6 位整数足以容纳且降低小数精度，与 daily_quote 对齐。
+# change_pct 精度 NUMERIC(12,4)（以真实库为准，2026-09-14 修正）：
+#   A股/港股 仙股「合股/拆股」异常日可达上万%（脏数据）；实测 max|change_pct| 已达 4737.61，
+#   逼近 8,4 上限 9999.9999；12,4 有 8 位整数余量，最安全。
+#   ⚠ 历史上本脚本/schema.sql 写的是 8,2，但真实库两张表实际都是 12,4 —— 按 AGENTS.md
+#     「真实库才是结构现状」，统一为 12,4，避免无谓且被视图拦截的 ALTER。
 _PREV_CLOSE_TYPE = "NUMERIC(12,4)"
-_CHANGE_PCT_TYPE = "NUMERIC(8,2)"
+_CHANGE_PCT_TYPE = "NUMERIC(12,4)"
+_CHANGE_PCT_TARGET = (12, 4)
+
+
+def _change_pct_type_now(tbl: str):
+    """读信息模式返回 change_pct 当前 (precision, scale)；列不存在返回 None。"""
+    from db import get_conn
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT numeric_precision, numeric_scale FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name=%s AND column_name='change_pct'",
+                (tbl,),
+            )
+            r = cur.fetchone()
+            return (r[0], r[1]) if r else None
+
+
+def _alter_change_pct_type(tbl: str):
+    """在【独立 autocommit 连接】上把 change_pct 转为目标精度（失败仅告警，不污染调用方事务）。
+
+    为什么不复用调用方游标：ALTER COLUMN TYPE 会被依赖该列的视图/规则拦截
+    （实测 v_daily_quote → "cannot alter type of a column used by a view or rule"）。
+    若在调用方事务内执行且用裸 except 吞掉异常，**事务会停留在 aborted 状态**，
+    之后任何语句都报 InFailedSqlTransaction（2026-09-14 港股全市场回填收尾时实际踩中）。
+    """
+    from db import get_conn
+    try:
+        with get_conn() as conn:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"ALTER TABLE {tbl} ALTER COLUMN change_pct TYPE {_CHANGE_PCT_TYPE} "
+                    f"USING change_pct::{_CHANGE_PCT_TYPE};"
+                )
+        log.info(f"[{tbl}] change_pct 精度已转换为 {_CHANGE_PCT_TYPE}")
+    except Exception as e:
+        log.warning(f"[{tbl}] change_pct 精度转换失败（保持现状，不影响主流程）: {str(e).strip()[:200]}")
 
 
 def ensure_prev_close_columns(cur, tbl: str):
-    """确保 prev_close / change_pct 两列存在且 change_pct 为 8,2（与 schema.sql 对齐；幂等、不丢数据）。
+    """确保 prev_close / change_pct 两列存在且精度为目标（幂等、事务安全）。
 
-    change_pct 精度 8,2：港股仙股 合股/拆股 异常日可达上万%（脏数据），8,4 仅 4 位整数会溢出；
-    8,2 留 6 位整数足以容纳且降低小数精度，与 daily_quote 对齐。
+    安全要点（2026-09-14 修复 InFailedSqlTransaction）：
+      · ADD COLUMN IF NOT EXISTS 是安全 no-op，可留在调用方事务内；
+      · ALTER COLUMN TYPE **先读 information_schema 判断**，已是目标精度则完全跳过
+        （避免无谓 ALTER 撞上视图依赖而报错）；
+      · 确需转换时走 `_alter_change_pct_type` 的独立 autocommit 连接，失败只告警；
+      · 不再用裸 `except: pass` —— 那会把调用方事务打成 aborted 却不自知。
     """
     cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS prev_close {_PREV_CLOSE_TYPE};")
     cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS change_pct {_CHANGE_PCT_TYPE};")
-    # 若列已存在但类型非目标（如早前残留 12,4 / 8,4），无损转换为 8,2
-    try:
-        cur.execute(
-            f"ALTER TABLE {tbl} ALTER COLUMN change_pct TYPE {_CHANGE_PCT_TYPE} "
-            f"USING change_pct::{_CHANGE_PCT_TYPE};"
-        )
-    except Exception:
-        pass  # 已是目标类型
+    if _change_pct_type_now(tbl) not in (None, _CHANGE_PCT_TARGET):
+        _alter_change_pct_type(tbl)
 
 
 def fill_prev_close_from_db(start=None, end=None):

@@ -108,6 +108,12 @@ GLOBAL_TASKS: list[GlobalTask] = [
     # 删除 3 年前过期数据（tick_data / trend_snapshot / realtime_order_size / collection_run_log 共 4 表）
     ("数据清理", "cleanup_old_data.py", {"hour": 4, "minute": 0}, None, True, None, 180),
 
+    # 全市场采集清单刷新（quote_universe）：每日 08:30 盘前一次。
+    # 富途 get_stock_basicinfo 全量拉取（无额度限制）→ 计数护栏（±10% / 绝对下限）→
+    # upsert + 30 天软删 → 新增代码同步进 stock_info（is_active=FALSE，不进实时深采池）。
+    # 三市场各自重试，单市场失败不影响其它市场；清单读取方：get_a/hk_market_turnover（v_quote_scope）。
+    ("全市场清单刷新", "sync_quote_universe.py", {"hour": 8, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
+
     # 每小时刷新: 富途系盘中实时, FRED/债券/汇率为日频(T-1)
     ("全球指数采集(每小时)", "get_global_benchmarks.py", {"hour": "*", "minute": 0}, None, True, None, 180),
 
@@ -202,6 +208,15 @@ GLOBAL_TASKS: list[GlobalTask] = [
     # 周六 09:00 跑一次（A股分红公告多为周五盘后披露），超时同财务任务设 2 小时。
     ("分红明细全量", "get_dividend_history.py",
      {"hour": 9, "minute": 0, "day_of_week": "sat"}, None, True, None, 7200),
+
+    # 公司资料（全市场简介 + 关注池主营构成）：富途 get_company_profile（1 票 1 次）+
+    # get_financials_revenue_breakdown（1 票 1 期 1 次；仅 is_active 关注池最近 4 期，
+    # 全市场 × 全历史 40+ 期调用量不可接受）。静态低频数据（简介基本不变、主营构成随
+    # 财报更新），周日 03:00 跑一次全量。
+    # 富途「公司详情」限流 30 次/30 秒（脚本已按 26 次/30 秒 节流留余量），
+    # 全市场约 9100 只逐票调用 ≈ 2.7 小时，超时设 4 小时。
+    ("公司资料全量", "get_company_profile.py",
+     {"hour": 3, "minute": 0, "day_of_week": "sun"}, None, True, None, 14400),
 
     # 全量画像每日计算：每个工作日 16:30 计算当日全量画像，写入 profile.tag_value。
     # 依赖当日行情快照（A股 15:10 / 港股 16:20 收盘采集已完成）。

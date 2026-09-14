@@ -47,7 +47,8 @@ def load_daily_features(stock):
         cur.execute("""
             SELECT trade_date, last_price, volume, turnover,
                    open_price, high_price, low_price
-            FROM daily_quote WHERE stock_code=%s
+            FROM v_daily_quote WHERE stock_code=%s
+              AND last_price IS NOT NULL    -- 池表含「仅有估值、无 OHLC」的行（估值回填），必须过滤
             ORDER BY trade_date
         """, (stock,))
         price_rows = cur.fetchall()
@@ -788,12 +789,12 @@ def main(stock="HK.00700"):
     seg_df = track_capital_intent(df)
     for _, seg in seg_df.iterrows():
         cat = CATEGORY_MAP.get(seg["phase"], "?")
-        lg_str = f" LG+{seg['cum_lg_net']/1e6:.1f}M" if abs(seg['cum_lg_net']) > 1e6 else ""
+        lg_str = f" LG+{seg['cum_big_net']/1e6:.1f}M" if abs(seg['cum_big_net']) > 1e6 else ""
         xl_str = f" XL+{seg['cum_xl_net']/1e6:.1f}M" if abs(seg['cum_xl_net']) > 1e6 else ""
         line = (f"  {seg['phase']:<22s} [{cat}] {seg['start']}→{seg['end']} "
                 f"({seg['days']:2d}天) "
                 f"段内{seg['ret_in']:+.2%}  "
-                f"大单累计{seg['cum_lg_net']/1e6:+.1f}M{lg_str}{xl_str}")
+                f"大单累计{seg['cum_big_net']/1e6:+.1f}M{lg_str}{xl_str}")
         fwd_10 = seg.get('fwd_10d', np.nan)
         if not pd.isna(fwd_10):
             line += f"  →10d {fwd_10:+.2%}"

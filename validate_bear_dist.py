@@ -19,7 +19,8 @@ def load_quote(stock):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT trade_date, last_price, prev_close, change_pct FROM daily_quote WHERE stock_code=%s ORDER BY trade_date",
+            "SELECT trade_date, last_price, prev_close, change_pct FROM v_daily_quote "
+            "WHERE stock_code=%s AND last_price IS NOT NULL ORDER BY trade_date",
             (stock,),
         )
         rows = cur.fetchall()

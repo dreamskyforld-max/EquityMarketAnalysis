@@ -232,10 +232,16 @@ def parse_schema(text):
             views[vname] = norm_view_def(body)
             i = j + 1
             continue
-        # 建表开始
-        m = re.match(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w]*)", line, re.I)
+        # 建表开始（支持 schema.table 限定名）
+        m = re.match(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:([A-Za-z_][\w]*)\.)?([A-Za-z_][\w]*)", line, re.I)
         if m:
-            tname = m.group(1).lower()
+            sch = (m.group(1) or "public").lower()
+            tbl = m.group(2).lower()
+            # 旧正则 [A-Za-z_][\w]* 不认点号：CREATE TABLE profile.tag_registry 会被
+            # 截成 "profile"，导致 4 张 profile 表的列被合并成一张假表，每次都误报
+            # 「public.profile 缺失」。改为支持限定名：非 public 用 schema.table 作 key，
+            # 末尾统一剔除（本工具只同步 public schema）。
+            tname = tbl if sch == "public" else f"{sch}.{tbl}"
             tables.setdefault(tname, {"cols": {}, "order": []})
             cur_table = tname
             # 可能 CREATE TABLE x ( ... ) 同行
@@ -271,6 +277,13 @@ def parse_schema(text):
                 i += 1
                 continue
         i += 1
+    # 剔除非 public schema 的期望对象：本工具只同步 public（多项目共用库，绝不触碰
+    # 其它 schema）。profile.* 的建表与按年分区由 profiling/schema.py 幂等执行，
+    # schema.sql 中的该段落仅作结构真相源登记，不参与本工具的 diff/修复。
+    for t in [t for t in tables if "." in t]:
+        tables.pop(t, None)
+    for k in [k for k, v in indexes.items() if v.get("tbl") not in tables]:
+        indexes.pop(k, None)
     return tables, indexes, views
 
 

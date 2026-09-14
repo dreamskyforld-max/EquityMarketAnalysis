@@ -14,7 +14,9 @@ def load_full_data(stock):
         cur.execute("""
             SELECT trade_date, last_price, volume, turnover,
                    open_price, high_price, low_price
-            FROM daily_quote WHERE stock_code=%s ORDER BY trade_date
+            FROM v_daily_quote WHERE stock_code=%s
+              AND last_price IS NOT NULL    -- 池表含「仅有估值、无 OHLC」的行（估值回填），必须过滤
+            ORDER BY trade_date
         """, (stock,))
         price = pd.DataFrame(cur.fetchall(),
             columns=["date","close","vol","turnover","open","high","low"])

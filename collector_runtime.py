@@ -106,6 +106,24 @@ def get_shared_ctx():
     return _LockedCtx()
 
 
+def close_shared_ctx():
+    """关闭进程级共享行情上下文（仅 CLI 独立运行收尾用）。
+
+    背景：futu OpenQuoteContext 会创建**非 daemon** 接收线程（Thread-1 (run)），
+    不调用 close() 时 CLI 脚本主逻辑跑完进程也不退出（表现为「命令挂住无输出」，
+    实测踩坑）。常驻进程（market_scheduler）**禁止调用**：共享上下文被其他
+    任务复用，关闭会中断后续任务（虽可经 _reconnect 自愈，但没必要）。
+    """
+    global _ctx
+    with _ctx_lock:
+        if _ctx is not None:
+            try:
+                _ctx.close()
+            except Exception:
+                pass
+            _ctx = None
+
+
 def run_module(script_name, codes=None, **kwargs):
     """惰性导入采集模块并调用其 run(codes)。import 仅发生一次/进程。"""
     mod = _MOD_CACHE.get(script_name)

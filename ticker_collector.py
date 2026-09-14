@@ -36,7 +36,7 @@ from datetime import datetime
 from typing import Any
 
 from futu import OpenQuoteContext, SubType, RET_OK, TickerHandlerBase, StockQuoteHandlerBase
-from db import get_conn, bulk_upsert, write_full_tick
+from db import get_conn, bulk_upsert, write_full_tick, update_quote_pool_intraday
 
 
 # ── 路径 ──────────────────────────────────────────────────────
@@ -343,6 +343,19 @@ def _refresh_quote_batch(batch: list) -> int:
                      "change_pct": change_pct,
                      "update_time": q["update_time"] or datetime.now()},
                 )
+
+                # 阶段 1 双写：同步刷新池表当日行（列名映射 last_price→close / turnover→amount 等；
+                # 语义与上面一致：只 UPDATE 已存在行，不 INSERT。
+                # 内部 SAVEPOINT 隔离：池表失败只回滚子事务并告警，不影响 daily_quote 刷新）
+                update_quote_pool_intraday(cur, code, {
+                    "last_price": last_price,
+                    "high_price": q["high_price"],
+                    "low_price": q["low_price"],
+                    "volume": q["volume"],
+                    "turnover": q["turnover"],
+                    "change_pct": change_pct,
+                    "update_time": q["update_time"] or datetime.now(),
+                })
         return len(batch)
     except Exception as e:
         log.error(f"实时报价刷新失败 ({len(batch)}条): {e}")

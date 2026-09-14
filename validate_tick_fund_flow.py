@@ -38,7 +38,8 @@ def load_price(stock):
         cur = conn.cursor()
         cur.execute(
             """SELECT trade_date, last_price, volume, turnover
-               FROM daily_quote WHERE stock_code=%s
+               FROM v_daily_quote WHERE stock_code=%s
+                 AND last_price IS NOT NULL
                ORDER BY trade_date""",
             (stock,),
         )

@@ -194,3 +194,120 @@ def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False,
     values_list = [tuple(d[c] for c in columns) for d in data_list]
     with conn.cursor() as cur:
         extras.execute_values(cur, query.as_string(conn), values_list)
+
+
+# ============================================================================
+# 写方双写（daily_quote 合并迁移 · 阶段 1）：daily_quote → 池表
+# ============================================================================
+# 背景：daily_quote 是 active 池的「1 分钟快照 + QUOTE 秒级刷新」表；
+#       a_daily_quote / hk_daily_quote 是全市场池表（统一视图 v_daily_quote 的数据源）。
+#       阶段 1 让池表也获得 active 池的分钟级/秒级新鲜度，读方才敢切到 v_daily_quote。
+# 开关：config.conf 的 [quote] dual_write（env QUOTE_DUAL_WRITE 覆盖），默认 true。
+# 回滚：置 false + 重启进程（旧路径完全不受影响）。
+#
+# 列名映射（daily_quote 命名 → 池表命名；其余同名列透传）：
+_QUOTE_COL_MAP = {
+    "last_price": "close",
+    "open_price": "open",
+    "high_price": "high",
+    "low_price": "low",
+    "turnover": "amount",
+}
+
+# 允许双写进池表的字段（daily_quote 命名侧）= 池表列 ∩ daily_quote 列。
+# 不在白名单的键一律忽略 —— 既不会撞上「列不存在」，
+# 也保证 ps_ttm_ratio / pcf_ttm_ratio 等池表独有列永不被本模块写入。
+_POOL_QUOTE_FIELDS = frozenset((
+    "stock_code", "trade_date", "update_time",
+    "last_price", "open_price", "high_price", "low_price",
+    "prev_close", "change_pct", "volume", "turnover",
+    "turnover_rate", "volume_ratio", "high_52w", "low_52w",
+    "total_market_val", "circular_market_val",
+    "pe_ratio", "pe_ttm_ratio", "pb_ratio", "dividend_ratio_ttm",
+))
+
+
+def dual_write_enabled() -> bool:
+    """池表双写开关：config.conf [quote] dual_write / env QUOTE_DUAL_WRITE，默认 true。"""
+    from config import val
+    v = str(val("quote", "dual_write", "QUOTE_DUAL_WRITE", "true")).strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def quote_pool_table(stock_code: str):
+    """按代码前缀路由池表：HK.* → hk_daily_quote；SH./SZ. → a_daily_quote；其它 → None（不写）。"""
+    if not stock_code:
+        return None
+    if stock_code.startswith("HK."):
+        return "hk_daily_quote"
+    if stock_code.startswith(("SH.", "SZ.")):
+        return "a_daily_quote"
+    return None
+
+
+def _build_pool_row(data: dict) -> dict:
+    """daily_quote 口径 dict → 池表口径 dict（列名映射 + 白名单过滤）。"""
+    return {_QUOTE_COL_MAP.get(k, k): v
+            for k, v in data.items() if k in _POOL_QUOTE_FIELDS}
+
+
+def write_quote_dual(conn, data: dict) -> bool:
+    """把一行「daily_quote 口径」行情双写进对应池表（整行 upsert，幂等）。
+
+    安全设计：
+      · 内部 SAVEPOINT 隔离 —— 池表写入失败只回滚该子事务并告警，
+        绝不影响调用方已完成的 daily_quote 写入；
+      · skip_null_updates=True —— 本路径不产出的列（估值/PS/PCF/52周等）保留库中原值；
+      · 白名单过滤 —— 不会因多余键撞上「列不存在」。
+    返回是否写入成功（未开启双写 / 非股票代码 → False）。
+    """
+    if not dual_write_enabled():
+        return False
+    table = quote_pool_table(data.get("stock_code", ""))
+    if not table:
+        return False
+    row = _build_pool_row(data)
+    if "stock_code" not in row or "trade_date" not in row:
+        return False
+    with conn.cursor() as cur:
+        cur.execute("SAVEPOINT dw_pool")
+        try:
+            bulk_upsert(conn, table, [row],
+                        conflict_cols=["stock_code", "trade_date"],
+                        skip_null_updates=True)
+            cur.execute("RELEASE SAVEPOINT dw_pool")
+            return True
+        except Exception as e:
+            cur.execute("ROLLBACK TO SAVEPOINT dw_pool")
+            logger.warning(f"[双写] {row.get('stock_code')} → {table} 失败"
+                           f"（已回滚子事务，不影响 daily_quote）: {e}")
+            return False
+
+
+def update_quote_pool_intraday(cur, stock_code: str, fields: dict) -> int:
+    """用 QUOTE 推送的行情列刷新池表「当日行」（只 UPDATE 已存在行，不 INSERT）。
+
+    与 ticker_collector 对 daily_quote 的语义一致：当日行不存在（如尚未采集）→ 0 行命中、不碰表。
+    同样 SAVEPOINT 隔离，失败只回滚子事务并告警。返回命中行数。
+    """
+    if not dual_write_enabled():
+        return 0
+    table = quote_pool_table(stock_code)
+    fields = {k: v for k, v in (fields or {}).items() if k in _POOL_QUOTE_FIELDS}
+    if not table or not fields:
+        return 0
+    # 表名/列名均来自本模块常量白名单，无注入面；值一律走 psycopg2 参数占位符
+    col_sets = ", ".join(f"{_QUOTE_COL_MAP.get(k, k)} = %({k})s" for k in fields)
+    query = (f"UPDATE {table} SET {col_sets} "
+             f"WHERE stock_code = %(stock_code)s AND trade_date = CURRENT_DATE")
+    cur.execute("SAVEPOINT dw_pool")
+    try:
+        cur.execute(query, {"stock_code": stock_code, **fields})
+        n = cur.rowcount
+        cur.execute("RELEASE SAVEPOINT dw_pool")
+        return n
+    except Exception as e:
+        cur.execute("ROLLBACK TO SAVEPOINT dw_pool")
+        logger.warning(f"[双写] {stock_code} → {table} 实时刷新失败"
+                       f"（已回滚子事务，不影响 daily_quote）: {e}")
+        return 0

@@ -4,7 +4,8 @@
 ===================================================================
 数据源（均为稳定表）：
   1. tick_data    → 成交量分布 Volume Profile（密集成交区 = 支撑/压力）
-  2. daily_quote  → 长期拐点(swing high/low)、枢轴点、均线、52周高低
+  2. v_daily_quote → 长期拐点(swing high/low)、枢轴点、均线、52周高低
+                     （a_daily_quote ∪ hk_daily_quote 并集；A股/港股均为 QFQ 前复权）
   3. daily_cbbc   → 牛熊证街货回收价（港股专属强信号：
                      牛证回收价=下方支撑/杀牛目标，熊证回收价=上方压力/杀熊目标）
 
@@ -92,14 +93,17 @@ def volume_profile(conn, stock_code, start_date, bucket):
     return cands, info
 
 
-# ---------- 2. 长期结构位（daily_quote） ----------
+# ---------- 2. 长期结构位（v_daily_quote = a_daily_quote ∪ hk_daily_quote） ----------
+# 阶段 2 切换：原读 daily_quote（active 池、仅进池后历史；A股为原始价），
+# 改读统一视图 → 历史回到上市区间、A股为 QFQ 前复权（除权日不再有假跳空）。
 def daily_structural(conn, stock_code, as_of_date, lookback_days):
     cur = conn.cursor()
     need = lookback_days + 12                                   # 多取给 swing 窗口
     cur.execute("""
         SELECT trade_date, high_price, low_price, last_price
-        FROM daily_quote
+        FROM v_daily_quote
         WHERE stock_code = %(code)s AND trade_date <= %(asof)s
+          AND high_price IS NOT NULL      -- 池表含「仅有估值、无 OHLC」的行（估值回填），必须过滤
         ORDER BY trade_date DESC
         LIMIT %(need)s
     """, {"code": stock_code, "asof": as_of_date, "need": need})
@@ -144,7 +148,7 @@ def daily_structural(conn, stock_code, as_of_date, lookback_days):
     # 52周高低
     cur2 = conn.cursor()
     cur2.execute("""
-        SELECT high_52w, low_52w FROM daily_quote
+        SELECT high_52w, low_52w FROM v_daily_quote
         WHERE stock_code = %(code)s AND trade_date <= %(asof)s
           AND high_52w IS NOT NULL
         ORDER BY trade_date DESC LIMIT 1
@@ -156,7 +160,7 @@ def daily_structural(conn, stock_code, as_of_date, lookback_days):
         cands.append({"level": float(r52[0]), "source": "52w_high", "weight": 0.7, "meta": {}})
         cands.append({"level": float(r52[1]), "source": "52w_low", "weight": 0.7, "meta": {}})
     info = {
-        "source": "daily_quote (长期结构位)",
+        "source": "v_daily_quote (长期结构位)",
         "n_days": len(rows),
         "swing_highs": swing_highs,
         "swing_lows": swing_lows,
@@ -257,10 +261,10 @@ def _cluster_and_score(cands, current_price, merge_pct=0.008):
 
 # ---------- 5. 编排 ----------
 def _run(conn, stock_code, as_of_date, lookback_days, vp_lookback_days, bucket, top_k, include_debug=False):
-    # 现价：优先 daily_quote，回退 tick_data 最新价
+    # 现价：优先 v_daily_quote，回退 tick_data 最新价
     cur = conn.cursor()
     cur.execute("""
-            SELECT last_price FROM daily_quote
+            SELECT last_price FROM v_daily_quote
             WHERE stock_code = %(code)s AND trade_date <= %(asof)s
               AND last_price IS NOT NULL
             ORDER BY trade_date DESC LIMIT 1

@@ -7,7 +7,8 @@
     python3 benchmark_correlation_daily.py SH.600900
 
 数据源:
-  - daily_quote         日行情 (change_pct, volume, turnover, last_price, prev_close)
+  - v_daily_quote       日行情 (change_pct, volume, turnover, last_price, prev_close)
+                        （a_daily_quote ∪ hk_daily_quote 统一视图）
   - daily_benchmark     日基准指数 (change_pct, volume, last_price)
 
 分析维度:
@@ -45,7 +46,7 @@ def load_data(stock_code: str) -> pd.DataFrame:
         SELECT trade_date, change_pct AS stock_ret,
                last_price AS stock_price, prev_close AS stock_prev_close,
                volume AS stock_vol, turnover AS stock_to
-        FROM daily_quote
+        FROM v_daily_quote
         WHERE stock_code = %s AND change_pct IS NOT NULL
     ),
     bench AS (

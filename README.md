@@ -220,6 +220,8 @@ python3 get_south_flow.py                # 南向资金
 python3 get_cbbc.py                      # 牛熊证
 python3 get_buyback.py                   # 港股回购
 python3 get_margin_balance.py            # 融资融券余额
+python3 get_company_profile.py           # 公司资料+主营构成（全市场，富途限流 26 次/30 秒，约 2.7 小时）
+python3 get_company_profile.py HK.00700  # 公司资料单票（profile + 主营构成）
 ```
 
 ### 回填历史数据

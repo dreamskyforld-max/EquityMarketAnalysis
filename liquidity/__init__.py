@@ -13,7 +13,7 @@
 数据源（均为既有表，不落中间表，现算）：
   daily_market_turnover —— 全港股总成交额（分钟/日快照）
   daily_ggt_hold        —— 南向资金（港股通持股明细）
-  daily_quote           —— 个股日频行情（量价流动性）
+  v_daily_quote         —— 个股日频行情（a_daily_quote ∪ hk_daily_quote，量价流动性）
   daily_benchmark       —— 指数基准（HSI 等）
   tick_data             —— 逐笔成交（微观结构）
   stock_sector          —— 股票-指数成分归属（板块划分）

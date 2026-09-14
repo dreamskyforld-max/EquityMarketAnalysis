@@ -18,7 +18,7 @@ A股全市场总成交额采集（富途批量快照版）
 import sys
 import os
 import logging
-from datetime import date, datetime, timezone, timedelta
+from datetime import date, datetime, timezone
 
 from futu import RET_OK
 from db import get_conn, bulk_upsert
@@ -31,9 +31,6 @@ logging.basicConfig(
 log = logging.getLogger("a_market_turnover")
 
 BATCH_SIZE = 400  # 富途 get_market_snapshot 单次上限 400 只
-
-CACHE_TABLE = "a_stock_list_cache"
-CACHE_TTL_DAYS = 7  # 缓存有效期（天）
 
 
 def _as_float(v):
@@ -62,90 +59,26 @@ def _parse_date(update_time):
 
 
 # ----------------------------------------------------------------------------
-# A股代码清单（富途 get_stock_basicinfo，带 DB 缓存）
+# A股采集清单（读 v_quote_scope）
 # ----------------------------------------------------------------------------
-def _ensure_cache_table():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {CACHE_TABLE} (
-                    stock_code  VARCHAR(20) NOT NULL,
-                    cache_date  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (stock_code)
-                )
-            """)
-        conn.commit()
-
-
-def _load_cached_codes():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT stock_code FROM {CACHE_TABLE} ORDER BY stock_code")
-            return [r[0] for r in cur.fetchall()]
-
-
-def _save_cache(codes, now):
-    data = [{"stock_code": c, "cache_date": now} for c in codes]
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"DELETE FROM {CACHE_TABLE}")
-            for d in data:
-                cur.execute(
-                    f"INSERT INTO {CACHE_TABLE} (stock_code, cache_date) VALUES (%s, %s)",
-                    (d["stock_code"], d["cache_date"]),
-                )
-        conn.commit()
-
-
 def _a_code_list():
-    """全 A 股正股代码列表（SH + SZ，带数据库缓存，7 天有效）。
+    """全 A 股采集清单：读 v_quote_scope（quote_universe.is_collectable ∪ stock_info.is_active）。
 
-    优先读缓存（未过期直接用），过期则调富途 get_stock_basicinfo 重新拉取并更新缓存。
+    替代原「富途 get_stock_basicinfo + 段号白名单 + 7 天 DB 缓存」实现：
+      · 清单由 sync_quote_universe.py 每日 08:30 统一维护（含计数护栏 + 30 天软删）；
+      · 段号白名单上移为 quote_universe.is_primary（口径列），采集侧不再硬编码，
+        因此这里会采到 B股/REIT/CDR 等非正股品种（口径过滤交给读方用 is_primary）；
+      · 并集 stock_info.is_active，以覆盖 SH.520900 这类「深采有、富途 STOCK 全集无」的品种。
     """
-    _ensure_cache_table()
-    now = datetime.now(timezone.utc)
-
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT MAX(cache_date) FROM {CACHE_TABLE}")
-            row = cur.fetchone()
-    cache_date = row[0] if row and row[0] else None
-    if cache_date is not None:
-        if now - cache_date < timedelta(days=CACHE_TTL_DAYS):
-            codes = _load_cached_codes()
-            if codes:
-                log.info(f"命中股票列表缓存（{cache_date.date()}，{len(codes)} 只）")
-                return codes
-
-    # 缓存过期/为空，调富途接口拉取（SH + SZ 两次）
-    ctx = get_shared_ctx()
-    codes = []
-    for market in ("SH", "SZ"):
-        try:
-            ret, data = ctx.get_stock_basicinfo(market, "STOCK")
-            if ret != RET_OK:
-                log.warning(f"get_stock_basicinfo({market}) 失败: {data}")
-                continue
-            for _, r in data.iterrows():
-                code = r.get("code")
-                if not code or not code.startswith(f"{market}."):
-                    continue
-                num = code.split(".", 1)[1]
-                # 仅保留标准 A 股正股号码段，排除非 A 股品种：
-                #  - B 股（沪 900 / 深 200 开头）：独立市场，不计入 A 股成交额
-                #  - 沪伦通 CDR / 公募 REITs 等（689/700/742/760 等开头）：
-                #    新浪 stock_zh_a_daily 无数据，且非标准 A 股正股，排除
-                # 保留段：沪市 600/601/603/605/688，深市 000/001/002/003/300/301
-                keep_sh = num[:3] in ("600", "601", "603", "605", "688")
-                keep_sz = num[:3] in ("000", "001", "002", "003", "300", "301")
-                if not (keep_sh or keep_sz):
-                    continue
-                codes.append(code)
-        except Exception as e:
-            log.warning(f"get_stock_basicinfo({market}) 异常: {e}")
-    if codes:
-        _save_cache(codes, now)
-        log.info(f"更新股票列表缓存（{now.date()}，{len(codes)} 只）")
+            cur.execute("SELECT stock_code FROM v_quote_scope "
+                        "WHERE market IN ('SH','SZ') ORDER BY stock_code")
+            codes = [r[0] for r in cur.fetchall()]
+    if not codes:
+        log.warning("v_quote_scope 返回空（清单未初始化？），本次不采集")
+    else:
+        log.info(f"A股采集清单（v_quote_scope）: {len(codes)} 只")
     return codes
 
 
@@ -268,7 +201,7 @@ _DDL = {
             low NUMERIC(12,4),
             close NUMERIC(12,4),
             prev_close NUMERIC(12,4),
-            change_pct NUMERIC(8,2),
+            change_pct NUMERIC(12,4),
             volume BIGINT,
             amount NUMERIC(22,2),
             turnover_rate NUMERIC(8,4),
@@ -299,7 +232,7 @@ def _ensure_table(table):
             # 补齐 prev_close / change_pct（旧库可能缺；CREATE TABLE IF NOT EXISTS 不补列）
             if table in ("a_daily_quote",):
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS prev_close NUMERIC(12,4);")
-                cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS change_pct NUMERIC(8,2);")
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS change_pct NUMERIC(12,4);")
         conn.commit()
 
 

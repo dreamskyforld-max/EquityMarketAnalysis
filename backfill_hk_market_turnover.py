@@ -2,7 +2,8 @@
 """
 港股全市场总成交额 · 历史回溯（新浪 stock_hk_daily 版，一次性全量）
 
-数据源：AKShare stock_hk_daily()（新浪财经港股个股日线，完整历史含 amount）
+数据源：AKShare stock_hk_daily(adjust="qfq")（新浪财经港股个股日线，完整历史含 amount）
+        —— 价格列为【QFQ 前复权】，与 a_daily_quote 口径统一（a 池走 stock_zh_a_daily(adjust="qfq")）。
 用途：遍历全港股，逐只拉历史日线成交额，按日 SUM → 全市场历史总成交额，
       回溯写入 daily_market_turnover；同时个股日线写入 hk_daily_quote。
 
@@ -10,6 +11,14 @@
   - 富途 request_history_kline 有「历史 K 线额度」限制（100 只/7天），
     全港股 2800+ 只需 28 周才能采完，无法做全量回溯。
   - 新浪 stock_hk_daily 无额度限制，能一次拿完整历史（仅耗时较长）。
+
+复权口径（2026-09-14 起统一为 QFQ 前复权）：
+  - 价格列（open/high/low/close/prev_close）用 adjust="qfq"，消除送股/配股/派息日除权跳空；
+    volume / amount 不受复权影响（已验证 raw 与 qfq 逐行完全一致），总成交额聚合口径不变。
+  - QFQ 锚定在「最新交易日」：每次新的除息事件后，需重跑本脚本再锚定历史
+    （不加 --resume 即全量重采覆盖；日常采集写入的当日行情在锚点处 raw==QFQ，无需额外处理）。
+  - 落库用 skip_null_updates=True：本脚本产出为 NULL 的估值列（市值/PE/PB/PS/PCF/
+    换手率/量比/52周）不会把库中已有有效值回写成 NULL。
 
 字段说明：新浪仅返回基础量价（date/open/high/low/close/volume/amount），
   估值字段（市值/PE/PB/换手率等）新浪不提供，统一置空（NULL），
@@ -42,7 +51,7 @@ prev_close / change_pct：
   采集时按每只股票的历史日线顺序递推（前交易日 close 即 prev_close），
   change_pct = (close-prev_close)/prev_close*100，与 daily_quote 对齐；首个交易日为 NULL。
   全量跑完后会库内再按 LAG 补齐「之前已落库但缺这两列」的历史行；亦可单独用
-  --fill-prev-close 仅做库内补齐（不采集）。change_pct 精度 NUMERIC(8,2)：
+  --fill-prev-close 仅做库内补齐（不采集）。change_pct 精度 NUMERIC(12,4)（以真实库为准）：
   个别仙股 合股/拆股 异常日可达上万%（脏数据，源数据 discontinuity）原样落库，下游按需识别。
 """
 import sys
@@ -65,6 +74,7 @@ def parse_args() -> "dict[str, object]":
     no_quotes = "--no-quotes" in sys.argv
     aggregate_only = "--aggregate-only" in sys.argv
     fill_prev_close = "--fill-prev-close" in sys.argv
+    codes_from_db = "--codes-from-db" in sys.argv
     start = None
     code = None
     limit = None
@@ -94,6 +104,7 @@ def parse_args() -> "dict[str, object]":
         "aggregate_only": aggregate_only,
         "limit": limit,
         "fill_prev_close": fill_prev_close,
+        "codes_from_db": codes_from_db,
     }
 
 
@@ -101,6 +112,21 @@ def _hk_code_list():
     # 复用 get_hk_market_turnover 的缓存版（带 7 天数据库缓存）
     from get_hk_market_turnover import _hk_code_list as _cached
     return _cached()
+
+
+def _db_code_list():
+    """库内已有的全部港股代码（用于 QFQ 全量重写）。
+
+    必要性：akshare 现货清单（stock_hk_spot）只覆盖在市股票，库内另有约 21 只
+    不在清单内（如已停牌/退市/换股代码 HK.029xx）；若按现货清单重写，
+    这些股票的 hk_daily_quote 历史会残留未复权价 → 表内口径不一致。
+    """
+    from db import get_conn
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT stock_code FROM hk_daily_quote "
+                        "WHERE LEFT(stock_code, 2) = 'HK' ORDER BY stock_code")
+            return [r[0] for r in cur.fetchall()]
 
 
 def _done_codes(start: date):
@@ -134,14 +160,79 @@ def _done_codes(start: date):
     return done, last[0]
 
 
+# 新浪港股前复权因子接口（与 akshare stock_hk_daily(adjust="qfq") 同源）
+_HK_QFQ_URL = "https://finance.sina.com.cn/stock/hkstock/{}/qfq.js"
+
+
+def _fetch_qfq_factors(sym, max_retry: int = 3):
+    """抓新浪港股前复权因子表 → {date: factor}（升序 dict）；失败返回 None。
+
+    因子语义：接口按日期【降序】返回记录，最新一条通常 f=1（前复权锚定最新）。
+    某交易日 d 的实际因子 = 「日期 <= d 的最新一条记录」的 f（从该记录日起向后生效）。
+
+    为什么不直接用 ak.stock_hk_daily(adjust="qfq")：其实现有两条【静默回退成 raw】
+    的路径（因子接口解析 SyntaxError / 因子表仅 1 行），回退时仍返回未复权数据，
+    调用方无法区分——全市场批量跑会静默写入 raw 冒充 QFQ。这里自行取因子，
+    拿不到就返回 None，由调用方跳过该股（绝不 raw 冒充 QFQ）。
+    """
+    import json
+    import requests
+    last_err = None
+    for attempt in range(max_retry):
+        try:
+            r = requests.get(_HK_QFQ_URL.format(sym), timeout=30)
+            r.raise_for_status()
+            txt = r.text
+            i, j = txt.find("{"), txt.rfind("}")
+            if i < 0 or j <= i:
+                raise ValueError("响应中未找到 JSON 体")
+            payload = json.loads(txt[i:j + 1])
+            data = payload.get("data") or []
+            if not data:
+                raise ValueError(f"因子表为空 (total={payload.get('total')})")
+            fac = {}
+            for it in data:
+                fac[pd.to_datetime(it["d"]).date()] = float(it["f"])
+            return dict(sorted(fac.items()))
+        except Exception as e:
+            last_err = e
+            time.sleep(1 + attempt)
+    log.warning(f"  {sym} 前复权因子获取失败（{max_retry} 次重试）: {last_err}")
+    return None
+
+
 def _fetch_daily(sym):
-    """新浪 stock_hk_daily 拉单只完整历史，返回 DataFrame（date 已转 date 类型）。"""
+    """新浪港股完整历史 → QFQ 前复权 DataFrame（date 已转 date 类型）。
+
+    做法：`stock_hk_daily(adjust="")` 取【原始价】（该分支无静默回退，可靠），
+    再自取前复权因子做换算：qfq = raw × factor（factor 按日期后向生效）。
+    与 a_daily_quote 口径统一（a 池走 stock_zh_a_daily(adjust="qfq")）。
+    已验证：volume/amount 不受复权影响；OHLC 同行同因子缩放，不存在部分调整。
+
+    因子拿不到 → 抛异常，由 fetch_history 计为失败并跳过（绝不 raw 冒充 QFQ）。
+    """
     import akshare as ak
-    df = ak.stock_hk_daily(symbol=sym, adjust="")
-    if df is None or df.empty:
+    raw = ak.stock_hk_daily(symbol=sym, adjust="")
+    if raw is None or raw.empty:
         return pd.DataFrame()
-    df = df.copy()
+    if "date" not in raw.columns:
+        # 新浪偶发返回结构异常（缺 date 列，如 HK.02905）→ 视为无数据，避免 KeyError 逃逸
+        log.warning(f"  {sym} 新浪返回缺少 date 列，按无数据处理")
+        return pd.DataFrame()
+    df = raw.copy()
     df["trade_date"] = pd.to_datetime(df["date"]).dt.date
+
+    fac = _fetch_qfq_factors(sym)
+    if fac is None:
+        raise RuntimeError(f"{sym} 前复权因子不可用，跳过该股（避免 raw 冒充 QFQ）")
+
+    fdf = pd.DataFrame({"d": pd.to_datetime(list(fac.keys())), "f": list(fac.values())})
+    keys = pd.DataFrame({"d": pd.to_datetime(df["trade_date"])}).sort_values("d")
+    merged = pd.merge_asof(keys, fdf, on="d", direction="backward")
+    # 早于最早因子记录的日期 → 用最早因子（backfill）；仍为空 → 视为无复权(f=1)
+    f = merged["f"].bfill().fillna(1.0).to_numpy()
+    for col in ("open", "high", "low", "close"):
+        df[col] = (df[col].astype(float) * f).round(4)
     return df
 
 
@@ -155,7 +246,8 @@ def _as_float(v):
 
 
 def fetch_history(start: date, code: str | None = None, quote_sink=None,
-                  resume: bool = False, limit: int | None = None):
+                  resume: bool = False, limit: int | None = None,
+                  codes_from_db: bool = False):
     """逐只拉历史日线，返回总成交额 DataFrame。
 
     code: 指定单只股票（如 HK.01857），None=全港股。
@@ -169,6 +261,9 @@ def fetch_history(start: date, code: str | None = None, quote_sink=None,
     """
     if code:
         codes = [code]
+    elif codes_from_db:
+        codes = _db_code_list()
+        log.info(f"代码清单来源：库内 hk_daily_quote 全量（{len(codes)} 只，含现货清单外代码）")
     else:
         codes = _hk_code_list()
     if not codes:
@@ -309,28 +404,66 @@ def _map_quote_row(code, td, row, prev_close=None, change_pct=None):
 # ----------------------------------------------------------------------------
 # prev_close / change_pct 列确保 + 库内 LAG 回填
 # ----------------------------------------------------------------------------
-# change_pct 精度 NUMERIC(8,2)：港股仙股 合股/拆股 异常日可达上万%（脏数据），8,4 仅 4 位
-# 整数会溢出；8,2 留 6 位整数足以容纳且降低小数精度，与 daily_quote 对齐。
+# change_pct 精度 NUMERIC(12,4)（以真实库为准，2026-09-14 修正）：
+#   港股/A股 仙股「合股/拆股」异常日可达上万%（脏数据）；实测 max|change_pct| 已达 4737.61，
+#   逼近 8,4 上限 9999.9999；12,4 有 8 位整数余量，最安全。
+#   ⚠ 历史上本脚本/schema.sql 写的是 8,2，但真实库两张表实际都是 12,4 —— 按 AGENTS.md
+#     「真实库才是结构现状」，统一为 12,4，避免无谓且被视图拦截的 ALTER。
 _PREV_CLOSE_TYPE = "NUMERIC(12,4)"
-_CHANGE_PCT_TYPE = "NUMERIC(8,2)"
+_CHANGE_PCT_TYPE = "NUMERIC(12,4)"
+_CHANGE_PCT_TARGET = (12, 4)
+
+
+def _change_pct_type_now(tbl: str):
+    """读信息模式返回 change_pct 当前 (precision, scale)；列不存在返回 None。"""
+    from db import get_conn
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT numeric_precision, numeric_scale FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name=%s AND column_name='change_pct'",
+                (tbl,),
+            )
+            r = cur.fetchone()
+            return (r[0], r[1]) if r else None
+
+
+def _alter_change_pct_type(tbl: str):
+    """在【独立 autocommit 连接】上把 change_pct 转为目标精度（失败仅告警，不污染调用方事务）。
+
+    为什么不复用调用方游标：ALTER COLUMN TYPE 会被依赖该列的视图/规则拦截
+    （实测 v_daily_quote → "cannot alter type of a column used by a view or rule"）。
+    若在调用方事务内执行且用裸 except 吞掉异常，**事务会停留在 aborted 状态**，
+    之后任何语句都报 InFailedSqlTransaction —— 2026-09-14 全市场回填收尾时实际踩中。
+    """
+    from db import get_conn
+    try:
+        with get_conn() as conn:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"ALTER TABLE {tbl} ALTER COLUMN change_pct TYPE {_CHANGE_PCT_TYPE} "
+                    f"USING change_pct::{_CHANGE_PCT_TYPE};"
+                )
+        log.info(f"[{tbl}] change_pct 精度已转换为 {_CHANGE_PCT_TYPE}")
+    except Exception as e:
+        log.warning(f"[{tbl}] change_pct 精度转换失败（保持现状，不影响主流程）: {str(e).strip()[:200]}")
 
 
 def ensure_prev_close_columns(cur, tbl: str):
-    """确保 prev_close / change_pct 两列存在且 change_pct 为 8,2（与 schema.sql 对齐；幂等、不丢数据）。
+    """确保 prev_close / change_pct 两列存在且精度为目标（幂等、事务安全）。
 
-    change_pct 精度 8,2：港股仙股 合股/拆股 异常日可达上万%（脏数据），8,4 仅 4 位整数会溢出；
-    8,2 留 6 位整数足以容纳且降低小数精度，与 daily_quote 对齐。
+    安全要点（2026-09-14 修复 InFailedSqlTransaction）：
+      · ADD COLUMN IF NOT EXISTS 是安全 no-op，可留在调用方事务内；
+      · ALTER COLUMN TYPE **先读 information_schema 判断**，已是目标精度则完全跳过
+        （避免无谓 ALTER 撞上视图依赖而报错）；
+      · 确需转换时走 `_alter_change_pct_type` 的独立 autocommit 连接，失败只告警；
+      · 不再用裸 `except: pass` —— 那会把调用方事务打成 aborted 却不自知。
     """
     cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS prev_close {_PREV_CLOSE_TYPE};")
     cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS change_pct {_CHANGE_PCT_TYPE};")
-    # 若列已存在但类型非目标（如早前残留 12,4 / 8,4），无损转换为 8,2
-    try:
-        cur.execute(
-            f"ALTER TABLE {tbl} ALTER COLUMN change_pct TYPE {_CHANGE_PCT_TYPE} "
-            f"USING change_pct::{_CHANGE_PCT_TYPE};"
-        )
-    except Exception:
-        pass  # 已是目标类型
+    if _change_pct_type_now(tbl) not in (None, _CHANGE_PCT_TARGET):
+        _alter_change_pct_type(tbl)
 
 
 def fill_prev_close_from_db(start: date | None = None):
@@ -486,9 +619,14 @@ class _QuoteWriter:
         log.info(f"个股日线落库 {self.total} 条（hk_daily_quote）")
 
     def _flush(self, chunk):
+        # skip_null_updates=True：本脚本只产出量价 + prev_close/change_pct，
+        # 估值类列（市值/PE/PB/PS/PCF/换手率/量比/52周）产出为 NULL；
+        # 冲突时仅覆盖有值字段，避免把日常采集/估值脚本已填的有效值回写成 NULL
+        # （与 backfill_a_market_turnover.py 同款防护）。
         with self._get_conn() as conn:
             self._bulk_upsert(conn, "hk_daily_quote", chunk,
-                              conflict_cols=["stock_code", "trade_date"])
+                              conflict_cols=["stock_code", "trade_date"],
+                              skip_null_updates=True)
         self.total += len(chunk)
         log.info(f"  个股日线已落库 {self.total} 条")
 
@@ -522,7 +660,8 @@ def run():
     interrupted = False
     try:
         df = fetch_history(start, code, quote_sink=writer,
-                           resume=resume, limit=limit)
+                           resume=resume, limit=limit,
+                           codes_from_db=bool(a["codes_from_db"]))
     except KeyboardInterrupt:
         # Ctrl+C：已落库的部分保留，下次 --resume 继续
         interrupted = True
