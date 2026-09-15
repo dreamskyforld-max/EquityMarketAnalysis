@@ -216,7 +216,8 @@ _QUOTE_COL_MAP = {
 
 # 允许双写进池表的字段（daily_quote 命名侧）= 池表列 ∩ daily_quote 列。
 # 不在白名单的键一律忽略 —— 既不会撞上「列不存在」，
-# 也保证 ps_ttm_ratio / pcf_ttm_ratio 等池表独有列永不被本模块写入。
+# 也保证 hk/a 池表的派生列永不被本模块写入（PS/PCF 两列已于 2026-09 下线，
+# 改由画像层 load_revenue_ttm 现算，详情见 profiling/quantile.py）。
 _POOL_QUOTE_FIELDS = frozenset((
     "stock_code", "trade_date", "update_time",
     "last_price", "open_price", "high_price", "low_price",

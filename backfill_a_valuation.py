@@ -11,10 +11,12 @@ A股 市值/市盈率/市净率/市销率/市现率 历史回溯（东方财富 
             PE_LAR                静态市盈率
             PB_MRQ                市净率(MRQ)
             PEG_CAR               PEG
-            PS_TTM                市销率(TTM)  → a_daily_quote.ps_ttm_ratio
-            PCF_OCF_TTM           市现率(TTM)  → a_daily_quote.pcf_ttm_ratio
             CLOSE_PRICE           收盘价
             TOTAL_SHARES          总股本
+
+    注：PS_TTM / PCF_OCF_TTM 东财该报表原生提供，但 2026-09 起不再落行情表 ——
+        PS/PCF 属派生值，统一由画像层 quantile.load_revenue_ttm + 行情表总市值现算
+        （避免「多个生产者各写各的」：港股一路曾把累计口径四期直接求和，分母虚高 2.4 倍）。
 
 为什么不用富途快照（get_a_market_turnover.py）：
     - 富途 get_market_snapshot 受订阅/权限限制，只能覆盖少数重点股，
@@ -70,13 +72,11 @@ FIELD_MAP = {
     "PE_LAR": "pe_ratio",
     "PB_MRQ": "pb_ratio",
     "PEG_CAR": "dividend_ratio_ttm",  # 注：东财 PEG 非股息率，下面 _map 会纠正
-    "PS_TTM": "ps_ttm_ratio",         # 市销率(TTM) = 总市值/营收TTM
-    "PCF_OCF_TTM": "pcf_ttm_ratio",   # 市现率(TTM) = 总市值/经营现金流TTM
 }
 # 实际 dividend_ratio_ttm 在东财该报表无直接列；这里用 PEG 占位后在 _map 置空处理
 # CLOSE_PRICE 为东财未复权收盘价，仅用于 QFQ 复权因子换算（见 _apply_qfq_factor），不单独落库
-# PS_TTM / PCF_OCF_TTM 东财 RPT_VALUEANALYSIS_DET 原生提供（实测 2026-08-27 全市场 5550 只均有值）
-EM_COLS = "SECURITY_CODE,TOTAL_MARKET_CAP,NOTLIMITED_MARKETCAP_A,PE_TTM,PE_LAR,PB_MRQ,PEG_CAR,PS_TTM,PCF_OCF_TTM,CLOSE_PRICE"
+# PS_TTM / PCF_OCF_TTM 不再请求也不再落库（派生值，由画像层现算，见上方说明）
+EM_COLS = "SECURITY_CODE,TOTAL_MARKET_CAP,NOTLIMITED_MARKETCAP_A,PE_TTM,PE_LAR,PB_MRQ,PEG_CAR,CLOSE_PRICE"
 
 
 # ----------------------------------------------------------------------------
@@ -148,19 +148,13 @@ def _ensure_table():
                 "  pe_ratio NUMERIC(12,4),"
                 "  pe_ttm_ratio NUMERIC(12,4),"
                 "  pb_ratio NUMERIC(12,4),"
-                "  ps_ttm_ratio NUMERIC(12,4),"
-                "  pcf_ttm_ratio NUMERIC(12,4),"
                 "  dividend_ratio_ttm NUMERIC(8,4),"
                 "  update_time TIMESTAMPTZ,"
                 "  created_at TIMESTAMPTZ DEFAULT NOW(),"
                 "  UNIQUE (stock_code, trade_date))"
             )
-            # 已存在旧表需补列（幂等；新部署走上面 CREATE 即含）
-            for col in ("ps_ttm_ratio", "pcf_ttm_ratio"):
-                cur.execute(
-                    f"ALTER TABLE a_daily_quote "
-                    f"ADD COLUMN IF NOT EXISTS {col} NUMERIC(12,4)"
-                )
+            # 注：ps_ttm_ratio / pcf_ttm_ratio 于 2026-09 下线（派生值不落事实表），
+            #     此处不得再建/补这两列，否则会把已删除的派生列复活。
         conn.commit()
 
 
@@ -186,8 +180,7 @@ def _done_dates():
                 "SELECT trade_date,"
                 " COUNT(*) FILTER (WHERE total_market_val IS NOT NULL) AS n_mkt,"
                 " COUNT(*) FILTER (WHERE total_market_val IS NOT NULL"
-                "   AND pe_ttm_ratio IS NOT NULL AND ps_ttm_ratio IS NOT NULL"
-                "   AND pcf_ttm_ratio IS NOT NULL) AS n_val"
+                "   AND pe_ttm_ratio IS NOT NULL) AS n_val"   # PS/PCF 列已废弃，不再计入进度
                 " FROM a_daily_quote GROUP BY trade_date"
             )
             rows = cur.fetchall()
@@ -244,8 +237,6 @@ def _fetch_one_day(td: date, session: requests.Session, max_retry=4):
                     "pe_ttm_ratio": _num(d.get("PE_TTM")),
                     "pe_ratio": _num(d.get("PE_LAR")),
                     "pb_ratio": _num(d.get("PB_MRQ")),
-                    "ps_ttm_ratio": _num(d.get("PS_TTM")),
-                    "pcf_ttm_ratio": _num(d.get("PCF_OCF_TTM")),
                     # 东财该报表无股息率(TTM)列，置空；字段级 upsert 会保留库里原值，不清空
                     "dividend_ratio_ttm": None,
                     # 东财未复权收盘价（CLOSE_PRICE），仅用于 QFQ 换算的复权因子，不落库（_em_close 前缀）
@@ -319,8 +310,7 @@ def _apply_qfq_factor(rows, td):
             for col in ("total_market_val", "circular_market_val"):
                 if r.get(col) is not None:
                     r[col] = round(r[col] * f, 2)
-            for col in ("pe_ttm_ratio", "pe_ratio", "pb_ratio",
-                        "ps_ttm_ratio", "pcf_ttm_ratio"):
+            for col in ("pe_ttm_ratio", "pe_ratio", "pb_ratio"):
                 if r.get(col) is not None:
                     r[col] = round(r[col] * f, 4)
             conv += 1
@@ -338,7 +328,7 @@ def _apply_qfq_factor(rows, td):
 # ----------------------------------------------------------------------------
 # 估值列（用于 upsert 的列）。OHLC/量价列一律不在此出现，绝不触碰。
 VAL_COLS = ["total_market_val", "circular_market_val", "pe_ratio",
-            "pe_ttm_ratio", "pb_ratio", "ps_ttm_ratio", "pcf_ttm_ratio",
+            "pe_ttm_ratio", "pb_ratio",
             "dividend_ratio_ttm", "update_time"]
 CONFLICT_COLS = ["stock_code", "trade_date"]
 

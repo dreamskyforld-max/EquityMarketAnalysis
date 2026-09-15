@@ -13,7 +13,10 @@
 
 数据源说明：
     · 行情/估值快照来自 a_daily_quote（A股）与 hk_daily_quote（港股），两表字段一致
-    · A股已补 ps_ttm_ratio / pcf_ttm_ratio；港股两列为空（接口未提供），相关标签仅覆盖 A 股
+    · **PS/PCF 不落行情表**：外部源不提供（富途快照无此两项），属派生值。曾经把它作为
+      ps_ttm_ratio / pcf_ttm_ratio 写进行情表，结果出现「多个生产者 + 各自实现」：
+      港股一路的实现走了 SUM(近4期)，而 financial_indicator 是累计口径，分母虚高约 2.4 倍。
+      现统一由本模块的 load_revenue_ttm（TTM 唯一实现）+ 行情表总市值在标签层现算。
 """
 from __future__ import annotations
 
@@ -47,9 +50,12 @@ def load_quote_snapshot(conn, as_of: date, use_cache: bool = True) -> pd.DataFra
     """加载某交易日全市场的市值 / 估值 / 价格快照（②③ 域共用底层）。
 
     返回列：stock_code, market, trade_date, total_market_val, circular_market_val,
-            pe_ttm, pb, ps_ttm, pcf_ttm, dividend_yield, close
+            pe_ttm, pb, dividend_yield, close, volume, turnover_rate
 
     注：A股与港股可能落在不同的最近交易日（节假日不同），trade_date 逐行保留。
+    注：这里只放**外部源直供、日采必写**的估值列（PE/PB/市值/股息率）。PS/PCF 是派生值，
+        不在本函数内提供，请用 load_revenue_ttm + total_market_val 现算，避免再走
+        「派生值落行情表 → 多生产者各写各的」老路。
     """
     if use_cache and as_of in _SNAPSHOT_CACHE:
         return _SNAPSHOT_CACHE[as_of]
@@ -65,7 +71,6 @@ def load_quote_snapshot(conn, as_of: date, use_cache: bool = True) -> pd.DataFra
             SELECT stock_code, %s::text AS market, %s::date AS trade_date,
                    total_market_val, circular_market_val,
                    pe_ttm_ratio AS pe_ttm, pb_ratio AS pb,
-                   ps_ttm_ratio AS ps_ttm, pcf_ttm_ratio AS pcf_ttm,
                    dividend_ratio_ttm AS dividend_yield, close,
                    volume::float8 AS volume, turnover_rate::float8 AS turnover_rate
             FROM {table}
@@ -80,12 +85,12 @@ def load_quote_snapshot(conn, as_of: date, use_cache: bool = True) -> pd.DataFra
         if frames
         else pd.DataFrame(
             columns=["stock_code", "market", "trade_date", "total_market_val",
-                     "circular_market_val", "pe_ttm", "pb", "ps_ttm", "pcf_ttm",
+                     "circular_market_val", "pe_ttm", "pb",
                      "dividend_yield", "close", "volume", "turnover_rate"]
         )
     )
     for c in ("total_market_val", "circular_market_val", "pe_ttm", "pb",
-              "ps_ttm", "pcf_ttm", "dividend_yield", "close", "volume", "turnover_rate"):
+              "dividend_yield", "close", "volume", "turnover_rate"):
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
     # 只缓存最近一个 as_of：常驻进程里长期累积会吃内存
@@ -187,6 +192,77 @@ def load_financial_history(conn, as_of: date, report_type: str = "annual",
         """,
         [report_type, as_of] + std_params + [periods],
     )
+
+
+_TTM_CACHE: dict[date, pd.DataFrame] = {}
+
+
+def load_revenue_ttm(conn, as_of: date) -> pd.DataFrame:
+    """每只股票截至 as_of 的**滚动 12 个月**营收 / 经营现金流（TTM）——全仓唯一实现。
+
+    ⚠ 口径关键（踩过坑）：financial_indicator 存的是**累计口径**，不是单季流水：
+        Q1 = 1-3 月累计、H1 = 1-6 月累计、Q3 = 1-9 月累计、annual = 全年。
+    所以 `SUM(近 4 期)` 会把累计数重复相加（实测分母虚高约 2.4 倍、PS 偏小 0.42 倍）。
+    标准滚动十二个月公式：
+        TTM = 本期累计 + 上年全年 − 上年同期累计
+    其中 report_type='annual' 时，TTM 就是当年年报本身。
+
+    验证（2026-09-14，A股 5545 只对照东财 PS_TTM）：比值 P25/P50/P75 = 1.000/1.000/1.000，
+    93.1% 的个股误差 <5%。
+
+    返回列：stock_code, report_type, report_date, rev_ttm, ocf_ttm
+    ⚠ 前视风险同 load_financial_latest：financial_indicator 只有 report_date 无披露日，
+      派生标签的 pit_capable 一律 False。
+    """
+    if as_of in _TTM_CACHE:
+        return _TTM_CACHE[as_of]
+
+    df = _read_sql(
+        conn,
+        """
+        WITH cur AS (
+            SELECT DISTINCT ON (stock_code)
+                   stock_code, report_type, report_date,
+                   revenue, operating_cash_flow,
+                   EXTRACT(YEAR FROM report_date)::int AS y
+            FROM financial_indicator
+            WHERE report_type IN ('Q1','H1','Q3','annual')
+              AND (revenue IS NOT NULL OR operating_cash_flow IS NOT NULL)
+              AND report_date <= %s
+            ORDER BY stock_code, report_date DESC
+        ), prev_same AS (
+            SELECT c.stock_code,
+                   f.revenue AS prev_rev, f.operating_cash_flow AS prev_ocf
+            FROM cur c JOIN financial_indicator f
+              ON f.stock_code = c.stock_code AND f.report_type = c.report_type
+             AND EXTRACT(YEAR FROM f.report_date) = c.y - 1 AND f.report_date < c.report_date
+        ), prev_ann AS (
+            SELECT c.stock_code,
+                   f.revenue AS ann_rev, f.operating_cash_flow AS ann_ocf
+            FROM cur c JOIN financial_indicator f
+              ON f.stock_code = c.stock_code AND f.report_type = 'annual'
+             AND EXTRACT(YEAR FROM f.report_date) = c.y - 1 AND f.report_date < c.report_date
+        )
+        SELECT c.stock_code, c.report_type, c.report_date,
+               CASE WHEN c.report_type = 'annual' THEN c.revenue
+                    WHEN pa.ann_rev IS NOT NULL AND ps.prev_rev IS NOT NULL
+                         THEN c.revenue + pa.ann_rev - ps.prev_rev END AS rev_ttm,
+               CASE WHEN c.report_type = 'annual' THEN c.operating_cash_flow
+                    WHEN pa.ann_ocf IS NOT NULL AND ps.prev_ocf IS NOT NULL
+                         THEN c.operating_cash_flow + pa.ann_ocf - ps.prev_ocf END AS ocf_ttm
+        FROM cur c
+        LEFT JOIN prev_same ps ON ps.stock_code = c.stock_code
+        LEFT JOIN prev_ann  pa ON pa.stock_code = c.stock_code
+        """,
+        (as_of,),
+    )
+    for c in ("rev_ttm", "ocf_ttm"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # 只缓存最近一个 as_of：常驻进程里长期累积会吃内存
+    _TTM_CACHE.clear()
+    _TTM_CACHE[as_of] = df
+    return df
 
 
 def tier_or_flag(values: pd.Series, by: pd.Series, flag: str,

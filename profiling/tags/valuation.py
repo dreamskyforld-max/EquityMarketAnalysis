@@ -21,11 +21,14 @@ PE = -5 在数值上小于 PE = 10，但前者是亏损股、后者是便宜股�
     val_pe_hist_pct  历史分位（个股自身时序百分位）
 
 数据来源：
-    a_daily_quote / hk_daily_quote  pe_ttm_ratio / pb_ratio / ps_ttm_ratio / pcf_ttm_ratio / 市值
-    financial_indicator             free_cash_flow（年报）
+    a_daily_quote / hk_daily_quote  pe_ttm_ratio / pb_ratio / 市值（外部源直供，日采必写）
+    financial_indicator             free_cash_flow（年报）、revenue / operating_cash_flow（滚动12个月）
 
-覆盖限制：
-    ps_ttm_ratio / pcf_ttm_ratio 目前仅 A 股有值（港股两列为空），相关标签只覆盖 A 股。
+PS/PCF 为什么不在行情表取：
+    两列曾作为派生值落行情表，由多个生产者（东财直采 + 本地推算 + 采集钩子）分别写入，
+    港股那一路把累计口径的 Q1/H1/Q3/annual 直接 SUM（分母虚高约 2.4 倍），且日常链路填不满。
+    现在统一：分子 = 行情表 total_market_val，分母 = quantile.load_revenue_ttm（TTM 唯一实现），
+    两市同源、无需区分，也不再依赖任何回填作业。
 """
 from __future__ import annotations
 
@@ -37,7 +40,7 @@ import pandas as pd
 from ..registry import tag, TIER, PLANNED_NO_DATA
 from ..quantile import (
     QUOTE_TABLES, load_quote_snapshot, load_financial_latest, load_gics_map,
-    assign_tier, historical_percentile, tier_or_flag,
+    assign_tier, historical_percentile, tier_or_flag, load_revenue_ttm,
 )
 from ._base import _conn, _read_sql, _frame
 
@@ -118,20 +121,33 @@ def val_pb_tier(as_of: date) -> pd.DataFrame:
     value_type=TIER,
     value_range={**_TIER_RANGE, "NEGATIVE": "营收为负或无效，不参与分档"},
     source_type="stat", update_freq="daily",
-    data_sources=["a_daily_quote", "hk_daily_quote", "stock_sector", "sector_hierarchy"],
-    compute_logic="PS(TTM) 在【市场+GICS】内做横截面五等分；非正值打 NEGATIVE。"
-                  "刻意不用全市场分组：PS 由商业模式决定（零售 0.2x vs 软件 10x），"
-                  "全市场档测量的主要是行业毛利结构而非贵贱，跨行业比较无意义。num_value 存 PS 原值",
-    pit_capable=True, owner="profiling",
+    data_sources=["a_daily_quote", "hk_daily_quote", "financial_indicator",
+                  "stock_sector", "sector_hierarchy"],
+    compute_logic="PS(TTM) = 总市值 / 滚动12个月营收，在【市场+GICS】内做横截面五等分；"
+                  "非正值打 NEGATIVE。刻意不用全市场分组：PS 由商业模式决定"
+                  "（零售 0.2x vs 软件 10x），全市场档测量的主要是行业毛利结构而非贵贱。"
+                  "num_value 存 PS 原值。"
+                  "分子取行情表 total_market_val（日采必写），分母取 load_revenue_ttm"
+                  "——TTM 口径仅此一处定义，标签不含自己的公式",
+    pit_capable=False,  # financial_indicator 只有 report_date 无披露日
+    owner="profiling",
 )
 def val_ps_ttm_tier(as_of: date) -> pd.DataFrame:
     with _conn() as conn:
         snap = load_quote_snapshot(conn, as_of)
         gics_map = load_gics_map(conn)
-    df = snap[snap["ps_ttm"].notna()].merge(gics_map, on="stock_code", how="inner")
+        ttm = load_revenue_ttm(conn, as_of)
+
+    df = snap[["stock_code", "market", "total_market_val"]].copy()
+    df["total_market_val"] = pd.to_numeric(df["total_market_val"], errors="coerce")
+    df = df.merge(ttm[["stock_code", "rev_ttm"]], on="stock_code", how="inner")
+    df = df.merge(gics_map, on="stock_code", how="inner")
+    df = df[(df["total_market_val"] > 0) & df["rev_ttm"].notna() & (df["rev_ttm"] != 0)]
+
+    ps = df["total_market_val"] / df["rev_ttm"]
     grp = df["market"].astype(str) + "|" + df["gics"].astype(str)
-    tier = tier_or_flag(df["ps_ttm"], by=grp, flag="NEGATIVE")
-    return _frame(df["stock_code"], tier, df["ps_ttm"])
+    tier = tier_or_flag(ps, by=grp, flag="NEGATIVE")
+    return _frame(df["stock_code"], tier, ps.round(4))
 
 
 @tag(
@@ -140,20 +156,32 @@ def val_ps_ttm_tier(as_of: date) -> pd.DataFrame:
     value_type=TIER,
     value_range={**_TIER_RANGE, "NEGATIVE": "经营现金流为负，不参与分档"},
     source_type="stat", update_freq="daily",
-    data_sources=["a_daily_quote", "hk_daily_quote", "stock_sector", "sector_hierarchy"],
-    compute_logic="PCF(TTM)（市值/经营现金流）在【市场+GICS】内做横截面五等分；非正值打 NEGATIVE。"
-                  "与 PS 同理：重资产行业的折旧摊销加回会系统性抬高 OCF，全市场比较无意义。"
-                  "PCF 比 PE 更难被会计操纵，适合行业内与 PE 交叉验证。num_value 存 PCF 原值",
-    pit_capable=True, owner="profiling",
+    data_sources=["a_daily_quote", "hk_daily_quote", "financial_indicator",
+                  "stock_sector", "sector_hierarchy"],
+    compute_logic="PCF(TTM) = 总市值 / 滚动12个月经营现金流，在【市场+GICS】内做横截面五等分；"
+                  "非正值打 NEGATIVE。与 PS 同理：重资产行业的折旧摊销加回会系统性抬高 OCF，"
+                  "全市场比较无意义。PCF 比 PE 更难被会计操纵，适合行业内与 PE 交叉验证。"
+                  "num_value 存 PCF 原值。分子取行情表 total_market_val，分母取 load_revenue_ttm"
+                  "（TTM 口径唯一实现）",
+    pit_capable=False,  # financial_indicator 只有 report_date 无披露日
+    owner="profiling",
 )
 def val_pcf_ttm_tier(as_of: date) -> pd.DataFrame:
     with _conn() as conn:
         snap = load_quote_snapshot(conn, as_of)
         gics_map = load_gics_map(conn)
-    df = snap[snap["pcf_ttm"].notna()].merge(gics_map, on="stock_code", how="inner")
+        ttm = load_revenue_ttm(conn, as_of)
+
+    df = snap[["stock_code", "market", "total_market_val"]].copy()
+    df["total_market_val"] = pd.to_numeric(df["total_market_val"], errors="coerce")
+    df = df.merge(ttm[["stock_code", "ocf_ttm"]], on="stock_code", how="inner")
+    df = df.merge(gics_map, on="stock_code", how="inner")
+    df = df[(df["total_market_val"] > 0) & df["ocf_ttm"].notna() & (df["ocf_ttm"] != 0)]
+
+    pcf = df["total_market_val"] / df["ocf_ttm"]
     grp = df["market"].astype(str) + "|" + df["gics"].astype(str)
-    tier = tier_or_flag(df["pcf_ttm"], by=grp, flag="NEGATIVE")
-    return _frame(df["stock_code"], tier, df["pcf_ttm"])
+    tier = tier_or_flag(pcf, by=grp, flag="NEGATIVE")
+    return _frame(df["stock_code"], tier, pcf.round(4))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

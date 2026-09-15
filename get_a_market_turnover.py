@@ -277,21 +277,6 @@ def _print(rec):
     print(f"标的数量 : {rec['stock_count']} 只")
 
 
-def _fill_today_valuation(rec, dry=False):
-    """当日 A 股估值（市值/PE/PB/PS/PCF）顺带回填，失败不影响成交额主流程。
-
-    复用 backfill_a_valuation.run_valuation_one_day（东财 RPT_VALUEANALYSIS_DET
-    当日快照 + QFQ 换算）。依赖 a_daily_quote 当日行已由本脚本写就（close 用于复权因子）。
-    """
-    if not rec or not rec.get("trade_date"):
-        return
-    try:
-        from backfill_a_valuation import run_valuation_one_day
-        run_valuation_one_day(rec["trade_date"], dry=dry)
-    except Exception as e:
-        log.warning(f"当日 A 股估值回填失败（不影响成交额主流程）: {e}")
-
-
 def run(codes=None, ctx=None):
     """采集入口（常驻调用兼容）。codes 可为代码列表，空则全 A 股。"""
     if not codes:
@@ -300,7 +285,6 @@ def run(codes=None, ctx=None):
     if rec.get("trade_date"):
         save_to_db(rec)
         _save_quotes(rec.get("quote_rows", []))
-        _fill_today_valuation(rec)
     _print(rec)
     return rec
 
@@ -313,5 +297,4 @@ if __name__ == "__main__":
     if rec.get("trade_date") and not dry:
         save_to_db(rec)
         _save_quotes(rec.get("quote_rows", []))
-        _fill_today_valuation(rec, dry=dry)
     os._exit(0)

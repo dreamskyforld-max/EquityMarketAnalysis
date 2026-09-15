@@ -792,8 +792,8 @@ CREATE TABLE IF NOT EXISTS hk_daily_quote (
     pe_ratio            NUMERIC(12,4),              -- 市盈率(静态)
     pe_ttm_ratio        NUMERIC(12,4),              -- 市盈率(TTM)
     pb_ratio            NUMERIC(12,4),              -- 市净率
-    ps_ttm_ratio        NUMERIC(12,4),              -- 市销率(TTM) = 总市值/营收TTM（由 financial_indicator 营收TTM 推算，非富途快照）
-    pcf_ttm_ratio       NUMERIC(12,4),              -- 市现率(TTM) = 总市值/经营活动现金流TTM（由 financial_indicator 经营现金流TTM 推算）
+    -- PS/PCF 两列已于 2026-09 下线：派生值不落事实表，改由画像层
+    -- profiling.quantile.load_revenue_ttm(滚动12个月营收/经营现金流) + total_market_val 现算
     dividend_ratio_ttm  NUMERIC(8,4),               -- 股息率(TTM, %)
     update_time         TIMESTAMPTZ,                -- 数据更新时间（富途快照的 update_time）
     created_at  TIMESTAMPTZ     DEFAULT NOW(),
@@ -801,9 +801,7 @@ CREATE TABLE IF NOT EXISTS hk_daily_quote (
     UNIQUE (stock_code, trade_date)
 );
 
-COMMENT ON TABLE  hk_daily_quote             IS '港股全量股票简版日线数据池（日常=富途 get_market_snapshot 快照；历史=新浪 stock_hk_daily(adjust=qfq)；清单=v_quote_scope；价格列统一 QFQ 前复权，与 a_daily_quote 口径一致；仅落当日有成交（amount>0）的行；PS/PCF 由 financial_indicator 推算）';
-COMMENT ON COLUMN hk_daily_quote.ps_ttm_ratio  IS '市销率(TTM)=总市值/营收TTM（financial_indicator 近4季营收滚动求和推算）';
-COMMENT ON COLUMN hk_daily_quote.pcf_ttm_ratio IS '市现率(TTM)=总市值/经营活动现金流TTM（financial_indicator 近4季经营现金流滚动求和推算）';
+COMMENT ON TABLE  hk_daily_quote             IS '港股全量股票简版日线数据池（日常=富途 get_market_snapshot 快照；历史=新浪 stock_hk_daily(adjust=qfq)；清单=v_quote_scope；价格列统一 QFQ 前复权，与 a_daily_quote 口径一致；仅落当日有成交（amount>0）的行）';
 COMMENT ON COLUMN hk_daily_quote.stock_code  IS '股票代码，如 HK.00700';
 COMMENT ON COLUMN hk_daily_quote.amount      IS '成交额（港元），全天完整值';
 COMMENT ON COLUMN hk_daily_quote.update_time IS '数据更新时间（富途快照的 update_time；历史回溯则为交易日）';
@@ -978,8 +976,7 @@ CREATE TABLE IF NOT EXISTS a_daily_quote (
     pe_ratio            NUMERIC(12,4),
     pe_ttm_ratio        NUMERIC(12,4),
     pb_ratio            NUMERIC(12,4),
-    ps_ttm_ratio        NUMERIC(12,4),                      -- 市销率(TTM) = 总市值/营收TTM（东财 RPT_VALUEANALYSIS_DET PS_TTM）
-    pcf_ttm_ratio       NUMERIC(12,4),                      -- 市现率(TTM) = 总市值/经营现金流TTM（东财 RPT_VALUEANALYSIS_DET PCF_OCF_TTM）
+    -- PS/PCF 两列已于 2026-09 下线（派生值不落事实表），见 hk_daily_quote 同名注释
     dividend_ratio_ttm  NUMERIC(8,4),
     update_time         TIMESTAMPTZ,
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
@@ -990,11 +987,9 @@ CREATE INDEX IF NOT EXISTS idx_aquote_trade_date ON public.a_daily_quote USING b
 -- 与 UNIQUE(stock_code, trade_date) 的区别：本索引服务于「按更新时间排序」的取最新快照场景。
 CREATE INDEX IF NOT EXISTS idx_aquote_stock_update_time ON a_daily_quote (stock_code, update_time);
 
-COMMENT ON TABLE  a_daily_quote                  IS 'A股个股每日行情/估值快照（日常=富途 get_market_snapshot 批量快照；清单=v_quote_scope；仅落当日有成交（amount>0）的行；PS/PCF 来自东财 RPT_VALUEANALYSIS_DET / backfill_a_valuation）';
+COMMENT ON TABLE  a_daily_quote                  IS 'A股个股每日行情/估值快照（日常=富途 get_market_snapshot 批量快照；清单=v_quote_scope；仅落当日有成交（amount>0）的行；历史市值/PE/PB 由东财回填）';
 COMMENT ON COLUMN a_daily_quote.stock_code       IS '股票完整代码，如 SH.600519';
 COMMENT ON COLUMN a_daily_quote.trade_date       IS '交易日';
-COMMENT ON COLUMN a_daily_quote.ps_ttm_ratio     IS '市销率(TTM)=总市值/营收TTM（东财 RPT_VALUEANALYSIS_DET PS_TTM，已按 QFQ 复权因子平移）';
-COMMENT ON COLUMN a_daily_quote.pcf_ttm_ratio    IS '市现率(TTM)=总市值/经营现金流TTM（东财 RPT_VALUEANALYSIS_DET PCF_OCF_TTM，已按 QFQ 复权因子平移）';
 COMMENT ON COLUMN a_daily_quote.prev_close  IS '昨收（前交易日收盘价）；由同表 LAG(close) 推算/回填，与 daily_quote.prev_close 对齐';
 COMMENT ON COLUMN a_daily_quote.change_pct  IS '涨跌幅(%) = (close-prev_close)/prev_close*100，与 daily_quote.change_pct 对齐';
 
@@ -1032,8 +1027,6 @@ SELECT
     pe_ratio,
     pe_ttm_ratio,
     pb_ratio,
-    ps_ttm_ratio,
-    pcf_ttm_ratio,
     dividend_ratio_ttm,
     created_at
 FROM a_daily_quote
@@ -1060,8 +1053,6 @@ SELECT
     pe_ratio,
     pe_ttm_ratio,
     pb_ratio,
-    ps_ttm_ratio,
-    pcf_ttm_ratio,
     dividend_ratio_ttm,
     created_at
 FROM hk_daily_quote;

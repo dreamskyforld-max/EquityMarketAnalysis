@@ -5,8 +5,8 @@
 为什么用百度：
     hk_daily_quote 的历史行由 backfill_hk_market_turnover.py 从新浪/akshare 回填，
     只含 OHLCV，不含市值/PE/PB（其文档明写"市值由富途快照当天补"）。
-    富途 get_market_snapshot 只返回当天快照，故 hk_daily_quote.total_market_val 历史全 NULL，
-    backfill_hk_valuation.py 依赖它通过 total_market_val ÷ TTM财务 现算 PS/PCF，从而全历史 0/0。
+    富途 get_market_snapshot 只返回当天快照，故 hk_daily_quote.total_market_val 历史全 NULL。
+    注：本脚本只负责把历史市值铺满；PS/PCF 列已废弃，由画像层用 load_revenue_ttm + 总市值现算。
 
     百度股市通（gushitong.baidu.com/opendata，resource_id=51171）按个股返回估值时间序列：
       - 总市值      （单位：亿，需 ×1e8 转元，与富途快照/财务表同尺度）
@@ -24,13 +24,12 @@
     high_52w / low_52w），沿用 bulk_upsert(skip_null_updates=True) 字段级防护：
     新值为空保留库中原值，不误伤其他列（close/amount/富途快照填的 circular 等）。
 
-两阶段自动串联（一次执行完成所有字段）：
+两阶段自动串联（现仅剩阶段一）：
     阶段一：采集 total_market_val / pe / pe_ttm / pb（百度）→ 落 hk_daily_quote；
-    阶段二：市值铺满后自动调用 backfill_hk_valuation.run_valuation，用
-            total_market_val ÷ TTM财务 现算 PS_TTM / PCF_TTM → 落 hk_daily_quote。
-    —— 人无需手工分两步走；脚本内部判断：仅当市值全部铺满（覆盖率>=99%）才进阶段二，
-       否则只做阶段一并提示用 --resume 续采（避免增量分轮跑导致部分交易日漏算 PS/PCF）。
-       阶段二也可独立运行：python3 backfill_hk_valuation.py。
+            high_52w / low_52w 由本表 OHLC 滚动 252 交易日推导补全。
+    阶段二（已废弃）：曾用 total_market_val ÷ TTM财务 现算 PS_TTM/PCF_TTM 落表。
+            现 PS/PCF 不再落行情表，两市统一由画像层 load_revenue_ttm + 总市值现算。
+    --no-valuation / --force-valuation 参数保留仅为兼容旧命令行，不再触发任何计算。
 
 断点续采：
     --resume 跳过已完成的股票（total_market_val 非空行数 / 总行数 >= 99%）。
@@ -357,9 +356,9 @@ def run():
                  f"（确认无遗漏要强制计算可加 --force-valuation）")
         return
 
-    log.info("市值已铺满，【阶段二】自动计算 PS/PCF ...")
-    from backfill_hk_valuation import run_valuation
-    run_valuation(resume=True)
+    # PS/PCF 列已废弃：两市统一由画像层 quantile.load_revenue_ttm + 行情表总市值现算，
+    # 不再由本回填链路写表（原第二阶段调用的 backfill_hk_valuation 已退役）。
+    log.info("市值已铺满（阶段二 PS/PCF 落表已废弃，无需计算）。")
 
 
 if __name__ == "__main__":

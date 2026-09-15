@@ -265,21 +265,6 @@ def _print(rec):
     print(f"标的数量 : {rec['stock_count']} 只")
 
 
-def _fill_today_valuation(rec, dry=False):
-    """当日港股 PS/PCF 顺带回填（纯库内 TTM 现算，无外部调用），失败不影响主流程。
-
-    复用 backfill_hk_valuation.run_valuation(date=...) 单日模式；
-    依赖 hk_daily_quote 当日行已由本脚本写就（total_market_val 用于 PS/PCF 分母）。
-    """
-    if not rec or not rec.get("trade_date"):
-        return
-    try:
-        from backfill_hk_valuation import run_valuation
-        run_valuation(date=rec["trade_date"], dry=dry)
-    except Exception as e:
-        log.warning(f"当日港股估值(PS/PCF)回填失败（不影响成交额主流程）: {e}")
-
-
 def run(codes=None, ctx=None):
     """采集入口（常驻调用兼容）。codes 可为代码列表，空则全港股。"""
     if not codes:
@@ -288,7 +273,6 @@ def run(codes=None, ctx=None):
     if rec.get("trade_date"):
         save_to_db(rec)
         _save_quotes(rec.get("quote_rows", []))
-        _fill_today_valuation(rec)
     _print(rec)
     return rec
 
@@ -302,7 +286,6 @@ if __name__ == "__main__":
     if rec.get("trade_date") and not dry:
         save_to_db(rec)
         _save_quotes(rec.get("quote_rows", []))
-        _fill_today_valuation(rec, dry=dry)
     # 独立运行：共享上下文由 collector_runtime 管理（常驻不关闭），
     # 富途 SDK 非 daemon 线程会导致进程挂住，这里显式退出。
     os._exit(0)

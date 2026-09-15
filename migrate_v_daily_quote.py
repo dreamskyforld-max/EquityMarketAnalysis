@@ -20,8 +20,8 @@ daily_quote 合并迁移 · 阶段 0（幂等，可重复执行）
 
 回灌时自动发生的差异（符合池表口径，属预期）：
     · change_pct 精度：池表为 NUMERIC(12,4)（真实库口径），daily_quote 为 NUMERIC(8,4)
-    · 池表独有的 ps_ttm_ratio / pcf_ttm_ratio 不参与回灌（daily_quote 无此列）；
-      如需补齐，可对相应日期跑 backfill_a_valuation.py / backfill_hk_valuation.py
+    · ps_ttm_ratio / pcf_ttm_ratio 两列已于 2026-09 从池表下线（派生值不落事实表），
+      现由画像层 profiling.quantile.load_revenue_ttm + 总市值现算，无需回灌
 
 用法
     python3 migrate_v_daily_quote.py            # 执行（幂等，可反复跑）
