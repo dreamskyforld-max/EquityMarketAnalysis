@@ -117,10 +117,17 @@ GLOBAL_TASKS: list[GlobalTask] = [
     # 每小时刷新: 富途系盘中实时, FRED/债券/汇率为日频(T-1)
     ("全球指数采集(每小时)", "get_global_benchmarks.py", {"hour": "*", "minute": 0}, None, True, None, 180),
 
-    # 全球指数分钟级采集：覆盖亚太(08:00–16:00 HK)+欧美盘至凌晨，避开低频 04:00–08:00
-    # 每5分钟一次，仅交易日；run 忽略 codes，全局只跑一次
-    ("全球指数分钟采集", "get_global_benchmarks_minute.py",
-     {"minute": "*/5", "hour": "8-11,13-16,17-23,0-3", "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 指数分钟采集 · 快源（恒生指数/恒生科技/上证/深证成指）：每 1 分钟。
+    # 时段覆盖 A股(9:30-15:00)+港股(9:30-16:00)；单批 4 次请求（富途 2 + 腾讯 2，均不支持多代码），
+    # 正常 <5s；增量写库（只写 MAX(ts) 回退 2 分钟后的 bar）。
+    # 历史全量/手动补采仍走 get_global_benchmarks_minute.py（已不在调度注册）。
+    ("指数分钟-快源", "get_index_minute_fast.py",
+     {"minute": "*", "hour": "9-11,13-16", "day_of_week": "mon-fri"}, None, True, None, 120),
+
+    # 指数分钟采集 · 国际（日经225/KOSPI，东财 push2）：东财反爬敏感，保持 5 分钟。
+    # 单批最多 2 指数 × 2 次短重试失败即弃（成功一批即补齐当天全部分钟，故失败无损）。
+    ("指数分钟-国际", "get_index_minute_intl.py",
+     {"minute": "*/5", "hour": "8-14", "day_of_week": "mon-fri"}, None, True, None, 120),
 
     # 股票-指数成分归属（参考数据，每周二 18:00 刷新；run 忽略 codes，全局只跑一次）
     ("指数成分归属", "get_stock_sector.py", {"day_of_week": 2, "hour": 18, "minute": 0}, None, True, None, 180),

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-全球基准指数分钟级采集 — 独立脚本（不改动现有 get_global_benchmarks.py）。
+全球基准指数分钟级采集 — 手动全量补采 CLI（保留）
+
+⚠️ 调度说明（2026-09-17 起）：本脚本已从 market_scheduler 拆分为两条独立调度任务——
+   快源（恒指/恒生科技/上证/深证成指，每 1 分钟）→ get_index_minute_fast.py
+   国际（日经/KOSPI，东财，每 5 分钟）      → get_index_minute_intl.py
+   本脚本保留作手动全量/多日补采（支持 --source/--klt/--days），不再被调度器调用。
 
 数据源:
   - 富途 OpenAPI K_1M:     恒生指数 / 恒生科技

@@ -186,7 +186,7 @@ _SEED_TABLE_CONFIG = [
     ("hk_daily_quote",          "update_time",  "minute", 0, 0, "get_hk_market_turnover(盘中刷新update_time)"),
     ("daily_market_turnover",   "snapshot_time","minute", 0, 0, "get_hk_market_turnover(盘中每5分钟)"),
     ("daily_benchmark",         "trade_date",   "day",    0, 0, "get_global_benchmarks(每小时/盘后全量)"),
-    ("benchmark_minute",        "mkt_time",     "minute", 0, 0, "get_global_benchmarks_minute"),
+    ("benchmark_minute",        "mkt_time",     "minute", 0, 0, "get_index_minute_fast + get_index_minute_intl"),
     ("trend_snapshot",          "snapshot_time","minute", 0, 0, "record_trend(盘中批量)"),
     ("tick_data",               "tick_time",    "minute", 0, 0, "ticker_collector(独立服务, tick_time有索引)"),
     ("realtime_order_size",     "snapshot_time","minute", 0, 0, "企业微信常驻服务"),
