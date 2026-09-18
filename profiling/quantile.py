@@ -16,7 +16,8 @@
     · **PS/PCF 不落行情表**：外部源不提供（富途快照无此两项），属派生值。曾经把它作为
       ps_ttm_ratio / pcf_ttm_ratio 写进行情表，结果出现「多个生产者 + 各自实现」：
       港股一路的实现走了 SUM(近4期)，而 financial_indicator 是累计口径，分母虚高约 2.4 倍。
-      现统一由本模块的 load_revenue_ttm（TTM 唯一实现）+ 行情表总市值在标签层现算。
+      现统一由本模块的 load_financial_ttm（TTM 唯一实现，营收/现金流/净利共用）+ 行情表
+      总市值在标签层现算（PS/PCF/PEG 同源）。
 """
 from __future__ import annotations
 
@@ -147,11 +148,16 @@ def _financial_std_filter(report_type: str) -> tuple[str, list]:
 
 
 def load_financial_latest(conn, as_of: date, report_type: str = "annual") -> pd.DataFrame:
-    """取每只股票 as_of 之前最近一期**标准报告期**财报。
+    """取每只股票 as_of 之前最近一期**标准报告期**财报（PIT：按实际披露日过滤）。
 
-    ⚠ 前视风险：financial_indicator 只有 report_date（报告期），没有实际披露日，
-    所以「2025 年报」在 2025-12-31 之后即可被取到，而真实披露可能晚至次年 4 月。
-    在补采 announce_date 之前，所有财报派生标签的 pit_capable 均为 False。
+    时点口径（PIT，防前视）：
+        过滤条件是 `report_date <= as_of` **且**（若有披露日）`announce_date <= as_of`。
+        否则「2025 年报」（report_date=2025-12-31）在 2025-12-31 当天就能取到，
+        而它实际要到次年 4 月才公告 —— 复现历史时点会用到当时不可能知道的信息。
+    覆盖说明：
+        · A 股：announce_date 覆盖率 96.5% → 已 PIT；
+        · 港股：披露日列全空 → `announce_date IS NULL` 放行，退化为「仅按报告期」，
+          仍有前视，港股的财报派生标签暂不可用于严格回测。
     """
     std, std_params = _financial_std_filter(report_type)
     return _read_sql(
@@ -163,9 +169,16 @@ def load_financial_latest(conn, as_of: date, report_type: str = "annual") -> pd.
                operating_cash_flow, free_cash_flow, revenue_yoy, net_profit_yoy
         FROM financial_indicator
         WHERE report_type = %s AND report_date <= %s {std}
+          -- 披露日可信度护栏：announce_date 回填存在污染（历史行普遍后移约 1 年，
+          -- 间隔中位数 392~475 天），只有「合理且已披露」才据此过滤；
+          -- 不合理的老数据按「未知」放行，避免把有效财报误判为未披露（错退回更老一期）。
+          AND (announce_date IS NULL
+               OR announce_date < report_date
+               OR announce_date - report_date > 180
+               OR announce_date <= %s)
         ORDER BY stock_code, report_date DESC
         """,
-        [report_type, as_of] + std_params,
+        [report_type, as_of] + std_params + [as_of],
     )
 
 
@@ -175,6 +188,7 @@ def load_financial_history(conn, as_of: date, report_type: str = "annual",
 
     序列类标签（ROE 稳定性、连续盈利年数、成长加速度）的底层取数。
     rn 是「期数序号」而非自然年——个别年份报告缺失时，连续性判断按期数近似。
+    PIT 同 load_financial_latest（A 股按披露日过滤；港股披露日为空则放行）。
     """
     std, std_params = _financial_std_filter(report_type)
     return _read_sql(
@@ -187,18 +201,23 @@ def load_financial_history(conn, as_of: date, report_type: str = "annual",
                    ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY report_date DESC) - 1 AS rn
             FROM financial_indicator
             WHERE report_type = %s AND report_date <= %s {std}
+              -- 披露日可信度护栏，同 load_financial_latest
+              AND (announce_date IS NULL
+                   OR announce_date < report_date
+                   OR announce_date - report_date > 180
+                   OR announce_date <= %s)
         ) t
         WHERE rn <= %s
         """,
-        [report_type, as_of] + std_params + [periods],
+        [report_type, as_of] + std_params + [as_of, periods],
     )
 
 
 _TTM_CACHE: dict[date, pd.DataFrame] = {}
 
 
-def load_revenue_ttm(conn, as_of: date) -> pd.DataFrame:
-    """每只股票截至 as_of 的**滚动 12 个月**营收 / 经营现金流（TTM）——全仓唯一实现。
+def load_financial_ttm(conn, as_of: date) -> pd.DataFrame:
+    """每只股票截至 as_of 的**滚动 12 个月**财务量（营收 / 经营现金流 / 净利润）——全仓唯一实现。
 
     ⚠ 口径关键（踩过坑）：financial_indicator 存的是**累计口径**，不是单季流水：
         Q1 = 1-3 月累计、H1 = 1-6 月累计、Q3 = 1-9 月累计、annual = 全年。
@@ -210,7 +229,14 @@ def load_revenue_ttm(conn, as_of: date) -> pd.DataFrame:
     验证（2026-09-14，A股 5545 只对照东财 PS_TTM）：比值 P25/P50/P75 = 1.000/1.000/1.000，
     93.1% 的个股误差 <5%。
 
-    返回列：stock_code, report_type, report_date, rev_ttm, ocf_ttm
+    返回列：stock_code, report_type, report_date,
+            rev_ttm, ocf_ttm,                       # 营收 / 经营现金流 TTM（PS、PCF 用）
+            np_ttm, np_ttm_prev, np_ttm_yoy         # 净利 TTM、上年同期 TTM、同比(%)
+    PIT：所有分支（cur / 上年同期 / 上一个年报 / 上上年）都叠加披露日过滤
+        `announce_date <= as_of OR announce_date IS NULL`（A 股已 PIT；港股披露日为空放行）。
+    `np_ttm_yoy` = (np_ttm / np_ttm_prev − 1) × 100，仅当上年同期 TTM > 0 时可算
+    （上年亏损的「扭亏」情形增速无定义 → NULL，由标签侧打 TURNAROUND）。
+
     ⚠ 前视风险同 load_financial_latest：financial_indicator 只有 report_date 无披露日，
       派生标签的 pit_capable 一律 False。
     """
@@ -223,41 +249,102 @@ def load_revenue_ttm(conn, as_of: date) -> pd.DataFrame:
         WITH cur AS (
             SELECT DISTINCT ON (stock_code)
                    stock_code, report_type, report_date,
-                   revenue, operating_cash_flow,
-                   EXTRACT(YEAR FROM report_date)::int AS y
+                   revenue, operating_cash_flow, net_profit
             FROM financial_indicator
             WHERE report_type IN ('Q1','H1','Q3','annual')
-              AND (revenue IS NOT NULL OR operating_cash_flow IS NOT NULL)
+              AND (revenue IS NOT NULL OR operating_cash_flow IS NOT NULL
+                   OR net_profit IS NOT NULL)
               AND report_date <= %s
+              -- 披露日可信度护栏，同 load_financial_latest
+              AND (announce_date IS NULL
+                   OR announce_date < report_date
+                   OR announce_date - report_date > 180
+                   OR announce_date <= %s)
             ORDER BY stock_code, report_date DESC
-        ), prev_same AS (
-            SELECT c.stock_code,
-                   f.revenue AS prev_rev, f.operating_cash_flow AS prev_ocf
+        ), p1 AS (
+            -- 上年同期 = 当前期之前**最近一份同类型**报告（不用日历年匹配：港股财年
+            -- 不统一，同一日历年可能有 1-31 / 7-31 两份年报，按年匹配会命中多行导致乘行）
+            SELECT DISTINCT ON (c.stock_code)
+                   c.stock_code, c.report_type, f.report_date AS p1_date,
+                   f.revenue AS p1_rev, f.operating_cash_flow AS p1_ocf, f.net_profit AS p1_np
             FROM cur c JOIN financial_indicator f
               ON f.stock_code = c.stock_code AND f.report_type = c.report_type
-             AND EXTRACT(YEAR FROM f.report_date) = c.y - 1 AND f.report_date < c.report_date
-        ), prev_ann AS (
-            SELECT c.stock_code,
-                   f.revenue AS ann_rev, f.operating_cash_flow AS ann_ocf
+             AND f.report_date < c.report_date
+             -- 披露日可信度护栏，同 load_financial_latest
+             AND (f.announce_date IS NULL
+                  OR f.announce_date < f.report_date
+                  OR f.announce_date - f.report_date > 180
+                  OR f.announce_date <= %s)
+            ORDER BY c.stock_code, f.report_date DESC
+        ), a1 AS (
+            -- 上一个完整年报 = 当前期之前最近的一份年报
+            SELECT DISTINCT ON (c.stock_code)
+                   c.stock_code, f.report_date AS a1_date,
+                   f.revenue AS a1_rev, f.operating_cash_flow AS a1_ocf, f.net_profit AS a1_np
             FROM cur c JOIN financial_indicator f
               ON f.stock_code = c.stock_code AND f.report_type = 'annual'
-             AND EXTRACT(YEAR FROM f.report_date) = c.y - 1 AND f.report_date < c.report_date
+             AND f.report_date < c.report_date
+             -- 披露日可信度护栏，同 load_financial_latest
+             AND (f.announce_date IS NULL
+                  OR f.announce_date < f.report_date
+                  OR f.announce_date - f.report_date > 180
+                  OR f.announce_date <= %s)
+            ORDER BY c.stock_code, f.report_date DESC
+        ), p2 AS (
+            -- 上上年同期（用于还原「上年同期那一行」的 TTM，才能做 TTM 同比）
+            SELECT DISTINCT ON (p.stock_code) p.stock_code, f.net_profit AS p2_np
+            FROM p1 p JOIN financial_indicator f
+              ON f.stock_code = p.stock_code AND f.report_type = p.report_type
+             AND f.report_date < p.p1_date
+             -- 披露日可信度护栏，同 load_financial_latest
+             AND (f.announce_date IS NULL
+                  OR f.announce_date < f.report_date
+                  OR f.announce_date - f.report_date > 180
+                  OR f.announce_date <= %s)
+            ORDER BY p.stock_code, f.report_date DESC
+        ), a2 AS (
+            SELECT DISTINCT ON (a.stock_code) a.stock_code, f.net_profit AS a2_np
+            FROM a1 a JOIN financial_indicator f
+              ON f.stock_code = a.stock_code AND f.report_type = 'annual'
+             AND f.report_date < a.a1_date
+             -- 披露日可信度护栏，同 load_financial_latest
+             AND (f.announce_date IS NULL
+                  OR f.announce_date < f.report_date
+                  OR f.announce_date - f.report_date > 180
+                  OR f.announce_date <= %s)
+            ORDER BY a.stock_code, f.report_date DESC
         )
         SELECT c.stock_code, c.report_type, c.report_date,
                CASE WHEN c.report_type = 'annual' THEN c.revenue
-                    WHEN pa.ann_rev IS NOT NULL AND ps.prev_rev IS NOT NULL
-                         THEN c.revenue + pa.ann_rev - ps.prev_rev END AS rev_ttm,
+                    WHEN a1.a1_rev IS NOT NULL AND p1.p1_rev IS NOT NULL
+                         THEN c.revenue + a1.a1_rev - p1.p1_rev END AS rev_ttm,
                CASE WHEN c.report_type = 'annual' THEN c.operating_cash_flow
-                    WHEN pa.ann_ocf IS NOT NULL AND ps.prev_ocf IS NOT NULL
-                         THEN c.operating_cash_flow + pa.ann_ocf - ps.prev_ocf END AS ocf_ttm
+                    WHEN a1.a1_ocf IS NOT NULL AND p1.p1_ocf IS NOT NULL
+                         THEN c.operating_cash_flow + a1.a1_ocf - p1.p1_ocf END AS ocf_ttm,
+               CASE WHEN c.report_type = 'annual' THEN c.net_profit
+                    WHEN a1.a1_np IS NOT NULL AND p1.p1_np IS NOT NULL
+                         THEN c.net_profit + a1.a1_np - p1.p1_np END AS np_ttm,
+               -- 上年同期的 TTM：当期是年报时即上年年报本身，否则同样按「累计+上年全年−上年同期」还原
+               CASE WHEN p1.p1_np IS NULL THEN NULL
+                    WHEN c.report_type = 'annual' THEN p1.p1_np
+                    WHEN p2.p2_np IS NOT NULL AND a2.a2_np IS NOT NULL
+                         THEN p1.p1_np + a2.a2_np - p2.p2_np END AS np_ttm_prev
         FROM cur c
-        LEFT JOIN prev_same ps ON ps.stock_code = c.stock_code
-        LEFT JOIN prev_ann  pa ON pa.stock_code = c.stock_code
+        LEFT JOIN p1 ON p1.stock_code = c.stock_code
+        LEFT JOIN a1 ON a1.stock_code = c.stock_code
+        LEFT JOIN p2 ON p2.stock_code = c.stock_code
+        LEFT JOIN a2 ON a2.stock_code = c.stock_code
         """,
-        (as_of,),
+        (as_of,) * 6,  # cur 的报告期 + 披露日，p1/a1/p2/a2 各一个披露日
     )
-    for c in ("rev_ttm", "ocf_ttm"):
+    for c in ("rev_ttm", "ocf_ttm", "np_ttm", "np_ttm_prev"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # 净利 TTM 同比（%）：上年同期 TTM 为负（扭亏）或缺失则不可算 → NULL
+    valid = df["np_ttm"].notna() & df["np_ttm_prev"].notna() & (df["np_ttm_prev"] > 0)
+    df["np_ttm_yoy"] = pd.NA
+    df["np_ttm_yoy"] = pd.to_numeric(df["np_ttm_yoy"], errors="coerce")
+    df.loc[valid, "np_ttm_yoy"] = (df.loc[valid, "np_ttm"] / df.loc[valid, "np_ttm_prev"] - 1) * 100
 
     # 只缓存最近一个 as_of：常驻进程里长期累积会吃内存
     _TTM_CACHE.clear()

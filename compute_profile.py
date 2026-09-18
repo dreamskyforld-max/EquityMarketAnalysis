@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """全量画像每日计算任务（供 market_scheduler.py 以 run(codes, ctx) 形式调用）。
 
-每个工作日收盘后（默认 16:30，见 market_scheduler.py 的 GLOBAL_TASKS 注册）
+每个工作日收盘后（16:45，见 market_scheduler.py 的 GLOBAL_TASKS 注册）
 计算当日全量画像，等价于手动执行：
     python3 -m profiling.run compute --as-of <今日> --force
 
 行为：
 - 写入 profile.tag_value（版本化：值变化才产生新版本，未变标签沿用上一有效版本）。
-- 依赖的当日行情快照由同调度器的「收盘采集」任务（A 股 15:10 / 港股 16:20）先行入库，
-  故 16:30 计算已能拿到当日收盘价。
+- 依赖的当日行情快照由同调度器的「收盘采集」任务（A 股 15:10 / 港股 16:20）先行入库。
 - force=True 跳过各标签的 update_freq 更新门禁，确保全量重算（未变标签不产生冗余版本）。
 - codes / ctx 由调度器传入，但本任务为全局全量，忽略二者。
+
+⚠ 必须 import profiling.tags：标签是「import 时注册」的（@tag 装饰器），
+   只 import engine 会让注册表为空 → compute_all 静默返回 []、日志出现「标签数=0」。
+   （2026-09-12 上线后连续 3 个交易日空跑，即此原因；下方加了空注册表硬校验防复发。）
 """
 from datetime import date
 from db import get_conn
-from profiling import engine
+from profiling import engine, registry
+from profiling import tags  # noqa: F401  触发全部标签注册（不可删！）
 from log_utils import setup_logger
 
 log = setup_logger("compute_profile")
@@ -23,7 +27,12 @@ log = setup_logger("compute_profile")
 def run(codes=None, ctx=None):
     """计算当日全量画像。异常直接向上冒泡，由调度器记录为执行失败。"""
     as_of = date.today()
-    log.info("【全量画像】开始计算 as_of=%s", as_of)
+    n_tags = len(registry.all_tags())
+    if n_tags == 0:
+        raise RuntimeError(
+            "标签注册表为空（profiling.tags 未导入？）——拒绝执行，避免静默产出 0 标签"
+        )
+    log.info("【全量画像】开始计算 as_of=%s（注册标签 %d 个）", as_of, n_tags)
     with get_conn() as conn:
         results = engine.compute_all(conn, as_of=as_of, force=True, mode="auto")
     n = len(results) if results else 0

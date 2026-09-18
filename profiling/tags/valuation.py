@@ -40,7 +40,7 @@ import pandas as pd
 from ..registry import tag, TIER, PLANNED_NO_DATA
 from ..quantile import (
     QUOTE_TABLES, load_quote_snapshot, load_financial_latest, load_gics_map,
-    assign_tier, historical_percentile, tier_or_flag, load_revenue_ttm,
+    assign_tier, historical_percentile, tier_or_flag, load_financial_ttm,
 )
 from ._base import _conn, _read_sql, _frame
 
@@ -136,7 +136,7 @@ def val_ps_ttm_tier(as_of: date) -> pd.DataFrame:
     with _conn() as conn:
         snap = load_quote_snapshot(conn, as_of)
         gics_map = load_gics_map(conn)
-        ttm = load_revenue_ttm(conn, as_of)
+        ttm = load_financial_ttm(conn, as_of)
 
     df = snap[["stock_code", "market", "total_market_val"]].copy()
     df["total_market_val"] = pd.to_numeric(df["total_market_val"], errors="coerce")
@@ -170,7 +170,7 @@ def val_pcf_ttm_tier(as_of: date) -> pd.DataFrame:
     with _conn() as conn:
         snap = load_quote_snapshot(conn, as_of)
         gics_map = load_gics_map(conn)
-        ttm = load_revenue_ttm(conn, as_of)
+        ttm = load_financial_ttm(conn, as_of)
 
     df = snap[["stock_code", "market", "total_market_val"]].copy()
     df["total_market_val"] = pd.to_numeric(df["total_market_val"], errors="coerce")
@@ -182,6 +182,71 @@ def val_pcf_ttm_tier(as_of: date) -> pd.DataFrame:
     grp = df["market"].astype(str) + "|" + df["gics"].astype(str)
     tier = tier_or_flag(pcf, by=grp, flag="NEGATIVE")
     return _frame(df["stock_code"], tier, pcf.round(4))
+
+
+@tag(
+    code="val_peg_tier", name="PEG(TTM)档", domain=DOMAIN,
+    num_unit="x",
+    value_type=TIER,
+    value_range={
+        **_TIER_RANGE,
+        "LOSS": "PE≤0（亏损），PEG 无意义",
+        "DECLINE": "净利 TTM 同比 ≤0（盈利下滑），PEG 为负/无意义",
+        "TURNAROUND": "扭亏（上年同期 TTM 净利≤0），增速无定义",
+    },
+    source_type="stat", update_freq="daily",
+    data_sources=["a_daily_quote", "hk_daily_quote", "financial_indicator",
+                  "stock_sector", "sector_hierarchy"],
+    compute_logic="PEG = PE(TTM) ÷ 净利 TTM 同比增速(%)，在【市场+GICS】内横截面五等分："
+                  "1=组内最便宜（性价比最高），5=最贵。增速按**百分数数值**代入"
+                  "（增速 20% 记 20，不是 0.2，否则数值差 100 倍）。"
+                  "分子 pe_ttm 取行情表（外部源直供、日采必写）；净利 TTM 与 TTM 同比取"
+                  "load_financial_ttm（累计口径还原为滚动 12 个月后同比，与 PE(TTM) 同期限，"
+                  "全仓唯一实现）。"
+                  "仅 PE>0 且增速>0 的象限参与分档；PE≤0 打 LOSS、增速≤0 打 DECLINE、"
+                  "扭亏（上年同期 TTM≤0）打 TURNAROUND。num_value 存 PEG 原值（可能为负，"
+                  "含义由 key_value 的 flag 表达）。"
+                  "注：本标签为**历史（trailing）PEG**，用已实现增速，非一致预期口径。"
+                  "另注意小基数/扭亏带来的增速极值会把 PEG 压到 0.0x（rank 分位对此免疫），"
+                  "筛选时建议结合 num_value 复核",
+    pit_capable=False,  # financial_indicator 只有 report_date 无披露日
+    owner="profiling",
+)
+def val_peg_tier(as_of: date) -> pd.DataFrame:
+    with _conn() as conn:
+        snap = load_quote_snapshot(conn, as_of)
+        gics_map = load_gics_map(conn)
+        ttm = load_financial_ttm(conn, as_of)
+
+    df = snap[["stock_code", "market", "pe_ttm"]].copy()
+    df["pe_ttm"] = pd.to_numeric(df["pe_ttm"], errors="coerce")
+    df = df.merge(ttm[["stock_code", "np_ttm", "np_ttm_prev", "np_ttm_yoy"]],
+                  on="stock_code", how="inner")
+    df = df.merge(gics_map, on="stock_code", how="inner")
+    df = df[df["pe_ttm"].notna()]
+
+    pe = df["pe_ttm"]
+    yoy = df["np_ttm_yoy"]
+    prev_np = pd.to_numeric(df["np_ttm_prev"], errors="coerce")
+    np_now = pd.to_numeric(df["np_ttm"], errors="coerce")
+
+    # PEG 原值：增速可算且非 0 时给出（含负值，供复核；档位含义由 key_value 表达）
+    peg = pe / yoy.where(yoy != 0)
+
+    key = pd.Series(pd.NA, index=df.index, dtype="object")
+    loss = pe <= 0
+    turn = (~loss) & (prev_np <= 0) & (np_now > 0)      # 扭亏：增速无定义
+    decline = (~loss) & (~turn) & (yoy <= 0)
+    key[loss] = "LOSS"
+    key[turn] = "TURNAROUND"
+    key[decline] = "DECLINE"
+
+    pos = (~loss) & (~turn) & (yoy > 0)
+    if pos.any():
+        grp = _market_industry_key(df.loc[pos, "market"], df.loc[pos, "gics"])
+        key[pos] = assign_tier(peg[pos], 5, by=grp)
+
+    return _frame(df["stock_code"], key, peg.round(4))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
