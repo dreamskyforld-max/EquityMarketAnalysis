@@ -115,7 +115,7 @@ STOCKS = load_stocks()
 #   market  : 交易时段判断用的市场标识（"HK"/"A"），仅当 force=False 时生效
 #   timeout : 单脚本超时秒数（默认 180）
 GlobalTask = tuple[str, str | list[str], dict[str, int | str], list[str] | None, bool, str | None, int]
-GLOBAL_TASKS: list[GlobalTask] = [
+GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType, reportAssignmentType]
     # 删除 3 年前过期数据（tick_data / trend_snapshot / realtime_order_size / collection_run_log 共 4 表）
     #("数据清理", "cleanup_old_data.py", {"hour": 4, "minute": 0}, None, True, None, 180),
 
@@ -256,8 +256,8 @@ GLOBAL_TASKS: list[GlobalTask] = [
 # 一次批量快照分发（get_quote 写 daily_quote + record_trend 写 trend_snapshot）。
 # 作为 GLOBAL_TASKS 项追加，与其他全局任务共用同一条注册循环。
 INTRADAY_GLOBAL_MODULES = ["get_quote.py", "record_trend.py"]
-_intraday_by_market = load_intraday_by_market()
-for _mkt, _mkt_codes in sorted(_intraday_by_market.items()):
+_intraday_by_market = load_intraday_by_market()  
+for _mkt, _mkt_codes in sorted(_intraday_by_market.items()):  
     GLOBAL_TASKS.append(
         (f"盘中批量采集-{_mkt}", INTRADAY_GLOBAL_MODULES,
          {"second": 0}, _mkt_codes, False, _mkt, 180)

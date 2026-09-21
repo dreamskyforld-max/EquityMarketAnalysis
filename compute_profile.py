@@ -6,6 +6,10 @@
     python3 -m profiling.run compute --as-of <今日> --force
 
 行为：
+- 先同步 profile.tag_registry（标签字典）+ profile.enum_value（值域），再计算标签。
+  字典是「代码即元数据」（@tag 装饰器）upsert 进去的，唯一写入口是 registry.sync_registry，
+  而 deploy.sh 不做、engine.compute_all 也不写 → 新环境只跑调度会导致 tag_registry 空表
+  （2026-09-21 线上即此情况），故在每日计算里补这一步自愈。
 - 写入 profile.tag_value（版本化：值变化才产生新版本，未变标签沿用上一有效版本）。
 - 依赖的当日行情快照由同调度器的「收盘采集」任务（A 股 15:10 / 港股 16:20）先行入库。
 - force=True 跳过各标签的 update_freq 更新门禁，确保全量重算（未变标签不产生冗余版本）。
@@ -33,6 +37,17 @@ def run(codes=None, ctx=None):
             "标签注册表为空（profiling.tags 未导入？）——拒绝执行，避免静默产出 0 标签"
         )
     log.info("【全量画像】开始计算 as_of=%s（注册标签 %d 个）", as_of, n_tags)
+
+    # 同步标签字典：单独一个连接先行提交，避免被后续计算异常回滚。
+    # 字典不参与计算本身（compute_all 用内存注册表），同步失败不应让当日画像整体缺数，
+    # 故只记 error 不中断 —— 但需人工跟进，否则新标签的中文名/值域/单位查不到。
+    try:
+        with get_conn() as conn_sync:
+            ins, upd = registry.sync_registry(conn_sync)
+        log.info("【全量画像】标签字典同步：新增 %d / 更新 %d", ins, upd)
+    except Exception:
+        log.exception("【全量画像】标签字典同步失败（不影响本次计算，需人工检查）")
+
     with get_conn() as conn:
         results = engine.compute_all(conn, as_of=as_of, force=True, mode="auto")
     n = len(results) if results else 0

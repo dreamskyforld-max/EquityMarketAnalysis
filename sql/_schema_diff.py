@@ -161,8 +161,13 @@ def norm_view_def(s):
     s = s.lower()
     # PG 反解析：~~ / !~~  ↔ LIKE / NOT LIKE
     s = s.replace("~~", " like ").replace("!~~", " not like ")
-    # PG 插入的显式类型转换 ::text / ::bigint / ::timestamp 等
-    s = re.sub(r"::[a-z][\w]*", "", s)
+    # PG 插入的显式类型转换 ::text / ::bigint / ::timestamp 等。
+    # ⚠ 必须连同类型修饰符一起删（::varchar(20) 整体删，而非只删 ::varchar）：
+    # PG 反解析会省略「no-op cast」（cast 目标与表达式自身类型完全相同的
+    # x::varchar(20)，如列本身即 varchar(20)）；若只删类型名会留下 "(20)"
+    # 残渣（期望侧有、实际侧被 PG 省略），导致永久误报「视图变更」——
+    # 这是纯文本差异，即便执行 CREATE OR REPLACE 也无法消除。
+    s = re.sub(r"::[a-z][\w]*(?:\s+varying)?(?:\s*\([^()]*\))?", "", s)
     # PG 把 in(...) 展开成 = any(array[...]) 或 = any(array[...][])（数组后可能带 ::text[]）
     # schema.sql 手写体则直接是 = any(array[...])。两者统一还原成 in(...)。
     s = re.sub(r"=\s*any\s*\(\s*array\[(.*?)\](?:\s*\[\s*\])?\s*\)", r"in(\1)", s)
@@ -184,6 +189,9 @@ def norm_view_def(s):
     s = re.sub(r'"', "", s)
     # 空白归一
     s = re.sub(r"\s+", " ", s)
+    # PG 对「裸列引用 + 与列同名的别名」会省略 AS（手写 a.col AS col → 反解析 a.col），
+    # 手写侧保留 AS → 抹平冗余别名 x as x → x，避免此类永久误报。
+    s = re.sub(r"\b([a-z_][\w]*)\s+as\s+\1\b", r"\1", s)
     s = s.replace(" (", "(").replace("( ", "(")
     s = s.replace(" )", ")").replace(") ", ")")
     s = s.strip().rstrip(";").strip()
