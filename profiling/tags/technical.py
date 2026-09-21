@@ -94,14 +94,25 @@ def _load_history(conn, as_of: date, window: int = W_1Y + 10) -> pd.DataFrame:
 def _metrics(s: pd.DataFrame) -> dict:
     """单只股票在窗口内的统计量（s 已按 trade_date 升序）。"""
     close = s["close"].to_numpy(dtype=float)
-    n = len(close)
     out = {"mom": np.nan, "rev": np.nan, "vol": np.nan,
            "beta": np.nan, "rvol": np.nan, "dvol": np.nan,
            "liq": np.nan, "turn": np.nan, "mdd": np.nan}
+
+    # 脏行情防御（实测：a_daily_quote 窗口内 5.6% 行 close IS NULL，多为北交所整行 NULL；
+    # hk_daily_quote 有少量 close=0 的退市/无成交代码）：
+    #   · close<=0 作分母 → inf 收益率，而 inf 能通过 notna() 混进分档、污染整组排序；
+    #   · NaN 参与除法 → 每票每次计算刷 RuntimeWarning，淹没真正的异常。
+    # 注意**不能删行**：r 与下方 bm（基准收益）按下标对齐，删行会让两者长度错位
+    # （实测报错 operands could not be broadcast together with shapes (7,) (6,)）。
+    # 故只做「非有限值归 NaN」，再在各自统计量内剔除 NaN —— 脏行不参与，但也不
+    # 传染整只股票。对无脏数据的股票结果完全不变。
+    n = len(close)
     if n < 2:
         return out
 
-    r = np.diff(close) / close[:-1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.diff(close) / close[:-1]
+    r = np.where(np.isfinite(r), r, np.nan)
 
     # 动量 12-1 与 1 月反转（注意索引：close[-22] 是 21 个交易日前）
     if n > W_1Y:
@@ -111,6 +122,7 @@ def _metrics(s: pd.DataFrame) -> dict:
             out["rev"] = (close[-1] / p_1m - 1) * 100
 
     rr = r[-W_1Y:]
+    rr = rr[np.isfinite(rr)]    # 脏价产生的无效收益不参与统计（否则整只被 NaN 传染）
     if len(rr) >= MIN_OBS_VOL:
         out["vol"] = np.std(rr, ddof=1) * np.sqrt(_TRADING_DAYS) * 100
         neg = rr[rr < 0]
@@ -131,13 +143,16 @@ def _metrics(s: pd.DataFrame) -> dict:
 
     # 最大回撤（窗口内 1 − close/cummax）
     w = close[-W_1Y - 1:]
+    w = w[np.isfinite(w) & (w > 0)]
     if len(w) > 1:
         out["mdd"] = float((1 - w / np.maximum.accumulate(w)).max() * 100)
 
     amt = s["amount"].to_numpy(dtype=float)[-W_1Q:]
-    out["liq"] = float(np.nanmean(amt)) if len(amt) else np.nan
+    amt = amt[np.isfinite(amt)]
+    out["liq"] = float(amt.mean()) if len(amt) else np.nan
     to = s["turnover_rate"].to_numpy(dtype=float)[-W_1Q:]
-    out["turn"] = float(np.nanmean(to)) if len(to) else np.nan
+    to = to[np.isfinite(to)]
+    out["turn"] = float(to.mean()) if len(to) else np.nan
     return out
 
 

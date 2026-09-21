@@ -113,6 +113,15 @@ def parse_index_signature(def_text):
 
 
 def norm_type(t):
+    """⚠ 本函数输出【只用于两侧比较】，绝不可拿去生成 DDL。
+
+    它会删掉类型里的所有空格，把多词类型压成非法拼写
+    （timestamp with time zone → timestampwithtimezone、
+      character varying(64) → charactervarying(64)、
+      double precision → doubleprecision），
+    直接执行会报 "type ... does not exist"。
+    生成 DDL 一律取 tables[t]["raw_cols"] 里的原始写法。
+    """
     if not t:
         return ""
     t = t.strip().lower()
@@ -183,6 +192,14 @@ def norm_view_def(s):
     s = re.sub(r"else null", "", s)                 # PG 自动补全 case 末尾 else null
     # group by / order by 中单列被 PG 包裹成 (col) -> col（不伤 over(partition by ...)）
     s = re.sub(r"\(\s*([a-z_][\w]*)\s*\)", r" \1 ", s)
+    # NullTest / BooleanTest（x IS [NOT] NULL / TRUE / FALSE / UNKNOWN）是原子表达式，
+    # PG 反解析永不保留其外层括号：手写 (col IS NULL) AS flag → 库内 col IS NULL AS flag。
+    # 这层括号纯属手写习惯，不抹平会造成永久误报（重复执行 CREATE OR REPLACE 也消不掉，
+    # 因为库里存的就是无括号形态）。只剥离这一类"可证明冗余"的原子——含 AND/OR 的
+    # 括号（如 (a OR b) AND c）有优先级语义，PG 会保留，绝不能动。
+    s = re.sub(
+        r"\(\s*([a-z_][\w]*\s+is\s+(?:not\s+)?(?:null|true|false|unknown))\s*\)",
+        r" \1 ", s)
     s = re.sub(r",\s+", ",", s)                     # 逗号后多余空格统一
     s = re.sub(r"\s*,\s*", ",", s)                   # 逗号前后空格统一去掉（含 in('q1', 'q3') ↔ in('q1' ,'q3')）
     # 双引号标识符
@@ -250,7 +267,8 @@ def parse_schema(text):
             # 「public.profile 缺失」。改为支持限定名：非 public 用 schema.table 作 key，
             # 末尾统一剔除（本工具只同步 public schema）。
             tname = tbl if sch == "public" else f"{sch}.{tbl}"
-            tables.setdefault(tname, {"cols": {}, "order": []})
+            # cols = 归一化类型（仅比对用）；raw_cols = 原始类型（生成 DDL 用）
+            tables.setdefault(tname, {"cols": {}, "order": [], "raw_cols": {}})
             cur_table = tname
             # 可能 CREATE TABLE x ( ... ) 同行
             rest = line[m.end():]
@@ -420,8 +438,10 @@ def parse_column_line(line, tname, tables):
     else:
         cname, ctype = m.group(1), m.group(2)
     cname = cname.lower()
-    ctype = norm_type(ctype.strip())
-    tables[tname]["cols"][cname] = ctype
+    # raw_cols: 保留 schema.sql 里的原始类型写法（仅压平空白），供生成 DDL 使用；
+    # cols: 归一化类型，仅供与 information_schema 比对。
+    tables[tname].setdefault("raw_cols", {})[cname] = re.sub(r"\s+", " ", ctype.strip())
+    tables[tname]["cols"][cname] = norm_type(ctype.strip())
     if cname not in tables[tname]["order"]:
         tables[tname]["order"].append(cname)
 
@@ -552,12 +572,15 @@ def main():
         if t not in act_tables:
             continue
         exp_c = exp_tables[t]["cols"]
+        exp_raw = exp_tables[t].get("raw_cols", {})
         act_c = act_tables[t]["cols"]
         for col, typ in exp_c.items():
+            # 比较用归一化类型 typ，进 SQL 用原始写法（fallback: 归一化为兜底）
+            ddl_typ = exp_raw.get(col, typ)
             if col not in act_c:
-                add_cols.append((t, col, typ))
+                add_cols.append((t, col, ddl_typ))
             elif act_c[col] != typ:
-                alter_cols.append((t, col, act_c[col], typ))
+                alter_cols.append((t, col, act_c[col], ddl_typ))
         for col in act_c:
             if col not in exp_c:
                 drop_cols.append((t, col))
@@ -668,7 +691,9 @@ def main():
     if new_tables or add_cols or new_indexes or new_views or changed_views:
         sql_lines.append("-- ── 低风险：新增表 / 列 / 索引 / 视图 ──")
         for t in new_tables:
-            sql_lines.append(gen_ddl_create_table(t, exp_tables[t]["cols"]))
+            # 列类型必须用 raw_cols（原始写法），归一化值会产出非法类型名
+            cols_for_ddl = exp_tables[t].get("raw_cols") or exp_tables[t]["cols"]
+            sql_lines.append(gen_ddl_create_table(t, cols_for_ddl))
         for t, col, typ in add_cols:
             sql_lines.append(gen_ddl_add_column(t, col, typ))
         for idx in new_indexes:
