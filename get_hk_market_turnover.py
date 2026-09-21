@@ -25,6 +25,7 @@ from datetime import date, datetime, timezone
 from futu import RET_OK
 from db import get_conn, bulk_upsert
 from collector_runtime import get_shared_ctx
+from snap_guard import RepairBudget, read_scope_codes, snapshot_batch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,16 +57,16 @@ def _hk_code_list():
         （阶段 0 就踩过：21 只库内 HK 代码不在清单内）；
       · 现由 sync_quote_universe.py 用富途 get_stock_basicinfo 维护全集（3,787 只），
         「僵尸股」由入库侧「只落成交额>0 的行」自然过滤，无需清单侧裁剪；
-      · 并集 realtime_collect_target（在池全集），覆盖深采池品种。
+      · 并集 realtime_collect_target（在池全集），覆盖深采池品种；
+      · snap_ok=false（快照黑名单：退市残留/供股权/临时代码，见 snap_guard.py）在此跳过——
+        富途快照整批原子，一个坏码废一批 400 只（HK.03888 断供事故根因），必须分批前排除。
     """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT stock_code FROM v_quote_scope WHERE market = 'HK' ORDER BY stock_code")
-            codes = [r[0] for r in cur.fetchall()]
+    codes, skipped = read_scope_codes(["HK"])
     if not codes:
         log.warning("v_quote_scope 返回空（清单未初始化？），本次不采集")
     else:
-        log.info(f"港股采集清单（v_quote_scope）: {len(codes)} 只")
+        log.info(f"港股采集清单（v_quote_scope）: {len(codes)} 只"
+                 + (f"（跳过快照黑名单 {skipped} 只）" if skipped else ""))
     return codes
 
 
@@ -81,14 +82,16 @@ def _norm_hk_code(code):
     return s if s.startswith("HK.") else f"HK.{s}"
 
 
-def fetch_market_snapshot_batch(codes, ctx=None):
+def fetch_market_snapshot_batch(codes, ctx=None, budget=None):
     """富途批量快照：返回 (trade_date, total_turnover, total_volume, stock_count, quote_rows)。
 
     返回字典额外带 ok_batches / failed_batches 供调用方做门禁（全批失败 = 无数据，
-    必须让调度器记为失败，不能静默成功）。
+    必须让调度器记为失败，不能静默成功）；snap_bad_removed 为本批自愈剔除的坏码
+    （已写快照黑名单，见 snap_guard.snapshot_batch）。
     """
     ctx = ctx or get_shared_ctx()
     targets = [_norm_hk_code(c) for c in codes]
+    budget = budget or RepairBudget()
 
     total_turnover = 0.0
     total_volume = 0
@@ -97,10 +100,14 @@ def fetch_market_snapshot_batch(codes, ctx=None):
     quote_rows = []
     ok_batches = 0
     failed_batches = 0
+    snap_bad_removed = []
 
     for i in range(0, len(targets), BATCH_SIZE):
         batch = targets[i:i + BATCH_SIZE]
-        ret, data = ctx.get_market_snapshot(batch)
+        # 带自愈：批次含「未知股票」→ 剔除坏码重试（成功才落黑名单），避免一个坏码废整批 400 只
+        ret, data, removed = snapshot_batch(ctx, batch, market="HK", budget=budget)
+        if removed:
+            snap_bad_removed.extend(removed)
         if ret != RET_OK:
             failed_batches += 1
             log.warning(f"批次 {i // BATCH_SIZE + 1} 失败: {data}")
@@ -141,6 +148,7 @@ def fetch_market_snapshot_batch(codes, ctx=None):
         "quote_rows": quote_rows,
         "ok_batches": ok_batches,
         "failed_batches": failed_batches,
+        "snap_bad_removed": snap_bad_removed,
     }
 
 
@@ -299,6 +307,9 @@ def run(codes=None, ctx=None):
     if not codes:
         codes = _hk_code_list()
     rec = fetch_market_snapshot_batch(codes, ctx)
+    bad_removed = rec.get("snap_bad_removed")
+    if isinstance(bad_removed, list) and bad_removed:
+        log.warning(f"本次剔除快照不可用代码 {len(bad_removed)} 只（已入黑名单，明日 08:30 清单刷新时复位重学）：{bad_removed}")
     # 门禁：一个批次都没成功 = 本次完全没采到数据。必须抛错让调度器记为失败，
     # 不能像 2026-09-15 那样「0 数据却记成功」，静默断供 5 个交易日。
     if codes and rec.get("ok_batches") == 0:

@@ -52,16 +52,23 @@ CREATE TABLE IF NOT EXISTS quote_universe (
     source          VARCHAR(20),                        -- 数据来源：futu_basicinfo / seed
     first_seen      TIMESTAMPTZ     DEFAULT NOW(),      -- 首次进入清单时间
     last_seen       TIMESTAMPTZ,                        -- 最近一次在源中出现时间（软删判定依据）
-    updated_at      TIMESTAMPTZ     DEFAULT NOW()
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+    -- 快照黑名单（snap_guard.py 写；当日有效策略：每日 08:30 sync_quote_universe 复位 at/reason、保留 cnt）
+    snap_bad_at     TIMESTAMPTZ,                        -- 最近一次富途快照报「未知股票」时间；NULL=快照正常
+    snap_bad_reason TEXT,                               -- 服务端错误原文（审计/排查，如「未知股票 02905」）
+    snap_bad_cnt    INTEGER         DEFAULT 0           -- 累计命中次数（跨日不清零；识别顽固坏码）
 );
 
 CREATE INDEX IF NOT EXISTS idx_quote_universe_scope ON quote_universe (market) WHERE is_collectable;
 
-COMMENT ON TABLE  quote_universe                 IS '全市场采集清单：采集范围(is_collectable)与口径(is_primary)的真相源；sync_quote_universe.py 每日 08:30 刷新';
+COMMENT ON TABLE  quote_universe                 IS '全市场采集清单：采集范围(is_collectable)与口径(is_primary)的真相源；sync_quote_universe.py 每日 08:30 刷新；snap_bad_* 为快照黑名单（snap_guard.py 写、当日有效）';
 COMMENT ON COLUMN quote_universe.seg             IS '代码段号（前 3 位），用于口径判定与分布审计，如 600/601/603/605/688/000/300/810';
 COMMENT ON COLUMN quote_universe.is_primary      IS '是否计入「全市场成交额」正股口径：A 股=正股段(600/601/603/605/688/000/001/002/003/300/301)；港股=全部 STOCK';
 COMMENT ON COLUMN quote_universe.is_collectable  IS '是否在采集范围。自动软删：last_seen 超 30 天未在源出现 → FALSE；再次出现自动恢复。⚠ 与 realtime_collect_target（人工实时池）语义不同';
 COMMENT ON COLUMN quote_universe.last_seen       IS '最近一次在源（富途 basicinfo）中出现的时间；软删判定依据';
+COMMENT ON COLUMN quote_universe.snap_bad_at     IS '快照黑名单：最近一次富途 get_market_snapshot 报「未知股票」的时间（NULL=快照正常）；当日有效，每日 08:30 sync_quote_universe 复位';
+COMMENT ON COLUMN quote_universe.snap_bad_reason IS '快照黑名单：服务端错误原文（如「未知股票 02905」），供审计/排查';
+COMMENT ON COLUMN quote_universe.snap_bad_cnt    IS '快照黑名单：累计命中次数（跨日不清零，复位时保留）；连续多日命中=顽固坏码（退市残留/供股权/临时代码），供人工清理';
 
 -- 1.1.1 实时采集配置表（realtime_collect_target；前端维护，采集端启动时读取）
 -- 定位：实时采集池的唯一真相源，取代旧 stock_info.is_active（已废弃）。
@@ -99,21 +106,28 @@ COMMENT ON COLUMN realtime_collect_target.applied_by     IS '配置写入人（�
 -- 注：stock_code 显式 cast 为 varchar(20) —— quote_universe 是 varchar(20)、
 -- realtime_collect_target 是 TEXT，不 cast 会让 UNION 结果变 text，导致
 -- CREATE OR REPLACE VIEW 报「cannot change data type of view column」。
+-- snap_ok 列（2026-09-21 增）：快照黑名单标记（quote_universe.snap_bad_at IS NULL）。
+--   富途 get_market_snapshot 是整批原子接口，批内一个「未知股票」废掉整批 400 只
+--   （HK.03888 断供事故根因）→ 采集端必须显式过滤 snap_ok=true 再分批。
+--   视图**不过滤**（保留全量），便于每日复位后复检与人工审计。
 CREATE OR REPLACE VIEW v_quote_scope AS
-SELECT DISTINCT ON (stock_code) stock_code, market, src
+SELECT DISTINCT ON (stock_code) stock_code, market, src, snap_ok
 FROM (
-    SELECT stock_code::varchar(20) AS stock_code, market, 'universe' AS src
+    SELECT stock_code::varchar(20) AS stock_code, market, 'universe' AS src,
+           (snap_bad_at IS NULL) AS snap_ok
       FROM quote_universe WHERE is_collectable
     UNION ALL
     SELECT t.stock_code::varchar(20) AS stock_code,
            COALESCE(s.market, split_part(t.stock_code, '.', 1)::char(2)) AS market,
-           'watchlist' AS src
+           'watchlist' AS src,
+           (qu.snap_bad_at IS NULL) AS snap_ok
       FROM realtime_collect_target t
       LEFT JOIN stock_info s ON s.stock_code = t.stock_code
+      LEFT JOIN quote_universe qu ON qu.stock_code = t.stock_code
 ) u
 ORDER BY stock_code, src;
 
-COMMENT ON VIEW v_quote_scope IS '全市场采集范围：quote_universe.is_collectable ∪ realtime_collect_target（在池全集；含 src 来源审计；供采集器读清单用）';
+COMMENT ON VIEW v_quote_scope IS '全市场采集范围：quote_universe.is_collectable ∪ realtime_collect_target（在池全集；含 src 来源审计；snap_ok=快照黑名单标记，采集端须显式过滤；供采集器读清单用）';
 
 -- 1.2 股票-指数成分归属表（参考数据，低频刷新）
 -- 反向建表：遍历「已知指数 → 全成分」，每只成分股落一行。

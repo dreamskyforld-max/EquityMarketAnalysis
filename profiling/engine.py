@@ -169,6 +169,12 @@ def compute_tag(conn: Any, tag_code: str, as_of: date | None = None,
                 mode: str = "auto") -> dict[str, Any]:
     """计算单个标签并落库。返回结果统计字典。
 
+    标签可 raise SkipTag 主动弃权（本次不产出）：引擎收到后不写库、不 diff，
+    现有版本原样保留 —— 避免「上游断供」被 diff 规则误读成「全市场标签失效」
+    而清空历史画像（2026-09-15 事故：单日关闭 55,035 行）。
+    是否在什么条件下弃权，由标签自己根据所需数据源与时效容忍度决定；
+    引擎不做任何统一的数据健康检查（通用检查由运维平台负责）。
+
     mode 决定「标签值变了怎么写」：
         snapshot  原地 UPDATE，只维护一份当前值（eff_from 保持不变，update_time 刷新）。
                   用于日常跑当天——不产生一天期的历史版本，避免写满全历史。
@@ -219,9 +225,20 @@ def compute_tag(conn: Any, tag_code: str, as_of: date | None = None,
         mode = "snapshot" if as_of == date.today() else "version"
     result["mode"] = mode
 
+    from .errors import SkipTag
+
     t0 = time.monotonic()
     try:
         df = _normalize(registry.get_func(tag_code)(as_of), meta)
+    except SkipTag as e:
+        # 标签主动弃权 = 「这次没法算」，不等于「算出来没有」。
+        # 必须在 diff 之前 return：一旦进 diff，本次结果集里没出现的股票会被判失效
+        # 而关闭旧版本 —— 9/15 事故正是混淆了这两种语义，单日关闭 55,035 行画像。
+        result["status"] = "skipped"
+        result["message"] = f"标签主动弃权，不产出且保留现有版本：{e}"
+        log.warning("[%s] as_of=%s %s", tag_code, as_of, result["message"])
+        _write_log(conn, meta, result, int((time.monotonic() - t0) * 1000))
+        return result
     except Exception as e:
         result["status"] = "error"
         result["message"] = f"计算失败: {type(e).__name__}: {e}"
@@ -407,7 +424,8 @@ def compute_domain(conn: Any, domain_prefix: str, as_of: date | None = None,
     if not metas:
         log.warning("域前缀 %r 下没有已注册标签", domain_prefix)
     return [
-        compute_tag(conn, m.code, as_of=as_of, dry_run=dry_run, force=force, mode=mode)
+        compute_tag(conn, m.code, as_of=as_of, dry_run=dry_run, force=force,
+                    mode=mode)
         for m in metas
     ]
 
@@ -416,6 +434,7 @@ def compute_all(conn: Any, as_of: date | None = None,
                 dry_run: bool = False, force: bool = False,
                 mode: str = "auto") -> list[dict[str, Any]]:
     return [
-        compute_tag(conn, m.code, as_of=as_of, dry_run=dry_run, force=force, mode=mode)
+        compute_tag(conn, m.code, as_of=as_of, dry_run=dry_run, force=force,
+                    mode=mode)
         for m in registry.all_tags()
     ]

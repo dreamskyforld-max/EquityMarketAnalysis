@@ -35,6 +35,7 @@ from datetime import date, datetime, timezone
 
 from db import get_conn
 from collector_runtime import get_shared_ctx
+from snap_guard import clear_snap_bad
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("sync_quote_universe")
@@ -92,7 +93,11 @@ def _is_primary(market, seg):
 
 
 def _ensure_table():
-    """确保 quote_universe 表与索引存在（DDL 从 sql/schema.sql 提取，避免两处维护漂移）。"""
+    """确保 quote_universe 表/索引/快照黑名单列 + v_quote_scope 视图就绪。
+
+    DDL 从 sql/schema.sql 提取，避免两处维护漂移；CREATE TABLE IF NOT EXISTS 不补列，
+    故对旧库显式 ADD COLUMN（幂等）；视图 CREATE OR REPLACE 同步 snap_ok 列（采集端据此过滤黑名单）。
+    """
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sql", "schema.sql")
     txt = open(path, encoding="utf-8").read()
     t0 = txt.find("CREATE TABLE IF NOT EXISTS quote_universe")
@@ -103,6 +108,17 @@ def _ensure_table():
         raise RuntimeError(f"{path} 未找到 idx_quote_universe_scope 定义")
     end = txt.find(";", i0)
     stmts = [s.strip() for s in txt[t0:end + 1].split(";") if s.strip()]
+    # 旧库补列（CREATE TABLE IF NOT EXISTS 不补列）：快照黑名单三列（snap_guard.py 读写）
+    stmts += [
+        "ALTER TABLE quote_universe ADD COLUMN IF NOT EXISTS snap_bad_at TIMESTAMPTZ",
+        "ALTER TABLE quote_universe ADD COLUMN IF NOT EXISTS snap_bad_reason TEXT",
+        "ALTER TABLE quote_universe ADD COLUMN IF NOT EXISTS snap_bad_cnt INTEGER DEFAULT 0",
+    ]
+    # 视图随 schema.sql 重建（v_quote_scope 增 snap_ok 列）
+    v0 = txt.find("CREATE OR REPLACE VIEW v_quote_scope")
+    if v0 < 0:
+        raise RuntimeError(f"{path} 未找到 v_quote_scope 定义")
+    stmts.append(txt[v0:txt.find(";", v0) + 1].strip())
     with get_conn() as conn:
         with conn.cursor() as cur:
             for s in stmts:
@@ -315,6 +331,11 @@ def run(codes=None, ctx=None):
                     (soft_days,))
                 n_off = cur.rowcount
         log.info(f"软删：{n_off} 只超 {soft_days} 天未在源出现 → is_collectable=FALSE")
+        # 快照黑名单复位（当日有效策略）：清单刷新 = 新一天的学习起点。
+        # 清 snap_bad_at/reason 让当天采集重新验证一遍（代码复活自动回归，防永久误伤）；
+        # snap_bad_cnt 跨日累计保留，用于识别连续多日命中的顽固坏码（退市残留/供股权/临时代码）。
+        n_reset = clear_snap_bad()
+        log.info(f"快照黑名单复位：{n_reset} 只（当日有效；snap_bad_cnt 累计保留）")
     else:
         log.info("dry-run：不写库")
 

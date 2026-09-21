@@ -29,7 +29,7 @@ import pandas as pd
 
 from ..registry import tag, TIER
 from ..quantile import assign_tier
-from ._base import _conn, _read_sql, _frame
+from ._base import _conn, _read_sql, _frame, require_fresh
 
 DOMAIN = "交易特征"
 
@@ -154,6 +154,13 @@ def _compute_all(as_of: date) -> pd.DataFrame:
         return _METRICS_CACHE[as_of]
 
     with _conn() as conn:
+        # 本域 9 个标签共用同一份行情窗口，数据可得性在这里一次性判定。
+        # 判据由本域按自身口径定：全部指标都是「截至当日收盘」的横截面统计，
+        # 日线必须当日到货。任一市场日线未到 → 该市场股票不会出现在结果集里，
+        # 若照常 diff 会被判「标签失效」而关闭历史版本（2026-09-15 事故形态：
+        # 单日关闭 55,035 行），故整体弃权，让现有版本原样保留。
+        require_fresh(conn, "a_daily_quote", as_of, max_lag=0)
+        require_fresh(conn, "hk_daily_quote", as_of, max_lag=0)
         q = _load_history(conn, as_of)
     if q.empty:
         return pd.DataFrame()
@@ -177,6 +184,18 @@ def _emit(df: pd.DataFrame, col: str, unit: str | None = "pct") -> pd.DataFrame:
     sub = df[df[col].notna()]
     tier = assign_tier(sub[col], 5, by=sub["market"])
     return _frame(sub["stock_code"], tier, sub[col].round(4))
+
+
+def require_benchmark(as_of: date) -> None:
+    """Beta / 残差波动专属判据：基准日线未到 → 弃权。
+
+    基准缺货不会报错，只会让 bm_ret 全为 NaN → beta/rvol 全 NaN → 结果集为空。
+    若照常返回空帧，这两个标签会被 diff 判成「无此标签」而关闭全部历史版本，
+    所以要显式弃权。本域其余 7 个标签不依赖基准，不受影响——判据按标签各异，
+    这正是「每个标签对自己负责」而非全域一刀切的地方。
+    """
+    with _conn() as conn:
+        require_fresh(conn, "daily_benchmark", as_of, max_lag=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -244,6 +263,7 @@ def trd_volatility_annual(as_of: date) -> pd.DataFrame:
     pit_capable=True, owner="profiling",
 )
 def trd_beta(as_of: date) -> pd.DataFrame:
+    require_benchmark(as_of)
     return _emit(_compute_all(as_of), "beta")
 
 
@@ -258,6 +278,7 @@ def trd_beta(as_of: date) -> pd.DataFrame:
     pit_capable=True, owner="profiling",
 )
 def trd_residual_vol(as_of: date) -> pd.DataFrame:
+    require_benchmark(as_of)
     return _emit(_compute_all(as_of), "rvol")
 
 

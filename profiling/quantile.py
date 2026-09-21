@@ -26,6 +26,8 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from .errors import SkipTag
+
 # 市场 → 行情表
 QUOTE_TABLES = {"A": "a_daily_quote", "HK": "hk_daily_quote"}
 
@@ -47,11 +49,22 @@ def latest_trade_date(conn, table: str, as_of: date) -> date | None:
         return row[0] if row else None
 
 
-def load_quote_snapshot(conn, as_of: date, use_cache: bool = True) -> pd.DataFrame:
+def load_quote_snapshot(conn, as_of: date, use_cache: bool = True,
+                        allow_lag: int = 0) -> pd.DataFrame:
     """加载某交易日全市场的市值 / 估值 / 价格快照（②③ 域共用底层）。
 
     返回列：stock_code, market, trade_date, total_market_val, circular_market_val,
             pe_ttm, pb, dividend_yield, close, volume, turnover_rate
+
+    数据契约（重要）
+    ---------------
+    本函数承诺返回 **as_of 当日**的快照。而 latest_trade_date 的定位是「<= as_of 的
+    最近交易日」，日线没到货时它会静默回退到前一天——算出来的标签看着正常、实为陈旧值，
+    还会被写成 as_of 当日的结果（标签版本号撒谎）。所以这里显式设门禁：当日数据未到
+    就 raise SkipTag，是否容忍由调用方（标签）通过 allow_lag 决定。
+
+        allow_lag      允许的最大滞后天数，缺省 0（严格要求当日到货）
+        as_of < 今天   补历史场景，本就在读旧数据，不做新鲜度门禁
 
     注：A股与港股可能落在不同的最近交易日（节假日不同），trade_date 逐行保留。
     注：这里只放**外部源直供、日采必写**的估值列（PE/PB/市值/股息率）。PS/PCF 是派生值，
@@ -62,10 +75,16 @@ def load_quote_snapshot(conn, as_of: date, use_cache: bool = True) -> pd.DataFra
         return _SNAPSHOT_CACHE[as_of]
 
     frames = []
+    check_fresh = as_of >= date.today()   # 补历史（as_of 在过去）时本就是读旧数据，不校验
     for mkt, table in QUOTE_TABLES.items():
         d = latest_trade_date(conn, table, as_of)
         if d is None:
             continue
+        if check_fresh and (as_of - d).days > allow_lag:
+            raise SkipTag(
+                f"{table} 最近交易日为 {d}，相对 as_of={as_of} 滞后 {(as_of - d).days} 天"
+                f"（允许 {allow_lag} 天）：拒绝以陈旧快照冒充当日数据"
+            )
         df = _read_sql(
             conn,
             f"""

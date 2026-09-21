@@ -56,7 +56,7 @@ import numpy as np
 import pandas as pd
 
 from ..registry import tag, TIER, UNIT_PCTL
-from ._base import _conn, _read_sql, _frame
+from ._base import _conn, _read_sql, _frame, require_fresh
 
 DOMAIN = "趋势状态"
 
@@ -113,6 +113,11 @@ def _positions(as_of: date) -> pd.DataFrame:
     是为 PIT 正确：快照列 high_52w/low_52w 在 a_daily_quote 历史覆盖≈0，直接读会破坏历史回填。
     """
     with _conn() as conn:
+        # 本域判据：52 周位置是「截至当日」的时点值，日线必须当日到货。
+        # 否则 _load_history 会取窗口内最后一行——日线没到时它静默回退到更早交易日，
+        # 算出来的位置数值看着正常、实为陈旧值，还会被写成 as_of 当日的结果。
+        require_fresh(conn, "a_daily_quote", as_of, max_lag=0)
+        require_fresh(conn, "hk_daily_quote", as_of, max_lag=0)
         q = _load_history(conn, as_of)
     if q.empty:
         return pd.DataFrame(columns=["stock_code", "market", "pos"])
