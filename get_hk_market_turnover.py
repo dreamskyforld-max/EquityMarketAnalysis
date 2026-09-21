@@ -69,23 +69,43 @@ def _hk_code_list():
     return codes
 
 
+def _norm_hk_code(code):
+    """统一成富途格式 HK.xxxxx（幂等：已带前缀的不重复加）。
+
+    清单源换过一次口径：akshare 现货清单返回纯数字（00700），v_quote_scope 返回
+    带前缀（HK.00700）。调用侧必须幂等拼接——否则拼成 HK.HK.00700 会被富途整批
+    判「未知股票」，10 个批次全废、当天全市场日线静默断供（2026-09-15 事故，
+    连续 5 个交易日无人发现，调度日志还记「成功」）。
+    """
+    s = str(code)
+    return s if s.startswith("HK.") else f"HK.{s}"
+
+
 def fetch_market_snapshot_batch(codes, ctx=None):
-    """富途批量快照：返回 (trade_date, total_turnover, total_volume, stock_count, quote_rows)。"""
+    """富途批量快照：返回 (trade_date, total_turnover, total_volume, stock_count, quote_rows)。
+
+    返回字典额外带 ok_batches / failed_batches 供调用方做门禁（全批失败 = 无数据，
+    必须让调度器记为失败，不能静默成功）。
+    """
     ctx = ctx or get_shared_ctx()
-    targets = [f"HK.{c}" for c in codes]
+    targets = [_norm_hk_code(c) for c in codes]
 
     total_turnover = 0.0
     total_volume = 0
     stock_count = 0
     trade_date = None
     quote_rows = []
+    ok_batches = 0
+    failed_batches = 0
 
     for i in range(0, len(targets), BATCH_SIZE):
         batch = targets[i:i + BATCH_SIZE]
         ret, data = ctx.get_market_snapshot(batch)
         if ret != RET_OK:
+            failed_batches += 1
             log.warning(f"批次 {i // BATCH_SIZE + 1} 失败: {data}")
             continue
+        ok_batches += 1
         for _, row in data.iterrows():
             code = row["code"]
             # 确定交易日期（以第一只为准）
@@ -105,6 +125,13 @@ def fetch_market_snapshot_batch(codes, ctx=None):
                 # 复活/新上市一旦有成交即自动开始落行（天然自愈，无 bootstrap 问题）。
                 quote_rows.append(_map_quote_row(code, td, row))
 
+    if targets and ok_batches == 0:
+        log.error(
+            "快照全部 %d 个批次失败（清单 %d 只）→ 本次无数据；"
+            "常见原因：代码格式错误（如重复前缀 HK.HK.xxxxx）或 OpenD 未就绪",
+            failed_batches, len(targets),
+        )
+
     return {
         "trade_date": trade_date,
         "total_turnover": total_turnover,
@@ -112,6 +139,8 @@ def fetch_market_snapshot_batch(codes, ctx=None):
         "stock_count": stock_count,
         "snapshot_time": datetime.now(timezone.utc),
         "quote_rows": quote_rows,
+        "ok_batches": ok_batches,
+        "failed_batches": failed_batches,
     }
 
 
@@ -270,6 +299,12 @@ def run(codes=None, ctx=None):
     if not codes:
         codes = _hk_code_list()
     rec = fetch_market_snapshot_batch(codes, ctx)
+    # 门禁：一个批次都没成功 = 本次完全没采到数据。必须抛错让调度器记为失败，
+    # 不能像 2026-09-15 那样「0 数据却记成功」，静默断供 5 个交易日。
+    if codes and rec.get("ok_batches") == 0:
+        raise RuntimeError(
+            f"港股全市场快照全部批次失败（{rec.get('failed_batches')} 批 / 清单 {len(codes)} 只）"
+        )
     if rec.get("trade_date"):
         save_to_db(rec)
         _save_quotes(rec.get("quote_rows", []))
