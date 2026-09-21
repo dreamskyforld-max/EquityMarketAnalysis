@@ -13,7 +13,7 @@
 
 采集范围（run(codes=None) 全市场模式）：
 - company_profile：quote_universe 全部可采集正股（1 票 1 次调用，约 9100 只）；
-- company_revenue_breakdown：仅关注池（stock_info.is_active）最近 N 期
+- company_revenue_breakdown：仅关注池（realtime_collect_target 在池全集）最近 N 期
   （1 票 1 期 1 次调用；全市场 × 全历史 40+ 期调用量不可接受，刻意限制）。
 - run(codes=[...]) 指定票模式：profile + breakdown 都采。
 
@@ -435,9 +435,9 @@ def _market_codes() -> list[str]:
 
 
 def _watch_codes() -> list[str]:
-    """关注池（stock_info.is_active=TRUE）：主营构成的默认采集范围。"""
+    """关注池（realtime_collect_target 在池全集）：主营构成的默认采集范围。"""
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT stock_code FROM stock_info WHERE is_active = TRUE "
+        cur.execute("SELECT stock_code FROM realtime_collect_target "
                     "ORDER BY stock_code")
         return [r[0] for r in cur.fetchall()]
 
@@ -540,7 +540,7 @@ def run(codes=None, ctx=None, periods: int = BREAKDOWN_PERIODS,
     periods: breakdown 采集的报告期数（最近 N 期，默认 4）。
     skip_breakdown: True 时只采公司资料。
     limit: >0 时对最终目标列表只取前 N 只（调试/分批用）。
-    watch_only: True 时全市场范围收窄为关注池（is_active），profile + breakdown 都采。
+    watch_only: True 时全市场范围收窄为关注池（realtime_collect_target），profile + breakdown 都采。
     start: 从第 N 只开始（1-based，与日志序号一致）——中断后续采用。
     start_code: 从指定代码开始（在目标列表中定位，优先级高于 start）。
 
@@ -624,7 +624,7 @@ if __name__ == "__main__":
     ap.add_argument("--limit", type=int, default=0,
                     help="全市场模式只采前 N 只（调试用）")
     ap.add_argument("--watch-only", action="store_true",
-                    help="只采关注池（stock_info.is_active），profile + breakdown 都采")
+                    help="只采关注池（realtime_collect_target 在池全集），profile + breakdown 都采")
     ap.add_argument("--start", type=int, default=1,
                     help="从第 N 只开始采集（1-based，与日志序号一致；中断后续采用）")
     ap.add_argument("--start-code", default=None,

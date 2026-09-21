@@ -6,14 +6,14 @@
 但只在全部处理完后重启一次服务，避免逐只重启 10 次。
 
 每只股票会：
-  1. 从富途 API 获取基本信息 → 写入 stock_info（upsert，幂等，is_active=TRUE）
+  1. 从富途 API 获取基本信息 → 写入 stock_info（upsert，幂等，名称/市场字典）
+     + 写入 realtime_collect_target（入池：collect_tick/collect_trend 开，quote 关）
   2. 回填 daily_quote 历史日线（默认 3 年，可用 BACKFILL_DAYS 覆盖）
   3. A 股：首次采集融资余额
 全部完成后统一重启 scheduler + ticker-collector 一次。
 
-注意：股票列表由 market_scheduler / ticker_collector 启动时从 stock_info
-(is_active=TRUE) 动态加载，本脚本只需写入 stock_info 即可，无需再改 STOCKS
-硬编码列表或 config.conf 的 [ticker] 订阅列表（已弃用该逻辑）。
+注意：采集清单由 market_scheduler / ticker_collector 启动时从 realtime_collect_target
+配置表加载（行存在=在池），写入该表后重启进程即自动纳入。
 
 用法：
     # 处理内置的 SH.520900 ETF 十大重仓股
@@ -150,17 +150,29 @@ def write_stock_info(code, name, market, symbol, currency):
         from db import get_conn
         with get_conn() as conn:
             cur = conn.cursor()
+            # stock_info：名称/市场字典（is_active 已废弃，池成员资格见 realtime_collect_target）
             cur.execute("""
-                INSERT INTO stock_info (stock_code, stock_name, market, symbol, currency, is_active)
-                VALUES (%s, %s, %s, %s, %s, TRUE)
+                INSERT INTO stock_info (stock_code, stock_name, market, symbol, currency)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (stock_code) DO UPDATE SET
                     stock_name = EXCLUDED.stock_name,
                     updated_at = NOW()
             """, (code, name, market, symbol, currency))
+            # realtime_collect_target：入池（collect_quote 默认关，按需在前端开启）
+            cur.execute("""
+                INSERT INTO realtime_collect_target
+                    (stock_code, collect_tick, collect_trend, collect_quote, applied_by)
+                VALUES (%s, TRUE, TRUE, FALSE, %s)
+                ON CONFLICT (stock_code) DO UPDATE SET
+                    collect_tick  = TRUE,
+                    collect_trend = TRUE,
+                    applied_at    = now(),
+                    applied_by    = EXCLUDED.applied_by
+            """, (code, "setup_new_stocks.py"))
             conn.commit()
-        log.info(f"  [{code}] stock_info 已写入: {name}")
+        log.info(f"  [{code}] 采集配置已写入: {name}（tick/trend=开, quote=关）")
     except Exception as e:
-        log.warning(f"  [{code}] stock_info 写入失败: {e}")
+        log.warning(f"  [{code}] 采集配置写入失败: {e}")
 
 
 # ── 步骤 2: 回填 daily_quote ───────────────────────────────
@@ -192,9 +204,8 @@ def collect_margin(code):
 
 
 # ── 服务重启（仅一次）─────────────────────────────────────
-# 注：股票列表已由 market_scheduler / ticker_collector 启动时从 stock_info
-# (is_active=TRUE) 动态加载，无需再改写 STOCKS 硬编码或 config.conf 的
-# [ticker] 订阅列表。写入 stock_info 后重启进程即自动纳入。
+# 注：采集清单由 market_scheduler / ticker_collector 启动时从 realtime_collect_target
+# 加载，写入该表后重启进程即自动纳入新票。
 
 IS_MAC = platform.system() == "Darwin"
 SERVICES = {

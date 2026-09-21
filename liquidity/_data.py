@@ -117,19 +117,20 @@ def load_sector(market: str | None = "HK") -> pd.DataFrame:
 
 
 def load_stock_info(market: str | None = "HK") -> pd.DataFrame:
-    """活跃股票列表（含市场、名称）。
+    """在池股票列表（含市场、名称）——口径：realtime_collect_target 在池全集。
 
     market: 市场过滤。'HK'=仅港股；None=全部。默认 HK。
     """
     if market:
-        where = "WHERE is_active = TRUE AND market = %s"
+        where = "WHERE s.market = %s"
         params = (market,)
     else:
-        where = "WHERE is_active = TRUE"
+        where = ""
         params = ()
     return read_sql(f"""
-        SELECT stock_code, stock_name, market, currency
-        FROM {T_STOCK_INFO}
+        SELECT s.stock_code, s.stock_name, s.market, s.currency
+        FROM {T_STOCK_INFO} s
+        JOIN realtime_collect_target t ON t.stock_code = s.stock_code
         {where}
-        ORDER BY stock_code
+        ORDER BY s.stock_code
     """, params)

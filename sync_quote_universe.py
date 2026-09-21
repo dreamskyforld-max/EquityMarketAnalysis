@@ -5,9 +5,9 @@
 做三件事：
   1) 从富途 get_stock_basicinfo(market, sec_type) 全量拉取 → upsert 进 quote_universe
   2) 软删：last_seen 超 N 天（默认 30）未在源出现 → is_collectable=FALSE（再出现自动恢复）
-  3) 联动：新增代码 INSERT 进 stock_info（is_active=FALSE，绝不自动进入实时深采池），
-     并补齐 stock_name / list_date / exchange_type / delisting；已存在行只更新这些
-     「源权威字段」，绝不触碰 is_active（人工开关）与 currency
+  3) 联动：新增代码 INSERT 进 stock_info（仅补名称字典，绝不写 realtime_collect_target、
+     不自动进入实时采集池），并补齐 stock_name / list_date / exchange_type / delisting；
+     已存在行只更新这些「源权威字段」与 currency
 
 刷新机制（2026-09-14 定稿）：
   · 频率：每日 08:30（market_scheduler.GLOBAL_TASKS，force=True 不受交易时段门控）
@@ -203,9 +203,9 @@ def _upsert_universe(conn, rows):
 
 
 def _sync_stock_info(conn, rows):
-    """联动：新增代码 → INSERT（is_active=FALSE）；已存在 → 只更新「源权威字段」，且仅在有变更时写。
+    """联动：新增代码 → INSERT 进 stock_info（仅补名称字典）；已存在 → 只更新「源权威字段」，且仅在有变更时写。
 
-    绝不触碰 is_active（人工深采开关）与 currency（历史两套约定并存，不掺和）。
+    绝不写 realtime_collect_target（采集池由前端维护）与 currency（历史两套约定并存，不掺和）。
     返回 (新增数, 有变更数)；rows 为空/None 时返回 (0, 0)。
     """
     from psycopg2.extras import execute_values
@@ -220,11 +220,11 @@ def _sync_stock_info(conn, rows):
             "HKD" if market == "HK" else "CNY",      # currency：与主流约定一致（不覆盖旧值）
             r["listing_date"], r["exchange_type"],
             False,                                   # delisting：富途当前对所有 STOCK 返回 False
-            False,                                   # is_active：绝不自动纳入实时深采池
         ))
+    # 只写名称字典，不写 realtime_collect_target（绝不自动纳入采集池）
     sql = """
         INSERT INTO stock_info (stock_code, stock_name, market, symbol, currency,
-                                list_date, exchange_type, delisting, is_active)
+                                list_date, exchange_type, delisting)
         VALUES %s
         ON CONFLICT (stock_code) DO UPDATE SET
             stock_name    = COALESCE(EXCLUDED.stock_name, stock_info.stock_name),
@@ -300,7 +300,7 @@ def run(codes=None, ctx=None):
         with get_conn() as conn:
             n_up = _upsert_universe(conn, fetched)
             total_up += n_up
-            # 联动 stock_info：新增 → INSERT(is_active=FALSE)；存量 → 只刷新源权威字段（有变更才写）
+            # 联动 stock_info：新增 → INSERT（仅名称字典）；存量 → 只刷新源权威字段（有变更才写）
             ins_n, chg_n = _sync_stock_info(conn, fetched)
             log.info(f"[{market}] quote_universe 写入 {n_up} 只；stock_info 联动：新增 {ins_n} 只、"
                      f"存量字段更新 {chg_n} 只")
@@ -330,9 +330,10 @@ def run(codes=None, ctx=None):
             except Exception as e:
                 log.info(f"（quote_universe 统计跳过：{type(e).__name__}）")
             conn.rollback()
-            cur.execute("SELECT COUNT(*), COUNT(*) FILTER (WHERE is_active) FROM stock_info")
+            cur.execute("SELECT (SELECT COUNT(*) FROM stock_info), "
+                        "(SELECT COUNT(*) FROM realtime_collect_target)")
             t, a = cur.fetchone()
-            log.info(f"stock_info：共 {t} 只（is_active={a}）")
+            log.info(f"stock_info：共 {t} 只；（实时采集池：{a} 只）")
     log.info(f"刷新完成（写入 {total_up} 只）")
 
 

@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-从 a_daily_quote 同步缺失股票到 stock_info（is_active=FALSE）
+从 a_daily_quote 同步缺失股票到 stock_info（仅补名称字典）
 
 背景：
-  - stock_info 不仅是对外展示的股票基本信息，更重要的是被 market_scheduler /
-    ticker_collector 在启动时读取（is_active=TRUE 才纳入采集/调度）。
-  - 富途接口权限有限，当前只能对重点筛选的股票做实时逐笔采集，所以新补入的
-    股票一律 is_active=FALSE，仅作为参考数据落地（名称映射、历史行情关联），
-    不会触发任何采集任务。
-  - 若将来某只股票要转为正式采集对象，再单独跑 setup_new_stock.py（写入
-    is_active=TRUE）即可，不要在此脚本里把 is_active 改 TRUE。
+  - stock_info 是「代码 → 名称/市场」字典（供分析、画像、前端选股用）。
+  - 采集池由 realtime_collect_target 表维护（行存在=在池），与 stock_info 无关：
+    本脚本补入的股票不写 realtime_collect_target，因此不会触发任何采集任务。
+  - 若将来某只股票要转为正式采集对象，跑 setup_new_stock.py（写 realtime_collect_target）。
 
 本脚本与 sync_hk_quote_to_stock_info.py 同源，差异仅在源表为 a_daily_quote
 （A 股 SH + SZ 全市场数据池），按 market 分组后批量调富途 get_stock_basicinfo
@@ -19,7 +16,7 @@
   1. 取 a_daily_quote 中所有去重 stock_code
   2. 与 stock_info 对比，找出映射不上的代码
   3. 按 market 分组（SH / SZ），批量调用富途 get_stock_basicinfo 获取名称
-  4. 批量写入 stock_info（upsert，is_active=FALSE），已存在则只更新名称
+  4. 批量写入 stock_info（upsert，仅名称字典），已存在则只更新名称
   5. 打印整理结果
 
 用法：
@@ -27,7 +24,7 @@
     .venv/bin/python3 sync_a_quote_to_stock_info.py --dry-run  # 只列出缺失、不写库
     .venv/bin/python3 sync_a_quote_to_stock_info.py --batch 500  # 自定义批大小
     .venv/bin/python3 sync_a_quote_to_stock_info.py --codes SH.600000 SZ.000001 HK.00700
-        # 只采集指定代码（支持多个，空格分隔），仍按 is_active=FALSE 落库
+        # 只采集指定代码（支持多个，空格分隔），仅补名称字典
 """
 
 import argparse
@@ -89,18 +86,17 @@ def get_stock_basicinfo_batch(market: str, code_list: list[str]) -> dict[str, st
     return result
 
 
-# ── 步骤 3: 批量写入 stock_info（is_active=FALSE）──
+# ── 步骤 3: 批量写入 stock_info（仅名称字典）──
 
-def upsert_inactive_batch(rows: list[tuple], dry_run: bool) -> None:
-    """批量写入/更新 stock_info，is_active 强制为 FALSE（仅补充参考数据）。
+def upsert_batch(rows: list[tuple], dry_run: bool) -> None:
+    """批量写入/更新 stock_info（仅补名称字典，不写 realtime_collect_target = 不进采集池）。
 
     rows: [(stock_code, stock_name, market, symbol, currency), ...]
-    关键点：VALUES 用 FALSE；ON CONFLICT 仅更新名称，绝不触碰 is_active
-    （避免把已 active 的股票误置为 FALSE，也不把 FALSE 误置为 TRUE）。
+    关键点：ON CONFLICT 仅更新名称，不动其他字段。
     """
     if dry_run:
         for code, name, *_ in rows:
-            log.info(f"  [DRY-RUN] 将写入 {code} → {name} (is_active=FALSE)")
+            log.info(f"  [DRY-RUN] 将写入 {code} → {name}")
         return
     if not rows:
         return
@@ -109,14 +105,14 @@ def upsert_inactive_batch(rows: list[tuple], dry_run: bool) -> None:
         cur = conn.cursor()
         cur.executemany("""
             INSERT INTO stock_info
-                (stock_code, stock_name, market, symbol, currency, is_active)
-            VALUES (%s, %s, %s, %s, %s, FALSE)
+                (stock_code, stock_name, market, symbol, currency)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (stock_code) DO UPDATE SET
                 stock_name = EXCLUDED.stock_name,
                 updated_at = NOW()
         """, rows)
         conn.commit()
-    log.info(f"  批量写入 {len(rows)} 条 (is_active=FALSE)")
+    log.info(f"  批量写入 {len(rows)} 条")
 
 
 # ── 主流程 ──
@@ -139,7 +135,7 @@ def normalize_codes(raw: list[str]) -> list[str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="补全 a_daily_quote 中缺失于 stock_info 的 A 股（is_active=FALSE）")
+    parser = argparse.ArgumentParser(description="补全 a_daily_quote 中缺失于 stock_info 的 A 股（仅补名称字典）")
     parser.add_argument("--dry-run", action="store_true", help="只列出缺失代码，不写库")
     parser.add_argument("--limit", type=int, default=0, help="仅处理前 N 只（调试用）")
     parser.add_argument("--batch", type=int, default=BATCH, help=f"每批请求富途的股票数（默认 {BATCH}）")
@@ -206,12 +202,12 @@ def main():
                 currency = "CNY"  # A 股统一人民币计价
                 name = names.get(code)
                 if name is None:
-                    # 富途拿不到就退化为用代码本身当名称，仍按 inactive 落库
+                    # 富途拿不到就退化为用代码本身当名称，仍按名称字典落库
                     name = code
                     log.warning(f"  [{code}] 富途无数据，退化为代码名落库")
                 rows.append((code, name, market, symbol, currency))
                 added.append((code, name))
-            upsert_inactive_batch(rows, args.dry_run)
+            upsert_batch(rows, args.dry_run)
             total += len(rows)
             log.info(f"  {market} 进度 {min(i + args.batch, len(codes))}/{len(codes)}")
 
@@ -219,11 +215,11 @@ def main():
     print(f"处理完成（{'DRY-RUN，未写库' if args.dry_run else '已写库'}）：")
     print(f"  补全股票数: {len(added)}")
     for code, name in added:
-        print(f"    ├─ {code}  {name}  [is_active=FALSE]")
+        print(f"    ├─ {code}  {name}")
     print(f"{'='*70}")
     log.info(
-        "提示：这些股票 is_active=FALSE，不会被采集/调度。若需转为正式采集对象，"
-        "请单独跑 setup_new_stock.py。"
+        "提示：这些股票仅补名称字典（不写 realtime_collect_target，不进采集池）。"
+        "若需转为正式采集对象，请单独跑 setup_new_stock.py。"
     )
 
 

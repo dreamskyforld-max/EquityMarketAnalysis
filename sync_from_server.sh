@@ -2,7 +2,7 @@
 # ============================================================================
 # 从服务器同步数据表到本机
 # 用法:
-#   ./sync_from_server.sh                          # 默认：同步 stock_info.is_active=TRUE 的全部股票的 tick_data + trend_snapshot
+#   ./sync_from_server.sh                          # 默认：同步实时采集池（realtime_collect_target）全部股票的 tick_data + trend_snapshot
 #   ./sync_from_server.sh tick_data                # 只同步 tick_data（默认 HK.00700）
 #   ./sync_from_server.sh -s SH.600900              # 同步所有表（指定股票）
 #   ./sync_from_server.sh -s SH.600900 tick_data    # 只同步 tick_data（指定股票）
@@ -34,8 +34,8 @@ while [[ $# -gt 0 ]]; do
             echo "  -s STOCK_CODE   stock code (default HK.00700)"
             echo "  TABLE_NAME      optional, sync single table (e.g. tick_data / daily_quote)"
             echo ""
-            echo "  No args: sync tick_data + trend_snapshot for all stocks where"
-            echo "           stock_info.is_active = TRUE (on the remote server)."
+            echo "  No args: sync tick_data + trend_snapshot for all stocks in"
+            echo "           realtime_collect_target (on the remote server)."
             exit 0
             ;;
         *)
@@ -429,13 +429,13 @@ sync_all_large_tables() {
 }
 
 # ==================================================================
-# 默认模式：从远程 stock_info 取 is_active=TRUE 的全部股票，
+# 默认模式：从远程 realtime_collect_target 取在池的全部股票，
 # 逐只同步 tick_data + trend_snapshot（LARGE_TABLES 即这两张表）
 # ==================================================================
 sync_active_stocks_large() {
-    echo "  Fetching active stock codes from remote stock_info (is_active = TRUE) ..."
+    echo "  Fetching in-pool stock codes from remote realtime_collect_target ..."
     local codes
-    codes=$(run_remote_sql "SELECT stock_code FROM stock_info WHERE is_active = TRUE ORDER BY stock_code;" | sed '/^$/d' | tr -d ' ')
+    codes=$(run_remote_sql "SELECT stock_code FROM realtime_collect_target ORDER BY stock_code;" | sed '/^$/d' | tr -d ' ')
     if [[ -z "$codes" ]]; then
         echo "  No active stocks found on remote, abort."
         return 1

@@ -48,6 +48,49 @@ def get_conn():
         conn.close()
 
 
+# ---------- 实时采集配置（realtime_collect_target）----------
+def get_realtime_targets():
+    """读取实时采集配置表 —— 采集端读取采集清单的唯一入口（取代旧 stock_info.is_active）。
+
+    返回:
+        {
+          "all":    [code, ...],   # 在池全集（表内所有行）→ 日频任务/在池判定
+          "tick":   [code, ...],   # collect_tick=TRUE  → TICKER 逐笔订阅
+          "trend":  [code, ...],   # collect_trend=TRUE → 盘中分钟级（get_quote + record_trend）
+          "quote":  [code, ...],   # collect_quote=TRUE → QUOTE(LV1) 推送订阅
+          "market": {code: "HK"/"SH"/"SZ"},   # market 映射（stock_info 缺失时按代码前缀兜底）
+        }
+
+    语义（与 realtime_collect_target 表注释一致）：
+      · 行存在 = 在实时采集池（等价旧 stock_info.is_active=TRUE）；
+      · 三开关只控对应实时采集，全 FALSE 的行 = 只采日频、不采实时；
+      · 读表失败直接抛异常，调用方不得静默回退旧配置（避免采集口径漂移）。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT t.stock_code,
+                       COALESCE(s.market, split_part(t.stock_code, '.', 1)::char(2)) AS market,
+                       t.collect_tick, t.collect_trend, t.collect_quote
+                FROM realtime_collect_target t
+                LEFT JOIN stock_info s ON s.stock_code = t.stock_code
+                ORDER BY t.stock_code
+            """)
+            rows = cur.fetchall()
+
+    targets = {"all": [], "tick": [], "trend": [], "quote": [], "market": {}}
+    for code, market, tick, trend, quote in rows:
+        targets["all"].append(code)
+        targets["market"][code] = market
+        if tick:
+            targets["tick"].append(code)
+        if trend:
+            targets["trend"].append(code)
+        if quote:
+            targets["quote"].append(code)
+    return targets
+
+
 def upsert(conn, table, data, conflict_cols):
     """
     INSERT ... ON CONFLICT DO UPDATE

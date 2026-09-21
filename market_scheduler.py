@@ -3,7 +3,8 @@
 市场数据定时调度服务
 - 以股票为中心配置，自动生成盘中（分钟级）和收盘（全量）采集任务
 - 支持港股和A股，通过 MARKET_PRESETS 定义各市场采集模块
-- 股票列表从 stock_info 表(is_active)动态加载，新股接入/停用由 setup_new_stock(s).py 管理
+- 股票列表从 realtime_collect_target 配置表加载（行存在=在池；三开关控实时细分），
+  新股接入/停用由前端或 setup_new_stock(s).py 管理，改表后重启本服务生效
 
 用法：
     python3 market_scheduler.py          # 前台运行
@@ -72,24 +73,34 @@ MARKET_PRESETS = {
     },
 }
 
-# ── 股票列表（从 stock_info 表读取 is_active 的股票）──────────
+# ── 股票列表（从 realtime_collect_target 配置表读取）──────────
 def load_stocks():
-    """从 stock_info 表读取活跃股票，返回 [{'code':..., 'market':...}, ...]"""
-    from db import get_conn
-    stocks = []
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT stock_code, market FROM stock_info "
-                    "WHERE is_active = TRUE ORDER BY stock_code"
-                )
-                for code, market in cur.fetchall():
-                    stocks.append({"code": code, "market": market})
-        log.info(f"从 stock_info 加载活跃股票 {len(stocks)} 只")
-    except Exception as e:
-        log.warning(f"加载 stock_info 失败，回退到空列表: {e}")
+    """从 realtime_collect_target 读取在池股票，返回 [{'code':..., 'market':...}, ...]。
+
+    口径：行存在 = 在池（等价旧 stock_info.is_active=TRUE）→ 日频任务
+    （收盘采集 / 相关性 / 宏观）按此全量注册；盘中实时任务另按
+    collect_trend 筛选（见 load_intraday_by_market）。
+    读表失败直接抛异常 → 进程退出，由 systemd（Restart=on-failure）重启重试。
+    """
+    from db import get_realtime_targets
+    targets = get_realtime_targets()
+    stocks = [{"code": c, "market": targets["market"].get(c)} for c in targets["all"]]
+    log.info(f"从 realtime_collect_target 加载在池股票 {len(stocks)} 只")
     return stocks
+
+
+def load_intraday_by_market():
+    """盘中批量采集清单：collect_trend=TRUE 的票按市场分组 → {'HK': [...], 'A': [...]}。"""
+    from db import get_realtime_targets
+    targets = get_realtime_targets()
+    by_market = {}
+    for code in targets["trend"]:
+        mkt = targets["market"].get(code)
+        mkt = "A" if mkt in ("SH", "SZ") else mkt
+        by_market.setdefault(mkt, []).append(code)
+    log.info("盘中批量采集（collect_trend）: %s",
+             {m: len(v) for m, v in sorted(by_market.items())} or "无")
+    return by_market
 
 
 STOCKS = load_stocks()
@@ -106,11 +117,11 @@ STOCKS = load_stocks()
 GlobalTask = tuple[str, str | list[str], dict[str, int | str], list[str] | None, bool, str | None, int]
 GLOBAL_TASKS: list[GlobalTask] = [
     # 删除 3 年前过期数据（tick_data / trend_snapshot / realtime_order_size / collection_run_log 共 4 表）
-    ("数据清理", "cleanup_old_data.py", {"hour": 4, "minute": 0}, None, True, None, 180),
+    #("数据清理", "cleanup_old_data.py", {"hour": 4, "minute": 0}, None, True, None, 180),
 
     # 全市场采集清单刷新（quote_universe）：每日 08:30 盘前一次。
     # 富途 get_stock_basicinfo 全量拉取（无额度限制）→ 计数护栏（±10% / 绝对下限）→
-    # upsert + 30 天软删 → 新增代码同步进 stock_info（is_active=FALSE，不进实时深采池）。
+    # upsert + 30 天软删 → 新增代码同步进 stock_info（仅名称字典，不进实时采集池）。
     # 三市场各自重试，单市场失败不影响其它市场；清单读取方：get_a/hk_market_turnover（v_quote_scope）。
     ("全市场清单刷新", "sync_quote_universe.py", {"hour": 8, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
 
@@ -217,7 +228,7 @@ GLOBAL_TASKS: list[GlobalTask] = [
      {"hour": 9, "minute": 0, "day_of_week": "sat"}, None, True, None, 7200),
 
     # 公司资料（全市场简介 + 关注池主营构成）：富途 get_company_profile（1 票 1 次）+
-    # get_financials_revenue_breakdown（1 票 1 期 1 次；仅 is_active 关注池最近 4 期，
+    # get_financials_revenue_breakdown（1 票 1 期 1 次；仅 realtime_collect_target 关注池最近 4 期，
     # 全市场 × 全历史 40+ 期调用量不可接受）。静态低频数据（简介基本不变、主营构成随
     # 财报更新），周日 03:00 跑一次全量。
     # 富途「公司详情」限流 30 次/30 秒（脚本已按 26 次/30 秒 节流留余量），
@@ -241,13 +252,11 @@ GLOBAL_TASKS: list[GlobalTask] = [
 ]
 
 # ── 盘中批量采集（按市场拆分）────────────────────────────────
-# 「每个市场每分钟一个全局任务」，codes=该市场全量股票，一次批量快照分发。
+# 「每个市场每分钟一个全局任务」，codes=该市场 collect_trend=TRUE 的全量股票，
+# 一次批量快照分发（get_quote 写 daily_quote + record_trend 写 trend_snapshot）。
 # 作为 GLOBAL_TASKS 项追加，与其他全局任务共用同一条注册循环。
 INTRADAY_GLOBAL_MODULES = ["get_quote.py", "record_trend.py"]
-_intraday_by_market = {}
-for _s in STOCKS:
-    _mkt = "A" if _s["market"] in ("SH", "SZ") else _s["market"]
-    _intraday_by_market.setdefault(_mkt, []).append(_s["code"])
+_intraday_by_market = load_intraday_by_market()
 for _mkt, _mkt_codes in sorted(_intraday_by_market.items()):
     GLOBAL_TASKS.append(
         (f"盘中批量采集-{_mkt}", INTRADAY_GLOBAL_MODULES,

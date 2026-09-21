@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-从服务器同步 stock_info 中 is_active=FALSE 的行到本机数据库。
+从服务器同步「不在实时采集池」的 stock_info 参考行到本机数据库。
 
 背景：
   - 服务器上已通过 sync_hk_quote_to_stock_info.py 批量补全了港股 stock_info
-    （is_active=FALSE，作为参考数据，不触发采集）。
-  - 本机需要这些中文名/映射数据用于分析，但不要覆盖本机现有 active 状态。
-  - 因此只同步 is_active=FALSE 的行，且 ON CONFLICT 仅更新 stock_name，
-    绝不触碰 is_active（保护本机原有 active=TRUE 的重点股票）。
+    （仅参考数据：不写 realtime_collect_target，不触发采集）。
+  - 本机需要这些中文名/映射数据用于分析，但不要覆盖本机已有内容。
+  - 因此只同步「不在实时采集池（realtime_collect_target）」的行，且 ON CONFLICT
+    仅更新 stock_name，不动本机其他字段。
 
 方法（复用 sync_from_server.sh 的 SSH + psql COPY 模式）：
-  1. ssh 到服务器，COPY 选出 is_active=FALSE 的目标列（排除 id/时间戳）到 stdout CSV
+  1. ssh 到服务器，COPY 选出不在 realtime_collect_target 的目标列（排除 id/时间戳）到 stdout CSV
   2. 本机用临时表 COPY FROM，再 INSERT ... ON CONFLICT(stock_code)
      DO UPDATE SET stock_name=EXCLUDED.stock_name
   3. 打印前后计数
@@ -37,13 +37,14 @@ REMOTE_HOST = "localhost"
 REMOTE_PORT = "5432"
 
 # stock_info 同步列（排除 id / created_at / updated_at，避免自增与时间戳冲突）
-SYNC_COLS = "stock_code, stock_name, market, symbol, currency, is_active"
+SYNC_COLS = "stock_code, stock_name, market, symbol, currency"
 
 
 def fetch_remote_csv() -> str:
-    """通过 SSH + 远端 psql COPY 把 is_active=FALSE 行导出为 CSV 文本。"""
+    """通过 SSH + 远端 psql COPY 把「不在实时采集池」的行导出为 CSV 文本。"""
     sql = (
-        f"\\COPY (SELECT {SYNC_COLS} FROM stock_info WHERE is_active=FALSE) "
+        f"\\COPY (SELECT {SYNC_COLS} FROM stock_info "
+        f"WHERE stock_code NOT IN (SELECT stock_code FROM realtime_collect_target)) "
         f"TO STDOUT CSV HEADER"
     )
     # 用 stdin 传 SQL，避免 -c 的单引号/特殊字符嵌套问题
@@ -65,7 +66,7 @@ def upsert_local(csv_text: str, dry_run: bool) -> int:
     """把 CSV 文本通过临时表 upsert 进本机 stock_info。返回影响行数。"""
     if dry_run:
         n = sum(1 for line in csv_text.strip().splitlines() if line and not line.startswith("stock_code"))
-        log.info(f"[DRY-RUN] 远端 FALSE 行数: {n}，未写库")
+        log.info(f"[DRY-RUN] 远端待同步行数: {n}，未写库")
         return n
 
     from db import get_conn
@@ -79,10 +80,10 @@ def upsert_local(csv_text: str, dry_run: bool) -> int:
             f"COPY _si_tmp({SYNC_COLS}) FROM STDIN WITH (FORMAT CSV, HEADER TRUE)",
             io.StringIO(csv_text),
         )
-        # upsert：仅更新 stock_name，绝不碰 is_active
+        # upsert：仅更新 stock_name，不动其他字段
         cur.execute("""
-            INSERT INTO stock_info (stock_code, stock_name, market, symbol, currency, is_active)
-            SELECT stock_code, stock_name, market, symbol, currency, is_active
+            INSERT INTO stock_info (stock_code, stock_name, market, symbol, currency)
+            SELECT stock_code, stock_name, market, symbol, currency
             FROM _si_tmp
             ON CONFLICT (stock_code) DO UPDATE SET
                 stock_name = EXCLUDED.stock_name,
@@ -94,19 +95,24 @@ def upsert_local(csv_text: str, dry_run: bool) -> int:
 
 
 def count_local_inactive() -> int:
+    """本机「不在实时采集池」的 stock_info 行数。"""
     from db import get_conn
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM stock_info WHERE is_active=FALSE")
+        cur.execute(
+            "SELECT COUNT(*) FROM stock_info s "
+            "WHERE NOT EXISTS (SELECT 1 FROM realtime_collect_target t "
+            "                  WHERE t.stock_code = s.stock_code)"
+        )
         return cur.fetchone()[0]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="同步服务器 stock_info 中 is_active=FALSE 的行到本机")
-    parser.add_argument("--dry-run", action="store_true", help="只统计远端 FALSE 行数，不写库")
+    parser = argparse.ArgumentParser(description="同步服务器「不在实时采集池」的 stock_info 行到本机")
+    parser.add_argument("--dry-run", action="store_true", help="只统计远端行数，不写库")
     args = parser.parse_args()
 
-    log.info("从服务器拉取 is_active=FALSE 的 stock_info 行...")
+    log.info("从服务器拉取「不在实时采集池」的 stock_info 行...")
     try:
         csv_text = fetch_remote_csv()
     except Exception as e:
@@ -114,17 +120,17 @@ def main():
         raise SystemExit(1)
 
     before = count_local_inactive()
-    log.info(f"本机同步前 is_active=FALSE 行数: {before}")
+    log.info(f"本机同步前「不在池」行数: {before}")
 
     affected = upsert_local(csv_text, args.dry_run)
 
     if args.dry_run:
-        log.info(f"[DRY-RUN] 完成，未写库。远端待同步 FALSE 行数: {affected}")
+        log.info(f"[DRY-RUN] 完成，未写库。远端待同步行数: {affected}")
         return
 
     after = count_local_inactive()
-    log.info(f"本机同步后 is_active=FALSE 行数: {after}（变化 {after - before:+d}）")
-    log.info("完成。注意：is_active 保持不变（FALSE 落库 / 原有 active 行不受影响）。")
+    log.info(f"本机同步后「不在池」行数: {after}（变化 {after - before:+d}）")
+    log.info("完成。")
 
 
 if __name__ == "__main__":

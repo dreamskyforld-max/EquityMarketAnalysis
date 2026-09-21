@@ -62,13 +62,13 @@ def _parse_date(update_time):
 # A股采集清单（读 v_quote_scope）
 # ----------------------------------------------------------------------------
 def _a_code_list():
-    """全 A 股采集清单：读 v_quote_scope（quote_universe.is_collectable ∪ stock_info.is_active）。
+    """全 A 股采集清单：读 v_quote_scope（quote_universe.is_collectable ∪ realtime_collect_target）。
 
     替代原「富途 get_stock_basicinfo + 段号白名单 + 7 天 DB 缓存」实现：
       · 清单由 sync_quote_universe.py 每日 08:30 统一维护（含计数护栏 + 30 天软删）；
       · 段号白名单上移为 quote_universe.is_primary（口径列），采集侧不再硬编码，
         因此这里会采到 B股/REIT/CDR 等非正股品种（口径过滤交给读方用 is_primary）；
-      · 并集 stock_info.is_active，以覆盖 SH.520900 这类「深采有、富途 STOCK 全集无」的品种。
+      · 并集 realtime_collect_target（在池全集），以覆盖 SH.520900 这类「深采有、富途 STOCK 全集无」的品种。
     """
     with get_conn() as conn:
         with conn.cursor() as cur:

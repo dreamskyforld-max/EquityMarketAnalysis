@@ -4,7 +4,7 @@
 背景
 ----
 ① 证券属性域需要上市日期（上市年限档标签）与交易所类型（板块标签），
-而 stock_info 原本只有 stock_code / stock_name / market / symbol / currency / is_active。
+而 stock_info 原本只有 stock_code / stock_name / market / symbol / currency。
 同时 stock_info（8152 只）少于日线表实际覆盖（A股 5700 + 港股 2807 ≈ 8500+），
 差的那批是已退市或从未登记过的股票——缺失它们会造成幸存者偏差。
 
@@ -17,8 +17,8 @@
 注意
 ----
 - 富途对很老的公司返回 1970-01-01 占位值（如 HK.00002 中电控股），视为缺失写 NULL。
-- 新增的股票一律 is_active = FALSE。**刻意保守**：现有采集池由 config.conf 定义，
-  补进来的历史/退市股票不应自动进入任何采集任务，避免改变既有采集行为。
+- 新增的股票仅作名称/元数据字典，不写 realtime_collect_target（不进采集池）。
+  **刻意保守**：补进来的历史/退市股票不应自动进入任何采集任务，避免改变既有采集行为。
 
 用法：
     python3 -m profiling.run backfill-basic
@@ -145,17 +145,16 @@ def _fill_from_quotes(conn) -> int:
 
     这类股票主要是富途已不返回的**已退市股**（约 17 只）。只补代码与市场，
     **不猜上市日期**（行情表最早日不代表上市日，猜了会污染上市年限档标签），
-    名称留空待后续数据源补。is_active=FALSE，不进入任何采集池。
+    名称留空待后续数据源补。仅作名称字典，不写 realtime_collect_target。
     """
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO stock_info (stock_code, market, symbol, currency, is_active)
+            INSERT INTO stock_info (stock_code, market, symbol, currency)
             SELECT DISTINCT q.stock_code,
                    split_part(q.stock_code, '.', 1),
                    split_part(q.stock_code, '.', 2),
-                   CASE WHEN split_part(q.stock_code, '.', 1) = 'HK' THEN '港元' ELSE '元' END,
-                   FALSE
+                   CASE WHEN split_part(q.stock_code, '.', 1) = 'HK' THEN '港元' ELSE '元' END
             FROM (
                 SELECT DISTINCT stock_code FROM a_daily_quote
                 UNION SELECT DISTINCT stock_code FROM hk_daily_quote
@@ -205,7 +204,7 @@ def run(conn: Any = None) -> dict[str, Any]:
                 """
                 INSERT INTO stock_info
                     (stock_code, stock_name, market, symbol, currency,
-                     list_date, exchange_type, delisting, is_active)
+                     list_date, exchange_type, delisting)
                 VALUES %s
                 ON CONFLICT (stock_code) DO UPDATE SET
                     list_date     = EXCLUDED.list_date,
@@ -217,7 +216,7 @@ def run(conn: Any = None) -> dict[str, Any]:
                                          THEN EXCLUDED.symbol ELSE stock_info.symbol END,
                     updated_at    = NOW()
                 """,
-                [(*p, False) for p in payload],
+                payload,
             )
 
         n_new = len({r["stock_code"] for r in rows} - existing)
@@ -228,7 +227,7 @@ def run(conn: Any = None) -> dict[str, Any]:
             "updated": len(rows) - n_new,
             "backfilled_from_quotes": n_backfill,
             "new_columns": added_cols,
-            "message": "新增股票 is_active=FALSE（不进入现有采集池），如需纳入请手动开启",
+            "message": "补入股票仅作名称/元数据字典（不写 realtime_collect_target，不进采集池），如需纳入请用 setup_new_stock.py",
         }
         log.info("stock_info 补齐完成: %s", stats)
         return stats

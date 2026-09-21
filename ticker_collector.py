@@ -10,7 +10,9 @@
 
 特性：
   - 开机自启（systemd），常驻运行，无需停止
-  - 配置文件 config.conf 的 [ticker]/[futu] 段管理订阅股票列表与富途地址
+  - 订阅清单来自 realtime_collect_target 配置表（collect_tick / collect_quote；
+    行存在=在池，前端维护，改表后重启本服务生效）
+  - 运行参数（富途地址/缓冲/刷新/健康检查）来自 config.conf [ticker]/[futu] 段
   - 支持多市场混合订阅：HK.*（港股）/ SH.* / SZ.*（A股）
   - 交易时段由 FutuOpenD 按各自市场管理，无需自行判断
   - 推送→缓冲→批量入库，不丢失数据
@@ -45,46 +47,28 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("ticker_collector")
 
 
-def load_stocks_from_db():
-    """从 stock_info 表读取活跃股票代码，返回 [code, ...]（is_active 过滤）。
-
-    与 market_scheduler 共用同一张表，避免逐笔订阅列表与分钟级调度列表不一致。
-    读取失败或为空时返回空列表（由调用方回退到 config.conf）。
-    """
-    from db import get_conn
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT stock_code FROM stock_info "
-                    "WHERE is_active = TRUE ORDER BY stock_code"
-                )
-                return [r[0] for r in cur.fetchall()]
-    except Exception as e:
-        log.warning(f"从 stock_info 读取股票列表失败，回退到 config: {e}")
-        return []
-
-
 def load_config():
-    """从统一 config.conf 加载配置（[ticker] 段 + [futu] 段）"""
+    """加载配置：订阅清单读 realtime_collect_target（唯一真相源），
+    运行参数（缓冲/刷新/连接/健康检查）来自 config.conf [ticker]/[futu] 段。
+
+    与 market_scheduler 共用同一张配置表，避免逐笔订阅列表与分钟级调度列表口径漂移。
+    读表失败直接抛异常 → 进程退出，由 systemd（Restart=always）重启重试；
+    不静默回退旧配置，避免按错误清单采集。
+    """
     from config import val
-    # 股票列表优先从 stock_info 表(is_active)读取；表为空或读取失败才回退 config.conf
-    db_stocks = load_stocks_from_db()
-    if db_stocks:
-        stocks = db_stocks
-        stocks_source = "stock_info"
-    else:
-        stocks_raw = val("ticker", "stocks", fallback="HK.00700")
-        stocks = [s.strip() for s in stocks_raw.split(",") if s.strip()]
-        stocks_source = "config.conf"
-    # QUOTE(LV1 实时报价) 订阅标的：富途免费 LV1 额度通常有限（远小于 100），
-    # 不能像 TICKER 那样一次性订阅全部股票。改为从配置显式指定少量有权限的代码。
-    # 缺省为空 → 不订阅 QUOTE（逐笔主链路不受影响，仅缺失实时报价刷新）。
-    quote_raw = val("ticker", "quote_stocks", fallback="")
-    quote_stocks = [s.strip() for s in quote_raw.split(",") if s.strip()]
+    from db import get_realtime_targets
+
+    targets = get_realtime_targets()
+    stocks = targets["tick"]          # TICKER 逐笔订阅（collect_tick=TRUE）
+    quote_stocks = targets["quote"]   # QUOTE(LV1) 推送订阅（collect_quote=TRUE）
+    # QUOTE(LV1) 订阅额度有限（免费 LV1 远小于 100 只），超限仅告警不自动裁剪，
+    # 由配置方（前端）收敛——避免静默少订阅造成"配了却没刷新"。
+    _QUOTE_SOFT_LIMIT = 100
+    if len(quote_stocks) > _QUOTE_SOFT_LIMIT:
+        log.warning(f"QUOTE 订阅 {len(quote_stocks)} 只，超过软上限 {_QUOTE_SOFT_LIMIT} 只，"
+                    f"富途 LV1 推送可能部分失败，请在前端收敛 collect_quote")
     return {
         "stocks": stocks,
-        "stocks_source": stocks_source,
         "quote_stocks": quote_stocks,
         "buffer_size": int(val("ticker", "buffer_size", fallback="500")),
         "flush_interval_seconds": int(val("ticker", "flush_interval_seconds", fallback="10")),
@@ -94,9 +78,6 @@ def load_config():
         # 订阅健康检查周期（秒）：FutuOpenD 每日重启/断线后，futu 库内部重连成功但
         # 重订阅可能静默失败（库只 log 不重试），须由本进程周期性校验并重建。
         "health_check_seconds": int(val("ticker", "health_check_seconds", fallback="60")),
-        # 全量逐笔旁路落盘开关（诊断用，默认关闭）：开启后富途推送的每一笔都无去重写入
-        # full_tick_data 表，用于定位"推了但 tick_data 没落"的问题。
-        "full_tick_capture": val("ticker", "full_tick_capture", fallback="false").lower() in ("1", "true", "yes", "on"),
     }
 
 
@@ -107,10 +88,11 @@ def _write_batch_to_db(batch: list) -> int:
     if not batch:
         return 0
     try:
+        from config import val
         with get_conn() as conn:
-            if load_config().get("full_tick_capture"):
-                # 诊断旁路：富途推送的每一笔都无去重写入 full_tick_data，
-                # 用于事后比对"推了什么 / tick_data 实际落了什么"。默认关闭。
+            # 全量逐笔旁路落盘（诊断用，默认关闭）：开启后富途推送的每一笔都无去重写入
+            # full_tick_data 表，用于定位"推了但 tick_data 没落"的问题。
+            if val("ticker", "full_tick_capture", fallback="false").lower() in ("1", "true", "yes", "on"):
                 columns = list(batch[0].keys())
                 write_full_tick(conn, batch, columns)
             bulk_upsert(
@@ -495,7 +477,9 @@ def main():
     log.info("=" * 50)
 
     cfg = load_config()
-    log.info(f"配置: stocks={cfg.get('stocks')} (来源: {cfg.get('stocks_source')}), "
+    log.info(f"配置(来源: realtime_collect_target): "
+             f"TICKER={len(cfg.get('stocks', []))} 只 {cfg.get('stocks')}, "
+             f"QUOTE={len(cfg.get('quote_stocks', []))} 只 {cfg.get('quote_stocks')}, "
              f"buffer_size={cfg.get('buffer_size')}, "
              f"flush_interval={cfg.get('flush_interval_seconds')}s")
 

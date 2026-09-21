@@ -26,7 +26,7 @@
 
 用法：
     python3 backfill_hk_market_turnover.py --years 3                 # 全港股回溯近 3 年
-    python3 backfill_hk_market_turnover.py --start 2023-01-01        # 全港股，指定起始日期
+    python3 backfill_hk_market_turnover.py --start 2019-01-01        # 全港股，指定起始日期
     python3 backfill_hk_market_turnover.py --code HK.01857           # 仅采集单只股票（可省略 HK. 前缀）
     python3 backfill_hk_market_turnover.py --code 01857 --start 2023-01-01  # 单只 + 起始日期
     python3 backfill_hk_market_turnover.py --code HK.01857 --dry-run # 只看不落库

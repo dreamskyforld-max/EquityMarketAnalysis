@@ -49,14 +49,14 @@ def _parse_date(update_time):
 # 港股采集清单（读 v_quote_scope）
 # ----------------------------------------------------------------------------
 def _hk_code_list():
-    """全港股采集清单：读 v_quote_scope（quote_universe.is_collectable ∪ stock_info.is_active）。
+    """全港股采集清单：读 v_quote_scope（quote_universe.is_collectable ∪ realtime_collect_target）。
 
     替代原「akshare stock_hk_spot 现货快照 + 7 天 DB 缓存」实现：
       · 现货快照只返回「当日有报价」的股票（约 2,800 只），会漏掉停牌/长期无成交/GEM 等
         （阶段 0 就踩过：21 只库内 HK 代码不在清单内）；
       · 现由 sync_quote_universe.py 用富途 get_stock_basicinfo 维护全集（3,787 只），
         「僵尸股」由入库侧「只落成交额>0 的行」自然过滤，无需清单侧裁剪；
-      · 并集 stock_info.is_active，覆盖深采池品种。
+      · 并集 realtime_collect_target（在池全集），覆盖深采池品种。
     """
     with get_conn() as conn:
         with conn.cursor() as cur:

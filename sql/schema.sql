@@ -15,7 +15,6 @@ CREATE TABLE IF NOT EXISTS stock_info (
     market          CHAR(2),                            -- 市场: HK/SH/SZ
     symbol          VARCHAR(10),                        -- 纯数字代码: 00700
     currency        VARCHAR(10)     DEFAULT '港元',      -- 货币单位
-    is_active       BOOLEAN         DEFAULT TRUE,       -- 是否活跃
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
     list_date       DATE,                               -- 上市日期（富途 listing_date；1970-01-01 占位值记为 NULL）
@@ -29,18 +28,17 @@ COMMENT ON COLUMN stock_info.stock_name           IS '股票中文名称';
 COMMENT ON COLUMN stock_info.market               IS '所属市场：HK(港股) / SH(上证) / SZ(深证)';
 COMMENT ON COLUMN stock_info.symbol               IS '纯数字代码，如 00700 / 600519';
 COMMENT ON COLUMN stock_info.currency             IS '交易货币单位，港股默认港元，A股默认元';
-COMMENT ON COLUMN stock_info.is_active            IS '是否仍在活跃采集，FALSE 时跳过该股票';
 COMMENT ON COLUMN stock_info.created_at           IS '记录创建时间';
 COMMENT ON COLUMN stock_info.updated_at           IS '记录最后更新时间';
 COMMENT ON COLUMN stock_info.list_date            IS '上市日期（富途 listing_date；1970-01-01 占位值记为 NULL）';
 COMMENT ON COLUMN stock_info.exchange_type        IS '交易所/板块类型（富途：CN_SH / CN_SZ / CN_STIB / CN_BJ / HK_MAINBOARD / HK_GEMBOARD）';
-COMMENT ON COLUMN stock_info.delisting            IS '是否已退市（富途 delisting）。补采脚本写入，新增股票一律 is_active=FALSE，不进入现有采集池';
+COMMENT ON COLUMN stock_info.delisting            IS '是否已退市（富途 delisting）。补采脚本写入，历史股票不进入实时采集池（不写 realtime_collect_target）';
 
 -- 1.1 全市场采集清单（quote_universe；sync_quote_universe.py 每日 08:30 刷新）
--- 定位：全市场「采集范围 + 口径」的真相源，与 stock_info（code→名称字典 + 人工深采开关）职责分离。
---   · 采集器只读本表（is_collectable）决定采什么；stock_info.is_active 仍只管实时深采池（人工维护，二者语义不同）。
+-- 定位：全市场「采集范围 + 口径」的真相源，与 stock_info（code→名称字典）职责分离。
+--   · 采集器只读本表（is_collectable）决定全市场口径采什么；实时深采池由 realtime_collect_target 单独维护。
 --   · 刷新器用富途 get_stock_basicinfo 全量拉取（无额度限制），带计数护栏 + 软删（30 天未在源出现才停用）。
---   · 新增代码同步 INSERT 进 stock_info（is_active=FALSE），保证名称字典同步。
+--   · 新增代码同步 INSERT 进 stock_info，保证名称字典同步（不写 realtime_collect_target，不自动进采集池）。
 CREATE TABLE IF NOT EXISTS quote_universe (
     stock_code      VARCHAR(20)     PRIMARY KEY,        -- 如 HK.00700 / SH.600519 / SZ.000001
     stock_name      VARCHAR(100),                       -- 名称快照（权威映射以 stock_info 为准）
@@ -62,24 +60,60 @@ CREATE INDEX IF NOT EXISTS idx_quote_universe_scope ON quote_universe (market) W
 COMMENT ON TABLE  quote_universe                 IS '全市场采集清单：采集范围(is_collectable)与口径(is_primary)的真相源；sync_quote_universe.py 每日 08:30 刷新';
 COMMENT ON COLUMN quote_universe.seg             IS '代码段号（前 3 位），用于口径判定与分布审计，如 600/601/603/605/688/000/300/810';
 COMMENT ON COLUMN quote_universe.is_primary      IS '是否计入「全市场成交额」正股口径：A 股=正股段(600/601/603/605/688/000/001/002/003/300/301)；港股=全部 STOCK';
-COMMENT ON COLUMN quote_universe.is_collectable  IS '是否在采集范围。自动软删：last_seen 超 30 天未在源出现 → FALSE；再次出现自动恢复。⚠ 与 stock_info.is_active（人工深采开关）语义不同';
+COMMENT ON COLUMN quote_universe.is_collectable  IS '是否在采集范围。自动软删：last_seen 超 30 天未在源出现 → FALSE；再次出现自动恢复。⚠ 与 realtime_collect_target（人工实时池）语义不同';
 COMMENT ON COLUMN quote_universe.last_seen       IS '最近一次在源（富途 basicinfo）中出现的时间；软删判定依据';
 
--- 1.1.1 全市场采集范围视图（采集器的唯一入口）
--- = union：全市场清单可采集 + 实时深采池（人工）。
---   并集的原因：富途 ("SH","STOCK") 不含 5xx ETF，深采池里的 SH.520900 这类品种
---   只能靠 stock_info.is_active 补齐；反之深采池未覆盖的品种由 universe 提供。
+-- 1.1.1 实时采集配置表（realtime_collect_target；前端维护，采集端启动时读取）
+-- 定位：实时采集池的唯一真相源，取代旧 stock_info.is_active（已废弃）。
+--   · 行存在 = 该股票在实时采集池（等价旧 is_active=TRUE）：
+--     日频任务（收盘 get_quote/get_trend、相关性、宏观）按「在表」全采。
+--   · 三开关只控实时细分：collect_tick → TICKER 逐笔；
+--     collect_trend → 盘中分钟级（get_quote + record_trend 每分钟批量）；
+--     collect_quote → QUOTE(LV1) 实时报价推送订阅。
+--   · 全 FALSE 的行 = 只采日频、不采实时；彻底停采 = 删除行。
+--   · 变更生效：写表后重启对应服务（tick/quote → ticker-collector；
+--     trend → market-scheduler），采集端不做运行时热生效。
+CREATE TABLE IF NOT EXISTS realtime_collect_target (
+    stock_code      TEXT            PRIMARY KEY,        -- 如 HK.00700 / SH.600519（TEXT，与真实库/前端 DDL 一致）
+    collect_tick    BOOLEAN         NOT NULL DEFAULT FALSE,   -- 实时交易流水（逐笔 TICKER）订阅开关
+    collect_trend   BOOLEAN         NOT NULL DEFAULT FALSE,   -- 分钟级趋势/股价（trend_snapshot + daily_quote 盘中）
+    collect_quote   BOOLEAN         NOT NULL DEFAULT FALSE,   -- 实时股价 QUOTE(LV1) 推送刷新开关
+    applied_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),   -- 配置写入/变更时间（写方维护）
+    applied_by      TEXT,                                     -- 配置写入人（前端账号 / 脚本名）
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE  realtime_collect_target                IS '实时采集配置表：行存在=在实时采集池（等价旧 stock_info.is_active=TRUE）；前端维护，采集端启动时读取';
+COMMENT ON COLUMN realtime_collect_target.stock_code     IS '股票完整代码，如 HK.00700 / SH.600519 / SZ.000001';
+COMMENT ON COLUMN realtime_collect_target.collect_tick   IS '实时交易流水（逐笔 TICKER）订阅开关 → ticker_collector';
+COMMENT ON COLUMN realtime_collect_target.collect_trend  IS '分钟级趋势/股价采集开关（record_trend 写 trend_snapshot、get_quote 盘中写 daily_quote）→ market_scheduler 盘中批量任务';
+COMMENT ON COLUMN realtime_collect_target.collect_quote  IS '实时股价 QUOTE(LV1) 推送订阅开关（QuoteRefresher 刷新 trend_snapshot/daily_quote 行情列）→ ticker_collector';
+COMMENT ON COLUMN realtime_collect_target.applied_at     IS '配置写入/变更时间（写方维护，用于人工核对"配置是否已重启生效"）';
+COMMENT ON COLUMN realtime_collect_target.applied_by     IS '配置写入人（前端账号 / 脚本名）';
+
+-- 1.1.2 全市场采集范围视图（采集器的唯一入口）
+-- = union：全市场清单可采集 + 实时采集池（人工，realtime_collect_target）。
+--   并集的原因：富途 ("SH","STOCK") 不含 5xx ETF，实时池里的 SH.520900 这类品种
+--   只能靠 realtime_collect_target 补齐；反之实时池未覆盖的品种由 universe 提供。
 --   src 列用于审计来源（universe 优先于 watchlist）。
+-- 注：stock_code 显式 cast 为 varchar(20) —— quote_universe 是 varchar(20)、
+-- realtime_collect_target 是 TEXT，不 cast 会让 UNION 结果变 text，导致
+-- CREATE OR REPLACE VIEW 报「cannot change data type of view column」。
 CREATE OR REPLACE VIEW v_quote_scope AS
 SELECT DISTINCT ON (stock_code) stock_code, market, src
 FROM (
-    SELECT stock_code, market, 'universe'  AS src FROM quote_universe WHERE is_collectable
+    SELECT stock_code::varchar(20) AS stock_code, market, 'universe' AS src
+      FROM quote_universe WHERE is_collectable
     UNION ALL
-    SELECT stock_code, market, 'watchlist' AS src FROM stock_info     WHERE is_active
+    SELECT t.stock_code::varchar(20) AS stock_code,
+           COALESCE(s.market, split_part(t.stock_code, '.', 1)::char(2)) AS market,
+           'watchlist' AS src
+      FROM realtime_collect_target t
+      LEFT JOIN stock_info s ON s.stock_code = t.stock_code
 ) u
 ORDER BY stock_code, src;
 
-COMMENT ON VIEW v_quote_scope IS '全市场采集范围：quote_universe.is_collectable ∪ stock_info.is_active（含 src 来源审计；供采集器读清单用）';
+COMMENT ON VIEW v_quote_scope IS '全市场采集范围：quote_universe.is_collectable ∪ realtime_collect_target（在池全集；含 src 来源审计；供采集器读清单用）';
 
 -- 1.2 股票-指数成分归属表（参考数据，低频刷新）
 -- 反向建表：遍历「已知指数 → 全成分」，每只成分股落一行。
@@ -1469,7 +1503,7 @@ COMMENT ON COLUMN company_profile.source             IS '当前值来源：futu(
 -- ============================================================================
 -- 主营构成（一票 × 报告期 × 口径 × 条目）
 -- 数据源: 富途 get_financials_revenue_breakdown（1 票 1 期 1 次调用）
--- 采集: get_company_profile.py（默认仅关注池 is_active + 最近 4 期，全历史 40+ 期调用量过大）
+-- 采集: get_company_profile.py（默认仅关注池 realtime_collect_target + 最近 4 期，全历史 40+ 期调用量过大）
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS company_revenue_breakdown (
     id             BIGSERIAL      PRIMARY KEY,
