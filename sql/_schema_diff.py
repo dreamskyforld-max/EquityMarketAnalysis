@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 # ============================================================================
-# _schema_diff.py — 数据库结构差异检测 + 生成修复 SQL（只读，绝不修改数据库）
+# _schema_diff.py — 数据库结构差异检测 + 生成修复 SQL（不修改任何持久对象）
 # ----------------------------------------------------------------------------
 # 设计原则（安全优先）:
-#   ★ 本脚本【只读取】数据库结构，【绝不执行任何 DDL】。
+#   ★ 结构读取全部是 SELECT；唯一的"写"是视图二级确认时在事务内创建
+#     TEMP VIEW 后立即 ROLLBACK（会话级临时对象，不落盘、不锁真实对象）。
 #   ★ 检测到差异后，仅【生成修复用的 SQL 语句】并打印 / 写入文件。
 #   ★ 所有实际修改由用户拿生成的 SQL 自行手动执行（可先 review 再跑）。
-#   ★ 即便用户误操作，脚本本身也不会动数据库一根汗毛。
+#   ★ 即便用户误操作，脚本本身也不会改数据库任何持久对象。
 #
 # 职责:
 #   1. 读取 $APP_DIR/sql/schema.sql（由 deploy.sh 同步过来的最新版）得到"期望结构"
-#   2. 只读连接本机 PostgreSQL，读出"实际结构"（SELECT 查询，不改库）
+#   2. 连接本机 PostgreSQL 读出"实际结构"（SELECT 查询）
 #   3. 语义化 diff，分类:
 #        - 新增表 / 新增列 / 新增索引 / 视图变更   → 低风险
 #        - 删除列 / 删除索引 / 修改列类型          → 高风险（会丢数据 / 改结构）
 #   4. 把所有修复 SQL 收集起来，输出到屏幕并写入带时间戳的文件，供用户手动执行。
 #
-# 依赖: 仅标准库 + 服务器上的 psql 客户端（只读查询用，PGPASSWORD 连 localhost）
+# 视图比对的两级策略（2026-09-23 增加二级）:
+#   一级（快速）: norm_view_def 文本归一化比对 —— 覆盖 PG 反解析的常见差异，
+#                但不可能穷尽（如 base.* 星号展开、冗余括号重写、多词类型名
+#                的隐式 cast……靠正则补不完）。
+#   二级（确认）: 一级判为「不一致」时，把 schema.sql 的视图定义放进
+#                BEGIN; CREATE TEMP VIEW ...; pg_get_viewdef(...); ROLLBACK;
+#                交给 PG 自己反解析后再比 —— 两侧同源，任何 PG 规范化差异
+#                都会自然对齐，消除假阳性，同时仍能发现真实定义差异。
+#
+# 依赖: 仅标准库 + 服务器上的 psql 客户端（PGPASSWORD 连 localhost）
 # 调用方: sql/sync_schema.sh（本机 ssh -t 到此脚本）
 # ============================================================================
 import configparser
@@ -44,7 +54,9 @@ def load_db_conf():
 
 
 # ── psql 查询工具 ────────────────────────────────────────────────────────────
-def psql_query(db, sql):
+def psql_run(db, sql, timeout=120):
+    """执行 SQL，返回 (returncode, stdout, stderr)，不 sys.exit —— 由调用方
+    决定如何处置错误（视图二级确认探针需要容忍失败并回退到一级判定）。"""
     env = dict(os.environ)
     env["PGPASSWORD"] = db["password"]
     cmd = [
@@ -53,12 +65,18 @@ def psql_query(db, sql):
         "-tA", "-F|", "-c", sql,
     ]
     try:
-        out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        out = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                             timeout=timeout)
     except FileNotFoundError:
         sys.exit("[x] 服务器未找到 psql 客户端，无法比对数据库")
-    if out.returncode != 0:
-        sys.exit(f"[x] psql 查询失败:\n{out.stderr.strip()}")
-    return out.stdout
+    return out.returncode, out.stdout, out.stderr
+
+
+def psql_query(db, sql):
+    rc, out, err = psql_run(db, sql)
+    if rc != 0:
+        sys.exit(f"[x] psql 查询失败:\n{err.strip()}")
+    return out
 
 
 # ── 类型规范化：让 schema.sql 的类型写法与 information_schema 对齐 ─────────────
@@ -149,21 +167,24 @@ def norm_type(t):
 
 
 def norm_view_def(s):
-    """视图定义语义归一化：把 schema.sql 手写体 与 pg_get_viewdef 反解析体
-    映射到同一形态，使"语义等价"的视图判为相等（不报差异）。
+    """视图定义文本归一化（视图比对的【一级快速路径】）：把 schema.sql 手写体
+    与 pg_get_viewdef 反解析体映射到同一形态，尽量让语义等价的视图判为相等。
 
     抹平的主要差异来源（均来自 PG 反解析的固定套路，手写体不会出现）：
       - 大小写、空白、换行
       - ~~ / !~~  ↔  LIKE / NOT LIKE
-      - PG 插入的显式类型转换 ::text / ::bigint 等
+      - PG 插入的显式类型转换 ::text / ::varchar(20) 等（含类型修饰符整体删）
       - PG 把 in(...) 展开成 = any(array[...][])
-      - 去 ::type 后可能丢的空格（'x'then → 'x' then）
+      - PG 省略「no-op cast」与「与列同名的冗余别名」
       - 表别名前缀（别名.列）
       - 双引号标识符、尾分号
 
-    注意：本函数【只读、纯文本】，不连接数据库、不执行任何 DDL，
-    符合脚本"只读不写"的安全契约。误判方向保守——漏归一时只会
-    "多报差异"（可执行幂等的 CREATE OR REPLACE），不会漏掉真实结构差异。
+    注意：本函数【只读、纯文本】，不连接数据库、不执行任何 DDL。
+    它不可能穷尽 PG 的全部规范化行为（如 base.* 星号展开、冗余括号重写、
+    多词类型名的隐式 cast 等无法用正则安全抹平），因此只作快速初筛：
+    凡一级判为「不一致」的视图，会再由 resolve_view_def_via_pg 交 PG 自己
+    反解析复核（二级确认）——两侧同源，不再产生假阳性。无需再为每个新发现的
+    规范化差异往这里补正则。
     """
     if not s:
         return ""
@@ -217,9 +238,16 @@ def norm_view_def(s):
 
 # ── 解析本地 schema.sql → 期望结构 ───────────────────────────────────────────
 def parse_schema(text):
+    """解析 schema.sql → 期望结构。
+
+    返回 (tables, indexes, views, views_raw):
+      views     : name -> norm_view_def 归一化后的 SELECT 主体（一级比对用）
+      views_raw : name -> 原始 SELECT 主体文本（二级确认：交 PG 反解析用）
+    """
     tables = {}      # name -> {cols: {col: type}, order: [col,...]}
     indexes = {}     # indexname -> tablename
     views = {}       # name -> 归一化后的 SELECT 主体（用于语义比对）
+    views_raw = {}   # name -> 原始 SELECT 主体（供 TEMP VIEW 二级确认）
     cur_table = None
 
     # 预处理：去掉注释行
@@ -255,6 +283,7 @@ def parse_schema(text):
             asm = re.search(r"\bAS\b\s*(.*)$", buf, re.I | re.S)
             body = asm.group(1).strip() if asm else buf.strip()
             views[vname] = norm_view_def(body)
+            views_raw[vname] = body
             i = j + 1
             continue
         # 建表开始（支持 schema.table 限定名）
@@ -310,7 +339,7 @@ def parse_schema(text):
         tables.pop(t, None)
     for k in [k for k, v in indexes.items() if v.get("tbl") not in tables]:
         indexes.pop(k, None)
-    return tables, indexes, views
+    return tables, indexes, views, views_raw
 
 
 def parse_columns(lines, idx, first_rest, tables, indexes, tname):
@@ -493,8 +522,8 @@ def read_actual(db):
     # 真正不同才计入差异。
     views = {}
     # 取库里视图的真实定义（pg_get_viewdef，多行压成空格避免被 splitlines 截断）。
-    # 这里存"原始定义"，不在 Python 侧做语义归一化——归一化交给 PG 自己完成
-    # （见 view_defs_equal：把 schema.sql 的视图 body 建 TEMP VIEW 后取 viewdef 对比）。
+    # 存 norm_view_def 归一化后的文本供一级比对；一级判为不一致时，再由
+    # resolve_view_def_via_pg 把 schema.sql 的定义交 PG 反解析复核（二级确认）。
     sql = ("SELECT c.relname, replace(pg_get_viewdef(c.oid, true), chr(10), ' ') "
            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
            "WHERE n.nspname = 'public' AND c.relkind = 'v';")
@@ -509,6 +538,49 @@ def read_actual(db):
         views[vname.strip().lower()] = norm_view_def(vdef)
 
     return tables, indexes, views
+
+
+# ── 视图二级确认：让 PG 自己反解析 schema.sql 的视图定义 ──────────────────────
+# 背景（2026-09-23）: 一级文本归一化（norm_view_def）不可能穷尽 PG 的反解析
+# 规范化行为——实测遇到的就包括：
+#   · base.*                    → PG 展开成完整列清单
+#   · ( (a) OR (b) OR (c) )     → PG 去掉冗余分组括号
+#   · DATE_TRUNC('year', date)  → PG 显示为 ... report_date with time zone
+#                                 （隐式 cast 到 timestamptz，多词类型名残留）
+#   · x::varchar(20)（列本身即 varchar(20)）→ PG 省略 no-op cast 与同名别名
+# 这些差异在 DB 层并不存在（库里可能已是最新定义），却让一级比对永久误报，
+# 且即使执行 CREATE OR REPLACE 也无法消除。
+# 解决: 把 schema.sql 的定义放进事务里建 TEMP VIEW，取 pg_get_viewdef 与库里的
+# 定义比 —— 两侧同源（都经 PG 反解析），上述差异自然对齐。
+# 安全: 仅创建会话级 TEMP VIEW 并随 ROLLBACK 消失，不触碰 public 任何对象、
+# 不产生持久副作用（已实测：temp view 的反解析结果与真实视图逐字一致）。
+def resolve_view_def_via_pg(db, body):
+    """用 PG 反解析 schema.sql 的视图定义主体 <body>。
+
+    成功返回 (viewdef_text, "")；失败返回 (None, 原因) —— 调用方应保守地沿用
+    一级判定（例如 body 引用了库中不存在的表/列，这本身就是值得人工看的信号）。
+    """
+    if not body:
+        return None, "schema.sql 中未取到定义文本"
+    probe = "_schema_diff_probe"
+    sql = (
+        "BEGIN;\n"
+        f"CREATE TEMP VIEW {probe} AS {body};\n"
+        f"SELECT replace(pg_get_viewdef('pg_temp.{probe}'::regclass, true), "
+        "chr(10), ' ');\n"
+        "ROLLBACK;"
+    )
+    rc, out, err = psql_run(db, sql, timeout=180)
+    if rc != 0:
+        return None, (err.strip() or out.strip())[:400]
+    # psql -tA 输出里混有语句标签（BEGIN / CREATE VIEW / ROLLBACK），过滤后拼接
+    label = re.compile(
+        r"^(BEGIN|CREATE(\s+OR\s+REPLACE)?\s+VIEW|ROLLBACK|DROP\s+VIEW|SET)\b", re.I)
+    defn = " ".join(l.strip() for l in out.splitlines()
+                    if l.strip() and not label.match(l.strip()))
+    if not defn:
+        return None, "未取到 viewdef（临时视图可能创建失败但 psql 未报错）"
+    return defn, ""
 
 
 # ── 生成修复 SQL（仅拼接字符串，绝不执行）─────────────────────────────────────
@@ -553,7 +625,7 @@ def main():
     with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
         schema_text = f.read()
 
-    exp_tables, exp_indexes, exp_views = parse_schema(schema_text)
+    exp_tables, exp_indexes, exp_views, exp_views_raw = parse_schema(schema_text)
     act_tables, act_indexes, act_views = read_actual(db)
 
     # 计算差异
@@ -616,18 +688,39 @@ def main():
         if info.get("sig") and info["sig"] in exp_sigs.get(tbl, set()):
             continue  # 期望侧已有相同内容的索引（可能名字不同），跳过
         drop_indexes.append(idx)
-    # 视图语义比对：归一化后定义不同才算 changed，否则忽略。
-    # exp_views / act_views 现在都是 {name: norm_def}。
-    #   - 目标库没有该视图              -> new_views（需创建）
-    #   - 目标库有，但归一化定义不一致  -> changed_views（需 CREATE OR REPLACE）
-    #   - 目标库有，且定义一致          -> 忽略（不再每次刷屏）
+    # 视图语义比对：两级策略（详见文件头说明）。
+    #   - 目标库没有该视图                    -> new_views（需创建）
+    #   - 一级 norm 不一致、二级 PG 复核一致  -> 忽略（confirmed_same，手写文本差异）
+    #   - 一级、二级都不一致                  -> changed_views（需 CREATE OR REPLACE）
+    #   - 一级不一致、二级无法执行（如引用了库中不存在的对象）-> 保守计入 changed_views
     new_views = [v for v in exp_views if v not in act_views]
-    changed_views = [v for v in exp_views
-                     if v in act_views and exp_views[v] != act_views[v]]
+    changed_views = []
+    confirmed_same = []   # 一级报差异、二级（PG 反解析）确认等价的视图
+    probe_failed = []     # [(name, reason)] 二级无法执行，保守按差异处理
+    for v in exp_views:
+        if v not in act_views or exp_views[v] == act_views[v]:
+            continue
+        pg_def, reason = resolve_view_def_via_pg(db, exp_views_raw.get(v, ""))
+        if pg_def is None:
+            changed_views.append(v)
+            probe_failed.append((v, reason))
+        elif norm_view_def(pg_def) == act_views[v]:
+            confirmed_same.append(v)
+        else:
+            changed_views.append(v)
 
     total = (len(new_tables) + len(add_cols) + len(alter_cols)
              + len(drop_cols) + len(new_indexes) + len(drop_indexes)
              + len(new_views) + len(changed_views))
+
+    # 二级确认结果提示（透明度：让用户知道哪些「疑似视图差异」被判定为文本等价）
+    if confirmed_same:
+        print(f"\n[i] {len(confirmed_same)} 个视图的手写文本差异已由 PG 反解析复核"
+              f"确认为等价（忽略，非真实差异）: {', '.join(confirmed_same)}")
+    if probe_failed:
+        print(f"\n[!] {len(probe_failed)} 个视图无法用 PG 反解析复核（保守按差异处理）:")
+        for v, reason in probe_failed:
+            print(f"    · {v}: {reason}")
 
     if total == 0:
         print("\n[i] 数据库结构与 schema.sql 一致，无需变更。")
