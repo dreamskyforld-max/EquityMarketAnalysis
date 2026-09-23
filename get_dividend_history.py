@@ -7,6 +7,10 @@
   PRETAX_BONUS_RMB 为每10股税前派息，SECUCODE 自带市场后缀可直接定位 SH/SZ/BJ）
 - 港股: 同花顺 F10 basic.10jqka.com.cn/HKxxxx/bonus.html（HTML 表格解析，
   含「不分红」预案行——显式公告，可直接用于连续分红年数判定）
+  ⚠ 该页以股代息行内嵌 tooltip 子 <table>（代息方案浮层），必须先剔除再交给 pandas，
+  否则内嵌表头会被并进外层列名 →「方案」列解析错位 → dps 全空（实测 HK.00005 中招）。
+  ⚠ 新股/从未分红票该区块显示「暂无数据」（页面正常、无表格）→ 视为空结果而非失败。
+  ⚠ 人民币柜台代码（8xxxx）同花顺无页面，按后 4 位映射回主板票（详见 ths_symbol）。
 
 写入表: dividend_history，唯一键 (stock_code, source, dedup_key)，
 ON CONFLICT DO UPDATE 幂等重刷（预案→实施进度推进原地更新）。
@@ -30,6 +34,7 @@ import urllib.parse
 from datetime import date
 from io import StringIO
 
+import lxml.html
 import pandas as pd
 
 from db import get_conn, bulk_upsert
@@ -89,14 +94,15 @@ def _dedup_rows(db_rows: list[dict]) -> list[dict]:
 
 
 def ths_symbol(hk_code: str) -> str:
-    """HK.00700 的 5 位代码 → 同花顺 URL 代码（去掉一个前导零）。
+    """HK.00700 的 5 位代码 → 同花顺 URL 代码（4 位，去掉首位）。
 
-    00700→0700  00005→0005  00381→0381  09660→9660（实测规律）。
+    实测规律：00700→0700  00005→0005  00381→0381  09660→9660  GEM 08081→8081。
+    人民币柜台（8xxxx）同票同分红，同花顺无 8xxxx 页面（实测 2417 字节的
+    「页面不存在」壳），同样取后 4 位映射回主板页面：
+    82331→2331（李宁 02331）  80700→0700（腾讯 00700）  80016→0016（新鸿基 00016）。
     """
     digits = str(hk_code).strip()
-    if digits.startswith("0"):
-        digits = digits[1:]
-    return digits
+    return digits[1:] if len(digits) == 5 else digits
 
 
 def parse_hk_plan(text: str):
@@ -252,8 +258,48 @@ def _resolve_col(df: pd.DataFrame, *keywords: str) -> str | None:
     return None
 
 
+def ths_parse_bonus(html: str) -> pd.DataFrame | None:
+    """同花顺 F10 页面 HTML → 分红派息表（纯函数，可单测）。
+
+    三种结果：
+    - 有表格：DataFrame（列名扁平化后返回）
+    - 区块存在且显示「暂无数据」（新股/从未分红）：空 DataFrame——正常结果，非失败
+    - 无 #bonus 区块，或区块内无表格也无「暂无数据」标记（无效代码/被风控/改版）：
+      None，交调用方按失败重试
+
+    实现要点：只取 #bonus 区块内首个 <table>，并先剔除其内嵌子表（以股代息 tooltip
+    浮层）。否则 pandas 会把整页所有表并进 tables[0]、把内嵌表头「代息方案」掺进
+    列名 → `_resolve_col(df, "方案")` 命中「公告日期」列 → dps 全为 None
+    （实测 HK.00005：570 行解析、105 条入库、0 条分红）。
+    """
+    if not html:
+        return None
+    root = lxml.html.fromstring(html)
+    boxes = root.xpath('//*[@id="bonus"]')
+    if not boxes:
+        return None
+    tables = boxes[0].xpath('.//table')
+    if not tables:
+        return pd.DataFrame() if "暂无数据" in boxes[0].text_content() else None
+    tbl = tables[0]
+    for sub in tbl.xpath('.//table'):   # 剔除内嵌 tooltip 子表
+        sub.getparent().remove(sub)
+    try:
+        # lxml 无类型存根，encoding="unicode" 运行时恒返回 str
+        parsed = pd.read_html(StringIO(lxml.html.tostring(tbl, encoding="unicode")))  # type: ignore[arg-type]
+    except ValueError:
+        return None
+    if not parsed:
+        return None
+    return _flatten_ths_columns(parsed[0])
+
+
 def fetch_hk_by_code(hk_digits: str) -> pd.DataFrame | None:
-    """单票港股分红派息表（hk_digits 为 5 位数字代码，如 00700）。失败返回 None。"""
+    """单票港股分红派息表（hk_digits 为 5 位数字代码，如 00700）。
+
+    返回 DataFrame（可能为空 = 页面「暂无数据」，即该票无分红记录）；
+    返回 None = 拉取/解析失败（调用方计入 fail，下次重跑补齐）。
+    """
     url = THS_BONUS_URL.format(sym=ths_symbol(hk_digits))
     last_err = None
     for attempt in range(1, THS_RETRY + 1):
@@ -261,12 +307,13 @@ def fetch_hk_by_code(hk_digits: str) -> pd.DataFrame | None:
             req = urllib.request.Request(url, headers=THS_HEADERS)
             with urllib.request.urlopen(req, timeout=20) as resp:
                 html = resp.read().decode("utf-8", errors="replace")
-            tables = pd.read_html(StringIO(html))
-            if not tables:
-                raise ValueError("no tables")
-            return _flatten_ths_columns(tables[0])
+            df = ths_parse_bonus(html)
+            if df is not None:
+                return df
+            last_err = ValueError("页面无 #bonus 分红表（无效代码/被风控/改版）")
         except Exception as e:
             last_err = e
+        if attempt < THS_RETRY:         # 末次失败不再空等
             time.sleep(1.0 * attempt)
     print(f"[THS] HK{hk_digits} 分红页拉取失败: {type(last_err).__name__}: {last_err}")
     return None
@@ -410,19 +457,21 @@ def _run_full(hk_only: bool = False):
         print("[港股] 代码清单获取失败，跳过港股")
     else:
         print(f"[港股] 共 {len(hk_codes)} 只，开始逐票拉取（限速 {THS_SLEEP_SEC}s）...")
-        ok = fail = 0
+        ok = fail = nodata = 0
         hk_rows_all = []
         for i, digits in enumerate(hk_codes, 1):
             df = fetch_hk_by_code(digits)
-            if df is not None:
-                rows = hk_df_to_db_rows(df, digits)
-                if rows:
-                    hk_rows_all.extend(rows)
-                ok += 1
-            else:
+            if df is None:
                 fail += 1
+            else:
+                ok += 1
+                if df.empty:
+                    nodata += 1          # 页面「暂无数据」：新股/从未分红，正常
+                else:
+                    hk_rows_all.extend(hk_df_to_db_rows(df, digits))
             if i % 200 == 0:
-                print(f"  进度 {i}/{len(hk_codes)}  ok={ok} fail={fail} 累计行数={len(hk_rows_all)}")
+                print(f"  进度 {i}/{len(hk_codes)}  ok={ok} fail={fail} "
+                      f"无数据={nodata} 累计行数={len(hk_rows_all)}")
             time.sleep(THS_SLEEP_SEC)
         # 分批入库（每 5000 行一批，避免单事务过大）
         for j in range(0, len(hk_rows_all), 5000):
@@ -430,7 +479,7 @@ def _run_full(hk_only: bool = False):
                 total += save_rows(hk_rows_all[j:j + 5000])
             except Exception as e:
                 print(f"[DB] 港股分红入库失败(批次{j//5000 + 1}): {type(e).__name__}: {e}")
-        print(f"[港股] 完成 ok={ok} fail={fail} 入库 {len(hk_rows_all)} 条")
+        print(f"[港股] 完成 ok={ok} fail={fail} 无数据={nodata} 入库 {len(hk_rows_all)} 条")
 
     print(f"分红明细全量完成: 入库 {total} 条，耗时 {time.time() - t0:.0f}s")
 

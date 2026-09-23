@@ -488,3 +488,15 @@ def historical_percentile(conn, table: str, value_col: str, as_of: date,
     if df.empty:
         return pd.Series(dtype="float64")
     return pd.to_numeric(df.set_index("stock_code")["pct"], errors="coerce")
+
+
+def clear_caches() -> None:
+    """释放本模块的计算缓存。
+
+    这三个缓存都只保留最近一个 as_of，单轮内跨域复用是对的；但常驻进程
+    （调度器）里它们不会随函数返回释放，上一轮的大对象会驻留到下一轮覆盖。
+    每轮计算结束后调用一次即可交还内存。
+    """
+    _SNAPSHOT_CACHE.clear()
+    _TTM_CACHE.clear()
+    _FIN_CTX_CACHE.clear()

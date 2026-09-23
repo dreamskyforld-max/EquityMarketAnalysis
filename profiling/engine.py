@@ -438,3 +438,17 @@ def compute_all(conn: Any, as_of: date | None = None,
                     mode=mode)
         for m in registry.all_tags()
     ]
+
+
+def clear_caches() -> None:
+    """释放各域的计算缓存。
+
+    模块级缓存（行情快照、财报上下文、窗口统计）在常驻进程里不会随函数返回
+    释放，上一轮的大对象会驻留到下一轮覆盖。常驻进程应在每轮计算结束后调用
+    一次；一次性脚本（CLI）进程退出时自然释放，不调用也无妨。
+    """
+    from . import quantile
+    from .tags import technical
+
+    quantile.clear_caches()
+    technical.clear_caches()

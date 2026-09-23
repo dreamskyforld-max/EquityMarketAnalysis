@@ -159,6 +159,15 @@ def _metrics(s: pd.DataFrame) -> dict:
 _METRICS_CACHE: dict[date, pd.DataFrame] = {}
 
 
+def clear_caches() -> None:
+    """释放本域的窗口统计缓存。
+
+    常驻进程（调度器）里模块级缓存不会随函数返回释放，上一轮的大对象会一直
+    驻留到下一轮覆盖 —— 每轮计算结束后调用一次，把内存交还给系统。
+    """
+    _METRICS_CACHE.clear()
+
+
 def _compute_all(as_of: date) -> pd.DataFrame:
     """窗口统计全量计算（本域 9 个标签共用的中间结果，按 as_of 缓存一次）。
 

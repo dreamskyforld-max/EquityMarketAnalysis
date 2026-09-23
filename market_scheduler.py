@@ -148,12 +148,12 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
 
     # 股票 vs 全球指数日收益率相关性分析（读 daily_quote/daily_benchmark 日频数据，
     # 盘后跑即可，盘中重算结果不变；单 job 内循环全部 STOCKS 逐票执行）
-    ("指数相关性分析", "benchmark_correlation_daily.py",
-     {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS], True, None, 180),
+    #("指数相关性分析", "benchmark_correlation_daily.py",
+    # {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS], True, None, 180),
 
     # 宏观环境三维评分（股/债/汇；读 daily_benchmark，盘后跑；单 job 内循环全部 STOCKS 逐票执行）
-    ("宏观环境评分", "macro_environment_score.py",
-     {"hour": 18, "minute": 0, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS], True, None, 180),
+    #("宏观环境评分", "macro_environment_score.py",
+    # {"hour": 18, "minute": 0, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS], True, None, 180),
 
     # 港股全市场总成交额：富途 get_market_snapshot 批量（~30秒）聚合全港股成交额，
     # 落 daily_market_turnover 作为「市场总体流动性水位」分母。
@@ -236,15 +236,12 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     ("公司资料全量", "get_company_profile.py",
      {"hour": 3, "minute": 0, "day_of_week": "sun"}, None, True, None, 14400),
 
-    # 全量画像每日计算：每个工作日 16:45 计算当日全量画像，写入 profile.tag_value。
+    # 全量画像每日计算：每个工作日 17:30 计算当日全量画像，写入 profile.tag_value。
     # 依赖当日行情快照（A股收盘采集 15:10、港股收盘采集 16:20 已完成）。
-    # 时间为何是 16:45 而不是一收盘就算：16:30 还挂着「港股全市场成交额-盘后补采」，
-    # 两者同分钟并发时，画像可能先读到尚未补完的港股当日行（半量快照）→ 该日股票被漏算、
-    # 旧版本被关闭。延后到 16:45 确保行情已结算完整。
     # run(codes, ctx) 全局任务，codes=None 由 profiling 自行决定全标签范围；
     # force=True 跳过各标签 update_freq 更新门禁，未变标签不产生冗余版本。
     ("全量画像计算", "compute_profile.py",
-     {"hour": 16, "minute": 45, "day_of_week": "mon-fri"}, None, True, None, 1800),
+     {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 1800),
 
     # 注意：采集层故障监控已由独立服务 monitor_collector.py（常驻进程，
     # systemd: monitor-collector.service）负责，不再挂在调度器里，

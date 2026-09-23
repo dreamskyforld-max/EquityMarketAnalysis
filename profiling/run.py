@@ -144,18 +144,46 @@ def main(argv=None) -> int:
             # （否则 static/quarterly 标签会被「距上次版本不足 N 天」拦住，历史区间算不动）
             force = args.force or as_of < today
 
-            def _run_one(d: date):
+            def _resolve_metas():
                 if args.tag:
-                    return [
-                        engine.compute_tag(conn, t, as_of=d, dry_run=args.dry_run,
-                                           force=force, mode=args.mode)
-                        for t in args.tag
-                    ]
+                    out = []
+                    for t in args.tag:
+                        m = registry.get(t)
+                        if m is None:
+                            log.error("未注册的标签: %s", t)
+                        else:
+                            out.append(m)
+                    return out
                 if args.domain:
-                    return engine.compute_domain(conn, args.domain, as_of=d, dry_run=args.dry_run,
-                                                 force=force, mode=args.mode)
-                return engine.compute_all(conn, as_of=d, dry_run=args.dry_run,
-                                          force=force, mode=args.mode)
+                    return registry.by_domain(args.domain)
+                return registry.all_tags()
+
+            metas = _resolve_metas()
+            if not metas:
+                log.error("没有匹配到任何标签，未执行")
+                return 1
+
+            def _run_one(d: date):
+                """逐标签独立事务执行。
+
+                不要改回「一个连接跑完所有标签」：77 个标签共用一个事务时，写入会
+                全憋到最后一次 commit 集中爆发（实测写峰值 88k 块/s，tag_value 单行
+                插入要同步维护 4 个索引），叠加 autovacuum / checkpoint / 采集任务
+                会打满磁盘队列。逐个提交把写峰值摊平，并隔离单个标签的失败。
+                dry-run 不写库，无需分批。
+                """
+                if args.dry_run:
+                    return [
+                        engine.compute_tag(conn, m.code, as_of=d, dry_run=True,
+                                           force=force, mode=args.mode)
+                        for m in metas
+                    ]
+                out = []
+                for m in metas:
+                    with get_conn() as c:
+                        out.append(engine.compute_tag(c, m.code, as_of=d,
+                                                      force=force, mode=args.mode))
+                return out
 
             if args.date_range:
                 start_s, end_s = args.date_range.split(":")
@@ -170,6 +198,9 @@ def main(argv=None) -> int:
             else:
                 results = _run_one(as_of)
                 _print_results(results)
+
+            # 释放各域缓存（对常驻调用方有意义；CLI 进程退出时本也会释放）
+            engine.clear_caches()
 
             failed = [r for r in results if r["status"] == "error"]
             if failed:
