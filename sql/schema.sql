@@ -545,7 +545,7 @@ CREATE TABLE IF NOT EXISTS trend_snapshot (
     buy_sell_ratio      NUMERIC(8,4),                       -- 主动买卖比
     excess_return_pct   NUMERIC(8,4),                       -- 超额收益(%)
     volume              BIGINT,                              -- 累计成交量（股）
-    turnover            NUMERIC(16,2),                      -- 累计成交额（亿元）
+    turnover            NUMERIC(16,4),                      -- 累计成交额（亿元），scale=4 → 最小刻度 1 万元
     buy_levels_str      TEXT,                               -- 买盘5档摘要: "472.8(6K) 472.6(14K) ..."
     sell_levels_str     TEXT,                               -- 卖盘5档摘要: "473.0(13K) 473.2(32K) ..."
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
@@ -566,7 +566,7 @@ COMMENT ON COLUMN trend_snapshot.small_in_net         IS '小单净流入（亿�
 COMMENT ON COLUMN trend_snapshot.buy_sell_ratio       IS '主动买卖比 = 主动性买盘股数 / 主动性卖盘股数，>1=主动买入占优，<1=主动卖出占优';
 COMMENT ON COLUMN trend_snapshot.excess_return_pct    IS '实时超额收益(%) = 个股当日涨跌幅 - 基准指数当日涨跌幅';
 COMMENT ON COLUMN trend_snapshot.volume               IS '累计成交量（股），从 get_market_snapshot 获取，NULL=该时刻无数据';
-COMMENT ON COLUMN trend_snapshot.turnover             IS '累计成交额（亿元），从 get_market_snapshot 获取，NULL=该时刻无数据';
+COMMENT ON COLUMN trend_snapshot.turnover             IS '累计成交额（亿元），从 get_market_snapshot 获取（数据源精度=整数元），NULL=该时刻无数据；scale=4 → 最小刻度 1 万元（原 scale=2 为 100 万元，量化误差会污染分钟差分与 VWAP 累计口径）';
 COMMENT ON COLUMN trend_snapshot.buy_levels_str       IS '买盘前5档摘要字符串，格式: "472.8(6K) 472.6(14K) ..."，括号内K=千股';
 COMMENT ON COLUMN trend_snapshot.sell_levels_str      IS '卖盘前5档摘要字符串，格式: "473.0(13K) 473.2(32K) ..."，可据此分析盘口挂单压力';
 COMMENT ON COLUMN trend_snapshot.created_at           IS '数据写入数据库的时间';
