@@ -771,6 +771,7 @@ CREATE TABLE IF NOT EXISTS financial_indicator (
     operating_cash_flow NUMERIC(18,2),                      -- 经营活动现金流量净额（元）
     free_cash_flow      NUMERIC(18,2),                      -- 自由现金流（元），暂留空，待补充 CAPEX
     announce_date       DATE,                               -- 财报实际披露/公告日（A股取东方财富业绩报表「最新公告日期」；港股暂无数据源，恒为 NULL）
+    fiscal_year_start   DATE,                               -- 财年起始日（港股取东财 START_DATE，如阿里 2025-04-01；A股为自然年 1-1）
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
 
     UNIQUE (stock_code, report_date)
@@ -779,7 +780,7 @@ CREATE TABLE IF NOT EXISTS financial_indicator (
 COMMENT ON TABLE  financial_indicator                          IS '年度财务指标（A股：AKShare stock_financial_abstract；港股：stock_financial_hk_analysis_indicator_em，OCF 由 OCF_SALES×OPERATE_INCOME 推算）';
 COMMENT ON COLUMN financial_indicator.stock_code               IS '股票完整代码，如 HK.00700 / SH.600519';
 COMMENT ON COLUMN financial_indicator.report_date              IS '报告期截止日 (YYYY-MM-DD)，年报为 12-31';
-COMMENT ON COLUMN financial_indicator.report_type              IS '报告类型，暂时只存 annual 年报，后续可扩展 Q1/Q2/H1/Q3';
+COMMENT ON COLUMN financial_indicator.report_type              IS '报告期类型（相对财年，需与 fiscal_year_start 配套解读）：Q1=财年首季单季(累计3个月) / H1=财年中期累计6个月 / Q3=财年前三季累计9个月 / annual=财年全年累计12个月。港股取东财 DATE_TYPE_CODE(001→annual/002→H1/003→Q1/004→Q3)，A股按自然年月末推导';
 COMMENT ON COLUMN financial_indicator.revenue                  IS '营业收入（元）';
 COMMENT ON COLUMN financial_indicator.net_profit               IS '归母净利润（元）';
 COMMENT ON COLUMN financial_indicator.gross_profit_rate        IS '毛利率(%)，毛利率 = (营收-营业成本)/营业成本';
@@ -791,6 +792,7 @@ COMMENT ON COLUMN financial_indicator.net_profit_yoy           IS '归母净利�
 COMMENT ON COLUMN financial_indicator.operating_cash_flow      IS '经营活动现金流量净额（元）。港股由 OCF_SALES% × OPERATE_INCOME 推算，A股直接取自抽象表';
 COMMENT ON COLUMN financial_indicator.free_cash_flow           IS '自由现金流（元），暂留空 NULL，后续补充 CAPEX 数据后计算（FCF = OCF - CAPEX）';
 COMMENT ON COLUMN financial_indicator.announce_date            IS '财报实际披露/公告日（A股来自东方财富业绩报表「最新公告日期」；港股暂无数据源，恒为 NULL）';
+COMMENT ON COLUMN financial_indicator.fiscal_year_start        IS '财年起始日（港股取自东方财富 START_DATE；A股为报告期所在自然年 1 月 1 日）。按财年分组做单季化拆解，避免非自然年财年公司（如阿里 4 月财年）被跨财年误减';
 COMMENT ON COLUMN financial_indicator.created_at               IS '数据写入数据库的时间';
 
 CREATE INDEX IF NOT EXISTS idx_financial_indicator_stock_date ON financial_indicator (stock_code, report_date DESC);
@@ -911,7 +913,15 @@ ORDER BY stock_code, snapshot_time DESC;
 
 COMMENT ON VIEW v_latest_trend_snapshot IS '各股票最新盘中趋势快照，取 trend_snapshot 中每只股票 snapshot_time 最大的一行';
 
--- 视图：季度单季财务指标（累计值自动拆解为 Q1/Q2/Q3/Q4 单季）
+-- 视图：季度单季财务指标（按财年拆解累计值 → 单季）
+--
+-- ⚠ 口径关键（2026-09-23 重写，修复非自然年财年公司被误减成负数）：
+--   拆解必须**按财年分组**、且**仅当期次类型严格连续（Q1→H1→Q3→annual）时才能相减**。
+--   旧版按「同一日历年 + LAG」相减，对 3 月财年末（阿里 09988：06-30 是财年首季、
+--   03-31 才是财年全年）、5 月财年末（新东方 09901）等公司全盘错位，产生 -7547 亿
+--   这类负营收；对只披露半年报的公司（周大福 01929）也会把半年累计当日历年后一期相减。
+--   财年分组键取 financial_indicator.fiscal_year_start（采集端写入），老数据 NULL 时按
+--   自然年兜底（A 股均为自然年财年，行为不变）。
 CREATE OR REPLACE VIEW v_financial_quarterly AS
 WITH base AS (
     SELECT
@@ -919,53 +929,57 @@ WITH base AS (
         revenue, net_profit, operating_cash_flow, free_cash_flow,
         gross_profit_rate, net_profit_rate, roe, debt_ratio,
         revenue_yoy, net_profit_yoy,
-        EXTRACT(YEAR FROM report_date)::int AS report_year
+        COALESCE(fiscal_year_start, DATE_TRUNC('year', report_date)::date) AS fiscal_year_start
     FROM financial_indicator
 ),
 ordered AS (
     SELECT
-        stock_code, report_date, report_type,
-        revenue, net_profit, operating_cash_flow, free_cash_flow,
-        gross_profit_rate, net_profit_rate, roe, debt_ratio,
-        revenue_yoy, net_profit_yoy, report_year,
+        base.*,
+        LAG(report_type)         OVER w AS prev_type,
         LAG(revenue)             OVER w AS prev_revenue,
         LAG(net_profit)          OVER w AS prev_net_profit,
-        LAG(operating_cash_flow) OVER w AS prev_ocf,
-        LAG(free_cash_flow)      OVER w AS prev_fcf,
-        LAG(report_year)         OVER w AS prev_year
+        LAG(operating_cash_flow) OVER w AS prev_ocf
     FROM base
-    WINDOW w AS (PARTITION BY stock_code ORDER BY report_date)
+    WINDOW w AS (PARTITION BY stock_code, fiscal_year_start ORDER BY report_date)
+),
+calc AS (
+    SELECT
+        stock_code, report_date, report_type,
+        -- 期次是否严格连续（H1 需前一期为 Q1；Q3 需前一期为 H1；annual 需前一期为 Q3），
+        -- 且前一期有值才可相减。不满足时该行保留累计原值（如只披露半年报+年报的公司）。
+        (    (report_type = 'H1'     AND prev_type = 'Q1' AND prev_revenue IS NOT NULL)
+          OR (report_type = 'Q3'     AND prev_type = 'H1' AND prev_revenue IS NOT NULL)
+          OR (report_type = 'annual' AND prev_type = 'Q3' AND prev_revenue IS NOT NULL)
+        ) AS single_quarter,
+        CASE
+            WHEN report_type = 'Q1' THEN 'Q1'
+            WHEN report_type = 'H1'     AND prev_type = 'Q1' AND prev_revenue IS NOT NULL THEN 'Q2'
+            WHEN report_type = 'Q3'     AND prev_type = 'H1' AND prev_revenue IS NOT NULL THEN 'Q3'
+            WHEN report_type = 'annual' AND prev_type = 'Q3' AND prev_revenue IS NOT NULL THEN 'Q4'
+            ELSE report_type
+        END AS period_type,
+        revenue, net_profit, operating_cash_flow, free_cash_flow,
+        prev_revenue, prev_net_profit, prev_ocf,
+        gross_profit_rate, net_profit_rate, roe, debt_ratio,
+        revenue_yoy, net_profit_yoy
+    FROM ordered
 )
 SELECT
     stock_code,
     report_date,
-    -- 标签转换：H1→Q2(单季)，annual→Q4(单季) 仅当同年有前序期
-    CASE
-        WHEN report_type = 'Q1'     THEN 'Q1'
-        WHEN report_type = 'H1' AND report_year = prev_year THEN 'Q2'
-        WHEN report_type = 'Q3' AND report_year = prev_year THEN 'Q3'
-        WHEN report_type = 'annual' AND report_year = prev_year THEN 'Q4'
-        ELSE report_type
-    END AS report_type,
-    -- 流量指标（可累计→可相减求单季）
-    CASE WHEN report_type = 'Q1'                         THEN revenue
-         WHEN report_year = prev_year                    THEN revenue - COALESCE(prev_revenue, 0)
-         ELSE revenue
-    END AS revenue,
-    CASE WHEN report_type = 'Q1'                         THEN net_profit
-         WHEN report_year = prev_year                    THEN net_profit - COALESCE(prev_net_profit, 0)
-         ELSE net_profit
-    END AS net_profit,
-    CASE WHEN report_type = 'Q1'                         THEN operating_cash_flow
-         WHEN report_year = prev_year                    THEN operating_cash_flow - COALESCE(prev_ocf, 0)
-         ELSE operating_cash_flow
-    END AS operating_cash_flow,
-    -- FCF：Q1/Q3 原值保留，Q2/Q4 无法计算(数据源季报缺capex)，设 NULL
-    CASE WHEN report_type IN ('Q1', 'Q3')                                  THEN free_cash_flow
-         WHEN report_type = 'H1'     AND (report_year != prev_year OR prev_year IS NULL)  THEN free_cash_flow
-         WHEN report_type = 'annual' AND (report_year != prev_year OR prev_year IS NULL)  THEN free_cash_flow
-         ELSE NULL
-    END AS free_cash_flow,
+    period_type AS report_type,
+    -- 流量指标：单季行 = 本期累计 − 前一期累计；非单季行（Q1 本身是单季，或缺失前序的
+    -- 累计行）保留原值
+    CASE WHEN single_quarter THEN revenue - prev_revenue
+         ELSE revenue END AS revenue,
+    CASE WHEN single_quarter THEN net_profit - prev_net_profit
+         ELSE net_profit END AS net_profit,
+    CASE WHEN single_quarter THEN operating_cash_flow - prev_ocf
+         ELSE operating_cash_flow END AS operating_cash_flow,
+    -- FCF：单季行（Q2/Q3/Q4）因数据源缺 capex 明细无法还原，置 NULL；
+    -- Q1 原值 / 未相减的累计行直接给出
+    CASE WHEN single_quarter THEN NULL
+         ELSE free_cash_flow END AS free_cash_flow,
     -- 比率/存量指标：不可相减，保持原值
     gross_profit_rate,
     net_profit_rate,
@@ -973,10 +987,10 @@ SELECT
     debt_ratio,
     revenue_yoy,
     net_profit_yoy
-FROM ordered
+FROM calc
 ORDER BY stock_code, report_date;
 
-COMMENT ON VIEW v_financial_quarterly IS '单季财务指标视图：将 financial_indicator 中累计值(Q1/H1/Q3/annual)拆解为 Q1/Q2/Q3/Q4 单季数据。revenue/net_profit/ocf 通过同年 LAG() 相减得到；free_cash_flow 因数据源 Q1/Q3 季报缺失 capex 明细，Q2/Q4 单季无法计算设 NULL；比率指标(ROE/毛利率等)保持原值。';
+COMMENT ON VIEW v_financial_quarterly IS '单季财务指标视图：将 financial_indicator 中累计值按【财年】(fiscal_year_start) 拆解为单季数据。仅当期次类型严格连续（Q1→H1→Q3→annual）且前一期有值时相减，否则保留累计原值（标签同步保持 Q1/H1/Q3/annual）；revenue/net_profit/ocf 相减求单季，free_cash_flow 单季行因数据源缺 capex 明细设 NULL；比率指标(ROE/毛利率等)保持原值。';
 
 -- ============================================================================
 -- 第三部分：扩展采集 / 监控 / 分析中间表

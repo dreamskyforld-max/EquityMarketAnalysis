@@ -13,6 +13,13 @@
     避免每次都打 AKShare。单只异常隔离，不中断整批。这是调度器全局任务的用法。
   - 指定模式 run([code,...])：仅采集给定代码（wecom 手动触发 / 调试用）。
 
+报告期类型与财年：
+  - 港股取东财 DATE_TYPE_CODE（001→annual / 002→H1 / 003→Q1 / 004→Q3，含义**相对财年**），
+    并把财年起始日写入 fiscal_year_start（东财 START_DATE）；
+  - A 股为自然年财年，按报告期末日推导类型、fiscal_year_start 写当年 1-1。
+  ⚠ 非自然年财年公司（阿里 4 月财年、新东方 6 月财年等）必须依赖这两列，
+    否则 v_financial_quarterly 的单季化会跨财年误减出负数（2026-09 已修）。
+
 落库：bulk_upsert → financial_indicator，唯一键 (stock_code, report_date)。
 常驻调用：run(codes, ctx=None)。
 __main__ 默认全量：`python get_financial.py`（不加参数即采集港股+A股全部代码）；
@@ -28,6 +35,24 @@ from db import get_conn, bulk_upsert
 
 # ---------- 港股采集 ----------
 
+# 东财 DATE_TYPE_CODE → 报告期类型（相对财年，不是日历季度）：
+#   001 = 年报（财年 12 个月）/ 002 = 中报（累计 6 个月）
+#   003 = 一季报（单季 3 个月）/ 004 = 三季报（累计 9 个月）
+# ⚠ 不能按 REPORT_DATE 的 MM-DD 猜报告期类型：对非自然年财年公司会全盘错位
+#   （阿里 09988 财年 4 月起：06-30 实为财年首季、03-31 才是财年全年；
+#    新东方 09901 财年 6 月起：报告期末日是 05-31/08-31/11-30/02-28）。
+#   旧实现按月份硬映射，导致 v_financial_quarterly 按日历年相减时算出 -7547 亿这类负营收。
+_HK_DATE_TYPE_MAP = {"001": "annual", "002": "H1", "003": "Q1", "004": "Q3"}
+
+
+def _hk_report_type(date_type_code) -> str | None:
+    """东财 DATE_TYPE_CODE → report_type；未知/缺失返回 None（由调用方兜底）。"""
+    s = str(date_type_code).strip() if date_type_code is not None else ""
+    if s.isdigit():
+        s = s.zfill(3)
+    return _HK_DATE_TYPE_MAP.get(s)
+
+
 def _build_hk_record(row, cf_data: dict) -> dict | None:
     report_date_str = str(row["REPORT_DATE"])[:10]
     revenue = row["OPERATE_INCOME"]
@@ -37,7 +62,9 @@ def _build_hk_record(row, cf_data: dict) -> dict | None:
 
     return {
         "report_date": date.fromisoformat(report_date_str),
-        "report_type": _report_type(report_date_str),
+        "report_type": _hk_report_type(row.get("DATE_TYPE_CODE")) or _report_type(report_date_str),
+        # 财年起始日（东财 START_DATE）：单季化拆解的分组键，避免非自然年财年被跨财年相减
+        "fiscal_year_start": _parse_date(row.get("START_DATE")),
         "revenue": _safe_float(revenue),
         "net_profit": _safe_float(row["HOLDER_PROFIT"]),
         "gross_profit_rate": _safe_float(row["GROSS_PROFIT_RATIO"]),
@@ -105,7 +132,10 @@ def fetch_a(symbol: str) -> list[dict]:
         if report_date is None:
             continue
 
-        record = {"report_date": report_date, "report_type": _report_type(str(report_date))}
+        record = {"report_date": report_date,
+                  "report_type": _report_type(str(report_date)),
+                  # A 股为自然年财年（年报期末日全部为 12-31），财年起始日即所在自然年 1-1
+                  "fiscal_year_start": date(report_date.year, 1, 1)}
         has_data = False
 
         for cn_name, db_field in A_INDICATOR_MAP.items():
@@ -126,10 +156,29 @@ def fetch_a(symbol: str) -> list[dict]:
 # ---------- A股披露日（业绩报表「最新公告日期」）----------
 
 def _parse_date(val) -> date | None:
-    """把 '2026-03-19' / '20260319' 等解析为 date；非法返回 None。"""
+    """把 '2026-03-19' / '20260319' / pandas Timestamp('2026-03-19 00:00:00') 解析为 date；非法返回 None。
+
+    注意 Timestamp/datetime 必须先走类型分支：直接 str() 会带时间部分
+    （'2026-04-01 00:00:00'），旧实现据此走字符串分支会因含非数字字符而静默返回 None
+    （曾导致港股 fiscal_year_start 全部写空）。
+    """
     if val is None:
         return None
-    s = str(val).strip().replace("-", "").replace("/", "")
+    try:
+        if val != val:          # NaN / NaT 自身不等于自身
+            return None
+    except Exception:
+        pass
+    if isinstance(val, datetime):       # 含 pandas Timestamp
+        return val.date()
+    if isinstance(val, date):
+        return val
+    if hasattr(val, "to_pydatetime"):   # 其它 pandas 时间类型兜底
+        try:
+            return val.to_pydatetime().date()
+        except Exception:
+            pass
+    s = str(val).strip().split(" ")[0].split("T")[0].replace("-", "").replace("/", "")
     if len(s) >= 8 and s.isdigit():
         try:
             return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
@@ -278,6 +327,13 @@ def _calc_fcff(indicator_rows: dict, period_col: str, revenue: float | None) -> 
 
 
 def _report_type(date_str: str) -> str:
+    """按报告期末日（自然年月末）推导报告期类型。
+
+    ⚠ 只适用于自然年财年公司：A 股，以及港股中 DATE_TYPE_CODE 缺失时的兜底。
+    非自然年财年公司必须用东财 DATE_TYPE_CODE（见 _hk_report_type），否则财年末
+    在 3/5 月等非常规月份的公司会被整体错标（旧实现的所有报告期都走这里，是 2026-09
+    负营收故障的根因）。
+    """
     mmdd = date_str[5:10] if len(date_str) >= 10 else ""
     mapping = {"12-31": "annual", "03-31": "Q1", "06-30": "H1", "09-30": "Q3"}
     return mapping.get(mmdd, "annual")

@@ -147,8 +147,12 @@ def load_stock_connect(conn) -> set:
     return set(df["stock_code"]) if not df.empty else set()
 
 
-# 各报告类型的标准期末日（月, 日）。financial_indicator 里混有非标准报告期的
-# 业绩快报（如 report_date=2026-05-31 的年报仅 6 条），不过滤会污染「最新一期」取数
+# 各报告期类型距财年起始日的月数（标准期末日 = 财年起始日 + 该月数 − 1 天）
+_STD_REPORT_MONTHS = {"Q1": 3, "H1": 6, "Q3": 9, "annual": 12}
+
+# 自然年固定期末日（月, 日）——仅用于没有 fiscal_year_start 的老数据（如 A 股）。
+# ⚠ 旧注释把 report_date=2026-05-31 的年报一律当"业绩快报污染"，实为新东方等
+#   5 月财年末公司的**真实年报**；现已改按财年推导，不再一刀切过滤。
 _STD_REPORT_MD = {
     "annual": ("12", "31"),
     "Q1": ("03", "31"),
@@ -158,12 +162,24 @@ _STD_REPORT_MD = {
 
 
 def _financial_std_filter(report_type: str) -> tuple[str, list]:
-    """财报取数的标准报告期过滤条件与参数。"""
+    """财报取数的标准报告期过滤条件与参数。
+
+    两类数据并存：
+      · 有 fiscal_year_start 的行：标准期末日 = 财年起始日 + 期次月数 − 1 天。这样
+        3 月财年末（阿里 09988，年报期末日 03-31）、5 月财年末（新东方 09901，05-31）
+        等非自然年公司的真实报告期，不会被误当"非标准报告期"过滤掉；
+      · 无 fiscal_year_start 的老行（A 股自然年公司）：退回按固定自然月末过滤，
+        仍可剔除业绩快报等非标准报告期数据。
+    """
+    months = _STD_REPORT_MONTHS.get(report_type)
     md = _STD_REPORT_MD.get(report_type)
-    if md:
-        return ("AND EXTRACT(MONTH FROM report_date) = %s AND EXTRACT(DAY FROM report_date) = %s",
-                [md[0], md[1]])
-    return "", []
+    if not months or not md:
+        return "", []
+    return (f"AND (CASE WHEN fiscal_year_start IS NOT NULL"
+            f" THEN report_date = (fiscal_year_start + INTERVAL '{months} months')::date - 1"
+            f" ELSE EXTRACT(MONTH FROM report_date) = %s AND EXTRACT(DAY FROM report_date) = %s"
+            f" END)",
+            [md[0], md[1]])
 
 
 def load_financial_latest(conn, as_of: date, report_type: str = "annual") -> pd.DataFrame:
