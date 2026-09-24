@@ -5,7 +5,7 @@
 功能：
   1. 从富途 API 获取股票基本信息 → 写入 stock_info（名称/市场字典）
   2. 写入 realtime_collect_target（入池：collect_tick/collect_trend 开，quote 关）
-  3. 回填 daily_quote 历史数据
+  3. 回填历史日线（按市场分流：港股 → hk_daily_quote，A 股 → a_daily_quote）
   4. 重启 scheduler + ticker-collector 服务
 
 注意：A 股融资融券明细由 get_margin_balance.py 常驻定时全量采集（覆盖所有 A 股，
@@ -25,7 +25,7 @@ import json
 import platform
 import subprocess
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
@@ -122,19 +122,33 @@ except Exception as e:
     log.warning(f"采集配置写入失败: {e}")
 
 
-# ── 步骤 3: 回填 daily_quote ───────────────────────────────
+# ── 步骤 3: 回填历史日线（按市场分流到对应的全市场回填脚本）─────
 
-# 回填窗口：默认 3 年历史日线（约 1095 自然日；含 52 周高低所需 pad，由 backfill 内部再加 260+ 天）
-BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "1095"))
-log.info(f"回填 daily_quote {BACKFILL_DAYS} 日数据...")
+# 回填脚本按市场选择（两者价格口径统一为前复权 QFQ，写表不同）：
+#   港股 HK.*    → backfill_hk_market_turnover.py  → hk_daily_quote
+#   A 股 SH./SZ. → backfill_a_market_turnover.py   → a_daily_quote
+# 脚本用 --code 只采本票，结束时会在库内重算全市场总成交额
+# （daily_market_turnover / a_daily_market_turnover），把新票纳入当日总额。
+BACKFILL_SCRIPT = "backfill_hk_market_turnover.py" if market == "HK" else "backfill_a_market_turnover.py"
+BACKFILL_TABLE = "hk_daily_quote" if market == "HK" else "a_daily_quote"
+
+# 回填窗口默认交给脚本自身口径（港股=近 3 年，A 股=上市以来全历史），
+# 与全市场批量回填的默认起始一致，后续跑批量 --resume 不会把本票误判为「已采完」。
+# 如需临时收窄窗口，可设 BACKFILL_DAYS（如 BACKFILL_DAYS=365）→ 转成 --start <今天-N 天>。
+BACKFILL_DAYS = os.environ.get("BACKFILL_DAYS", "").strip()
+backfill_cmd = [sys.executable, os.path.join(SCRIPTS_DIR, BACKFILL_SCRIPT), "--code", stock_code]
+if BACKFILL_DAYS:
+    backfill_cmd += ["--start", (date.today() - timedelta(days=int(BACKFILL_DAYS))).isoformat()]
+
+log.info(f"回填历史日线: {BACKFILL_TABLE}（{BACKFILL_SCRIPT} --code {stock_code}）...")
 result = subprocess.run(
-    [sys.executable, os.path.join(SCRIPTS_DIR, "backfill_daily_quote.py"), stock_code, str(BACKFILL_DAYS)],
-    capture_output=True, text=True, timeout=180, cwd=SCRIPTS_DIR,
+    backfill_cmd,
+    capture_output=True, text=True, timeout=600, cwd=SCRIPTS_DIR,
 )
 if result.returncode == 0:
-    log.info("daily_quote 回填完成")
+    log.info(f"{BACKFILL_TABLE} 回填完成")
 else:
-    log.warning(f"daily_quote 回填失败: {result.stderr.strip()[-200:]}")
+    log.warning(f"{BACKFILL_TABLE} 回填失败: {result.stderr.strip()[-200:]}")
 
 
 # ── 步骤 4: 重启服务 ──
@@ -183,7 +197,7 @@ print(f"""
 新股接入完成: {stock_code} ({stock_name})
   ├─ stock_info              ✅
   ├─ realtime_collect_target ✅ (tick/trend=开, quote=关)
-  ├─ daily_quote 回填         ✅ ({BACKFILL_DAYS}日)
+  ├─ {BACKFILL_TABLE} 回填   ✅
   └─ 服务重启                 ✅ ({scheduler_svc} + {ticker_svc})
 {'='*60}
 """)

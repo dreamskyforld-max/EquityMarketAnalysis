@@ -8,7 +8,8 @@
 每只股票会：
   1. 从富途 API 获取基本信息 → 写入 stock_info（upsert，幂等，名称/市场字典）
      + 写入 realtime_collect_target（入池：collect_tick/collect_trend 开，quote 关）
-  2. 回填 daily_quote 历史日线（默认 3 年，可用 BACKFILL_DAYS 覆盖）
+  2. 回填历史日线（港股 → hk_daily_quote / A 股 → a_daily_quote；窗口默认交给
+     对应回填脚本，可用 BACKFILL_DAYS 收窄）
   3. A 股：首次采集融资余额
 全部完成后统一重启 scheduler + ticker-collector 一次。
 
@@ -22,7 +23,7 @@
     # 指定代码（空格分隔，纯数字自动推断市场）
     .venv/bin/python3 setup_new_stocks.py HK.00700 00857 01088
 
-    # 自定义回填天数
+    # 自定义回填窗口（收窄为最近 N 天；不设则用回填脚本默认口径）
     BACKFILL_DAYS=365 .venv/bin/python3 setup_new_stocks.py 01088 00883
 """
 
@@ -31,6 +32,7 @@ import os
 import platform
 import subprocess
 import logging
+from datetime import date, timedelta
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
@@ -107,7 +109,9 @@ DEFAULT_CODES = [
     "02228",  # 晶泰控股
 ]
 
-BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "1095"))
+# 回填窗口：默认空 = 交给回填脚本自身口径（港股近 3 年 / A 股上市以来全历史）；
+# 设为天数（如 BACKFILL_DAYS=365）则转成 --start <今天-N 天> 收窄窗口。
+BACKFILL_DAYS = os.environ.get("BACKFILL_DAYS", "").strip()
 
 
 # ── 代码解析：兼容纯数字自动推断市场 ────────────────────────
@@ -175,17 +179,22 @@ def write_stock_info(code, name, market, symbol, currency):
         log.warning(f"  [{code}] 采集配置写入失败: {e}")
 
 
-# ── 步骤 2: 回填 daily_quote ───────────────────────────────
+# ── 步骤 2: 回填历史日线（按市场分流到对应的全市场回填脚本）─────
 
-def backfill_daily(code):
-    result = subprocess.run(
-        [sys.executable, os.path.join(SCRIPTS_DIR, "backfill_daily_quote.py"), code, str(BACKFILL_DAYS)],
-        capture_output=True, text=True, timeout=300, cwd=SCRIPTS_DIR,
-    )
+def backfill_daily(code, market):
+    # 港股 → backfill_hk_market_turnover.py（hk_daily_quote）
+    # A 股 → backfill_a_market_turnover.py（a_daily_quote）
+    # 两者 QFQ 前复权口径统一；--code 只采本票，结束时库内重算全市场总成交额。
+    script = "backfill_hk_market_turnover.py" if market == "HK" else "backfill_a_market_turnover.py"
+    table = "hk_daily_quote" if market == "HK" else "a_daily_quote"
+    cmd = [sys.executable, os.path.join(SCRIPTS_DIR, script), "--code", code]
+    if BACKFILL_DAYS:
+        cmd += ["--start", (date.today() - timedelta(days=int(BACKFILL_DAYS))).isoformat()]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=SCRIPTS_DIR)
     if result.returncode == 0:
-        log.info(f"  [{code}] daily_quote 回填完成")
+        log.info(f"  [{code}] {table} 回填完成")
     else:
-        log.warning(f"  [{code}] daily_quote 回填失败: {result.stderr.strip()[-200:]}")
+        log.warning(f"  [{code}] {table} 回填失败: {result.stderr.strip()[-200:]}")
 
 
 # ── 步骤 3: A 股融资余额 ───────────────────────────────────
@@ -247,7 +256,7 @@ def main():
         log.info(f"=== 接入: {code} (市场={market}, 币种={currency}) ===")
         name = get_stock_info(code) or code
         write_stock_info(code, name, market, symbol, currency)
-        backfill_daily(code)
+        backfill_daily(code, market)
         if stock_type == "A":
             collect_margin(code)
         results.append((code, name, market))

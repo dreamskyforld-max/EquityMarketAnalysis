@@ -5,6 +5,8 @@ A股全市场总成交额 · 历史回溯（akshare stock_zh_a_daily / 新浪源
 数据源：AKShare stock_zh_a_daily()（新浪财经 A股个股日线）。
        返回该代码上市以来的完整历史日线，含 amount/volume/turnover 等字段；
        无富途历史 K 线额度限制，实测稳定，全 A 约 1-2 小时跑完。
+       ETF/基金（SH 5xxxxx / SZ 15·16·18xxxx，如 SH.520900）新浪个股接口不覆盖，
+       单独走腾讯 newfqkline 前复权分支（见 _fetch_fund_kline）。
 
 用途：遍历全 A 股（SH+SZ，代码清单取自富途 get_stock_basicinfo 当前上市列表），
        逐只拉历史日线成交额，按日 SUM → 全市场历史总成交额，写入 a_daily_market_turnover；
@@ -56,7 +58,7 @@ import socket
 import json
 import os
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 import pandas as pd
 
@@ -157,13 +159,108 @@ def _done_codes():
 
 
 # ----------------------------------------------------------------------------
+# ETF/基金分支：腾讯 K 线（新浪个股接口不覆盖基金代码）
+# ----------------------------------------------------------------------------
+# 为什么需要单独分支（2026-09-24 排查 SH.520900 无数据）：
+#   新浪个股接口 stock_zh_a_daily 底层取 realstock/company/{sym}/hisdata/klc_kl.js，
+#   该文件只对股票存在；基金代码（SH 5 开头 / SZ 15·16·18 开头）返回的不是 JSON，
+#   akshare 抛 JSONDecodeError → 重试耗尽后返回空 → 整票被当成「无数据」跳过。
+#   腾讯 newfqkline 覆盖基金，且直接给前复权价（锚定最新交易日，与 a_daily_quote 口径一致）。
+#   注意不要用它的 fqkline/get 变体：那个接口当日行四个价格都填成前收盘（实测假价）。
+#   字段：[date, open, close, high, low, volume(手), {}, 换手率(%), 成交额(万元), '']
+TX_KLINE_URL = ("https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+                "?param={sym},day,{start},{end},{count},qfq")
+TX_KLINE_COUNT = 320       # 单次请求条数（接口硬上限 640，取 320 留余量交错分页）
+TX_KLINE_MAX_PAGES = 40    # 分页安全上限（40 × 320 ≈ 52 年日线，足够任何基金历史）
+
+
+def _is_fund_code(full: str) -> bool:
+    """基金/ETF 代码形态判定：上交所 SH 5xxxxx，深交所 SZ 15/16/18xxxx。
+
+    这些代码段是场内基金（ETF/LOF/封基），不在新浪个股接口覆盖范围内。
+    沪市股票段为 600/601/603/605/688/689，深市为 000/001/002/003/300/301，不重叠。
+    """
+    market, _, num = full.partition(".")
+    if market == "SH":
+        return num.startswith("5")
+    if market == "SZ":
+        return num.startswith(("15", "16", "18"))
+    return False
+
+
+def _fetch_fund_kline(full):
+    """腾讯 newfqkline 拉 ETF/基金完整历史前复权日线（返回与 _fetch_kline 同构的 DataFrame）。
+
+    · 价格 qfq 前复权，锚定最新交易日 —— 与 stock_zh_a_daily(adjust="qfq") 口径一致
+    · volume 接口为「手」→ ×100 换股；amount 为「万元」→ ×1e4 换元（实测与库内既有行一致，
+      仅因接口按手/万元取整有 ≤100 股、≤100 元的尾差）
+    · turnover 接口为百分数 → ÷100 换小数（_map_quote_row 内部再 ×100 落库）
+    · 与股票分支一致：返回【完整上市以来历史】，窗口截断交给 fetch_history 处理，
+      以便窗口外的前一交易日仍能推出首条落库行的 prev_close
+    分页：接口单次最多回 640 根，按 end 逐段向前翻页、按日期去重合并。
+    """
+    import requests
+    market, num = full.split(".", 1)
+    sym = f"sh{num}" if market == "SH" else f"sz{num}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    end_s = date.today().isoformat()   # 腾讯 end 为闭区间（含当日）
+    rows: dict[str, list] = {}         # 日期 → 原始行（分页去重）
+    for _ in range(TX_KLINE_MAX_PAGES):
+        url = TX_KLINE_URL.format(sym=sym, start="", end=end_s, count=TX_KLINE_COUNT)
+        try:
+            payload = requests.get(url, headers=headers, timeout=30).json()
+        except Exception as e:
+            log.warning(f"  {full} 腾讯 K 线请求失败（end={end_s}）: {e}")
+            break
+        part = ((payload.get("data") or {}).get(sym) or {}).get("qfqday") or []
+        if not part:
+            break
+        before = len(rows)
+        for r in part:
+            if len(r) >= 9:            # 跳过字段不全的行
+                rows[r[0]] = r
+        oldest = min(r[0] for r in part)
+        if len(rows) == before:        # 本批没带来新日期 → 已到上市首日
+            break
+        nxt = date.fromisoformat(oldest) - timedelta(days=1)
+        if nxt.isoformat() >= end_s:   # 防御：日期未向前推进
+            break
+        end_s = nxt.isoformat()
+
+    if not rows:
+        return pd.DataFrame()
+    recs = []
+    for k in sorted(rows):
+        r = rows[k]
+        vol = _as_float(r[5])   # 手
+        tv = _as_float(r[7])    # 换手率（百分数）
+        amt = _as_float(r[8])   # 成交额（万元）
+        recs.append({
+            "date":       date.fromisoformat(r[0]),
+            "trade_date": date.fromisoformat(r[0]),
+            "open":       _as_float(r[1]),
+            "close":      _as_float(r[2]),
+            "high":       _as_float(r[3]),
+            "low":        _as_float(r[4]),
+            "volume":     int(vol * 100) if vol is not None else 0,
+            # 上市首日接口给 0.00（份额分母未定，是占位不是真值）→ 置 None 不落假 0%
+            "turnover":   (tv / 100) if (tv is not None and tv > 0) else None,
+            "amount":     (amt * 1e4) if amt is not None else None,
+        })
+    log.info(f"  {full} 腾讯 ETF/基金日线 {len(recs)} 条（{recs[0]['trade_date']} ~ {recs[-1]['trade_date']}）")
+    return pd.DataFrame(recs)
+
+
+# ----------------------------------------------------------------------------
 # 单只历史 K 线
 # ----------------------------------------------------------------------------
 def _fetch_kline(full, start=None, end=None):
-    """akshare stock_zh_a_daily（新浪）拉单只完整历史日线，返回 DataFrame（trade_date 已转 date）。
+    """拉单只完整历史日线，返回 DataFrame（trade_date 已转 date）。
+
+    股票 → akshare stock_zh_a_daily（新浪）；ETF/基金 → 腾讯 newfqkline 前复权（见 _fetch_fund_kline）。
 
     start / end 为日期下界 / 上界（均为闭区间）。end 为 None 表示无截止日。
-    新浪源返回该代码完整上市以来日线；仅显式传入 start/end 时才按窗口截断，
+    数据源返回该代码完整上市以来日线；仅显式传入 start/end 时才按窗口截断，
     不传则保留完整历史（全量采集）。
 
     full 为带交易所前缀的完整代码（如 SH.600900 / SH.900901 / SZ.200011）。
@@ -174,8 +271,12 @@ def _fetch_kline(full, start=None, end=None):
       - turnover = 换手率（小数，如 0.003 → 0.3%）
     新浪代码前缀按【交易所】映射（SH→sh, SZ→sz），不能用数字开头判断——
     否则 B 股（900/200 开头）、沪伦通 CDR（689/700 等）会被错分到 sz 而查不到。
-    注意：新浪接口对未上市/退市的代码可能返回空，调用方按「无数据」跳过。
+    注意：数据源对未上市/退市的代码可能返回空，调用方按「无数据」跳过。
     """
+    # ETF/基金：新浪个股接口取不到（实测 SH.520900 抛 JSONDecodeError 后空数据），走腾讯分支
+    if _is_fund_code(full):
+        return _fetch_fund_kline(full)
+
     import akshare as ak
     market, num = full.split(".", 1)
     sina_sym = f"sh{num}" if market == "SH" else f"sz{num}"
@@ -194,7 +295,8 @@ def _fetch_kline(full, start=None, end=None):
                 if df is not None and not df.empty:
                     break
             except Exception:
-                if attempt < 2:
+                # 5 次尝试之间都留 2s 间隔（原写法 attempt<2 会让后两次连打）
+                if attempt < 4:
                     time.sleep(2)
         else:
             return pd.DataFrame()
@@ -582,6 +684,8 @@ class _QuoteWriter:
         self._bulk_upsert = bulk_upsert
         self._buf = []
         self.total = 0
+        # 本次实际落库的日期区间 (min, max)：run() 单票模式据此收敛全市场总额重算范围
+        self.span = None
 
     def __call__(self, rows):
         self._buf.extend(rows)
@@ -601,6 +705,11 @@ class _QuoteWriter:
                               conflict_cols=["stock_code", "trade_date"],
                               skip_null_updates=True)
         self.total += len(chunk)
+        dts = [r["trade_date"] for r in chunk if r.get("trade_date")]
+        if dts:
+            lo, hi = min(dts), max(dts)
+            self.span = (lo, hi) if self.span is None else (
+                min(self.span[0], lo), max(self.span[1], hi))
         log.info(f"  个股日线已落库 {self.total} 条")
 
 
@@ -644,7 +753,24 @@ def run():
 
     if not dry:
         # 总成交额一律在库内重算，不用内存 agg（单轮/单只都不完整）
-        aggregate_from_db(start, end)
+        agg_start, agg_end, skip_agg = start, end, False
+        if code:
+            # 单票模式：范围收敛到本次实际落库的日期区间。
+            # 全表口径（start/end 均为 None）要扫 a_daily_quote 全量 1700+ 万行 / 8700+ 个交易日，
+            # 单票也白等约 3 分钟；按本次落库日期的 min/max 重算，对这些交易日的
+            # SUM/COUNT 结果与全表重算完全等价（每个交易日的行都在区间内）。
+            if writer is not None and writer.span:
+                agg_start, agg_end = writer.span
+            else:
+                # --no-quotes 等不落库的单票场景：本次没有新数据，无需重算
+                skip_agg = True
+                log.info("本次无日线落库，跳过全市场总额重算")
+        if not skip_agg:
+            log.info(
+                f"开始重算全市场总成交额（区间 {agg_start or '上市以来'} ~ {agg_end or '至今'}，"
+                "库内 GROUP BY，日期多时可能持续数分钟）..."
+            )
+            aggregate_from_db(agg_start, agg_end)
         # 补齐「之前已落库但缺 prev_close/change_pct」的历史行（采集递推只覆盖本次新采部分）
         if not code:
             fill_prev_close_from_db(start, end)
