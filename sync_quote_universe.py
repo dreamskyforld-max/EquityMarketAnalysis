@@ -35,7 +35,6 @@ from datetime import date, datetime, timezone
 
 from db import get_conn
 from collector_runtime import get_shared_ctx
-from snap_guard import clear_snap_bad
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("sync_quote_universe")
@@ -331,11 +330,9 @@ def run(codes=None, ctx=None):
                     (soft_days,))
                 n_off = cur.rowcount
         log.info(f"软删：{n_off} 只超 {soft_days} 天未在源出现 → is_collectable=FALSE")
-        # 快照黑名单复位（当日有效策略）：清单刷新 = 新一天的学习起点。
-        # 清 snap_bad_at/reason 让当天采集重新验证一遍（代码复活自动回归，防永久误伤）；
-        # snap_bad_cnt 跨日累计保留，用于识别连续多日命中的顽固坏码（退市残留/供股权/临时代码）。
-        n_reset = clear_snap_bad()
-        log.info(f"快照黑名单复位：{n_reset} 只（当日有效；snap_bad_cnt 累计保留）")
+        # 快照黑名单**不再自动复位**（2026-09-28 定稿：发现即拉黑、永久有效）：
+        # 坏码终身只报错一次，之后由 v_quote_scope.snap_ok 在清单层直接跳过，不再重复请求。
+        # 需要恢复某代码时人工解除：python3 snap_guard.py list / unblock <stock_code>。
     else:
         log.info("dry-run：不写库")
 

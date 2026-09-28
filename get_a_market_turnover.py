@@ -100,7 +100,7 @@ def fetch_market_snapshot_batch(codes, ctx=None, budget=None):
 
     for i in range(0, len(targets), BATCH_SIZE):
         batch = targets[i:i + BATCH_SIZE]
-        # 带自愈：批次含「未知股票」→ 剔除坏码重试（成功才落黑名单），避免一个坏码废整批 400 只
+        # 带自愈：批次含「未知股票」→ 剔除坏码重试（发现即落黑名单），避免一个坏码废整批 400 只
         batch_market = str(batch[0])[:2] if batch else None
         ret, data, removed = snapshot_batch(ctx, batch, market=batch_market, budget=budget)
         if removed:
@@ -291,7 +291,8 @@ def run(codes=None, ctx=None):
     rec = fetch_market_snapshot_batch(codes, ctx)
     bad_removed = rec.get("snap_bad_removed")
     if isinstance(bad_removed, list) and bad_removed:
-        log.warning(f"本次剔除快照不可用代码 {len(bad_removed)} 只（已入黑名单，明日 08:30 清单刷新时复位重学）：{bad_removed}")
+        log.warning(f"本次剔除快照不可用代码 {len(bad_removed)} 只"
+                    f"（已入黑名单·永久有效，解除用 python3 snap_guard.py unblock）：{bad_removed}")
     if rec.get("trade_date"):
         save_to_db(rec)
         _save_quotes(rec.get("quote_rows", []))

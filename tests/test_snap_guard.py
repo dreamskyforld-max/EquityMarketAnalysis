@@ -4,8 +4,9 @@
 废掉整批 400 只（HK.03888 断供事故）。本文件锁住快照自愈机制的四个安全阀：
   1. 只有「未知股票」错误允许拉黑（限流/断线绝不拉黑）；
   2. 提取的坏码必须落在当前批次内（防双前缀场景把正常码误拉黑）；
-  3. 剔除后重试成功才写黑名单（失败不写，下次重学）；
-  4. 修复有预算上限（防限流雪崩）。
+  3. **发现即拉黑**（2026-09-28 定稿）：提取到坏码当轮即写黑名单，不等重试成功——
+     失败批次不白学，黑名单永久有效（人工 CLI 解除）；
+  4. 修复有预算/轮次上限（防限流雪崩），但耗尽时坏码已落黑名单。
 """
 import os
 import sys
@@ -99,8 +100,8 @@ def test_snapshot_batch_repairs_bad_code_and_marks(monkeypatch):
     assert budget.left == 4                                          # 只消耗 1 次修复调用
 
 
-def test_snapshot_batch_marks_only_after_success(monkeypatch):
-    """剔除后重试仍限流失败 → 不写黑名单（下次重学，宁漏不误伤）。"""
+def test_snapshot_batch_marks_even_if_retry_fails(monkeypatch):
+    """发现坏码当轮即拉黑（2026-09-28 定稿）：剔除后重试即使再失败，黑名单也已落账。"""
     marked = []
     monkeypatch.setattr(g, "mark_snap_bad",
                         lambda codes, reason="", market=None: marked.extend(codes) or len(codes))
@@ -114,12 +115,12 @@ def test_snapshot_batch_marks_only_after_success(monkeypatch):
             self.n += 1
             if self.n == 1:
                 return -1, "未知股票 02900"
-            return -1, _RATE_LIMIT_MSG
+            return -1, _RATE_LIMIT_MSG          # 剔除后重试撞限流
 
     ret, data, removed = g.snapshot_batch(_Ctx(), ["HK.00700", "HK.02900"],
                                           market="HK", budget=g.RepairBudget(5))
     assert ret != 0 and removed == ["HK.02900"]
-    assert marked == []                       # 未确认成功 → 不拉黑
+    assert marked == ["HK.02900"]             # 证据成立即落账，不等重试成功
 
 
 def test_snapshot_batch_rate_limit_never_marks(monkeypatch):
@@ -152,8 +153,8 @@ def test_snapshot_batch_double_prefix_not_mis_blacklisted(monkeypatch):
     assert len(ctx.batches) == 1              # 无法定位 → 不做无意义重试
 
 
-def test_snapshot_batch_budget_exhausted(monkeypatch):
-    """预算耗尽 → 不再修复（不拉黑），防止撞限流雪崩。"""
+def test_snapshot_batch_budget_exhausted_still_marks(monkeypatch):
+    """预算耗尽 → 不再重试，但已提取到的坏码仍落黑名单（失败批不白学）。"""
     marked = []
     monkeypatch.setattr(g, "mark_snap_bad",
                         lambda codes, reason="", market=None: marked.extend(codes) or len(codes))
@@ -161,7 +162,22 @@ def test_snapshot_batch_budget_exhausted(monkeypatch):
     ret, data, removed = g.snapshot_batch(ctx, ["HK.00700", "HK.02900"],
                                           market="HK", budget=g.RepairBudget(0))
     assert ret != 0 and removed == []
-    assert marked == []
+    assert marked == ["HK.02900"]
+
+
+def test_snapshot_batch_max_rounds_exhausted_still_marks(monkeypatch):
+    """轮次上限耗尽 → 整批放弃，但已暴露的坏码全部落账（含最后暴露、未及剔除的那个）。"""
+    marked = []
+    monkeypatch.setattr(g, "mark_snap_bad",
+                        lambda codes, reason="", market=None: marked.extend(codes) or len(codes))
+    ctx = _SnapCtx(valid=["HK.00700"])        # 批内 3 个坏码，max_rounds=2 必然耗尽
+    ret, data, removed = g.snapshot_batch(
+        ctx, ["HK.00700", "HK.02901", "HK.02902", "HK.02903"],
+        market="HK", budget=g.RepairBudget(50), max_rounds=2)
+
+    assert ret != 0                                          # 轮次耗尽 → 整批放弃
+    assert removed == ["HK.02901", "HK.02902"]               # 只有被剔除的 2 个算 removed
+    assert marked == ["HK.02901", "HK.02902", "HK.02903"]    # 暴露即落账（最后 1 个也落）
 
 
 def test_snapshot_batch_other_error_passthrough(monkeypatch):
@@ -179,7 +195,7 @@ def test_snapshot_batch_other_error_passthrough(monkeypatch):
 
 
 def test_snapshot_batch_all_codes_removed(monkeypatch):
-    """极端：整批全被判未知股票 → 清空后返回失败，不死循环、不写黑名单。"""
+    """极端：整批全被判未知股票 → 清空后返回失败，不死循环；暴露的坏码已落黑名单。"""
     marked = []
     monkeypatch.setattr(g, "mark_snap_bad",
                         lambda codes, reason="", market=None: marked.extend(codes) or len(codes))
@@ -188,4 +204,4 @@ def test_snapshot_batch_all_codes_removed(monkeypatch):
     assert ret != 0
     assert removed == ["HK.02900"]
     assert len(ctx.batches) == 1              # 剔除后批空 → 立即返回，不再调用
-    assert marked == []                       # 从未成功过 → 不拉黑
+    assert marked == ["HK.02900"]             # 逐个暴露过程中即落账

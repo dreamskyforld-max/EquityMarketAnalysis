@@ -309,7 +309,8 @@ def run(codes=None, ctx=None):
     rec = fetch_market_snapshot_batch(codes, ctx)
     bad_removed = rec.get("snap_bad_removed")
     if isinstance(bad_removed, list) and bad_removed:
-        log.warning(f"本次剔除快照不可用代码 {len(bad_removed)} 只（已入黑名单，明日 08:30 清单刷新时复位重学）：{bad_removed}")
+        log.warning(f"本次剔除快照不可用代码 {len(bad_removed)} 只"
+                    f"（已入黑名单·永久有效，解除用 python3 snap_guard.py unblock）：{bad_removed}")
     # 门禁：一个批次都没成功 = 本次完全没采到数据。必须抛错让调度器记为失败，
     # 不能像 2026-09-15 那样「0 数据却记成功」，静默断供 5 个交易日。
     if codes and rec.get("ok_batches") == 0:
