@@ -48,6 +48,47 @@ def get_conn():
         conn.close()
 
 
+# ---------- 标识符工具（支持 schema.table 形态）----------
+def _table_ident(table: str):
+    """表标识符：兼容 'schema.table'（如 regime.macro_series）。
+
+    坑：psycopg2 的 sql.Identifier('regime.macro_series') 会把整串当成**单个**标识符，
+    生成 "regime.macro_series"（一个带点的怪表名）→ relation does not exist。
+    必须拆成 schema/table 两段分别加引号。
+    """
+    parts = [p for p in str(table).split(".") if p]
+    if len(parts) == 2:
+        return sql.SQL("{}.{}").format(sql.Identifier(parts[0]), sql.Identifier(parts[1]))
+    return sql.Identifier(table)
+
+
+def _table_alias(table: str) -> sql.Identifier:
+    """ON CONFLICT DO UPDATE 里引用目标表时用**裸表名**作限定符（SQL 隐式别名规则）。"""
+    return sql.Identifier(str(table).split(".")[-1])
+
+
+def _adapt_value(v):
+    """值适配：dict/list → JSONB；NaN/NaT → NULL。
+
+    坑 1：psycopg2 不会自动适配 dict，会报 can't adapt type 'dict'。
+    坑 2：pandas 的 NaN 被 psycopg2 写成 **PostgreSQL 的 numeric NaN 字面量**
+          （不是 NULL）→ `count(col)` 把它当非空、`sum(col)`/`avg(col)` 整体传播成
+          NaN，聚合结果静默失真。实测踩中：a_daily_quote 的 SH.520900（场内基金）
+          估值字段为 NaN，导致 `sum(circular_market_val)` 全表按日聚合变 NaN。
+    因此统一在写入层把 NaN/NaT 转成 NULL。
+    """
+    if isinstance(v, (dict, list)):
+        return extras.Json(v)
+    if v is None:
+        return None
+    try:
+        if v != v:          # NaN / NaT / Decimal('NaN') 自反不等
+            return None
+    except Exception:
+        pass
+    return v
+
+
 # ---------- 实时采集配置（realtime_collect_target）----------
 def get_realtime_targets():
     """读取实时采集配置表 —— 采集端读取采集清单的唯一入口（取代旧 stock_info.is_active）。
@@ -100,7 +141,7 @@ def upsert(conn, table, data, conflict_cols):
     conflict_cols: 冲突列列表，如 ['stock_code', 'trade_date']
     """
     columns = list(data.keys())
-    values = [data[c] for c in columns]
+    values = [_adapt_value(data[c]) for c in columns]
 
     placeholders = sql.SQL(", ").join([sql.Placeholder()] * len(columns))
     col_identifiers = sql.SQL(", ").join([sql.Identifier(c) for c in columns])
@@ -111,7 +152,7 @@ def upsert(conn, table, data, conflict_cols):
     if not update_cols:
         # 所有列都是冲突列，使用 DO NOTHING
         query = sql.SQL("INSERT INTO {table} ({cols}) VALUES ({vals}) ON CONFLICT ({conflict}) DO NOTHING").format(
-            table=sql.Identifier(table),
+            table=_table_ident(table),
             cols=col_identifiers,
             vals=placeholders,
             conflict=conflict_target,
@@ -125,7 +166,7 @@ def upsert(conn, table, data, conflict_cols):
             "INSERT INTO {table} ({cols}) VALUES ({vals}) "
             "ON CONFLICT ({conflict}) DO UPDATE SET {update_set}"
         ).format(
-            table=sql.Identifier(table),
+            table=_table_ident(table),
             cols=col_identifiers,
             vals=placeholders,
             conflict=conflict_target,
@@ -197,7 +238,7 @@ def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False,
         query = sql.SQL(
             "INSERT INTO {table} ({cols}) VALUES %s ON CONFLICT ({conflict}) DO NOTHING"
         ).format(
-            table=sql.Identifier(table),
+            table=_table_ident(table),
             cols=col_identifiers,
             conflict=conflict_target,
         )
@@ -205,7 +246,7 @@ def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False,
         query = sql.SQL(
             "INSERT INTO {table} ({cols}) VALUES %s ON CONFLICT ({conflict}) DO NOTHING"
         ).format(
-            table=sql.Identifier(table),
+            table=_table_ident(table),
             cols=col_identifiers,
             conflict=conflict_target,
         )
@@ -215,7 +256,7 @@ def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False,
             # 避免历史回溯脚本把已存在的估值字段（市值/PE/PB/52w 等）回写为空。
             update_set = sql.SQL(", ").join([
                 sql.SQL("{col} = COALESCE(EXCLUDED.{col}, {tbl}.{col})").format(
-                    col=sql.Identifier(c), tbl=sql.Identifier(table)
+                    col=sql.Identifier(c), tbl=_table_alias(table)
                 )
                 for c in update_cols
             ])
@@ -228,13 +269,13 @@ def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False,
             "INSERT INTO {table} ({cols}) VALUES %s "
             "ON CONFLICT ({conflict}) DO UPDATE SET {update_set}"
         ).format(
-            table=sql.Identifier(table),
+            table=_table_ident(table),
             cols=col_identifiers,
             conflict=conflict_target,
             update_set=update_set,
         )
 
-    values_list = [tuple(d[c] for c in columns) for d in data_list]
+    values_list = [tuple(_adapt_value(d[c]) for c in columns) for d in data_list]
     with conn.cursor() as cur:
         extras.execute_values(cur, query.as_string(conn), values_list)
 

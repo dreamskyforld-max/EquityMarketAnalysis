@@ -243,6 +243,65 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     ("全量画像计算", "compute_profile.py",
      {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 1800),
 
+    # ── 市场状态分析系统（regime schema）采集 ─────────────────────────────
+    # 2026-09-30 起（P0-2 落地）：数据写入 regime.macro_series / public.trading_calendar，
+    # 监控登记见 monitor_collector._REGIME_TABLE_CONFIG。
+    # 中债收益率曲线（国债 + 中短期票据AAA + 商业银行普通债AAA，官方盘后发布）：19:00 取。
+    ("中债收益率曲线", "get_cn_bond.py",
+     {"hour": 19, "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 全A 市场级估值（乐咕乐股，月频序列但月内滚动更新）：19:10 刷新。
+    ("全A市场估值", "get_macro_valuation.py",
+     {"hour": 19, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 交易日历维护（A股 AKShare 预排 + 港股由成交额表派生）：交易日 08:45 盘前刷新。
+    ("交易日历维护", "init_trading_calendar.py",
+     {"hour": 8, "minute": 45, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # 宏观月/季频包（PMI/CPI/PPI/社融/M1M2/GDP/LPR/用电量/市值…，日检幂等：发布即落库）。
+    # 排在 18:20 —— 必须早于 18:45 的「市场状态计算」（计算层按 PIT 取当日已发布值）。
+    ("宏观月频采集", "get_macro_monthly.py",
+     {"hour": 18, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 600),
+    # 宏观日频包（HIBOR/Shibor/商品 + 信用利差/期限利差派生）：18:30，同样早于计算层。
+    ("宏观日频采集", "get_macro_daily.py",
+     {"hour": 18, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 600),
+
+    # 分析师一致预期每日快照：18:40（早于计算层，供修正宽度当日可用）。
+    # ⚠ 逐日快照是「差分依赖」：漏采一天即永久断档（源不提供历史序列，无法补算）。
+    ("一致预期快照", "get_analyst_forecast.py",
+     {"hour": 18, "minute": 40, "day_of_week": "mon-fri"}, None, True, None, 600),
+
+    # 申万一级行业指数增量更新：18:10（早于 18:45 计算层，行业层指标当日可用）。
+    # 注：调度器在进程内调 run(codes, ctx=...)，不传命令行参数 →
+    #     backfill_sw_industry.run 的 incremental 默认为 True（只 upsert 尾部，避免每日写 20 万行）。
+    ("申万行业指数", "backfill_sw_industry.py",
+     {"hour": 18, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 900),
+
+    # 行业估值快照（申万一级 PE/PB/股息率）：18:15，早于 18:45 计算层。
+    # ⚠ 源只给当前横截面、**无历史序列** → 每个交易日必须当日采到，漏采即永久缺失。
+    ("行业估值快照", "get_sector_valuation.py",
+     {"hour": 18, "minute": 15, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # 行业映射月度复核：每月 1 日 08:20（行业分类会随指数公司调整而变）。
+    # confirmed=true 的行不会被覆盖（人工/规则判断优先于自动结果）。
+    ("行业映射重算", "build_sector_mapping.py",
+     {"day": 1, "hour": 8, "minute": 20}, None, True, None, 900),
+
+    # 行业资金流（同花顺源，东财 push2 已断连换源）：15:35 A 股收盘后。
+    # ⚠ 源只提供「当前快照」无历史 → 每个交易日的快照必须当日采到，漏采即永久缺失。
+    ("行业资金流", "get_sector_fund_flow.py",
+     {"hour": 15, "minute": 35, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # 市场情绪事件采集：19:30（IPO / 基金发行 / 解禁 / 董监高增减持，四类一次跑完）。
+    # 晚于计算层（18:45）不影响当日可用性：事件指标为「公告先行」或滞后一日口径，
+    # 次日计算即纳入；解禁排期前瞻 180 天，不缺一日。
+    ("市场事件采集", "get_market_events.py",
+     {"hour": 19, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 900),
+
+    # 市场状态计算层（读原始表算指标 → regime.indicator_value / market_regime_daily）。
+    # 依赖当日终值：A股 16:10、港股 16:30 盘后补采 + 港股沽空 18:30 三采 → 18:45 跑。
+    # 增量窗口 45 天（自动重算并覆盖近段），首次/补历史用 --backfill（分块，可中断续跑）。
+    ("市场状态计算", "market_state_daily.py",
+     {"hour": 18, "minute": 45, "day_of_week": "mon-fri"}, None, True, None, 1800),
+
     # 注意：采集层故障监控已由独立服务 monitor_collector.py（常驻进程，
     # systemd: monitor-collector.service）负责，不再挂在调度器里，
     # 以免「调度器挂掉→监控也失效」的同源单点故障。

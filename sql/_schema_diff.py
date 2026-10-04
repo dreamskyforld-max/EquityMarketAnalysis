@@ -266,9 +266,12 @@ def parse_schema(text):
         # 其后可能紧跟独立的 "COMMENT ON VIEW ...;"（不属于视图 DDL 主体）。
         # 判定结束的可靠信号：某行以 ';' 结尾（且该行单引号配对，避开字符串内分号）。
         # 视图 SELECT 主体内部不会出现"行尾 ;"（子查询的 ");" 即视图结束）。
-        m = re.match(r"CREATE\s+OR\s+REPLACE\s+VIEW\s+([A-Za-z_][\w]*)", line, re.I)
+        # 支持 schema 限定名（如 regime.v_macro_latest）：旧正则只取第一个标识符，
+        # 会把 schema 名 "regime" 当成视图名 → 误报「视图 regime 缺失」。
+        m = re.match(r"CREATE\s+OR\s+REPLACE\s+VIEW\s+(?:([A-Za-z_][\w]*)\.)?([A-Za-z_][\w]*)", line, re.I)
         if m:
-            vname = m.group(1).lower()
+            vsch = (m.group(1) or "public").lower()
+            vname = m.group(2).lower() if vsch == "public" else f"{vsch}.{m.group(2).lower()}"
             buf = line
             j = i
             while True:
@@ -339,6 +342,10 @@ def parse_schema(text):
         tables.pop(t, None)
     for k in [k for k, v in indexes.items() if v.get("tbl") not in tables]:
         indexes.pop(k, None)
+    # 非 public 视图同理剔除（如 regime.v_macro_latest，由 regime_schema.py 幂等创建）
+    for v in [v for v in views if "." in v]:
+        views.pop(v, None)
+        views_raw.pop(v, None)
     return tables, indexes, views, views_raw
 
 

@@ -36,7 +36,9 @@ if os.path.exists(env_path):
 # ── 指数定义（与 backfill_benchmark 保持一致）──
 BENCHMARKS = {
     # 富途 K线（港股指数）
-    "HK.800000":  ("恒生指数",               "futu"),
+    # 恒指改走 AKShare 新浪源：实测可回溯到 2013-08（3 年，3227 行），
+    # 富途 K 线受额度限制拿不到更早；指数不复权，两源数值一致（重叠区间可比对）。
+    "HK.800000":  ("恒生指数",               "hk_sina"),
     "HK.800700":  ("恒生科技指数",           "futu"),
     # A股指数（新浪源，服务器端 futu 无 A 股权限）
     "SH.000001":  ("上证指数",               "sina_a"),
@@ -75,8 +77,9 @@ FRED_TICKER = {
     "US.VIXCLS": "VIXCLS", "US.DTWEXBGS": "DTWEXBGS",
 }
 
-# 采集窗口：最近 3 年
+# 采集窗口：富途源最近 3 年（受额度限制）；FRED 源拉 1990 起全历史
 _LOOKBACK_DAYS = 1095
+_FRED_START = "1990-01-01"
 # 富途单页 K 线条数上限（3 年约 750 交易日，1000 足够）
 _FUTU_MAX = 1000
 # 东财 lmt（3 年约 750 交易日，留余量）
@@ -157,6 +160,60 @@ def collect_futu(bench_code, bench_name):
         quote_ctx.close()
 
 
+def collect_hk_sina(bench_code, bench_name):
+    """港股指数全历史（AKShare 新浪源 `stock_hk_index_daily_sina`）。
+
+    实测：HSI 自 2013-08-20 起 3227 行（覆盖 2015 牛熊）；指数不复权，
+    与富途源重叠区间数值一致（服务端每小时任务仍用富途保持当日/增量新鲜）。
+    """
+    import warnings
+    warnings.filterwarnings("ignore")
+    import akshare as ak
+
+    symbol = {"HK.800000": "HSI", "HK.800700": "HSTECH"}.get(bench_code)
+    if not symbol:
+        print(f"  ❌ 未配置新浪港股指数符号")
+        return 0
+    try:
+        df = ak.stock_hk_index_daily_sina(symbol=symbol)
+    except Exception as e:
+        print(f"  ❌ 拉取失败: {type(e).__name__}: {e}")
+        return 0
+    if df is None or len(df) < 2:
+        print(f"  ⚠️ 数据不足 ({len(df) if df is not None else 0}行)")
+        return 0
+
+    df = df.dropna(subset=["close"]).reset_index(drop=True)
+    has_vol = "volume" in df.columns
+    has_amt = "amount" in df.columns
+    recs = []
+    for i in range(len(df)):
+        td = df.iloc[i]["date"]
+        if not isinstance(td, datetime.date):
+            td = datetime.date.fromisoformat(str(td)[:10])
+        v = float(df.iloc[i]["close"])
+        prev = float(df.iloc[i - 1]["close"]) if i > 0 else None
+        rec = {
+            "bench_code": bench_code, "bench_name": bench_name,
+            "trade_date": td,
+            "update_time": datetime.datetime.combine(td, datetime.time.min),
+            "last_price": v, "prev_close": prev,
+            "change_pct": round((v / prev - 1) * 100, 4) if prev else None,
+            "close_20d_ago": float(df.iloc[i - 20]["close"]) if i >= 20 else None,
+        }
+        if has_vol:
+            vol = df.iloc[i].get("volume")
+            rec["volume"] = int(vol) if vol and vol == vol else None
+        if has_amt:
+            amt = df.iloc[i].get("amount")
+            rec["turnover"] = float(amt) if amt and amt == amt else None
+        recs.append(rec)
+    print(f"  ✅ 获取 {len(recs)} 行 ({recs[0]['trade_date']} ~ {recs[-1]['trade_date']})")
+    ins, skip = write_records(recs)
+    print(f"  ✅ 写入 {ins} 条, 跳过 {skip} 条")
+    return ins
+
+
 def collect_fred(bench_code, bench_name):
     """FRED：拉取最近 1 年"""
     from config import val
@@ -168,7 +225,7 @@ def collect_fred(bench_code, bench_name):
 
     ticker = FRED_TICKER.get(bench_code, bench_code.split(".")[-1])
     end = datetime.date.today()
-    start = end - datetime.timedelta(days=_LOOKBACK_DAYS)
+    start = datetime.date.fromisoformat(_FRED_START)   # 全历史（各序列实际起点以源为准）
 
     try:
         df = pdr.data.DataReader(ticker, "fred", start=start.isoformat(), end=end.isoformat())
@@ -383,6 +440,8 @@ def collect(bench_code):
     print(f"\n── {name} ({bench_code}) [{source}] ──")
     if source == "futu":
         return collect_futu(bench_code, name)
+    elif source == "hk_sina":
+        return collect_hk_sina(bench_code, name)
     elif source == "fred":
         return collect_fred(bench_code, name)
     elif source == "sina":
@@ -501,7 +560,8 @@ if __name__ == "__main__":
 
     if not only:
         print("=" * 60)
-        print(f"开始采集全部 {len(targets)} 个基准指数最近 {_LOOKBACK_DAYS} 天的数据")
+        print(f"开始采集全部 {len(targets)} 个基准指数"
+              f"（富途 {_LOOKBACK_DAYS} 天 / FRED {_FRED_START} 起 / 恒指新浪全历史）")
         print("=" * 60)
 
     import time as _time

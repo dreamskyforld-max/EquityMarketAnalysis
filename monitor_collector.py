@@ -119,6 +119,7 @@ _DDL = {
             refresh_weekday INT      NOT NULL DEFAULT 0,  -- period='week' 时生效：刷新日星期几(0=Mon..6=Sun)
             group_by     VARCHAR(64),                     -- 非空时按该列 GROUP BY 逐分组判停滞（如 benchmark_minute 的 bench_code）
             active       BOOLEAN     NOT NULL DEFAULT TRUE,
+            market       VARCHAR(8)  NOT NULL DEFAULT 'HK', -- 判停滞用的日历市场：CN=只看 A 股交易日 / HK=港股（默认）
             remark       VARCHAR(120),
             UNIQUE (db_name, table_name)
         );
@@ -148,10 +149,17 @@ def ensure_tables():
                 "ALTER TABLE monitor_table_config "
                 "ADD COLUMN IF NOT EXISTS group_by VARCHAR(64)"
             )
+            # 兼容存量库：market 列（按市场取交易日历，见 _CN_MONITOR_TABLES）
+            cur.execute(
+                "ALTER TABLE monitor_table_config "
+                "ADD COLUMN IF NOT EXISTS market VARCHAR(8) NOT NULL DEFAULT 'HK'"
+            )
         conn.commit()
     _seed_table_config()
     _seed_task_config()
     _migrate_monitor_config()
+    _migrate_regime_monitor_config()
+    _migrate_market_config()
 
 
 # 当前真正在采集的表的种子配置（仅在配置表为空时写入）。
@@ -236,6 +244,122 @@ def _migrate_monitor_config():
                 "AND (group_by IS NULL OR group_by='')"
             )
         conn.commit()
+
+
+# 市场状态分析系统（regime schema）表登记：随 regime_schema.py 落地（2026-09-30）。
+# indicator_value / market_regime_daily 属「计算层」，P1 上线前以 active=FALSE 预登记，
+# 避免空表被误判为「从未采集」而持续告警。
+_REGIME_TABLE_CONFIG = [
+    # (db_name, table_name, time_column, period, expect_lag, refresh_weekday, remark, active)
+    ("regime", "macro_series", "updated_at", "lowfreq", 3, 0,
+     "get_cn_bond(日) + get_macro_valuation(月) + 各宏观采集", True),
+    ("regime", "indicator_dict", "updated_at", "lowfreq", 30, 0,
+     "指标字典（market_state_daily 每次运行同步）", True),
+    ("regime", "indicator_value", "updated_at", "day", 1, 0,
+     "市场状态计算层 market_state_daily（工作日 18:45）", True),
+    ("regime", "market_regime_daily", "updated_at", "day", 1, 0,
+     "市场状态合成（同上，与 indicator_value 同批写入）", True),
+    ("regime", "analyst_forecast_snapshot", "snapshot_date", "day", 1, 0,
+     "get_analyst_forecast（逐日快照，18:40；缺一天即断档不可补）", True),
+    # 事件表用 updated_at 判「采集器是否还活着」：业务日期天然稀疏（可能数日无新事件），
+    # 采集器每轮全量 upsert 会刷新 updated_at，故 day/1 不会误报也不会漏报（19:30 跑）。
+    ("regime", "ipo_event", "updated_at", "day", 1, 0,
+     "get_market_events（IPO，19:30）", True),
+    ("regime", "fund_issuance_event", "updated_at", "day", 1, 0,
+     "get_market_events（基金发行，19:30）", True),
+    ("regime", "unlock_schedule", "updated_at", "day", 1, 0,
+     "get_market_events（解禁，19:30）", True),
+    ("regime", "insider_trade", "updated_at", "day", 1, 0,
+     "get_market_events（董监高增减持，19:30）", True),
+    ("regime", "sector_fund_flow", "updated_at", "day", 1, 0,
+     "get_sector_fund_flow（行业资金流，15:35；源只给当前快照，漏采即永久缺失）", True),
+    ("regime", "sector_mapping", "updated_at", "lowfreq", 45, 0,
+     "build_sector_mapping（行业映射月度复核，每月 1 日）", True),
+    ("regime", "sector_daily", "updated_at", "day", 1, 0,
+     "market_state_daily（逐行业横截面，18:45 计算层写入）", True),
+    ("regime", "sector_valuation_snapshot", "updated_at", "day", 1, 0,
+     "get_sector_valuation（行业估值快照，18:15；源无历史，漏采即永久缺失）", True),
+    ("public", "trading_calendar", "updated_at", "lowfreq", 7, 0,
+     "init_trading_calendar（年度追加 + 日增量）", True),
+]
+
+
+def _migrate_regime_monitor_config():
+    """regime / trading_calendar 监控登记（幂等，存量与全新库通用）。"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for db, tbl, col, period, lag, wd, remark, active in _REGIME_TABLE_CONFIG:
+                cur.execute(
+                    "INSERT INTO monitor_table_config "
+                    "(db_name, table_name, time_column, period, expect_lag, "
+                    " refresh_weekday, remark, active) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (db_name, table_name) DO NOTHING",
+                    (db, tbl, col, period, lag, wd, remark, active),
+                )
+            # 配置修正兜底（幂等）：计算层已上线（2026-09-30 P1），三张表转 active；
+            # 若将来再次出现「表已建但数据未落地」，用同样方式临时置 false 避免误报。
+            cur.execute(
+                "UPDATE monitor_table_config SET active=true "
+                "WHERE db_name='regime' "
+                "AND table_name IN ('indicator_dict','indicator_value','market_regime_daily')"
+            )
+        conn.commit()
+
+
+# A 股专属表：停滞判定必须用 **A 股日历**（market='CN'）。
+#
+# 背景（实测 2026-10-02）：A 股国庆休市而港股开市，监控一律用港股日历取「最近交易日」，
+# 于是 A 股专属表被误判落后（告警原文：「最新交易日 2026-09-30，已落后 2 天」），
+# 而该类表在 10-01/10-02 本就不该有数据。
+#
+# 分类依据是**表内实际数据**（不看表名猜）：抽样 `stock_code` 前缀与语义——
+#   · daily_margin_balance     → 仅 SH./SZ.（两融）
+#   · daily_trend              → 仅 SH.（趋势跟踪池）
+#   · realtime_order_size      → 仅 SH.（逐笔委托）
+#   · daily_northbound_flow    → 北向资金（A 股通道）
+#   · macro_environment_score  → A 股宏观环境打分
+#   · 5 张 regime 表           → 一致预期/IPO/基金/解禁/增减持，源与口径均仅 A 股
+#
+# 其余保持默认 'HK'，理由：
+#   · 混合/全球表（daily_quote / daily_benchmark / benchmark_minute / indicator_value /
+#     market_regime_daily / stock_sector / trading_calendar）含港股序列，用**更宽**的港股
+#     日历才不会漏报，也保持既有告警口径不变；
+#   · 港股通类表（daily_ggt_hold 等）真实交易日是「沪深港**共同开市**」的交集，
+#     单一市场日历无法精确表达（CN/HK 各有独家假日），暂按 HK 并在文档标注为已知残差。
+_CN_MONITOR_TABLES = {
+    ("public", "daily_margin_balance"),
+    ("public", "daily_northbound_flow"),
+    ("public", "daily_trend"),
+    ("public", "macro_environment_score"),
+    ("public", "realtime_order_size"),
+    ("regime", "analyst_forecast_snapshot"),
+    ("regime", "fund_issuance_event"),
+    ("regime", "insider_trade"),
+    ("regime", "ipo_event"),
+    ("regime", "unlock_schedule"),
+    ("regime", "sector_fund_flow"),
+    ("regime", "sector_mapping"),
+    ("regime", "sector_daily"),
+    ("regime", "sector_valuation_snapshot"),
+}
+
+
+def _migrate_market_config():
+    """把 A 股专属表的 market 更新为 'CN'（幂等；其余保持默认 'HK'）。"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            n = 0
+            for db, tbl in sorted(_CN_MONITOR_TABLES):
+                cur.execute(
+                    "UPDATE monitor_table_config SET market='CN' "
+                    "WHERE db_name=%s AND table_name=%s AND market<>'CN'",
+                    (db, tbl),
+                )
+                n += cur.rowcount
+        conn.commit()
+    if n:
+        log.info(f"监控日历基准迁移：{n} 张 A 股专属表 → market='CN'")
 
 
 def _seed_task_config():
@@ -366,10 +490,11 @@ def _refresh_trading_days():
     _trading_day_fetched_at = today_d.isoformat()
     markets = ["HK", "US"]
     new_status: Dict[str, set[str]] = {}
+    # 先算好区间：except 分支也要用（富途 import 失败时 start/end 不能未定义）
+    end = (today_d + timedelta(days=_TRADE_DAY_FETCH_DAYS)).isoformat()
+    start = (today_d - timedelta(days=_TRADE_DAY_FETCH_DAYS)).isoformat()
     try:
         from futu import OpenQuoteContext, Market
-        end = (today_d + timedelta(days=_TRADE_DAY_FETCH_DAYS)).isoformat()
-        start = (today_d - timedelta(days=_TRADE_DAY_FETCH_DAYS)).isoformat()
         with OpenQuoteContext(host="127.0.0.1", port=11111) as ctx:
             for mkt in markets:
                 m = getattr(Market, mkt, Market.HK)
@@ -382,7 +507,13 @@ def _refresh_trading_days():
                             s.add(day_str)
                 new_status[mkt] = s
         _trading_day_status = {k: v for k, v in new_status.items()}
-        log.info(f"交易日状态刷新成功: 覆盖 {start}~{end}, HK={len(_trading_day_status.get('HK', set()))}天")
+        # A 股日历：富途接口不提供 A 股交易日，改读本项目自维护的 public.trading_calendar
+        # （由 init_trading_calendar.py 每日 08:45 刷新，akshare 预排含节假日）。
+        # 读不到则 CN 留空 → is_trading_day 回落港股日历（旧行为），并打印告警。
+        _trading_day_status["CN"] = _load_cn_trading_days(start, end)
+        log.info(f"交易日状态刷新成功: 覆盖 {start}~{end}, "
+                 f"HK={len(_trading_day_status.get('HK', set()))}天, "
+                 f"CN={len(_trading_day_status.get('CN', set()))}天")
         return True
     except Exception as e:
         log.warning(f"富途交易日批量查询失败，降级 weekday: {e}")
@@ -392,15 +523,35 @@ def _refresh_trading_days():
             d = today_d + timedelta(days=i)
             if d.weekday() < 5:
                 s.add(d.isoformat())
-        _trading_day_status = {"HK": s, "US": s}
+        _trading_day_status = {"HK": s, "US": s, "CN": _load_cn_trading_days(start, end)}
         return False
+
+
+def _load_cn_trading_days(start: str, end: str) -> set:
+    """读 A 股交易日（public.trading_calendar，market='CN'）。
+
+    这是 A 股专属表判停滞的日历基准：富途只给 HK/US，若 CN 缺失会回落港股日历，
+    于是「港股开市/A 股休市」的日子 A 股表被误判落后（实测 2026-10-02）。
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT cal_date FROM public.trading_calendar "
+                    "WHERE market = 'CN' AND is_open AND cal_date BETWEEN %s AND %s",
+                    (start, end))
+                return {r[0].isoformat() for r in cur.fetchall()}
+    except Exception as e:
+        log.warning(f"A 股交易日历读取失败（A 股专属表将回落港股日历判停滞）: {e}")
+        return set()
 
 
 def is_trading_day(d, market="HK") -> bool:
     """判断 d(date) 是否为交易日。
 
     只读模块级变量 _trading_day_status（由 _refresh_trading_days 每日刷新），
-    巡检热路径完全不调用富途接口。
+    巡检热路径完全不调用富途接口；CN 来自本项目 trading_calendar（见 _load_cn_trading_days）。
+    取不到 market 对应集合时回落港股（兼容既有行为）。
     """
     if not _trading_day_status:  # 尚未初始化（极端情况），立即拉一次
         _refresh_trading_days()
@@ -434,7 +585,7 @@ def is_collection_active() -> bool:
     return hk or a or after
 
 
-def is_intraday_active() -> bool:
+def is_intraday_active(market: str = "HK") -> bool:
     """严格交易时段（仅用于分钟级 data_stale 判断）。
 
     与 is_collection_active 的关键区别：**不含盘后补采窗口 16:00-20:00**。
@@ -446,18 +597,22 @@ def is_intraday_active() -> bool:
     覆盖：港股 9:30-12:00 / 13:00-16:10 + 缓冲到 16:40（收盘竞价 16:00-16:10
     + 16:30 盘后补采快照）；A 股 9:30-11:30 / 13:00-15:00。
     16:41 之后分钟级表冻结属正常，不告警（次日 9:30 数据刷新后由活跃期 resolve）。
+
+    market：'CN' 时按 A 股日历 + 仅 A 股窗口（A 股专属分钟级表如 realtime_order_size，
+            在港股开市/A 股休市的日子不应判活跃，否则会误报 CRIT）。
     """
     now = datetime.now()
+    mk = market or "HK"
     if now.weekday() >= 5:
         return False
-    if not is_trading_day(now.date(), "HK"):
+    if not is_trading_day(now.date(), mk):
         return False
     h, m = now.hour, now.minute
     hk = ((h == 9 and m >= 30) or (10 <= h < 12) or (h == 12 and m == 0)
           or (13 <= h < 16) or (h == 16 and m <= 40))   # 含收盘竞价 + 16:30 盘后补采缓冲
     a = ((h == 9 and m >= 30) or (h == 10) or (h == 11 and m <= 30)
          or (13 <= h < 15) or (h == 15 and m == 0))
-    return hk or a
+    return a if mk == "CN" else (hk or a)
 
 
 def _window_start(minutes: int = WINDOW_MIN):
@@ -578,15 +733,18 @@ def _check_task_stall():
 
 
 # 全业务表监控配置：覆盖所有采集落库的表（不含监控自身表 collection_*）
-def _last_trading_date(reference):
-    """返回 reference 之前（含）最近的一个真实交易日。
+def _last_trading_date(reference, market: str = "HK"):
+    """返回 reference 之前（含）最近的一个真实交易日（按 market 的日历）。
 
     读每日刷新的交易日状态变量（自动含周末+节假日），
     接口不可用时降级值为仅跳过周六日的近似。
+
+    market：'CN' = A 股交易日（A 股专属表必须用，否则港股开市/A 股休市日会误报落后）；
+            'HK' = 港股日历（默认，兼容混合/全球表与既有告警口径）。
     """
     d = reference.date() if hasattr(reference, "date") else reference
     for _ in range(14):  # 最多往前找两周，避免死循环
-        if is_trading_day(d, "HK"):
+        if is_trading_day(d, market):
             return d
         d = d - timedelta(days=1)
     # 降级：仅跳过周末
@@ -609,18 +767,39 @@ def _check_data_stale():
     扩展新表只需往 monitor_table_config 插一行，无需改代码/重启。
     """
     now = datetime.now(timezone.utc)
-    today = _last_trading_date(now)
-    # 分钟级表用「严格交易时段」（不含盘后窗口），避免收盘后冻结被误判 stale；
-    # 日/周/低频分支不使用此变量。
-    active = is_intraday_active()
+    # 交易日基准按表所属市场分别计算（CN=只用 A 股日历；其余用港股日历），
+    # 否则 A 股专属表在「港股开市/A 股休市」的日子会被误判落后（实测 2026-10-02）。
+    _today_cache: dict = {}
+    _active_cache: dict = {}
+
+    def _today_for(market: str):
+        mk = market or "HK"
+        if mk not in _today_cache:
+            _today_cache[mk] = _last_trading_date(now, mk)
+        return _today_cache[mk]
+
+    def _active_for(market: str):
+        """分钟级表用「严格交易时段」（不含盘后窗口），避免收盘后冻结被误判 stale；
+        日/周/低频分支不使用此值。"""
+        mk = market or "HK"
+        if mk not in _active_cache:
+            _active_cache[mk] = is_intraday_active(mk)
+        return _active_cache[mk]
+
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT table_name, time_column, period, expect_lag, refresh_weekday, group_by "
-                    "FROM monitor_table_config WHERE active=true ORDER BY table_name"
+                    "SELECT db_name, table_name, time_column, period, expect_lag, refresh_weekday, group_by, market "
+                    "FROM monitor_table_config WHERE active=true ORDER BY db_name, table_name"
                 )
-                rows = cur.fetchall()
+                # 非 public schema 拼成限定名（如 regime.macro_series）；public 保持裸表名，
+                # 以免改变既有告警 source 口径（前端按 source 展示/去重）。
+                rows = [
+                    (tbl if (db or "public") == "public" else f"{db}.{tbl}",
+                     col, period, lag, wd, gby, (mkt or "HK"))
+                    for db, tbl, col, period, lag, wd, gby, mkt in cur.fetchall()
+                ]
     except Exception as e:
         log.warning(f"读取 monitor_table_config 失败: {e}")
         return
@@ -658,12 +837,13 @@ def _check_data_stale():
     # 关键优化：不查 MAX(col) 全表扫描，而是带「时间下界」窗口查询，
     #   只扫最近一段数据（利用时间列索引做 range scan，无索引表也只扫窗口内行）。
     # 下界按 period 推算，确保覆盖判定所需的最长 idle 窗口。
-    window_start = _compute_window_start(now, today, rows)
+    window_start = _compute_window_start(now, _today_for, rows)
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                for table, col, period, lag, wd, group_by_col in rows:
-                    start = window_start.get((period, lag, wd))
+                for table, col, period, lag, wd, group_by_col, market in rows:
+                    start = window_start.get((period, lag, wd, market))
+                    today, active = _today_for(market), _active_for(market)
                     try:
                         if group_by_col:
                             # 按分组逐序列判停滞（如 benchmark_minute 的 bench_code）：
@@ -689,36 +869,40 @@ def _check_data_stale():
         log.warning(f"data_stale 巡检连接失败: {e}")
 
 
-def _compute_window_start(now, today, rows):
+def _compute_window_start(now, today_for, rows):
     """为每张表计算 MAX(col) 查询的时间下界（窗口起点）。
 
     目的：避免对大表做无下界的 MAX() 全表扫描。窗口只需覆盖
     「判定 stale 所需的最长 idle 区间 + 余量」即可，且下界对齐「真实交易日」
-    （用富途接口判断），避免节假日/周末把窗口落在无数据的非交易日导致误报。
+    （按表所属市场取日历），避免节假日/周末把窗口落在无数据的非交易日导致误报。
     minute 表: 最近真实交易日 09:00 HKT（覆盖当天盘中 + 盘后补采窗口）
     day 表   : 最近交易日 - (lag + 2) 天
     week 表  : 最近刷新日 - (lag + 2) 周
     lowfreq  : now - (lag + 2) 天
+
+    today_for: callable(market) → 该市场最近交易日（带缓存；见 _check_data_stale）
+    下界按 (period, lag, wd, market) 缓存 —— 同一市场+周期的表共用一个窗口。
     """
     starts = {}
-    for table, col, period, lag, wd in rows:
+    # rows 为 7 元组（含 group_by 与 market；分组判定在 _check_grouped_stale 内单独处理）
+    for table, col, period, lag, wd, _gby, market in rows:
         if period == "minute":
             # 最近真实交易日开盘前：确保窗口落在「有数据的交易日」，
             # 节假日/周末当天无数据也不会误判（窗口回溯到上一交易日）。
             # 用 HKT 09:00（= UTC 01:00），与数据列时区对齐。
-            tday = _last_trading_date(now)
-            starts[(period, lag, wd)] = datetime(tday.year, tday.month, tday.day,
-                                                 9, 0, tzinfo=HKT)
+            tday = today_for(market)
+            starts[(period, lag, wd, market)] = datetime(tday.year, tday.month, tday.day,
+                                                         9, 0, tzinfo=HKT)
         elif period == "day":
-            starts[(period, lag, wd)] = today - timedelta(days=lag + 2)
+            starts[(period, lag, wd, market)] = today_for(market) - timedelta(days=lag + 2)
         elif period == "week":
             # 找「最近一个 refresh_weekday」：从 today 倒退到首个 weekday==wd
-            d = today
+            d = today_for(market)
             while d.weekday() != wd:
                 d = d - timedelta(days=1)
-            starts[(period, lag, wd)] = d - timedelta(weeks=lag + 2)
+            starts[(period, lag, wd, market)] = d - timedelta(weeks=lag + 2)
         elif period == "lowfreq":
-            starts[(period, lag, wd)] = now - timedelta(days=lag + 2)
+            starts[(period, lag, wd, market)] = now - timedelta(days=lag + 2)
     return starts
 
 
