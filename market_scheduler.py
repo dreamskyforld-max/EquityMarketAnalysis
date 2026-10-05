@@ -236,12 +236,13 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     ("公司资料全量", "get_company_profile.py",
      {"hour": 3, "minute": 0, "day_of_week": "sun"}, None, True, None, 14400),
 
-    # 全量画像每日计算：每个工作日 17:30 计算当日全量画像，写入 profile.tag_value。
-    # 依赖当日行情快照（A股收盘采集 15:10、港股收盘采集 16:20 已完成）。
-    # run(codes, ctx) 全局任务，codes=None 由 profiling 自行决定全标签范围；
-    # force=True 跳过各标签 update_freq 更新门禁，未变标签不产生冗余版本。
-    ("全量画像计算", "compute_profile.py",
-     {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 1800),
+    # 全量画像计算（已迁出，2026-10-05）：改由独立 systemd 单元
+    # compute-profile.service + compute-profile.timer（Mon-Fri 17:30，模板见
+    # system/ 目录）运行。迁出原因：画像的大内存计算（全市场行情窗口 ~220 万行）
+    # 曾两次把整机拖入内存-IO 雪崩（2026-09-29、09-30 各 5.5h / 8.4h），并遗留
+    # 调度器进程内的 futu 锁死（10-01~10-05 全量采集超时）；独立进程 + cgroup
+    # 内存上限可把故障限制在画像自身。任务监控改走 collection_task_log 埋点
+    # （compute_profile.run 内置），见 monitor_collector._PROFILE_TASK_CONFIG。
 
     # ── 市场状态分析系统（regime schema）采集 ─────────────────────────────
     # 2026-09-30 起（P0-2 落地）：数据写入 regime.macro_series / public.trading_calendar，

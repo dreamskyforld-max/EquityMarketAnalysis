@@ -56,7 +56,7 @@ import numpy as np
 import pandas as pd
 
 from ..registry import tag, TIER, UNIT_PCTL
-from ._base import _conn, _read_sql, _frame, require_fresh
+from ._base import _conn, _read_sql_stream, _distinct_codes, _frame, require_fresh
 
 DOMAIN = "趋势状态"
 
@@ -64,6 +64,19 @@ W_1Y = 252          # 1 年窗口（交易日），与 ⑦ technical.py 同约�
 _W = 20             # 位置区间宽度（百分点）：0-20 / 20-40 / 40-60 / 60-80 / 80-100
 
 _QUOTE_TABLES = (("A", "a_daily_quote"), ("HK", "hk_daily_quote"))
+
+# 大表取数参数：与 ⑦ technical.py 同款（全市场 ~220 万行窗口），
+# 分批 + dtype 瘦身 + 按股票分批计算，缘由见 _base._read_sql_stream
+# 与 technical._STREAM_CHUNK 注释。
+_STREAM_CHUNK = 50_000
+_BATCH_CODES = 500   # 逐批计算的股票数/批（每批 ~500 只 × 262 天 ≈ 13 万行）
+_QUOTE_DTYPES = {
+    "stock_code": "category",
+    "trade_date": "datetime64[ns]",
+    "high": "float64",
+    "low": "float64",
+    "close": "float64",
+}
 
 # 位置区间 → 档次说明。注意这里的 20% 是**价格位置区间的宽度**，
 # 不是 ⑦ 那种「占全市场 20% 的股票」的横截面口径，故写全区间避免误读。
@@ -76,32 +89,33 @@ _POSITION_RANGE = {
 }
 
 
-def _load_history(conn, as_of: date) -> pd.DataFrame:
-    """加载截止 as_of 的近一年个股行情（high / low / close）。
-
-    交易日历从 a_daily_quote 推，限定精确窗口，避免全表扫描。
-    """
+def _window_start(conn, as_of: date) -> date | None:
+    """窗口起点：as_of 往前数 W_1Y+1 个交易日的首个日期（日历从 a_daily_quote 推）。"""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT MIN(d) FROM (SELECT DISTINCT trade_date d FROM a_daily_quote "
             "WHERE trade_date <= %s ORDER BY d DESC LIMIT %s) t",
             (as_of, W_1Y + 1),
         )
-        start = cur.fetchone()[0]
-    if start is None:
-        return pd.DataFrame()
+        return cur.fetchone()[0]
 
-    frames = []
-    for mkt, table in _QUOTE_TABLES:
-        f = _read_sql(
-            conn,
-            f"SELECT stock_code, trade_date, high::float8 AS high, low::float8 AS low, "
-            f"close::float8 AS close FROM {table} WHERE trade_date BETWEEN %s AND %s",
-            (start, as_of),
-        )
-        f["market"] = mkt
-        frames.append(f)
-    return pd.concat(frames, ignore_index=True)
+
+def _load_batch(conn, table: str, codes: list[str], start: date, as_of: date) -> pd.DataFrame:
+    """按股票批次加载窗口行情（high / low / close）。
+
+    取数走 _read_sql_stream（服务端游标分批）+ dtype 瘦身。WHERE 用
+    stock_code = ANY(...) 限定批内股票 + ORDER BY stock_code, trade_date：
+    两张表都有 (stock_code, trade_date) 索引 → 索引扫描天然有序、PG 无需排序，
+    下游 groupby 也不必再做 sort_values（内存背景见 _base._read_sql_stream）。
+    """
+    return _read_sql_stream(
+        conn,
+        f"SELECT stock_code, trade_date, high::float8 AS high, low::float8 AS low, "
+        f"close::float8 AS close FROM {table} "
+        f"WHERE stock_code = ANY(%s) AND trade_date BETWEEN %s AND %s "
+        f"ORDER BY stock_code, trade_date",
+        (list(codes), start, as_of), chunk_size=_STREAM_CHUNK, dtypes=_QUOTE_DTYPES,
+    )
 
 
 def _positions(as_of: date) -> pd.DataFrame:
@@ -114,24 +128,45 @@ def _positions(as_of: date) -> pd.DataFrame:
     """
     with _conn() as conn:
         # 本域判据：52 周位置是「截至当日」的时点值，日线必须当日到货。
-        # 否则 _load_history 会取窗口内最后一行——日线没到时它静默回退到更早交易日，
+        # 否则窗口会取到最后一行所在的更早交易日——日线没到时它静默回退到陈旧日期，
         # 算出来的位置数值看着正常、实为陈旧值，还会被写成 as_of 当日的结果。
         require_fresh(conn, "a_daily_quote", as_of, max_lag=0)
         require_fresh(conn, "hk_daily_quote", as_of, max_lag=0)
-        q = _load_history(conn, as_of)
-    if q.empty:
+        start = _window_start(conn, as_of)
+        if start is None:
+            return pd.DataFrame(columns=["stock_code", "market", "pos"])
+
+        # 按股票分批「加载 → 聚合 → 释放」：任意时刻只驻留单批数据
+        # （与 ⑦ technical._compute_all 同款，内存背景见 _base._read_sql_stream）。
+        # 每只股票只出现在一个批次里，逐批的 agg 拼起来即为全量，无需二次聚合。
+        aggs = []
+        for mkt, table in _QUOTE_TABLES:
+            codes = _distinct_codes(conn, table, start, as_of)
+            for i in range(0, len(codes), _BATCH_CODES):
+                f = _load_batch(conn, table, codes[i:i + _BATCH_CODES], start, as_of)
+                if f.empty:
+                    continue
+                # 先剔除坏快照行：high/low/close<=0 或 high<low（如 HK 某日 high=0,low=0
+                # 的脏数据）。否则单条 high=0 会让 min(low)=0，毒化整只股票的区间把它整只丢掉。
+                valid = ((f["high"] > 0) & (f["low"] > 0) & (f["close"] > 0)
+                         & (f["high"] >= f["low"]))
+                # 无需 sort：_load_batch 的 SQL 已按 (stock_code, trade_date) 排序，
+                # 布尔过滤不改变行序。
+                f = f[valid]
+                if f.empty:
+                    continue
+                # observed=True 必须显式给：stock_code 是 category，默认 observed=False
+                # 会为「字典中有、本帧无行」的类别产出空组混进聚合结果。
+                g = f.groupby("stock_code", sort=False, observed=True)
+                a = g.agg(hi=("high", "max"), lo=("low", "min"))
+                # 末行即 as_of 当日收盘（日期已升序，last() 取最后一笔）
+                a["close"] = g["close"].last()
+                a["market"] = pd.Categorical([mkt] * len(a))
+                aggs.append(a.reset_index())
+                del f
+    if not aggs:
         return pd.DataFrame(columns=["stock_code", "market", "pos"])
-
-    # 先剔除坏快照行：high/low/close<=0 或 high<low（如 HK 某日 high=0,low=0 的脏数据）。
-    # 否则单条 high=0 会让 min(low)=0，毒化整只股票的区间把它整只丢掉。
-    valid = (q["high"] > 0) & (q["low"] > 0) & (q["close"] > 0) & (q["high"] >= q["low"])
-    q = q[valid].sort_values(["stock_code", "trade_date"])
-
-    g = q.groupby("stock_code", sort=False)
-    agg = g.agg(hi=("high", "max"), lo=("low", "min"))
-    # 末行即 as_of 当日收盘（已按日期升序，tail(1) 取最后一笔）
-    agg["close"] = g["close"].last()
-    agg["market"] = g["market"].last()
+    agg = pd.concat(aggs, ignore_index=True)
 
     # 仅剔除退化/空值样本：区间须有真实宽度（high>low）、端点为正、收盘为正。
     # 不再卡「满 252 交易日」覆盖率——否则上市不足一年的股票（如 HK.02513 仅 165 行）整只丢失。
@@ -145,7 +180,7 @@ def _positions(as_of: date) -> pd.DataFrame:
 
     pos = (agg["close"] - agg["lo"]) / (agg["hi"] - agg["lo"]) * 100
     agg["pos"] = pos.clip(lower=0.0, upper=100.0)
-    return agg.reset_index()
+    return agg
 
 
 # ⚠️ 本标签刻意保持 is_exclusive=False / confidence_req=False（默认值）。

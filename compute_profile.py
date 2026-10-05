@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""全量画像每日计算任务（供 market_scheduler.py 以 run(codes, ctx) 形式调用）。
+"""全量画像每日计算任务。
 
-每个工作日收盘后（17:30，见 market_scheduler.py 的 GLOBAL_TASKS 注册）
-计算当日全量画像，等价于手动执行：
-    python3 -m profiling.run compute --as-of <今日> --force
+执行方式（2026-10-05 起）：独立 systemd 单元 compute-profile.service + .timer
+（Mon-Fri 17:30，模板见 system/ 目录）。原 market_scheduler 内的「全量画像计算」
+任务已移除：本任务的大内存计算（全市场行情窗口 ~220 万行）曾两次把整机拖入
+内存-IO 雪崩（2026-09-29、09-30 各 5.5h / 8.4h），并遗留调度器进程内的 futu
+锁死（10-01~10-05 全量超时）——迁出后用 cgroup 内存上限（MemoryMax）把故障
+限制在画像自身。手动执行：
+    .venv/bin/python3 compute_profile.py
+    systemctl start compute-profile.service
 
 行为：
 - 先同步 profile.tag_registry（标签字典）+ profile.enum_value（值域），再计算标签。
@@ -19,6 +24,7 @@
    只 import engine 会让注册表为空 → compute_all 静默返回 []、日志出现「标签数=0」。
    （2026-09-12 上线后连续 3 个交易日空跑，即此原因；下方加了空注册表硬校验防复发。）
 """
+import sys
 import time
 from datetime import date
 
@@ -31,7 +37,54 @@ log = setup_logger("compute_profile")
 
 
 def run(codes=None, ctx=None):
-    """计算当日全量画像。异常直接向上冒泡，由调度器记录为执行失败。"""
+    """计算当日全量画像。异常直接向上冒泡，让调用方（systemd / 调度器）记为失败。
+
+    codes / ctx 仅为兼容原调度器 run_module 的调用签名而保留，本任务全局全量、
+    忽略二者。附任务级埋点（collection_task_log）：monitor_collector 的 task_stall
+    依赖它判定「全量画像计算」是否停摆（monitor_task_config 已登记该任务）。
+    仍被 market_scheduler 进程内调用时不写埋点 —— 调度器 execute_task 已自带
+    同名埋点，重复写会产生两条记录（迁移过渡期用，迁到独立服务后自然只走本路径）。
+    """
+    _rid = None if _in_scheduler() else _task_start()
+    _t0 = time.monotonic()
+    status = "ok"
+    try:
+        return _compute()
+    except BaseException:
+        status = "error"
+        raise
+    finally:
+        _task_end(_rid, status, time.monotonic() - _t0)
+
+
+def _in_scheduler() -> bool:
+    """当前是否运行在 market_scheduler 进程内（其 execute_task 已有任务埋点）。"""
+    return "market_scheduler" in sys.modules
+
+
+def _task_start():
+    """任务级埋点起点（best-effort：监控不可用不得影响画像主流程）。"""
+    try:
+        from monitor_collector import record_task_start
+        return record_task_start("全量画像计算")
+    except Exception:
+        log.warning("任务埋点 record_task_start 失败（不影响计算）", exc_info=True)
+        return None
+
+
+def _task_end(rid, status, elapsed_s):
+    """任务级埋点终点（best-effort，同 _task_start）。"""
+    if rid is None:
+        return
+    try:
+        from monitor_collector import record_task_end
+        record_task_end(rid, status, duration_s=round(elapsed_s, 2))
+    except Exception:
+        log.warning("任务埋点 record_task_end 失败（不影响计算）", exc_info=True)
+
+
+def _compute():
+    """画像计算主体（原 run 的全部逻辑；埋点包裹在 run 里）。"""
     as_of = date.today()
     n_tags = len(registry.all_tags())
     if n_tags == 0:
@@ -70,7 +123,15 @@ def run(codes=None, ctx=None):
     log.info("【全量画像】完成 as_of=%s, 标签数=%d, 失败=%d, 耗时=%.0fs",
              as_of, len(results), n_err, time.monotonic() - t0)
 
-    # 释放各域缓存：调度器是常驻进程，不清会让上一轮的大对象（窗口行情等）
-    # 一直驻留到下一轮覆盖。
+    # 释放各域缓存：大对象（窗口行情等）在模块级缓存里不会随函数返回释放，
+    # 会驻留到下一轮覆盖。独立进程退出时本可自然归还，保留调用是为兼容
+    # 「同进程内连续多次计算」（回填/测试）场景。
     engine.clear_caches()
     return True
+
+
+if __name__ == "__main__":
+    # 独立运行入口：由 systemd 单元 compute-profile.service 调用
+    # （compute-profile.timer 每日 17:30 触发；模板见 system/ 目录）。
+    # 异常自然冒泡 → 非零退出码 → systemd 记为 failed。
+    run()

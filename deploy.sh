@@ -40,6 +40,8 @@ SYNC_USER="deploy-sync"
 ROOT_HOST="106.55.42.60"                          # 生产服务器 IP
 APP_DIR="/home/mkt/EquityMarketAnalysis"          # 服务器代码目录
 SERVICES=(market-scheduler ticker-collector monitor-collector wecom-collector-a)
+# 定时单元（非常驻：不随 restart 重启，由 systemd 排期；改 unit 后 ./deploy.sh up 会重载）
+TIMERS=(compute-profile.timer)
 RSYNC_SSH="ssh -i $SYNC_KEY -o IdentitiesOnly=yes -o ConnectTimeout=15"
 
 # rsync 排除清单 = 保护服务器侧产物 + 过滤本地垃圾。
@@ -57,6 +59,9 @@ RSYNC_EXCLUDES=(
   --exclude 'trend_cache/'
   --exclude 'south_cache_*.json' --exclude 'margin_cache_*.json'
   --exclude '*_data.txt' --exclude '*.csv'
+  # _schema_diff.py 生成的修复 SQL：本机跑它只为验证脚本，产物不应被当成
+  # "服务器待执行 SQL"推送过去（服务器要用时在服务器上重新生成）
+  --exclude 'sql/schema_fix_*.sql'
   # 本地垃圾（与 .gitignore 对齐）
   --exclude '__pycache__/' --exclude '*.pyc' --exclude '.pytest_cache/'
   --exclude '.idea/' --exclude '.workbuddy/' --exclude '.DS_Store'
@@ -167,6 +172,8 @@ cmd_install_reqs() {
 
 cmd_up() {
   cmd_sync
+  # 注：system/ 下 unit 模板的变更需先 ./deploy.sh bootstrap（daemon-reload + 渲染）；
+  # 渲染后由下方 cmd_restart 段的重载步骤让 timer 的新排期生效。
   # ── 依赖安装：requirements.txt 变更时，sync 后自动在目标机重装 ────────────
   # 与 bootstrap 全量流程相比只跑 STEP=venv（venv+pip），不触碰 config/服务渲染，
   # 避免重复交互；幂等（pip 对未变包是 no-op）。
@@ -189,6 +196,10 @@ cmd_up() {
     [[ "$ans" =~ ^[Yy]$ ]] || { warn "已跳过重启（代码已推送，稍后手动 ./deploy.sh restart）"; return 0; }
   fi
   cmd_restart
+  # 定时单元重载：让 OnCalendar / 资源上限等 unit 变更生效（幂等；未安装则忽略）。
+  # 不并入 cmd_restart：对常驻服务重启是必要动作，对 timer 只是刷新排期。
+  root_ssh "systemctl restart ${TIMERS[*]} 2>/dev/null || true"
+  log "定时单元已重载: ${TIMERS[*]}"
 }
 
 cmd_restart() {
@@ -201,7 +212,7 @@ cmd_restart() {
 
 cmd_status() {
   log "服务状态（$ROOT_HOST）"
-  root_ssh "for s in ${SERVICES[*]}; do printf '%-22s %s\n' \"\$s\" \"\$(systemctl is-active \$s)\"; done"
+  root_ssh "for s in ${SERVICES[*]} ${TIMERS[*]}; do printf '%-24s %s\n' \"\$s\" \"\$(systemctl is-active \$s)\"; done"
 }
 
 cmd_logs() {

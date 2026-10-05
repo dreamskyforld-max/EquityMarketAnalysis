@@ -13,9 +13,18 @@
 #   1. 读取 $APP_DIR/sql/schema.sql（由 deploy.sh 同步过来的最新版）得到"期望结构"
 #   2. 连接本机 PostgreSQL 读出"实际结构"（SELECT 查询）
 #   3. 语义化 diff，分类:
-#        - 新增表 / 新增列 / 新增索引 / 视图变更   → 低风险
-#        - 删除列 / 删除索引 / 修改列类型          → 高风险（会丢数据 / 改结构）
+#        - 新增表 / 新增列 / 缺 NOT NULL / 新增索引（含 PK/UNIQUE 约束）/ 视图变更 → 低风险
+#        - 删除列 / 删除索引 / 修改列类型                                       → 高风险
+#        - 库比 schema.sql 更严格（多余 NOT NULL）                              → 仅提示
 #   4. 把所有修复 SQL 收集起来，输出到屏幕并写入带时间戳的文件，供用户手动执行。
+#
+# 修复 SQL 的完整性（2026-10-05 补，起因: trading_calendar 缺主键 + 三列缺
+# NOT NULL 被检出，但"修复 SQL"却是空的）:
+#   · 约束型索引（建表块内联 PRIMARY KEY / UNIQUE）在 schema.sql 中没有独立
+#     CREATE INDEX 语句 → 用 ALTER TABLE ADD CONSTRAINT 还原（旧版静默跳过）；
+#   · nullable 差异纳入比对（旧版只比类型不比 NOT NULL），收敛方向生成 SET NOT NULL；
+#   · 新建表的 DDL 带上 NOT NULL 与 PK/UNIQUE 约束（旧版只有列名 + 类型）；
+#   · 任何"检出差异但无法生成 SQL"的情况显式打印 [!] 提示，绝不静默。
 #
 # 视图比对的两级策略（2026-09-23 增加二级）:
 #   一级（快速）: norm_view_def 文本归一化比对 —— 覆盖 PG 反解析的常见差异，
@@ -340,6 +349,15 @@ def parse_schema(text):
     # schema.sql 中的该段落仅作结构真相源登记，不参与本工具的 diff/修复。
     for t in [t for t in tables if "." in t]:
         tables.pop(t, None)
+    # 主键列在 PG 里隐含 NOT NULL：把表级 PRIMARY KEY 的列补进期望 notnull，
+    # 否则与库里 attnotnull=True 比对会误报"库更严格"（列级 PRIMARY KEY 已在
+    # parse_column_line 处理；此处覆盖 PRIMARY KEY (a, b) 的表级写法）。
+    # 必须在剔除索引之前执行 —— 主键信息存在 indexes[*]["constraint"] 里。
+    for info in indexes.values():
+        con = info.get("constraint")
+        if con and con["kind"] == "PRIMARY KEY" and info["tbl"] in tables:
+            for c in con["cols"]:
+                tables[info["tbl"]].setdefault("notnull", {})[c] = True
     for k in [k for k, v in indexes.items() if v.get("tbl") not in tables]:
         indexes.pop(k, None)
     # 非 public 视图同理剔除（如 regime.v_macro_latest，由 regime_schema.py 幂等创建）
@@ -390,21 +408,35 @@ def collect_inline_indexes(line, indexes, tname, current_col=None):
     line = line.strip()
     if not line:
         return
+    # 备注（2026-10-05）: 约束型索引除 sig（比对用）外，记录 constraint 元信息
+    # （kind = PRIMARY KEY / UNIQUE，cols = 列名列表）。schema.sql 里没有它们的
+    # 独立 CREATE INDEX 语句 → 修复 SQL 必须用 ALTER TABLE ADD CONSTRAINT 还原；
+    # 旧版生成侧只认 CREATE INDEX，导致"报了差异却没有修复 SQL"（trading_calendar
+    # 缺主键即此形态），须靠这里的元信息兜底。
     # 显式命名约束: CONSTRAINT xxx PRIMARY KEY / UNIQUE (...)
     m = re.match(r"CONSTRAINT\s+([A-Za-z_][\w]*)\s+(PRIMARY\s+KEY|UNIQUE)", line, re.I)
     if m:
         name = m.group(1).lower()
         unique = bool(re.search(r"UNIQUE", m.group(2), re.I))
         cols = _extract_constraint_cols(line, current_col)
-        indexes[name] = {"tbl": tname, "sig": parse_index_signature(
-            f"CREATE {'UNIQUE ' if unique else ''}INDEX {name} ON {tname} ({cols})")}
+        indexes[name] = {
+            "tbl": tname,
+            "sig": parse_index_signature(
+                f"CREATE {'UNIQUE ' if unique else ''}INDEX {name} ON {tname} ({cols})"),
+            "constraint": {"kind": "UNIQUE" if unique else "PRIMARY KEY",
+                           "cols": _split_cols(cols)},
+        }
         return
     # 内联 PRIMARY KEY（表级带括号，或列级无括号）
     if re.search(r"\bPRIMARY\s+KEY\b", line, re.I):
         name = f"{tname}_pkey"
         cols = _extract_constraint_cols(line, current_col, primary=True)
-        indexes[name] = {"tbl": tname, "sig": parse_index_signature(
-            f"CREATE UNIQUE INDEX {name} ON {tname} ({cols})")}
+        indexes[name] = {
+            "tbl": tname,
+            "sig": parse_index_signature(
+                f"CREATE UNIQUE INDEX {name} ON {tname} ({cols})"),
+            "constraint": {"kind": "PRIMARY KEY", "cols": _split_cols(cols)},
+        }
         return
     # 匿名 UNIQUE (a, b, ...)  -> {table}_{col1}_{col2}_..._key
     # 注意: PG 对匿名 UNIQUE 约束生成的物理索引名是【全列】而非仅首列，
@@ -414,13 +446,32 @@ def collect_inline_indexes(line, indexes, tname, current_col=None):
     m = re.match(r"UNIQUE\s*\(", line, re.I)
     if m:
         cols = _extract_constraint_cols(line, current_col)
-        col_list = [c.strip().split()[0].lower() for c in cols.split(",") if c.strip()]
+        col_list = _split_cols(cols)
         if not col_list:
             return
         name = f"{tname}_{'_'.join(col_list)}_key"
-        indexes[name] = {"tbl": tname, "sig": parse_index_signature(
-            f"CREATE UNIQUE INDEX {name} ON {tname} ({cols})")}
+        indexes[name] = {
+            "tbl": tname,
+            "sig": parse_index_signature(
+                f"CREATE UNIQUE INDEX {name} ON {tname} ({cols})"),
+            "constraint": {"kind": "UNIQUE", "cols": col_list},
+        }
         return
+
+
+def _split_cols(cols_str):
+    """'market,cal_date' → ['market', 'cal_date']（去空白与行内修饰，统一小写）。
+
+    用于把 _extract_constraint_cols 的逗号拼接串还原成列名列表（生成
+    ADD CONSTRAINT 的列清单 / 建表 DDL 的约束子句都要用）。
+    """
+    out = []
+    for c in (cols_str or "").split(","):
+        c = c.strip()
+        if not c:
+            continue
+        out.append(c.split()[0].lower())
+    return out
 
 
 def _extract_constraint_cols(line, current_col, primary=False):
@@ -480,6 +531,15 @@ def parse_column_line(line, tname, tables):
     tables[tname]["cols"][cname] = norm_type(ctype.strip())
     if cname not in tables[tname]["order"]:
         tables[tname]["order"].append(cname)
+    # notnull: 期望的 NOT NULL 状态（2026-10-05 补 —— 旧版只比类型、不比 nullable，
+    # 漏报了 trading_calendar 的 market/cal_date/is_open 缺 NOT NULL）。
+    # PG 语义上三种写法都隐含 NOT NULL，必须一起识别，否则与库里的 attnotnull=True
+    # 比对时会误报"库更严格"：① 显式 NOT NULL；② 列级 PRIMARY KEY；
+    # ③ SERIAL 家族（smallint/integer/bigint + serial 都是 NOT NULL）。
+    explicit_nn = bool(re.search(r"\bNOT\s+NULL\b", line, re.I))
+    inline_pk = bool(re.search(r"\bPRIMARY\s+KEY\b", line, re.I))
+    serial_nn = bool(re.match(r"(?:small|big)?serial\b", ctype.strip(), re.I))
+    tables[tname].setdefault("notnull", {})[cname] = explicit_nn or inline_pk or serial_nn
 
 
 # ── 读取实际结构 ──────────────────────────────────────────────────────────────
@@ -487,7 +547,7 @@ def read_actual(db):
     tables = {}
     # 列（含类型）
     sql = (
-        "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod) "
+        "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull "
         "FROM pg_class c "
         "JOIN pg_attribute a ON a.attrelid = c.oid "
         "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -503,9 +563,13 @@ def read_actual(db):
         if len(parts) < 3:
             continue
         t, c, typ = parts[0], parts[1], parts[2]
-        tables.setdefault(t, {"cols": {}, "order": []})
+        tables.setdefault(t, {"cols": {}, "order": [], "notnull": {}})
         tables[t]["cols"][c] = norm_type(typ)
         tables[t]["order"].append(c)
+        # attnotnull：实际库的 NOT NULL 状态（-tA 模式下布尔输出 t/f）。
+        # 2026-10-05 补：之前只比类型，漏报 nullable 差异。
+        if len(parts) >= 4:
+            tables[t].setdefault("notnull", {})[c] = parts[3].strip().lower() in ("t", "true")
 
     # 索引（含 indexdef，用于按"内容指纹"比对，避免同名不同名误报）
     # 返回结构: indexes[name] = {tbl, sig}
@@ -594,9 +658,55 @@ def resolve_view_def_via_pg(db, body):
 # 说明: 以下所有函数只负责产出一条 SQL 文本，交给用户自行 review / 手动执行。
 # 脚本本身不调用 psql 执行任何写操作。
 
-def gen_ddl_create_table(t, cols):
-    col_defs = ", ".join(f'"{c}" {ty}' for c, ty in cols.items())
-    return f'CREATE TABLE IF NOT EXISTS "{t}" ({col_defs});'
+def gen_ddl_create_table(t, table_info, constraints=()):
+    """生成建表 DDL（含 NOT NULL 与 PK / UNIQUE 约束）。
+
+    旧版只输出「列名 + 类型」—— 新建表的 DDL 会丢掉 NOT NULL / 主键 / 唯一约束，
+    建出来的表与 schema.sql 仍不一致（下次 diff 又报差异），2026-10-05 补齐。
+    constraints: [(name, kind, cols)]，由 main 从 exp_indexes[*]["constraint"] 收集。
+    """
+    raw = table_info.get("raw_cols") or table_info.get("cols") or {}
+    nn = table_info.get("notnull", {})
+    order = table_info.get("order") or list(raw.keys())
+    parts = []
+    for c in order:
+        ty = raw.get(c)
+        if ty is None:
+            continue
+        parts.append(f'"{c}" {ty}' + (" NOT NULL" if nn.get(c) else ""))
+    for name, kind, cols in constraints:
+        if not cols:
+            continue
+        col_list = ", ".join(f'"{x}"' for x in cols)
+        parts.append(f'CONSTRAINT "{name}" {kind} ({col_list})')
+    return f'CREATE TABLE IF NOT EXISTS "{t}" ({", ".join(parts)});'
+
+
+def gen_ddl_add_constraint(t, name, kind, cols):
+    """约束型索引（主键 / 唯一约束）的修复 DDL。
+
+    schema.sql 里这类约束写在建表块内（如 PRIMARY KEY (a, b)），没有独立
+    CREATE INDEX 语句 → 修复必须用 ALTER TABLE ADD CONSTRAINT 还原。
+    （2026-10-05 修：此前生成侧只认 CREATE INDEX，导致"报了差异却没有 SQL"，
+     trading_calendar 缺主键即此形态）
+    低风险（向 schema 收敛）；ADD CONSTRAINT 需全表校验：若已有重复行
+    （PK / UNIQUE）或主键列含 NULL 会执行失败 —— 失败不损坏数据，清理后重跑。
+    """
+    col_list = ", ".join(f'"{c}"' for c in cols)
+    return (f'-- 注: 若表中已有违反约束的数据（重复行 / 主键列为 NULL）会执行失败，'
+            f'失败不损坏数据\n'
+            f'ALTER TABLE "{t}" ADD CONSTRAINT "{name}" {kind} ({col_list});')
+
+
+def gen_ddl_set_not_null(t, col):
+    """收敛 NOT NULL 的修复 DDL（低风险）。
+
+    若该列已有 NULL 值会执行失败（失败不损坏数据）；执行前可自查：
+        SELECT count(*) FROM "<t>" WHERE "<col>" IS NULL;
+    """
+    return (f'-- 注: 若 "{col}" 已有 NULL 行会执行失败（可先自查 '
+            f'SELECT count(*) FROM "{t}" WHERE "{col}" IS NULL）\n'
+            f'ALTER TABLE "{t}" ALTER COLUMN "{col}" SET NOT NULL;')
 
 
 def gen_ddl_add_column(t, col, typ):
@@ -621,38 +731,30 @@ def gen_ddl_alter_type(t, col, new):
     return f'ALTER TABLE "{t}" ALTER COLUMN "{col}" TYPE {new};'
 
 
-def main():
-    print("=" * 64)
-    print("  数据库增量同步 (schema.sql ↔ 目标库)")
-    print("=" * 64)
-    if not os.path.exists(SCHEMA_PATH):
-        sys.exit(f"[x] 找不到 {SCHEMA_PATH}")
+# ── 差异计算与修复 SQL 组装（纯函数，供 main 与单元测试共用）────────────────────
+# 2026-10-05 从 main() 抽出：原逻辑内联在 main 里无法单测；抽出后
+# tests/test_schema_diff.py 可构造「服务器态」直接验证修复 SQL 的正确性。
 
-    db = load_db_conf()
-    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
-        schema_text = f.read()
+def diff_schema(exp_tables, exp_indexes, act_tables, act_indexes):
+    """表 / 列 / nullable / 索引（含 PK·UNIQUE 约束）的差异计算（纯函数，不连库）。
 
-    exp_tables, exp_indexes, exp_views, exp_views_raw = parse_schema(schema_text)
-    act_tables, act_indexes, act_views = read_actual(db)
-
-    # 计算差异
-    # 注意: 目标库可能是多项目共用。本项目只拥有"schema.sql 声明范围内"的对象，
-    # 绝不触碰未知表/索引（那些属于其他项目）。
+    视图差异涉及 PG 二级确认（需要连库），不在本函数职责内，仍由 main 处理。
+    """
     new_tables = [t for t in exp_tables if t not in act_tables]
 
-    # other_tables: 库里有、但本项目未声明的表。在共用库里这绝大多数是其他
-    # 项目的表，不能自动提议 DROP。仅记录、提示，不进入任何危险操作列表。
-    other_tables = [t for t in act_tables if t not in exp_tables and t not in act_views]
-
-    add_cols = []     # (table, col, type)
-    alter_cols = []   # (table, col, old, new)
-    drop_cols = []    # (table, col) —— 仅限本项目已声明表内
+    add_cols = []         # (table, col, type)
+    alter_cols = []       # (table, col, old, new)
+    drop_cols = []        # (table, col) —— 仅限本项目已声明表内
+    set_not_null = []     # (table, col) 期望 NOT NULL、库中可空 → SET NOT NULL（低风险）
+    loosen_not_null = []  # (table, col) 库中 NOT NULL、schema.sql 未声明 → 仅提示
     for t in exp_tables:
         if t not in act_tables:
             continue
         exp_c = exp_tables[t]["cols"]
         exp_raw = exp_tables[t].get("raw_cols", {})
         act_c = act_tables[t]["cols"]
+        exp_nn = exp_tables[t].get("notnull", {})
+        act_nn = act_tables[t].get("notnull", {})
         for col, typ in exp_c.items():
             # 比较用归一化类型 typ，进 SQL 用原始写法（fallback: 归一化为兜底）
             ddl_typ = exp_raw.get(col, typ)
@@ -660,6 +762,17 @@ def main():
                 add_cols.append((t, col, ddl_typ))
             elif act_c[col] != typ:
                 alter_cols.append((t, col, act_c[col], ddl_typ))
+            # NULLABLE 比对（2026-10-05 补）：只做"收敛方向"（期望 NOT NULL、
+            # 库中可空）并生成 SET NOT NULL；反向（库比 schema.sql 更严格）仅提示、
+            # 不生成 SQL —— 放宽生产约束不该由脚本擅自提议，且 schema.sql 未写
+            # NOT NULL 时库里的 NOT NULL 可能是有意为之。
+            if col in act_nn:
+                want_nn = exp_nn.get(col, False)
+                have_nn = act_nn[col]
+                if want_nn and not have_nn:
+                    set_not_null.append((t, col))
+                elif have_nn and not want_nn:
+                    loosen_not_null.append((t, col))
         for col in act_c:
             if col not in exp_c:
                 drop_cols.append((t, col))
@@ -667,7 +780,7 @@ def main():
     # 索引按"内容指纹"比对：同名不同名只要列/方向/唯一性一致就互相抵消，
     # 不算差异（例如旧约束索引 daily_quote_stock_code_trade_date_key 与
     # 新索引 idx_daily_quote_stock_date 内容一致，仅名字不同，无需改动）。
-    # exp_indexes / act_indexes 的值为 {tbl, sig}
+    # sig 为 None（解析失败）不参与抵消 —— 与旧行为一致。
     from collections import defaultdict
     act_sigs = defaultdict(set)   # tbl -> set(sig)
     for info in act_indexes.values():
@@ -695,6 +808,108 @@ def main():
         if info.get("sig") and info["sig"] in exp_sigs.get(tbl, set()):
             continue  # 期望侧已有相同内容的索引（可能名字不同），跳过
         drop_indexes.append(idx)
+
+    return {
+        "new_tables": new_tables,
+        "add_cols": add_cols,
+        "alter_cols": alter_cols,
+        "drop_cols": drop_cols,
+        "set_not_null": set_not_null,
+        "loosen_not_null": loosen_not_null,
+        "new_indexes": new_indexes,
+        "drop_indexes": drop_indexes,
+    }
+
+
+def build_low_risk_sql(schema_text, exp_tables, exp_indexes, diffs):
+    """低风险修复 SQL 的生成（纯函数，不连库，便于单测）。
+
+    diffs: diff_schema() 的返回 dict，另需含 new_views / changed_views
+           （视图差异由 main 计算后并入）。
+    返回 SQL 行列表（含注释行）；无差异时返回空列表。
+    """
+    new_tables = diffs["new_tables"]
+    add_cols = diffs["add_cols"]
+    set_not_null = diffs["set_not_null"]
+    new_indexes = diffs["new_indexes"]
+    new_views = diffs.get("new_views", [])
+    changed_views = diffs.get("changed_views", [])
+    if not (new_tables or add_cols or set_not_null or new_indexes
+            or new_views or changed_views):
+        return []
+    lines = ["-- ── 低风险：新增表 / 列 / 非空 / 索引 / 约束 / 视图 ──"]
+    for t in new_tables:
+        # 列类型必须用 raw_cols（原始写法），归一化值会产出非法类型名；
+        # 约束（PK / UNIQUE）必须随建表语句一起建，否则建出的表仍缺约束
+        # （2026-10-05 补 —— 旧版只输出「列名 + 类型」）。
+        cons = [(name, info["constraint"]["kind"], info["constraint"]["cols"])
+                for name, info in exp_indexes.items()
+                if info.get("tbl") == t and info.get("constraint")]
+        lines.append(gen_ddl_create_table(t, exp_tables[t], cons))
+    for t, col, typ in add_cols:
+        lines.append(gen_ddl_add_column(t, col, typ))
+    for t, col in set_not_null:
+        lines.append(gen_ddl_set_not_null(t, col))
+    for idx in new_indexes:
+        ddl = extract_index_ddl(schema_text, idx)
+        if ddl:
+            lines.append(ddl)
+            continue
+        # 约束型索引（建表块内联 PRIMARY KEY / UNIQUE）在 schema.sql 里没有独立
+        # CREATE INDEX 语句 → 用 ADD CONSTRAINT 还原。旧版此处 `if ddl:` 为假就
+        # 静默跳过，导致"报了差异却没有修复 SQL"（trading_calendar 缺主键即此
+        # 形态）；现在兜底，实在还原不了也留显式提示，绝不静默。
+        info = exp_indexes.get(idx) or {}
+        con = info.get("constraint")
+        tbl = info.get("tbl")
+        if con and tbl and con["cols"]:
+            lines.append(gen_ddl_add_constraint(tbl, idx, con["kind"], con["cols"]))
+        else:
+            lines.append(
+                f'-- [!] {idx} ON {tbl or "?"}: schema.sql 中无独立 CREATE INDEX '
+                f'语句、也无法按约束还原 —— 请人工从建表块提取定义后手工执行')
+    for v in new_views + changed_views:
+        ddl = extract_view_ddl(schema_text, v)
+        if ddl:
+            lines.append(ddl)
+    lines.append("")
+    return lines
+
+
+def main():
+    print("=" * 64)
+    print("  数据库增量同步 (schema.sql ↔ 目标库)")
+    print("=" * 64)
+    if not os.path.exists(SCHEMA_PATH):
+        sys.exit(f"[x] 找不到 {SCHEMA_PATH}")
+
+    db = load_db_conf()
+    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+        schema_text = f.read()
+
+    exp_tables, exp_indexes, exp_views, exp_views_raw = parse_schema(schema_text)
+    act_tables, act_indexes, act_views = read_actual(db)
+
+    # 计算差异
+    # 注意: 目标库可能是多项目共用。本项目只拥有"schema.sql 声明范围内"的对象，
+    # 绝不触碰未知表/索引（那些属于其他项目）。
+    # 表 / 列 / nullable / 索引差异走纯函数（便于单测：可独立构造「服务器态」
+    # 验证修复 SQL 的正确性，见 tests/test_schema_diff.py）。
+    # 视图差异涉及 PG 二级确认（需要连库），仍在下方单独计算。
+    d = diff_schema(exp_tables, exp_indexes, act_tables, act_indexes)
+    new_tables = d["new_tables"]
+    add_cols = d["add_cols"]
+    alter_cols = d["alter_cols"]
+    drop_cols = d["drop_cols"]
+    set_not_null = d["set_not_null"]
+    loosen_not_null = d["loosen_not_null"]
+    new_indexes = d["new_indexes"]
+    drop_indexes = d["drop_indexes"]
+
+    # other_tables: 库里有、但本项目未声明的表。在共用库里这绝大多数是其他
+    # 项目的表，不能自动提议 DROP。仅记录、提示，不进入任何危险操作列表。
+    other_tables = [t for t in act_tables if t not in exp_tables and t not in act_views]
+
     # 视图语义比对：两级策略（详见文件头说明）。
     #   - 目标库没有该视图                    -> new_views（需创建）
     #   - 一级 norm 不一致、二级 PG 复核一致  -> 忽略（confirmed_same，手写文本差异）
@@ -718,7 +933,7 @@ def main():
 
     total = (len(new_tables) + len(add_cols) + len(alter_cols)
              + len(drop_cols) + len(new_indexes) + len(drop_indexes)
-             + len(new_views) + len(changed_views))
+             + len(new_views) + len(changed_views) + len(set_not_null))
 
     # 二级确认结果提示（透明度：让用户知道哪些「疑似视图差异」被判定为文本等价）
     if confirmed_same:
@@ -741,9 +956,15 @@ def main():
         print(f"  + 表      {t}  ({len(exp_tables[t]['cols'])} 列)")
     for t, col, typ in add_cols:
         print(f"  + 列      {t}.{col}  {typ}")
+    for t, col in set_not_null:
+        print(f"  + 非空    {t}.{col}  SET NOT NULL")
     for idx in new_indexes:
         t = exp_indexes[idx]["tbl"]
-        print(f"  + 索引    {idx} ON {t}")
+        con = exp_indexes[idx].get("constraint")
+        if con:
+            print(f"  + 约束    {idx}  {con['kind']} ({', '.join(con['cols'])}) ON {t}")
+        else:
+            print(f"  + 索引    {idx} ON {t}")
     for v in new_views:
         print(f"  + 视图    {v}")
     for v in changed_views:
@@ -757,6 +978,17 @@ def main():
             print(f"    · {t}")
         if len(other_tables) > 50:
             print(f"    · … 及另外 {len(other_tables) - 50} 张")
+
+    # 库比 schema.sql 更严格（NOT NULL）：仅提示、不生成 SQL、不计入差异总数。
+    # schema.sql 未声明 NOT NULL 时，库里的约束可能是有意为之（或历史遗留），
+    # 擅自 DROP NOT NULL 属于放宽生产约束，不由脚本提议。
+    if loosen_not_null:
+        print(f"\n[i] {len(loosen_not_null)} 列在库中为 NOT NULL、schema.sql 未声明"
+              f"（库更严格，未生成 SQL；如需放宽请人工 ALTER ... DROP NOT NULL）:")
+        for t, col in loosen_not_null[:20]:
+            print(f"    · {t}.{col}")
+        if len(loosen_not_null) > 20:
+            print(f"    · … 及另外 {len(loosen_not_null) - 20} 列")
 
     # 高风险：删除 / 修改（仅限本项目已声明对象）
     if drop_cols or drop_indexes or alter_cols:
@@ -787,24 +1019,11 @@ def main():
     sql_lines.append("-- ===========================================================")
     sql_lines.append("")
 
-    # 低风险: 新增
-    if new_tables or add_cols or new_indexes or new_views or changed_views:
-        sql_lines.append("-- ── 低风险：新增表 / 列 / 索引 / 视图 ──")
-        for t in new_tables:
-            # 列类型必须用 raw_cols（原始写法），归一化值会产出非法类型名
-            cols_for_ddl = exp_tables[t].get("raw_cols") or exp_tables[t]["cols"]
-            sql_lines.append(gen_ddl_create_table(t, cols_for_ddl))
-        for t, col, typ in add_cols:
-            sql_lines.append(gen_ddl_add_column(t, col, typ))
-        for idx in new_indexes:
-            ddl = extract_index_ddl(schema_text, idx)
-            if ddl:
-                sql_lines.append(ddl)
-        for v in new_views + changed_views:
-            ddl = extract_view_ddl(schema_text, v)
-            if ddl:
-                sql_lines.append(ddl)
-        sql_lines.append("")
+    # 低风险: 新增表 / 列 / 非空 / 索引 / 约束 / 视图
+    # （生成逻辑抽到 build_low_risk_sql —— 纯函数，tests/test_schema_diff.py 直接验证）
+    d["new_views"] = new_views
+    d["changed_views"] = changed_views
+    sql_lines.extend(build_low_risk_sql(schema_text, exp_tables, exp_indexes, d))
 
     # 高风险: 删列 / 删索引 / 改类型 —— 默认注释，需手工确认
     if drop_cols or drop_indexes or alter_cols:
@@ -836,7 +1055,15 @@ def main():
             f.write(sql_text + "\n")
         print(f"\n[+] 修复 SQL 已写入: {out_path}")
     except OSError as e:
-        print(f"\n[!] 写入文件失败（不影响上方已打印的 SQL）: {e}")
+        # sql/ 目录属 deploy-sync（rsync 推送通道），以其它身份运行（如 mkt）时
+        # 不可写 —— 退化写 /tmp，保证 SQL 能落盘被复制/执行（2026-10-05 补）。
+        alt_path = os.path.join("/tmp", os.path.basename(out_path))
+        try:
+            with open(alt_path, "w", encoding="utf-8") as f:
+                f.write(sql_text + "\n")
+            print(f"\n[+] sql/ 目录不可写（{e}）；修复 SQL 已改写入: {alt_path}")
+        except OSError as e2:
+            print(f"\n[!] 写入文件失败（不影响上方已打印的 SQL）: {e2}")
 
     print("\n[i] 脚本仅做检测，未对数据库做任何修改。请复制上方 SQL 或打开生成的文件，"
           "确认无误后手动执行。")

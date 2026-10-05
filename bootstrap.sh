@@ -302,10 +302,16 @@ render_config(){
 render_services(){
   log "[7/8] 渲染 service 模板"
   local svcdir=/etc/systemd/system
-  local services=(FutuOpenD market-scheduler ticker-collector monitor-collector wecom-collector-a)
-  for s in "${services[@]}"; do
-    local tpl="$APP_DIR/system/$s.service"
-    [[ -f "$tpl" ]] || { warn "缺 $tpl, 跳过 $s"; continue; }
+  # 常驻服务 + 定时单元。compute-profile 为 oneshot 画像计算任务：
+  # service 无 [Install]（不随开机自启），仅由同名 timer 触发。
+  local units=(
+    FutuOpenD.service market-scheduler.service ticker-collector.service
+    monitor-collector.service wecom-collector-a.service
+    compute-profile.service compute-profile.timer
+  )
+  for u in "${units[@]}"; do
+    local tpl="$APP_DIR/system/$u"
+    [[ -f "$tpl" ]] || { warn "缺 $tpl, 跳过 $u"; continue; }
     sed \
       -e "s|{{APP_USER}}|$(escape_sed "$APP_USER")|g" \
       -e "s|{{APP_DIR}}|$(escape_sed "$APP_DIR")|g" \
@@ -313,8 +319,8 @@ render_services(){
       -e "s|{{FUTU_USER}}|$(escape_sed "$FUTU_USER")|g" \
       -e "s|{{FUTU_OPEND_DIR}}|$(escape_sed "$FUTU_OPEND_DIR")|g" \
       -e "s|{{FUTU_LOGIN_ACCOUNT}}|$(escape_sed "$FUTU_LOGIN_ACCOUNT")|g" \
-      "$tpl" > "$svcdir/$s.service"
-    log "  已渲染 $s.service → $svcdir"
+      "$tpl" > "$svcdir/$u"
+    log "  已渲染 $u → $svcdir"
   done
   systemctl daemon-reload
 }
@@ -328,6 +334,11 @@ enable_services(){
       && log "  $s 已启用" \
       || warn "  $s 启用失败 (检查 FutuOpenD 是否已登录 / 日志 journalctl -u $s)"
   done
+  # 画像计算：只 enable timer（compute-profile.service 为 oneshot 且无 [Install]，
+  # 不随开机自启，仅由 timer 触发；手动执行用 systemctl start compute-profile.service）
+  systemctl enable --now compute-profile.timer >/dev/null 2>&1 \
+    && log "  compute-profile.timer 已启用（工作日 17:30）" \
+    || warn "  compute-profile.timer 启用失败 (日志 journalctl -u compute-profile)"
   # FutuOpenD 需先手动登录
   if [[ -x "$FUTU_OPEND_DIR/FutuOpenD" ]]; then
     if confirm "FutuOpenD 是否已完成首次登录并启动? (若否则先 cd $FUTU_OPEND_DIR && ./FutuOpenD)"; then

@@ -292,48 +292,79 @@ def _clip(s, start: datetime.date, end: datetime.date) -> pd.Series:
     return s[mask]
 
 
+# 逐股滚动的分批大小（股票数/批）。每批约 500 只 × 445 天 ≈ 15 万行（峰值 ~40MB），
+# 取代原实现的一次性全市场加载（~200 万行 / 峰值 888MB，见下）。
+_WINDOW_BATCH_CODES = 500
+
+
 def _per_stock_windows(conn, market: str, w_start: datetime.date, end: datetime.date) -> pd.DataFrame:
     """逐股滚动窗口：60 日新高/新低、MA60/MA200 上下占比。
 
     为什么不全在 SQL 里做（性能实测）：PostgreSQL 的 max()/min() 移动窗口**没有逆函数**，
     1.4M 行 × 60 帧 ≈ 33s；改成「SQL 只取原始列 + pandas rolling（C 实现）」后 <3s。
+
+    ⚠ 内存（2026-10-05 修，勿改回一次性加载）：原实现一次 read_sql_query 就把
+    全市场 ~200 万行（A 股 5300 只 × 445 天窗口）拉进 pandas，实测峰值 888MB
+    （HK 354MB）——在 1.9GB 内存的小机上直接打穿可用余量，与画像计算 09-29/30
+    的整机内存-IO 雪崩同款（会连带遗留 futu 锁死、全量采集停摆）。
+    改为**按股票分批**：每批 500 只的完整窗口单独 rolling、按 trade_date 聚合累加。
+    逐股窗口互不跨股（rolling 的 groupby stem 是 stock_code）→ 数学等价；
+    峰值只与单批相关（~40MB），与窗口总行数脱钩。
+
     返回：按 trade_date 聚合的家数（ok60/ok200 为有效样本数，nh60/nl60/ab60/ab200 为命中数）。
     """
     if market == "CN":
-        sql = """SELECT trade_date, stock_code, close FROM a_daily_quote
-                 WHERE trade_date BETWEEN %s AND %s AND close IS NOT NULL
-                   AND close <> 'NaN'::numeric AND left(stock_code,5) <> ALL(%s)"""
-        params = [w_start, end, list(CN_EXCLUDE_PREFIX)]
+        tbl = "a_daily_quote"
+        flt = "close IS NOT NULL AND close <> 'NaN'::numeric AND left(stock_code,5) <> ALL(%s)"
+        fparams = [list(CN_EXCLUDE_PREFIX)]
     else:
-        sql = """SELECT trade_date, stock_code, close FROM hk_daily_quote
-                 WHERE trade_date BETWEEN %s AND %s AND close IS NOT NULL
-                   AND close <> 'NaN'::numeric AND amount >= %s"""
-        params = [w_start, end, HK_MIN_AMOUNT]
+        tbl = "hk_daily_quote"
+        flt = "close IS NOT NULL AND close <> 'NaN'::numeric AND amount >= %s"
+        fparams = [HK_MIN_AMOUNT]
 
-    df = _q(conn, sql, params)
-    if df.empty:
+    # 窗口内有数据的股票清单（DISTINCT / ORDER 交给 PG，客户端只收几千行）
+    codes = _q(conn,
+               f"SELECT DISTINCT stock_code FROM {tbl} "
+               f"WHERE trade_date BETWEEN %s AND %s AND {flt} ORDER BY stock_code",
+               [w_start, end] + fparams)["stock_code"].tolist()
+    if not codes:
         return pd.DataFrame()
-    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
-    df = df.sort_values(["stock_code", "trade_date"], kind="mergesort").reset_index(drop=True)
 
-    roll = df.groupby("stock_code", sort=False)["close"]
-    n60 = roll.rolling(60, min_periods=1).count().reset_index(level=0, drop=True)
-    n200 = roll.rolling(200, min_periods=1).count().reset_index(level=0, drop=True)
-    h60 = roll.rolling(60, min_periods=1).max().reset_index(level=0, drop=True)
-    l60 = roll.rolling(60, min_periods=1).min().reset_index(level=0, drop=True)
-    ma60 = roll.rolling(60, min_periods=1).mean().reset_index(level=0, drop=True)
-    ma200 = roll.rolling(200, min_periods=1).mean().reset_index(level=0, drop=True)
+    agg = None
+    for i in range(0, len(codes), _WINDOW_BATCH_CODES):
+        batch = codes[i:i + _WINDOW_BATCH_CODES]
+        df = _q(conn,
+                f"SELECT trade_date, stock_code, close FROM {tbl} "
+                f"WHERE stock_code = ANY(%s) AND trade_date BETWEEN %s AND %s AND {flt} "
+                f"ORDER BY stock_code, trade_date",
+                [batch, w_start, end] + fparams)
+        if df.empty:
+            continue
+        df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+        df = df.sort_values(["stock_code", "trade_date"], kind="mergesort").reset_index(drop=True)
 
-    ok60, ok200 = n60 >= 60, n200 >= 200
-    agg = pd.DataFrame({
-        "trade_date": df["trade_date"],
-        "ok60": ok60.astype(int), "ok200": ok200.astype(int),
-        "nh60": (ok60 & (df["close"] >= h60)).astype(int),
-        "nl60": (ok60 & (df["close"] <= l60)).astype(int),
-        "ab60": (ok60 & (df["close"] > ma60)).astype(int),
-        "ab200": (ok200 & (df["close"] > ma200)).astype(int),
-    })
-    return agg.groupby("trade_date")[["ok60", "ok200", "nh60", "nl60", "ab60", "ab200"]].sum()
+        # 批内逐股滚动（算法与参数和旧版完全一致，仅数据范围缩小到本批）
+        roll = df.groupby("stock_code", sort=False)["close"]
+        n60 = roll.rolling(60, min_periods=1).count().reset_index(level=0, drop=True)
+        n200 = roll.rolling(200, min_periods=1).count().reset_index(level=0, drop=True)
+        h60 = roll.rolling(60, min_periods=1).max().reset_index(level=0, drop=True)
+        l60 = roll.rolling(60, min_periods=1).min().reset_index(level=0, drop=True)
+        ma60 = roll.rolling(60, min_periods=1).mean().reset_index(level=0, drop=True)
+        ma200 = roll.rolling(200, min_periods=1).mean().reset_index(level=0, drop=True)
+
+        ok60, ok200 = n60 >= 60, n200 >= 200
+        part = pd.DataFrame({
+            "trade_date": df["trade_date"],
+            "ok60": ok60.astype(int), "ok200": ok200.astype(int),
+            "nh60": (ok60 & (df["close"] >= h60)).astype(int),
+            "nl60": (ok60 & (df["close"] <= l60)).astype(int),
+            "ab60": (ok60 & (df["close"] > ma60)).astype(int),
+            "ab200": (ok200 & (df["close"] > ma200)).astype(int),
+        }).groupby("trade_date")[["ok60", "ok200", "nh60", "nl60", "ab60", "ab200"]].sum()
+        # 逐批累加（同一天跨批相加；本批缺失的日期按 0 补 —— 该批当天无有效样本，正确）
+        agg = part if agg is None else agg.add(part, fill_value=0)
+        del df
+    return agg.astype(int) if agg is not None else pd.DataFrame()
 
 
 # ── 计算：CN ────────────────────────────────────────────────────────────────

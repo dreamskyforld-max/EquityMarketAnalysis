@@ -160,6 +160,7 @@ def ensure_tables():
     _migrate_monitor_config()
     _migrate_regime_monitor_config()
     _migrate_market_config()
+    _migrate_profile_task_config()
 
 
 # 当前真正在采集的表的种子配置（仅在配置表为空时写入）。
@@ -201,15 +202,22 @@ _SEED_TABLE_CONFIG = [
 ]
 
 
-# 任务级 stall 监控 seed：只纳入"应持续运行"的高频任务。
+# 任务级 stall 监控 seed：只纳入"应持续运行"的任务。
 # 低频/一次性任务（日/周级）不进表，避免非刷新日被误报停摆。
 # 元组: (task_name, max_interval_min, remark)
-# 暂不 seed 任何任务：现有高频任务（盘中批量采集 / 港股成交额 / 全球指数分钟）
-# 的「是否在跑」已被 data_stale 覆盖（对应数据表都在监控），task_stall 对它们
-# 是冗余，且会因盘后不写 task_log 而误报（任务盘后不跑，但 stall 检查窗口仍开）。
-# monitor_task_config 表与 _check_task_stall 逻辑保留，供未来「成功与否不反映在
-# 数据表上」的任务（如纯清理类）使用。
-_SEED_TASK_CONFIG = []
+# 高频采集任务（盘中批量采集 / 港股成交额 / 全球指数分钟）的「是否在跑」已被
+# data_stale 覆盖（对应数据表都在监控），task_stall 对它们是冗余，且会因盘后
+# 不写 task_log 而误报（任务盘后不跑，但 stall 检查窗口仍开），故不入表。
+#
+# 全量画像计算（2026-10-05 从 market_scheduler 迁出为独立 systemd 单元）：
+# 它的产出（profile.tag_value）每天都有部分标签 SkipTag 或原地更新，data_stale
+# 判不出「任务是否执行」；用 collection_task_log 埋点（compute_profile.run 内置
+# record_task_start/end 写入）判停摆最准。max_interval 1440 分钟（每日一次）：
+# warn=1.5x(36h) / crit=2x(48h) 的阈值天然容忍周末与「当天还没到 17:30」，
+# 只有连续 ≥1.5 天没跑（如任务被 OOM 杀掉、timer 失效）才告警。
+_SEED_TASK_CONFIG = [
+    ("全量画像计算", 1440, "compute-profile.timer 每日 17:30（独立 systemd 单元）"),
+]
 
 
 def _seed_table_config():
@@ -369,6 +377,22 @@ def _seed_task_config():
             cur.execute("SELECT COUNT(*) FROM monitor_task_config")
             if cur.fetchone()[0] > 0:
                 return
+            for name, max_min, remark in _SEED_TASK_CONFIG:
+                cur.execute(
+                    "INSERT INTO monitor_task_config (task_name, max_interval_min, remark) "
+                    "VALUES (%s, %s, %s) ON CONFLICT (task_name) DO NOTHING",
+                    (name, max_min, remark),
+                )
+        conn.commit()
+
+
+def _migrate_profile_task_config():
+    """画像任务监控登记（幂等）：_seed_task_config 只在配置表为空时写入，
+    存量库（已有其它行、或表为空但曾 seed 过空列表）两条路都要覆盖 ——
+    与 _migrate_regime_monitor_config 同模式，逐行 ON CONFLICT DO NOTHING 补登记。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
             for name, max_min, remark in _SEED_TASK_CONFIG:
                 cur.execute(
                     "INSERT INTO monitor_task_config (task_name, max_interval_min, remark) "
