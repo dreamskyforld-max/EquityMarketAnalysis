@@ -60,6 +60,31 @@ DERIVED = [
      "pp", "商业银行普通债(AAA) 10Y − 国债 10Y"),
     ("CN.TERM_SPREAD_10Y_1Y", "期限利差-国债 10Y−1Y", "CN.BOND_10Y", "CN.BOND_1Y",
      "pp", "国债收益率曲线陡峭度，倒挂为衰退预警"),
+    ("CN.CREDIT_SPREAD_MTN_AA_5Y", "信用利差-中短期票据AA 5Y", "CN.MTN_AA_5Y", "CN.BOND_5Y",
+     "pp", "AA 级中短票 5Y − 国债 5Y（低等级信用风险的绝对定价）"),
+    ("CN.GRADE_SPREAD_AA_AAA_5Y", "等级利差-AA−AAA 5Y", "CN.MTN_AA_5Y", "CN.MTN_AAA_5Y",
+     "pp", "**等级利差**（AA 中票 − AAA 中票）：同期限、仅信用等级不同 → 纯风险偏好读数，"
+           "走阔=风险偏好收缩（比绝对信用利差更少受无风险利率干扰）"),
+]
+
+# 通胀高频（日频）：CPI 的先行/验证序列
+#   猪价源 `spot_hog_year_trend_soozhu`：**约 7.5 个月滚动窗口** → 逐日累积；
+#   菜篮子源 `macro_china_vegetable_basket`：**2005-09 起的完整日频指数**（含源侧算好的同比）
+PRICES = [
+    ("CN.PORK_PRICE", "生猪价格(瘦肉型, 元/公斤)", "spot_hog_year_trend_soozhu", "价格"),
+    ("CN.VEG_BASKET", "菜篮子批发价格指数", "macro_china_vegetable_basket", "最新值"),
+    ("CN.VEG_BASKET_YOY", "菜篮子批发价格指数-近1年涨跌幅", "macro_china_vegetable_basket", "近1年涨跌幅"),
+]
+
+# 跨表派生：(code, 名称, 左序列, 右序列, 单位, 说明)
+#   序列写法 "macro:CODE"（regime.macro_series）/ "bench:CODE"（daily_benchmark）。
+#   为什么单独一类：中美利差需要**中债曲线（macro_series）− 美债（daily_benchmark，FRED 源）**
+#   跨两张表；而美债期限利差虽同表，但归属宏观口径（不进 daily_benchmark 的行情命名空间）。
+CROSS_DERIVED = [
+    ("CN.US_SPREAD_10Y", "中美利差-中债10Y−美债10Y", "macro:CN.BOND_10Y", "bench:US.DGS10",
+     "pp", "中美利差（外资配置中国资产的机会成本）；走阔通常伴随人民币企稳/外资流入改善"),
+    ("US.TERM_SPREAD_10Y_2Y", "美债期限利差 10Y−2Y", "bench:US.DGS10", "bench:US.DGS2",
+     "pp", "美债曲线陡峭度；倒挂为经典衰退预警（全球流动性与风险偏好的领先信号）"),
 ]
 
 
@@ -163,16 +188,107 @@ def _derived_rows(conn) -> list:
     return rows
 
 
+def _price_rows() -> list:
+    """通胀高频价格序列（猪价 / 菜篮子指数 + 同比）：日频，幂等刷新。
+
+    口径注意：猪价源**未标注单位**（数值量级符合元/公斤），已在 extra.remark 注明；
+    猪价源只有约 7.5 个月滚动窗口 → 历史靠逐日累积（不像菜篮子有 2005 起的完整历史）。
+    """
+    import warnings
+    warnings.filterwarnings("ignore")
+    import akshare as ak
+    import pandas as pd
+
+    cache: dict = {}
+    rows = []
+    for code, name, func, col in PRICES:
+        if func not in cache:
+            try:
+                cache[func] = getattr(ak, func)()
+            except Exception as e:
+                print(f"    ❌ {code}: 接口 {func} 失败 {type(e).__name__}: {str(e)[:60]}")
+                cache[func] = None
+        df = cache[func]
+        if df is None or len(df) == 0 or col not in df.columns:
+            print(f"    ⚠️ {code}: 无数据或无列「{col}」")
+            continue
+        n = 0
+        for _, r in df.iterrows():
+            v = pd.to_numeric(r.get(col), errors="coerce")
+            dt = pd.to_datetime(r.get("日期"), errors="coerce")
+            if pd.isna(v) or pd.isna(dt):
+                continue
+            dd = dt.date()
+            rows.append({
+                "series_code": code, "series_name": name, "period_date": dd,
+                "value": round(float(v), 4),
+                "unit": "index" if "指数" in name else "cny_per_kg",
+                "freq": "day", "market": "CN", "source": f"akshare:{func}",
+                "release_time": datetime.datetime.combine(dd, datetime.time(18, 0), tzinfo=TZ_CN),
+                "revision": 0,
+                "extra": {"remark": "猪价源未标注单位（数值量级=元/公斤）；源窗口约 7.5 个月"
+                           if code == "CN.PORK_PRICE" else None},
+                "updated_at": datetime.datetime.now(TZ_CN),
+            })
+            n += 1
+        print(f"    · {code}: {n} 条")
+    return rows
+
+
+def _cross_derived_rows(conn) -> list:
+    """跨表派生（macro_series ↔ daily_benchmark）：中美利差、美债期限利差。
+
+    口径：按**同日**做差（两源都是交易日序列，取交集；任一缺失则该日不产出，
+    不做 ffill —— 利差是当日市场定价，用陈旧值拼接会造假信号）。
+    """
+    import pandas as pd
+
+    def _load(spec: str) -> dict:
+        kind, code = spec.split(":", 1)
+        if kind == "macro":
+            df = pd.read_sql_query(
+                """SELECT period_date, value FROM regime.macro_series
+                   WHERE series_code=%s AND revision=0 ORDER BY period_date""", conn, params=[code])
+        else:
+            df = pd.read_sql_query(
+                """SELECT trade_date AS period_date, last_price AS value FROM daily_benchmark
+                   WHERE bench_code=%s ORDER BY trade_date""", conn, params=[code])
+        return {r["period_date"]: float(r["value"]) for _, r in df.iterrows()
+                if r["value"] is not None and not pd.isna(r["value"])}
+
+    rows = []
+    for code, name, left, right, unit, remark in CROSS_DERIVED:
+        la, rb = _load(left), _load(right)
+        n = 0
+        for dd in sorted(set(la) & set(rb)):
+            v = la[dd] - rb[dd]
+            rows.append({
+                "series_code": code, "series_name": name, "period_date": dd,
+                "value": round(float(v), 4), "unit": unit, "freq": "day",
+                "market": code.split(".")[0],
+                "source": "derived:get_macro_daily:cross",
+                "release_time": datetime.datetime.combine(dd, datetime.time(18, 0), tzinfo=TZ_CN),
+                "revision": 0, "extra": {"expr": f"{left} - {right}", "remark": remark},
+                "updated_at": datetime.datetime.now(TZ_CN),
+            })
+            n += 1
+        print(f"    · {code}: {n} 条（跨表派生 {left} − {right}）")
+    return rows
+
+
 def run(codes=None, ctx=None, dry_run: bool = False):
     """采集入口：全量幂等刷新。"""
     print("  ── 拆借利率 ──")
     rows = _rate_rows()
     print("  ── 商品 ──")
     rows += _commodity_rows()
+    print("  ── 通胀高频（猪价/菜篮子）──")
+    rows += _price_rows()
 
     with get_conn() as conn:
         print("  ── 利差派生 ──")
         drows = _derived_rows(conn)
+        drows += _cross_derived_rows(conn)
         if dry_run:
             print("  --dry-run：不写库")
             return len(rows) + len(drows)

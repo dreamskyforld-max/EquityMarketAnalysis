@@ -128,6 +128,47 @@ INDICATORS: list[dict] = [
     dict(code="RISK.TERM_SPREAD", name="期限利差(国债 10Y−1Y)", layer=1, dimension="风险",
          market_scope="CN", unit="pp", direction="high_good", freq="day",
          formula="CN.TERM_SPREAD_10Y_1Y；倒挂（低/负）为衰退预警"),
+    dict(code="RISK.CREDIT_SPREAD_AA", name="信用利差(中票AA 5Y−国债5Y)", layer=1, dimension="风险",
+         market_scope="CN", unit="pp", direction="high_risk", freq="day",
+         remark="AA 档绝对信用利差；⚠ 源只保留最近 3 个交易日 → **历史靠逐日累积**，早期分位无意义",
+         formula="CN.MTN_AA_5Y − CN.BOND_5Y（源：get_cn_bond AA 档 + get_macro_daily 派生）"),
+    dict(code="RISK.GRADE_SPREAD", name="信用等级利差(AA−AAA 5Y)", layer=1, dimension="风险",
+         market_scope="CN", unit="pp", direction="high_risk", freq="day",
+         remark="同期限仅等级不同 → **纯风险偏好读数**（走阔=风险偏好收缩），比绝对信用利差更少受"
+                "无风险利率干扰；已纳入 FSI（sign +1）",
+         formula="CN.MTN_AA_5Y − CN.MTN_AAA_5Y"),
+    dict(code="MACRO.VEG_BASKET_YOY", name="菜篮子批发价同比(CPI 高频)", layer=1, dimension="通胀",
+         market_scope="CN", unit="pct", direction="high_risk", freq="day",
+         remark="农业农村部菜篮子批发价格指数的近 1 年涨跌幅（源侧算好）；CPI 食品项的日频先行验证",
+         formula="源 macro_china_vegetable_basket「近1年涨跌幅」"),
+    dict(code="MACRO.PORK_PRICE", name="生猪价格(瘦肉型)", layer=1, dimension="通胀",
+         market_scope="CN", unit="cny_per_kg", direction="high_risk", freq="day",
+         remark="⚠ 源约 7.5 个月滚动窗口 + 未标注单位（量级=元/公斤）→ 历史逐日累积，早期分位无意义",
+         formula="源 spot_hog_year_trend_soozhu「价格」"),
+    dict(code="MACRO.CORE_CPI_YOY", name="核心CPI同比(剔除食品能源)", layer=1, dimension="通胀",
+         market_scope="CN", unit="pct", direction="high_risk", freq="day",
+         remark="核心通胀=真实需求侧通胀黏性（剔除食品/能源扰动）；⚠ 源库仅 2021-01 起有该口径 "
+                "→ 分位样本约 5 年；与 MACRO.VEG_BASKET_YOY（食品项）对照看结构性通胀",
+         formula="CN.CORE_CPI_YOY（源：国家统计局「国家数据」月度库，官方名「不包括食品和能源"
+                 "居民消费价格指数(上年同月=100)」，指数−100 → 同比%）"),
+    dict(code="MACRO.CLI_CN", name="OECD 综合领先指标(中国)", layer=1, dimension="景气",
+         market_scope="CN", unit="index", direction="high_good", freq="day",
+         remark="100=长期趋势，高于 100 = 扩张；**领先经济拐点约 3-6 个月**（不入合成，作周期定位"
+                "的独立读数）；1992-05 起 413 个月无缺口，源：OECD SDMX（发布滞后按月初+45 天保守估）",
+         formula="CN.CLI（OECD Composite leading indicators，振幅调整口径）"),
+    dict(code="MACRO.CLI_GLOBAL", name="OECD 综合领先指标(G20)", layer=1, dimension="景气",
+         market_scope="GLOBAL", unit="index", direction="high_good", freq="day",
+         remark="全球周期（含新兴市场）宽口径；与 MACRO.CLI_CN 对照可分离「国内 vs 外部」驱动力",
+         formula="GLOBAL.CLI_G20（OECD SDMX）"),
+    dict(code="MACRO.CN_US_SPREAD", name="中美利差(中债10Y−美债10Y)", layer=1, dimension="资金",
+         market_scope="CN+HK", unit="pp", direction="neutral", freq="day",
+         remark="外资配置中国资产的机会成本；**无单一方向**——走阔利好人民币与外资流入，"
+                "但若因美债风险溢价飙升而走阔则相反，须结合美元指数与汇率解读",
+         formula="CN.BOND_10Y − US.DGS10（同日，源：get_macro_daily 跨表派生）"),
+    dict(code="MACRO.US_TERM_SPREAD", name="美债期限利差(10Y−2Y)", layer=1, dimension="风险",
+         market_scope="GLOBAL", unit="pp", direction="high_good", freq="day",
+         remark="倒挂=经典衰退预警（全球流动性与风险偏好的领先信号）；CN/HK 双侧均接入",
+         formula="US.DGS10 − US.DGS2（同日，源：get_macro_daily 跨表派生）"),
     dict(code="FLOW.HIBOR_3M", name="HIBOR 3月(港币流动性)", layer=1, dimension="资金",
          market_scope="HK", unit="pct", direction="high_risk", freq="day",
          formula="HK.HIBOR_3M；港元资金面收紧→港股估值与流动性承压"),
@@ -234,6 +275,8 @@ COMPOSITES = {
         ("RISK.CREDIT_SPREAD", 1),            # 信用维度（原计划缺口，已用中债曲线补齐）
         ("RISK.TERM_SPREAD", -1),             # 期限结构
         ("MACRO.CREDIT_IMPULSE", -1),         # 信用扩张 → 压力↓
+        ("MACRO.US_TERM_SPREAD", -1),         # 美债曲线倒挂 → 全球压力↑（§3.4 外部维度）
+        ("RISK.GRADE_SPREAD", 1),             # 等级利差走阔 → 信用风险偏好收缩（§3.2 信用维度）
         ("FLOW.HIBOR_3M", 1),                 # 港币资金面（HK 专属）
     ]),
 }
@@ -471,6 +514,15 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     out.update(_macro_pit_map(conn, out["BREADTH.ADV_RATIO"].index, {
         "RISK.CREDIT_SPREAD": "CN.CREDIT_SPREAD_MTN_AAA_10Y",
         "RISK.TERM_SPREAD": "CN.TERM_SPREAD_10Y_1Y",
+        "MACRO.CN_US_SPREAD": "CN.US_SPREAD_10Y",      # 中美利差（外资机会成本）
+        "MACRO.US_TERM_SPREAD": "US.TERM_SPREAD_10Y_2Y",   # 美债期限结构（全球风险偏好）
+        "RISK.CREDIT_SPREAD_AA": "CN.CREDIT_SPREAD_MTN_AA_5Y",   # AA 绝对信用利差
+        "RISK.GRADE_SPREAD": "CN.GRADE_SPREAD_AA_AAA_5Y",        # 等级利差（风险偏好）
+        "MACRO.VEG_BASKET_YOY": "CN.VEG_BASKET_YOY",   # CPI 食品项高频
+        "MACRO.PORK_PRICE": "CN.PORK_PRICE",           # 猪价（通胀高频）
+        "MACRO.CORE_CPI_YOY": "CN.CORE_CPI_YOY",       # 核心CPI（剔除食品能源；源仅 2021 起）
+        "MACRO.CLI_CN": "CN.CLI",                      # OECD 领先指标（中国）
+        "MACRO.CLI_GLOBAL": "GLOBAL.CLI_G20",          # OECD 领先指标（G20，全球周期）
     }))
     out["MACRO.CREDIT_IMPULSE"] = _credit_impulse(conn, out["BREADTH.ADV_RATIO"].index)
 
@@ -572,8 +624,12 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     out["VAL.ERP"] = 1.0 / out["VAL.PE_TTM_MEDIAN"].replace(0, np.nan) * 100 - dgs_s
 
     # 宏观接入：HIBOR 3M（港元流动性）+ 中国信用脉冲（HK 用其作为边际驱动代理），PIT 填充
-    out.update(_macro_pit_map(conn, out["VAL.PE_TTM_MEDIAN"].index,
-                              {"FLOW.HIBOR_3M": "HK.HIBOR_3M"}))
+    out.update(_macro_pit_map(conn, out["VAL.PE_TTM_MEDIAN"].index, {
+        "FLOW.HIBOR_3M": "HK.HIBOR_3M",
+        # 外部变量对港股解释力更高（market_profile §3.4 港股特殊性）→ 同样接入
+        "MACRO.CN_US_SPREAD": "CN.US_SPREAD_10Y",
+        "MACRO.US_TERM_SPREAD": "US.TERM_SPREAD_10Y_2Y",
+    }))
     out["MACRO.CREDIT_IMPULSE"] = _credit_impulse(conn, out["VAL.PE_TTM_MEDIAN"].index)
 
     return {k: _clip(v, start, end) for k, v in out.items()}
