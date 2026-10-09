@@ -7,9 +7,11 @@
               CN.NEW_LOAN(新增人民币贷款) / CN.LPR_1Y / CN.LPR_5Y
     通胀价格  CN.CPI_MOM / CN.CPI_YOY / CN.CORE_CPI_YOY(核心CPI)
               / CN.PPI_YOY / CN.PPI_CPI_SCISSOR(派生)
-    经济周期  CN.PMI_MFG / CN.PMI_NONMFG / CN.IP_YOY(工业增加值) / CN.GDP_YOY / CN.GDP
+    经济周期  CN.PMI_MFG / CN.PMI_NONMFG / CN.PMI_NEW_ORDERS(新订单分项) / CN.IP_YOY(工业增加值)
+              / CN.INDUSTRIAL_PROFIT_YOY(工业企业利润，累计口径) / CN.GDP_YOY / CN.GDP
               / OECD CLI（CN/US/JP/DE/KR + G7/G20，源：OECD SDMX）
-    市场/实体 CN.MARKET_CAP(沪深市价总值，巴菲特指标分子) / CN.ELECTRICITY_YOY / CN.CONSUMER_CONFIDENCE
+    市场/实体 CN.MARKET_CAP(沪深市价总值，巴菲特指标分子) / CN.ELECTRICITY_YOY(用电量)
+              / CN.POWER_GEN_YOY(发电量) / CN.FREIGHT_YOY(货运量) / CN.CONSUMER_CONFIDENCE
     情绪      CN.ACCOUNT_NEW(新增投资者；⚠ 源已停更于 2023-08)
 
 口径与 PIT：
@@ -51,6 +53,8 @@ NBS_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 _NBS_SESSION = None
 _NBS_MIN_GAP = 1.2       # 两次请求最小间隔（秒）：防触发反爬限流（实测高频遍历会被持续拦）
 _NBS_LAST_CALL = 0.0
+_NBS_TREE_CACHE: dict = {}   # (pid, code) → 子节点；多序列共用一条路径时不重复下钻
+_NBS_IND_CACHE: dict = {}    # cid → 指标清单；同叶子的多个指标复用一次请求
 
 
 def _nbs_session():
@@ -111,16 +115,26 @@ def _nbs_json(method: str, url: str, tries: int = 3, **kw):
 
 
 def _nbs_tree(pid: str, code: str = "1") -> list:
-    """目录树一级子节点（code=1 月度数据）；pid='' 取顶层。"""
-    j = _nbs_json("GET", f"{NBS_API}/new/queryIndexTreeAsync", params={"pid": pid, "code": code})
-    return j.get("data") or []
+    """目录树一级子节点（code=1 月度数据）；pid='' 取顶层。
+
+    带进程内缓存：CLI/核心CPI/发电量/利润/PMI… 多个序列各自下钻同一条路径，
+    不缓存就会「每个序列重走一遍树」（5 个序列 ≈ 20 次请求）→ 既慢又更容易触发反爬限流。
+    """
+    key = (pid, code)
+    if key not in _NBS_TREE_CACHE:
+        j = _nbs_json("GET", f"{NBS_API}/new/queryIndexTreeAsync",
+                      params={"pid": pid, "code": code})
+        _NBS_TREE_CACHE[key] = j.get("data") or []
+    return _NBS_TREE_CACHE[key]
 
 
 def _nbs_indicators(cid: str) -> list:
-    """某目录叶子下的指标清单（含官方名 i_showname 与指标 id _id）。"""
-    j = _nbs_json("GET", f"{NBS_API}/new/queryIndicatorsByCid",
-                  params={"cid": cid, "dt": "", "name": ""})
-    return (j.get("data") or {}).get("list") or []
+    """某目录叶子下的指标清单（含官方名 i_showname 与指标 id _id）。同样带缓存。"""
+    if cid not in _NBS_IND_CACHE:
+        j = _nbs_json("GET", f"{NBS_API}/new/queryIndicatorsByCid",
+                      params={"cid": cid, "dt": "", "name": ""})
+        _NBS_IND_CACHE[cid] = (j.get("data") or {}).get("list") or []
+    return _NBS_IND_CACHE[cid]
 
 
 def _nbs_esdata(cid: str, indicator_ids: list, root_id: str, dts: list) -> list:
@@ -132,21 +146,38 @@ def _nbs_esdata(cid: str, indicator_ids: list, root_id: str, dts: list) -> list:
 
 
 def _nbs_period(code):
-    """期间码「202608MM」→ 当月 1 日（MM=月度；年度码 YY 返回 None）。"""
-    m = re.fullmatch(r"(\d{4})(\d{2})MM", str(code or ""))
-    if not m:
-        return None
-    y, mo = int(m.group(1)), int(m.group(2))
-    return datetime.date(y, mo, 1) if 1 <= mo <= 12 else None
+    """期间码 → period_date（月首日）。
+
+    实测两种编码：月度 `202608MM`、季度 `202603SS`（季度码用 **2 位季度号**）。
+    季度按「该季度**首月**」落库（Q1→01-01、Q2→04-01、Q3→07-01、Q4→10-01），
+    与项目既有季度口径（`_parse_period` 的「末季度起始月」）一致。
+    """
+    t = str(code or "")
+    m = re.fullmatch(r"(\d{4})(\d{2})MM", t)
+    if m:
+        y, mo = int(m.group(1)), int(m.group(2))
+        return datetime.date(y, mo, 1) if 1 <= mo <= 12 else None
+    q = re.fullmatch(r"(\d{4})(\d{2})SS", t)
+    if q:
+        y, qq = int(q.group(1)), int(q.group(2))
+        return datetime.date(y, (qq - 1) * 3 + 1, 1) if 1 <= qq <= 4 else None
+    return None
 
 
 def _nbs_dts(spec: dict) -> list:
-    """期间区间 —— **必须显式给**：`dts=""` 时接口只返回默认的最近 9 个月
-    （实测核心 CPI 只回来 17 条、首段被截断）；给区间则一次返全（实测 27 年跨度的请求
-    可正常返回 324 个月，无分页上限）。
+    """期间参数 —— **必须显式给**：`dts=""` 时接口只返回默认窗口
+    （月度只回最近 9 个月，实测核心 CPI 因此只回来 17 条、首段被截断）。
+
+    ⚠ 月度与季度的传法**不同**（实测）：
+      · 月度 → 区间串 `["199001MM-202608MM"]`（27 年跨度可一次返回 324 个月，无分页上限）；
+      · 季度 → **必须逐期枚举** `["201101SS","201102SS",…]`：区间串（含 `SS/QQ` 各种写法）一律 500。
     """
+    today = datetime.date.today()
+    if spec.get("quarterly"):
+        y0 = int(spec.get("dts_from", "1990"))
+        return [f"{y}{q:02d}SS" for y in range(y0, today.year + 1) for q in (1, 2, 3, 4)]
     start = spec.get("dts_from", "200001")
-    end = spec.get("dts_to") or datetime.date.today().strftime("%Y%m")
+    end = spec.get("dts_to") or today.strftime("%Y%m")
     return [f"{start}MM-{end}MM"]
 
 
@@ -174,8 +205,10 @@ def _nbs_fetch(spec: dict) -> dict:
     minus = spec.get("minus", 0)
     dts = spec.get("dts") or _nbs_dts(spec)
     for leaf in leaves:
+        # 指标名用**前匹配**（startswith）：实测「货运量_同比增长」正是「铁路货运量_同比增长」
+        #   的子串，用 `in` 会把铁路/公路/水运/民航分品种一并命中并混算成总量（发电量目录同理）。
         ids = [x["_id"] for x in _nbs_indicators(leaf["_id"])
-               if spec["indicator"] in str(x.get("i_showname") or "")]
+               if str(x.get("i_showname") or "").strip().startswith(spec["indicator"])]
         if not ids:
             continue                        # 该时段库无此指标（如 2016-2020 无核心 CPI）
         hit_seg += 1
@@ -189,6 +222,10 @@ def _nbs_fetch(spec: dict) -> dict:
             except (TypeError, ValueError):
                 continue                    # 未公布月份为空串
             out[pd_] = round(v - minus, 4)
+    if hit_seg == 0:
+        # 全时段都没匹配到 → 明确报错，避免「静默空序列」被误读成「今天没新数据」
+        raise RuntimeError(f"NBS「{spec['indicator']}」在 {len(leaves)} 个叶子中均未匹配"
+                           f"（官方名可能已变，请核对 i_showname 前缀）")
     print(f"    · NBS「{spec['indicator']}」：命中 {hit_seg}/{len(leaves)} 个时段目录")
     return dict(sorted(out.items()))
 
@@ -238,6 +275,143 @@ def _sdmx_cli(spec: dict, cache: dict) -> dict:
     return data.get(spec["ref_area"], {})
 
 
+# ── 央行「社会融资规模」直连（PBoC 官网，替代已停更的 akshare 商务部镜像）─────────
+# 背景：`macro_china_shrzgm`（社融增量）上游是商务部镜像，**冻结于 2026-04**，
+#   而它正是 MACRO.CREDIT_IMPULSE 的输入 → 指标值被冻结在 −3.21（「静默失效」，最危险的一类）。
+# 央行官网路径（2026-10-09 实测）：
+#   ① 统计数据索引页 `/diaochatongjisi/116219/116319/index.html`（UTF-8）列出各年目录，
+#      每年下挂「社会融资规模」子页 → 页内条目含 **htm/xls/pdf 附件**；
+#   ② 抓 **htm** 附件即可解析（无需 Excel 库）；每月发布一份、**每份覆盖当年 1-12 月**；
+#   ③ 年份子页 URL **除当年外是随机 ID**（`/116219/116319/5570903/5570885/`），当年页才是
+#      `/{年}ntjsj/shrzgm/` → 故一律从索引页**就近配对**解析，勿硬编码。
+# ⚠ 三个实测坑：
+#   · 附件编码**新旧不一**（2016-2019 是 UTF-8、2020+ 是 GBK）→ 需自动判定；
+#   · 表格是「项目行 × 月份列」宽表，每月份占 **2 列**（存量 / 增速%）→ 按**位置**配对，
+#     不可先过滤空值再配对（会错位）；
+#   · **口径断点**：2018-12 及更早为旧口径（不含国债/地方政府债），2019-01 起新口径
+#     → 水平值跨 2019 差分会出现假跳变（实测 2018-12 192.37 → 2019-01 231.55 万亿元）。
+PBC_BASE = "http://www.pbc.gov.cn"
+PBC_INDEX = f"{PBC_BASE}/diaochatongjisi/116219/116319/index.html"
+_PBC_CACHE: dict = {}
+
+
+def _pbc_get(url: str, attach: bool = False) -> str:
+    """取页面/附件文本。页面是 UTF-8；附件编码新旧不一 → 用关键字自动判定。"""
+    import requests
+    r = requests.get(url, timeout=40, verify=False, headers={
+        "User-Agent": NBS_UA, "Accept": "text/html,application/xhtml+xml,*/*"})
+    r.raise_for_status()
+    if not attach:
+        return r.content.decode("utf-8", "ignore")
+    for enc in ("gb18030", "utf-8"):
+        t = r.content.decode(enc, "ignore")
+        if "社会融资规模存量" in t or "社会融资规模增量" in t:
+            return t
+    return r.content.decode("utf-8", "ignore")
+
+
+def _pbc_year_map() -> dict:
+    """{年份: 社融子页 URL} —— 从索引页把「社会融资规模」链接配到**最近的**年份标签上。"""
+    if "years" in _PBC_CACHE:
+        return _PBC_CACHE["years"]
+    idx = _pbc_get(PBC_INDEX)
+    ypos = [(int(m.group(1)), m.start()) for m in re.finditer(r"(\d{4})年统计数据", idx)]
+    spos = [(m.group(1), m.start()) for m in
+            re.finditer(r"href=[\"']([^\"']+)[\"'][^>]*>\s*社会融资规模\s*</a>", idx)]
+    out, seen = {}, set()
+    for href, sp in spos:
+        prev = [y for y, yp in ypos if yp < sp]
+        if prev and prev[-1] not in seen:
+            seen.add(prev[-1])
+            out[prev[-1]] = href
+    _PBC_CACHE["years"] = out
+    return out
+
+
+def _pbc_entries(url: str) -> list:
+    """子页条目 → [(条目名, htm 附件 URL)]（按 `titp20` 分块，块内取首个 .htm）。"""
+    t = _pbc_get(url)
+    out = []
+    # 标题块的分隔属性**单双引号都可能出现**（老页面 style 不同）→ 两者都接受
+    for part in re.split(r"class=[\"']titp20[\"']", t)[1:]:
+        name = re.sub(r"[^\u4e00-\u9fa5]", "", part.split("<")[0].split(">")[-1])
+        m = re.search(r"href=[\"']([^\"']+\.htm)[\"']", part)
+        out.append((name, m.group(1) if m else None))
+    return out
+
+
+def _pbc_rows(txt: str) -> list:
+    """htm 表 → [[单元格文本, ...], ...]（去掉标签与 &nbsp;，**保留空单元格占位**）。"""
+    rows = []
+    for r in re.findall(r"<tr[^>]*>(.*?)</tr>", txt, re.S):
+        cells = [re.sub(r"<[^>]+>|&nbsp;|\s+", "", c) for c in
+                 re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", r, re.S)]
+        rows.append(cells)
+    return rows
+
+
+def _pbc_parse(txt: str, kind: str) -> dict:
+    """社融 htm → {(年, 月): 值}。
+
+    · 存量/存量同比 = 「项目行 × 月份列」宽表：总量行 = 首格以「社会融资规模存量」开头，
+      表头行 = 含 ≥6 个 `YYYY.M` 的单元格；每月份占 2 列（存量、增速）→ **按位置**取。
+    · 增量 = 「月份行 × 项目列」：首格为 `YYYY.M`，第一个数值列即社会融资规模增量合计（亿元）。
+    """
+    out = {}
+    rows = _pbc_rows(txt)
+    if kind == "flow":
+        for cells in rows:
+            m = re.fullmatch(r"(\d{4})\.(\d{1,2})", cells[0] if cells else "")
+            if m and len(cells) > 1 and cells[1]:
+                try:
+                    out[(int(m.group(1)), int(m.group(2)))] = float(cells[1])
+                except ValueError:
+                    pass
+        return out
+    hdr, tot = None, None
+    for cells in rows:
+        months = [c for c in cells if re.fullmatch(r"\d{4}\.\d{1,2}", c)]
+        if len(months) >= 6:
+            hdr = months
+        if cells and cells[0].startswith("社会融资规模存量") and len(cells) > 10:
+            tot = cells[1:]                       # 保留空位 → 按位置配对不错位
+    if not hdr or not tot:
+        return out
+    idx = 0 if kind == "stock" else 1             # 0=存量 1=增速
+    for i, mk in enumerate(hdr):
+        if 2 * i + 1 >= len(tot) or not tot[2 * i + idx]:
+            continue
+        try:
+            y, mo = (int(v) for v in mk.split("."))
+            out[(y, mo)] = float(tot[2 * i + idx])
+        except ValueError:
+            continue
+    return out
+
+
+def _pbc_fetch(spec: dict) -> dict:
+    """央行社融序列 → {period_date: value}。按年份升序抓取，**后年文件覆盖前年**（源会修订）。"""
+    kind = spec["kind"]
+    target = "存量统计表" if kind.startswith("stock") else "增量统计表"
+    out = {}
+    ymap = _pbc_year_map()
+    used = 0
+    for y in sorted(ymap):
+        if y < spec.get("from_year", 2016):
+            continue
+        htm = [h for nm, h in _pbc_entries(PBC_BASE + ymap[y])
+               if nm.startswith("社会融资规模" + target) and h]
+        if not htm:
+            continue
+        pts = _pbc_parse(_pbc_get(PBC_BASE + htm[0], attach=True), kind)
+        used += 1
+        scale = spec.get("scale", 1.0)          # 存量源为万亿元 → ×10000 统一为亿元
+        for (yy, mm), v in pts.items():
+            out[datetime.date(yy, mm, 1)] = round(v * scale, 4)
+    print(f"    · 央行社融「{target}」：解析 {used} 个年度文件，共 {len(out)} 个月")
+    return dict(sorted(out.items()))
+
+
 # ── 序列定义：code / 名称 / 接口 / 取值列 / 单位 / 频率 / 发布滞后(天)
 SERIES = [
     # 货币与信用
@@ -246,18 +420,47 @@ SERIES = [
     #   akshare 全库无其它新鲜替代（已枚举 85 个 macro_china_* 接口核对）。
     #   → 历史可用、更新停摆；新鲜度替代用 CN.NEW_LOAN（新增人民币贷款，更新至 2026-08）。
     #   换源（央行官网直连）列为 P1。
-    dict(code="CN.SHRZGM_INC", name="社会融资规模增量(月)", func="macro_china_shrzgm",
+    dict(code="CN.SHRZGM_INC", name="社会融资规模增量(月,旧源)", func="macro_china_shrzgm",
          col="社会融资规模增量", unit="yi_yuan", freq="month", lag=45,
-         remark="⚠ 源（商务部镜像）停更于 2026-04；替代口径见 CN.NEW_LOAN"),
-    dict(code="CN.SHRZGM_RMB_LOAN", name="社融-人民币贷款(月)", func="macro_china_shrzgm",
+         remark="⚠ 源（商务部镜像）停更于 2026-04 → **已被央行直连的 CN.TSF_FLOW_M 取代**"
+                "（见 §7.24）；本序列仅保留历史，勿再用于新计算"),
+    dict(code="CN.SHRZGM_RMB_LOAN", name="社融-人民币贷款(月,旧源)", func="macro_china_shrzgm",
          col="其中-人民币贷款", unit="yi_yuan", freq="month", lag=45,
-         remark="⚠ 源停更于 2026-04"),
+         remark="⚠ 源停更于 2026-04；分项可由 CN.TSF_* 派生，暂保留历史"),
+    # —— 央行官网直连（换源落地，见文首 PBC_* 说明）——
+    # 社融**存量**是本轮换源的核心：MACRO.CREDIT_IMPULSE 原来只能拿「增量」做代理，
+    # 且增量源已停更 → 现用存量/GDP 的 BIS 口径重算（见 market_state_daily._credit_impulse）。
+    dict(code="CN.TSF_STOCK", name="社会融资规模存量(央行)", unit="yi_yuan", freq="month", lag=45,
+         source="pbc:social-financing",
+         remark="央行「社会融资规模存量统计表」（源单位万亿元 → ×10000 统一为亿元）。"
+                "⚠ **口径断点**：2018-12 及更早为旧口径（不含国债/地方政府债），2019-01 起新口径"
+                "→ 水平值**不可跨 2019 直接差分**（实测 2018-12 = 192.37 → 2019-01 = 231.55 万亿元）；"
+                "实测 2016-01 起可得（其中 2018 年仅 7-12 月、2015 年页无 htm）",
+         pbc=dict(kind="stock", from_year=2016, scale=10000)),
+    dict(code="CN.TSF_STOCK_YOY", name="社会融资规模存量同比(央行)", unit="pct", freq="month", lag=45,
+         source="pbc:social-financing",
+         remark="同表「增速（%）」列；源按**当期口径**重算上年同期 → 同比序列跨口径断点的可比性"
+                "好于水平值（水平值仍不可跨断点差分）",
+         pbc=dict(kind="stock_yoy", from_year=2016)),
+    dict(code="CN.TSF_FLOW_M", name="社会融资规模增量-当月(央行)", unit="yi_yuan", freq="month", lag=45,
+         source="pbc:social-financing",
+         remark="央行「社会融资规模增量统计表」当月合计（亿元）；**替换已停更的 CN.SHRZGM_INC**"
+                "（其源为商务部镜像、冻结于 2026-04）",
+         pbc=dict(kind="flow", from_year=2016)),
     dict(code="CN.NEW_LOAN", name="新增人民币贷款(月)", func="macro_china_new_financial_credit",
          col="当月", unit="yi_yuan", freq="month", lag=45),
     dict(code="CN.M2_YOY", name="M2 同比", func="macro_china_money_supply",
          col="货币和准货币(M2)-同比增长", unit="pct", freq="month", lag=45),
     dict(code="CN.M1_YOY", name="M1 同比", func="macro_china_money_supply",
          col="货币(M1)-同比增长", unit="pct", freq="month", lag=45),
+    # M0（现金）：同一接口已有该列，无需另找源。
+    # 注：NBS「金融 → 货币供应量」也有 M0 同比，但实测其表**比本接口晚一个月**
+    #   （2026-10-09 时 NBS 只到 2026-07，本接口已到 2026-08），故 M0 一并走本接口；
+    #   两者重叠月逐月一致（2026-07 = 11.6% ✓ 已交叉验证）。
+    dict(code="CN.M0_YOY", name="M0 同比", func="macro_china_money_supply",
+         col="流通中的现金(M0)-同比增长", unit="pct", freq="month", lag=45,
+         remark="M0=流通中现金；与 M1/M2 同源同表（akshare macro_china_money_supply）；"
+                "M0 高增常伴随后续 M1 回升（资金活化前奏）"),
     dict(code="CN.LPR_1Y", name="LPR 1年期", func="macro_china_lpr",
          col="LPR1Y", unit="pct", freq="month", date_col="TRADE_DATE", lag=1,
          release_from_date=True, remark="源为日频重复报价 → 按月去重保留当月最后一次发布"),
@@ -288,8 +491,28 @@ SERIES = [
          col="制造业-指数", unit="index", freq="month", lag=45),
     dict(code="CN.PMI_NONMFG", name="非制造业 PMI", func="macro_china_pmi",
          col="非制造业-指数", unit="index", freq="month", lag=45),
+    # PMI 新订单（最领先的分项）：akshare 的 macro_china_pmi 只有总指数（列：月份/制造业-指数/
+    # 制造业-同比增长/非制造业-指数/非制造业-同比增长），**无分项** → 走 NBS 月度库
+    # 「采购经理指数 → 制造业采购经理指数 → 新订单指数 (%)」。
+    dict(code="CN.PMI_NEW_ORDERS", name="制造业 PMI 新订单指数", unit="index", freq="month", lag=45,
+         source="nbs:stream/esData",
+         remark="PMI 中最领先的成分（订单先于生产）；50=荣枯线。实测 2005-01 起 261 个月、"
+                "最新 **2026-09**；与 CN.PMI_MFG（总指数）互为验证",
+         nbs=dict(path=["月度数据", "采购经理指数"],
+                  leaf_prefix="制造业采购经理指数", indicator="新订单指数")),
     dict(code="CN.IP_YOY", name="工业增加值同比", func="macro_china_gyzjz",
          col="同比增长", unit="pct", freq="month", lag=45, use_release_col="发布时间"),
+    # 工业企业利润（A 股盈利的同步指标）。原判「源不可得」→ 2026-10-09 经 NBS 月度库落地。
+    # ⚠ **累计口径**：NBS 该表只有累计值/累计增长（无单月），故 value = **年初至今累计同比**，
+    #   与 CN.IP_YOY（单月同比）**不可直接相减**；月度变化里含累计基数效应。
+    # ⚠ 缺口：1 月每年都缺（1-2 月合并发布）；2007-2010 仅 2/5/8/11 月有值（该期为准季度发布）。
+    dict(code="CN.INDUSTRIAL_PROFIT_YOY", name="工业企业利润总额累计同比", unit="pct",
+         freq="month", lag=45, source="nbs:stream/esData",
+         remark="⚠ **累计口径**（年初至今累计同比，非单月）→ 勿与 CN.IP_YOY（单月同比）直接相减；"
+                "缺口：**1 月每年缺**（1-2 月合并发布），2007-2010 仅 2/5/8/11 月有值；"
+                "实测 2000-02 起 265 个月（最新 2026-08 = 15.7%）；A 股盈利的同步验证",
+         nbs=dict(path=["月度数据", "工业"],
+                  leaf_prefix="工业企业主要经济指标", indicator="利润总额累计增长")),
     # OECD 复合领先指标 CLI（跨国可比；见文首 SDMX 说明）。
     # PIT 口径：**沿用月频默认 lag=45**。注意 lag 以「**月初**（period_date）」为基准，
     #   而 OECD 上月 CLI 的实际发布在**次月初**（实测：2026-09 读数在 2026-10-08 已可得，
@@ -322,12 +545,41 @@ SERIES = [
     # GDP 口径（重要）：源按**年内累计**披露（第1季度 / 第1-2季度 / 第1-3季度 / 第1-4季度），
     #   period_date = 该累计区间的**末季度起始月**（Q1→01-01、H1→04-01、9M→07-01、FY→10-01），
     #   value 也是**累计值**（非单季）→ 消费方做同比/环比时勿直接当单季用。
+    # ⚠ lag 由 100 调为 **110**（2026-10-09）：实测 NBS 季度 GDP 于**季后次月 15-20 日**发布
+    #   （Q3 数据 ≈ 10-18），距 period_date（季度首月 1 日）约 105-110 天 → lag=100 会提前 5-10 天
+    #   视为可得（轻微前视）。属 PIT 收紧，历史 release_time 一并前移。
     dict(code="CN.GDP_YOY", name="GDP 同比(累计口径)", func="macro_china_gdp",
-         col="国内生产总值-同比增长", unit="pct", freq="quarter", lag=100,
+         col="国内生产总值-同比增长", unit="pct", freq="quarter", lag=110,
          remark="年内累计同比；period_date=末季度起始月（H1 记 04-01）"),
     dict(code="CN.GDP", name="GDP 绝对值(季, 年内累计)", func="macro_china_gdp",
-         col="国内生产总值-绝对值", unit="yi_yuan", freq="quarter", lag=100,
+         col="国内生产总值-绝对值", unit="yi_yuan", freq="quarter", lag=110,
          remark="年内累计绝对值（非单季）；period_date=末季度起始月"),
+    # NBS 季度库补充（产出缺口 / 美林时钟的输入；2026-10-09 落地）：
+    #   · 环比增长速度 = **已季调**的单季环比 %（NBS 自算 SA）→ 可直接链成 SA 实际水平；
+    #   · 单季同比    = 「指数(上年同期=100) 当季值」− 100 → **单季**口径，比 CN.GDP_YOY 的
+    #     年内累计口径更干净，且历史长得多（1993Q1 起）。
+    dict(code="CN.GDP_QOQ", name="GDP 环比增速(季调, 单季)", unit="pct", freq="quarter", lag=110,
+         source="nbs:stream/esData",
+         remark="NBS 已季调的单季环比（官方口径）；2011Q1 起 62 个季度。"
+                "→ 链成 SA 实际水平后做产出缺口（MACRO.OUTPUT_GAP）",
+         nbs=dict(path=["季度数据", "国民经济核算"], leaf_prefix="国内生产总值环比增长速度",
+                  indicator="国内生产总值环比增长速度 (%)", code="2", quarterly=True)),
+    dict(code="CN.GDP_YOY_Q", name="GDP 单季实际同比", unit="pct", freq="quarter", lag=110,
+         source="nbs:stream/esData",
+         remark="NBS「国内生产总值指数(上年同期=100) 当季值」− 100；**单季**实际同比"
+                "（区别于 CN.GDP_YOY 的年内累计口径）；1993Q1 起 134 个季度",
+         nbs=dict(path=["季度数据", "国民经济核算"], leaf_prefix="国内生产总值指数",
+                  indicator="国内生产总值指数 (上年同期=100) 当季值", minus=100,
+                  code="2", quarterly=True)),
+    # 实际 GDP 水平（不变价）：用户指出的「国民经济核算 → 国内生产总值」节点。
+    # ⚠ **未季调**水平 → 不能直接做产出缺口（见 remark 的实测证据）；产出缺口仍用已季调的环比链。
+    dict(code="CN.GDP_REAL_Q", name="GDP 实际水平(不变价, 单季)", unit="yi_yuan", freq="quarter",
+         lag=110, source="nbs:stream/esData",
+         remark="NBS「国内生产总值(不变价) 当季值」；2007Q1 起 78 季；**未季调** → 直接 HP 会把季节性"
+                "当周期，而 4 季滚动和会在危机时**摊平冲击**（实测 2020 疫情低点：已季调环比链 −9.55% "
+                "vs 本序列 4 季滚动和 −3.53%）→ 产出缺口口径**继续用 CN.GDP_QOQ 链**，本序列作水平参考/敏感性对照",
+         nbs=dict(path=["季度数据", "国民经济核算"], leaf_prefix="国内生产总值 (不变价)",
+                  indicator="国内生产总值 (不变价) 当季值", code="2", quarterly=True)),
     # 市场与实体
     dict(code="CN.MARKET_CAP_SH", name="沪深市价总值-上海", func="macro_china_stock_market_cap",
          col="市价总值-上海", unit="yi_yuan", freq="month", date_col="数据日期", lag=45),
@@ -335,13 +587,28 @@ SERIES = [
          col="市价总值-深圳", unit="yi_yuan", freq="month", date_col="数据日期", lag=45),
     dict(code="CN.ELECTRICITY_YOY", name="全社会用电量同比", func="macro_china_society_electricity",
          col="全社会用电量同比", unit="pct", freq="month", date_col="统计时间", lag=45,
-         remark="源「统计时间」为点分隔（如 2026.8）；历史曾因解析失败被压成年度，已修"),
+         remark="源「统计时间」为点分隔（如 2026.8）；历史曾因解析失败被压成年度，已修；"
+                "⚠ 与发电量同属 NBS 月度口径 → 存在**1–2 月合并发布**造成的固有缺口"
+                "（240 行/273 个月跨度），滚动窗口须按缺失处理"),
     # 货运量（实体经济的另一高频验证；源按「统计对象」分口径，必须显式取「合计」）
     dict(code="CN.FREIGHT_YOY", name="货运量同比(合计)", func="macro_china_society_traffic_volume",
          col="货运量同比增长", unit="pct", freq="month", date_col="统计时间", lag=45,
          row_filter={"统计对象": "合计"}),
     dict(code="CN.CONSUMER_CONFIDENCE", name="消费者信心指数", func="macro_china_xfzxx",
          col="消费者信心指数-指数值", unit="index", freq="month", lag=45),
+    # 发电量（NBS「能源 → 能源主要产品产量 → 发电量 → 发电量同比增长」；2026-10-09 实测 2000-02 起 280 个月）
+    # 【口径要点】该目录下同时有「发电量」「火力发电量」「水力/核能/风力/太阳能发电量」共 6 个平级叶子，
+    #   故 leaf_prefix 必须用**前匹配**（startswith）而非包含匹配——否则「火力发电量」等会被一并取回并混算。
+    dict(code="CN.POWER_GEN_YOY", name="发电量同比", unit="pct", freq="month", lag=45,
+         source="nbs:stream/esData",
+         remark="⚠ 与 CN.ELECTRICITY_YOY（全社会用电量）**口径不同、不可互替**：本序列是「规模以上"
+                "工业发电量」，**不含规模以下/分布式光伏与自备电厂**；实测 2026-08 二者背离 5.1pp"
+                "（发电量 −0.8% vs 用电量 +4.3%），全样本符号一致率 88%、相关 0.63。"
+                "**实体活跃度优先看用电量**（需求侧、覆盖全社会），发电量作供给侧对照；"
+                "⚠ 另有**1–2 月合并发布**的固有缺口（实测缺 1 月 26 个 / 2 月 12 个，另有 2012-06 "
+                "一次源侧缺失）：280 行/319 个月跨度 → 做滚动窗口/环比时须按缺失处理，**勿补 0**",
+         nbs=dict(path=["月度数据", "能源", "能源主要产品产量"],
+                  leaf_prefix="发电量", indicator="发电量同比增长")),
     # 情绪（源已停更，仅作历史序列）
     dict(code="CN.ACCOUNT_NEW", name="新增投资者数量(万户)", func="stock_account_statistics_em",
          col="新增投资者-数量", unit="count", freq="month", date_col="数据日期", lag=45,
@@ -422,6 +689,9 @@ def _collect_one(defn: dict, cache: dict) -> list:
     if defn.get("sdmx"):
         # OECD SDMX 直连（多个 CLI 序列共用一次请求，结果经 cache 复用）
         return [_mk_row(defn, d, v) for d, v in _sdmx_cli(defn["sdmx"], cache).items()]
+    if defn.get("pbc"):
+        # 央行「社会融资规模」直连（htm 附件解析；见文首 PBC_* 说明）
+        return [_mk_row(defn, d, v) for d, v in _pbc_fetch(defn["pbc"]).items()]
     fn = defn["func"]
     if fn not in cache:
         import warnings

@@ -49,12 +49,15 @@ BENCHMARKS = {
     "US.NASDAQCOM":   ("纳斯达克综合指数",   "fred"),
     "US.VIXCLS":      ("VIX恐慌指数",        "fred"),
     "US.DTWEXBGS":    ("美元指数(贸易加权)", "fred"),
+    # 通胀预期（10 年期盈亏平衡通胀率 = 10Y 名义 − 10Y TIPS；FRED 自 2003-01 起）——§3.3 缺口
+    "US.T10YIE":      ("通胀预期(10Y盈亏平衡)", "fred"),
     # 国际指数（AKShare 新浪源）
     "JP.N225":        ("日经225指数",        "sina"),
     "KR.KS11":        ("韩国KOSPI指数",      "sina"),
     "DE.GDAXI":       ("德国DAX指数",        "sina"),
-    # 离岸人民币兑美元中间价（AKShare 外汇局全历史）
-    "FX.USDCNY":      ("离岸人民币(USD/CNY)", "currency"),
+    # 在岸人民币兑美元（AKShare currency_boc_safe，中行牌价全历史）
+    # 注：**不是在岸 vs 离岸之别**——本条**在岸**（中国银行折算价/中间价）；离岸 CNH 无稳定免费源。
+    "FX.USDCNY":      ("在岸人民币(中行折算价)", "currency"),
     # 美债收益率（AKShare bond_zh_us_rate，中美利率总表）
     "US.DGS10":       ("美国10年期国债收益率", "bond"),
     "US.DGS2":        ("美国2年期国债收益率",  "bond"),
@@ -74,7 +77,7 @@ EM_SECID = {
 
 FRED_TICKER = {
     "US.SP500": "SP500", "US.DJIA": "DJIA", "US.NASDAQCOM": "NASDAQCOM",
-    "US.VIXCLS": "VIXCLS", "US.DTWEXBGS": "DTWEXBGS",
+    "US.VIXCLS": "VIXCLS", "US.DTWEXBGS": "DTWEXBGS", "US.T10YIE": "T10YIE",
 }
 
 # 采集窗口：富途源最近 3 年（受额度限制）；FRED 源拉 1990 起全历史

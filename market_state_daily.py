@@ -118,10 +118,18 @@ INDICATORS: list[dict] = [
          market_scope="CN+HK", unit="pct", direction="high_risk", freq="day",
          formula="mean20(下跌家数 / 有行情家数 * 100)；系统性同步下跌代理（真实两两相关性成本高，v1 用占比代理）"),
     # —— 宏观接入（来源 regime.macro_series，月度/日度值前向填充到交易日）——
-    dict(code="MACRO.CREDIT_IMPULSE", name="信贷脉冲代理(社融12M滚动同比)", layer=1, dimension="宏观",
+    dict(code="MACRO.CREDIT_IMPULSE", name="信贷脉冲(社融存量/GDP 同比变化)", layer=1, dimension="宏观",
+         market_scope="CN+HK", unit="pp", direction="high_good", freq="month",
+         remark="真值口径（Biggs/Mayer）：信用流量/GDP 比率的同比变化 pp，实测 −5.5~+5.9；"
+                "⚠ 脉冲自 2021-02 起有值（存量口径 2019-01 起 + 流量需 12 月）；旧「12M 滚动增量同比」"
+                "代理的源已停更且值被冻结在 −3.21 → 本轮换央行直连（详见 §7.24）；HK 侧仍作中国信用代理",
+         formula="F_t/GDP_ttm_t − F_{t−12}/GDP_ttm_{t−12}，F = CN.TSF_STOCK 的 12 个月差分（亿元）；"
+                 "GDP_ttm = CN.GDP 差分回单季后的滚动 4 季合计（PIT：只用当时已发布数据）"),
+    dict(code="MACRO.TSF_STOCK_YOY", name="社会融资规模存量同比", layer=1, dimension="资金",
          market_scope="CN+HK", unit="pct", direction="high_good", freq="month",
-         remark="HK 侧用中国信用周期作代理（港股边际驱动：中国信用 + 美元流动性）",
-         formula="12M 滚动社融增量 的同比变化率(%)（二阶导近似；真值口径需社融存量/GDP，待外采）"),
+         remark="央行「社会融资规模存量统计表」同比（2016-01 起；源按当期口径重算上年同期 → "
+                "同比序列跨 2019 口径断点的可比性优于水平值）；信用扩张的月度读数",
+         formula="CN.TSF_STOCK_YOY（源：中国人民银行 统计数据 → 社会融资规模，htm 附件直连）"),
     dict(code="RISK.CREDIT_SPREAD", name="信用利差(中票AAA 10Y−国债10Y)", layer=1, dimension="风险",
          market_scope="CN", unit="pp", direction="high_risk", freq="day",
          formula="CN.CREDIT_SPREAD_MTN_AAA_10Y；利差走阔=违约担忧/风险偏好下降（源：get_macro_daily 派生）"),
@@ -160,6 +168,54 @@ INDICATORS: list[dict] = [
          market_scope="GLOBAL", unit="index", direction="high_good", freq="day",
          remark="全球周期（含新兴市场）宽口径；与 MACRO.CLI_CN 对照可分离「国内 vs 外部」驱动力",
          formula="GLOBAL.CLI_G20（OECD SDMX）"),
+    # —— §3.4 外部与汇率 + §5.4 跨资产成分（**复用 get_global_benchmarks 已采序列，零新增采集**）——
+    dict(code="MACRO.DXY", name="美元指数(ICE DXY)", layer=1, dimension="资金",
+         market_scope="GLOBAL", unit="index", direction="high_risk", freq="day",
+         remark="全球流动性总闸门：强美元压制新兴市场（A股/港股）；⚠ 源 2016-09 起（yfinance DX-Y.NYB）"
+                "→ 分位样本约 10 年；与 MACRO.DTWEXBGS 互为口径校验",
+         formula="daily_benchmark US.DXY 收盘（get_global_benchmarks 每小时采）"),
+    dict(code="MACRO.DTWEXBGS", name="美元指数(Fed 贸易加权)", layer=1, dimension="资金",
+         market_scope="GLOBAL", unit="index", direction="high_risk", freq="day",
+         remark="美联储广义贸易加权美元指数（**2006 起，样本长于 ICE DXY**）；两口径同向但幅值不同",
+         formula="daily_benchmark US.DTWEXBGS（FRED）"),
+    dict(code="MACRO.FED_FUNDS", name="有效联邦基金利率(EFFR)", layer=1, dimension="资金",
+         market_scope="GLOBAL", unit="pct", direction="high_risk", freq="day",
+         remark="美联储政策利率的实际成交口径（2001-12 起）；高位=紧缩环境（§3.4 美联储政策）",
+         formula="daily_benchmark US.EFFR（FRED）"),
+    dict(code="MACRO.BREAKEVEN_10Y", name="通胀预期(10Y盈亏平衡)", layer=1, dimension="通胀",
+         market_scope="GLOBAL", unit="pct", direction="high_risk", freq="day",
+         remark="10Y 名义国债 − 10Y TIPS = 市场隐含通胀预期（**2003-01 起长样本**，FRED T10YIE）；"
+                "补 §3.3「通胀预期」缺口（中债隐含通胀预期无免费源，故用美债口径作全球锚）；"
+                "与 MACRO.CORE_CPI_YOY（已实现核心通胀）对照可分离「预期 vs 现实」",
+         formula="daily_benchmark US.T10YIE（FRED，get_global_benchmarks 每小时采）"),
+    dict(code="RISK.VIX", name="VIX 恐慌指数", layer=1, dimension="风险",
+         market_scope="GLOBAL", unit="index", direction="high_risk", freq="day",
+         remark="全球风险偏好温度（**1990 起长样本**）；已作为 §5.4 风险偏好指数成分（取反）",
+         formula="daily_benchmark US.VIXCLS（FRED）"),
+    dict(code="MACRO.SPX_MOM20", name="标普500 20日动量", layer=1, dimension="跨资产",
+         market_scope="GLOBAL", unit="pct", direction="high_good", freq="day",
+         remark="全球权益风险偏好（20 个**美股**交易日动量，再对齐本市场交易日）",
+         formula="US.SP500 收盘 20 日变动 %"),
+    dict(code="MACRO.COPPER_MOM20", name="铜价 20日动量", layer=1, dimension="跨资产",
+         market_scope="GLOBAL", unit="pct", direction="high_good", freq="day",
+         remark="工业需求/再通胀的交易信号（铜 = 全球需求侧最纯的商品）",
+         formula="CMDTY.COPPER 收盘 20 日变动 %"),
+    dict(code="MACRO.GOLD_MOM20", name="黄金 20日动量", layer=1, dimension="跨资产",
+         market_scope="GLOBAL", unit="pct", direction="high_risk", freq="day",
+         remark="避险需求（金强 = risk-off；作为 §5.4 成分**取反**）",
+         formula="CMDTY.GOLD 收盘 20 日变动 %"),
+    dict(code="MACRO.OUTPUT_GAP", name="产出缺口(实际−潜在 GDP)", layer=1, dimension="景气",
+         market_scope="CN", unit="pct", direction="high_good", freq="day",
+         remark="**水平口径**：(实际 GDP − 潜在 GDP)/潜在 GDP。实际水平由 NBS **已季调**的单季环比"
+                "（CN.GDP_QOQ）链成；潜在 = **单边** HP（λ=1600，逐期只用已发布样本重算 → 无前视）。"
+                "⚠ 源链自 2011Q1 起、前 12 季为滤波暖机 → **2014Q1 起有值**（约 50 个季度）",
+         formula="(lv − HP单边(lv, λ=1600))/HP × 100；lv = 100·Π(1+CN.GDP_QOQ/100)"),
+    dict(code="MACRO.CLOCK_QUADRANT", name="美林投资时钟象限", layer=1, dimension="景气",
+         market_scope="CN", unit="code", direction="neutral", freq="day",
+         remark="**分类值**：1=复苏(增长↑/通胀↓) 2=过热(↑/↑) 3=滞胀(↓/↑) 4=衰退(↓/↓)；"
+                "增长轴=产出缺口方向（本季 vs 上季），通胀轴=CPI 同比 6 个月方向；"
+                "⚠ 分类值**不分位**（percentile 恒为空，勿当连续指标用）",
+         formula="quadrant(sign(ΔMACRO.OUTPUT_GAP), sign(CPI_YOY(t) − CPI_YOY(t−6)))"),
     dict(code="MACRO.CN_US_SPREAD", name="中美利差(中债10Y−美债10Y)", layer=1, dimension="资金",
          market_scope="CN+HK", unit="pp", direction="neutral", freq="day",
          remark="外资配置中国资产的机会成本；**无单一方向**——走阔利好人民币与外资流入，"
@@ -247,6 +303,9 @@ INDICATORS: list[dict] = [
          remark="需 ≥5 个交易日数据（min_periods=5），不足则空——避免把部分窗口当完整窗口",
          formula="Σ 近5个交易日 SECTOR.FLOW_NET"),
 ]
+
+# 不做历史分位的指标：分类/编码类（分位对类别标签无意义，写入时 percentile 置空）
+NO_PERCENTILE = {"MACRO.CLOCK_QUADRANT"}
 
 # 合成指数：成员 = (indicator_code, sign)；sign=+1 高分贡献高，-1 取 100−分位
 COMPOSITES = {
@@ -521,6 +580,7 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
         "MACRO.VEG_BASKET_YOY": "CN.VEG_BASKET_YOY",   # CPI 食品项高频
         "MACRO.PORK_PRICE": "CN.PORK_PRICE",           # 猪价（通胀高频）
         "MACRO.CORE_CPI_YOY": "CN.CORE_CPI_YOY",       # 核心CPI（剔除食品能源；源仅 2021 起）
+        "MACRO.TSF_STOCK_YOY": "CN.TSF_STOCK_YOY",     # 社融存量同比（央行直连）
         "MACRO.CLI_CN": "CN.CLI",                      # OECD 领先指标（中国）
         "MACRO.CLI_GLOBAL": "GLOBAL.CLI_G20",          # OECD 领先指标（G20，全球周期）
     }))
@@ -534,6 +594,15 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
 
     # ⑩ 行业层（申万一级行业宽度/动量分化 + 行业资金流；不入合成）
     out.update(_sector_indicators(conn, out["BREADTH.ADV_RATIO"].index))
+
+    # ⑪ 产出缺口 + 美林时钟（季度输入 + 月度通胀方向；逐期单边滤波 → 无前视；不入合成）
+    gap_pts = _output_gap_points(conn)
+    out["MACRO.OUTPUT_GAP"] = _pit_fill(out["BREADTH.ADV_RATIO"].index, gap_pts)
+    out["MACRO.CLOCK_QUADRANT"] = _pit_fill(out["BREADTH.ADV_RATIO"].index,
+                                            _clock_points(conn, gap_pts))
+
+    # ⑫ §3.4 外部环境 + §5.4 跨资产成分（复用已采序列；供风险偏好指数用）
+    out.update(_global_block(conn, out["BREADTH.ADV_RATIO"].index))
 
     return {k: _clip(v, start, end) for k, v in out.items()}
 
@@ -629,8 +698,16 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
         # 外部变量对港股解释力更高（market_profile §3.4 港股特殊性）→ 同样接入
         "MACRO.CN_US_SPREAD": "CN.US_SPREAD_10Y",
         "MACRO.US_TERM_SPREAD": "US.TERM_SPREAD_10Y_2Y",
+        # 中国信用（绝对利差 + 等级利差）：既是中国信用周期的读数，也是 §5.4 风险偏好指数的成分
+        #   —— 该指数成分以 GLOBAL 为主，若 HK 侧缺信用成分会与 CN 侧口径不一致
+        "RISK.CREDIT_SPREAD": "CN.CREDIT_SPREAD_MTN_AAA_10Y",
+        "RISK.GRADE_SPREAD": "CN.GRADE_SPREAD_AA_AAA_5Y",
+        "MACRO.TSF_STOCK_YOY": "CN.TSF_STOCK_YOY",     # 社融存量同比（中国信用扩张读数）
     }))
     out["MACRO.CREDIT_IMPULSE"] = _credit_impulse(conn, out["VAL.PE_TTM_MEDIAN"].index)
+
+    # §3.4 外部环境 + §5.4 跨资产成分（GLOBAL 口径 → 双市场同算，风险偏好指数才能各自落地）
+    out.update(_global_block(conn, out["VAL.PE_TTM_MEDIAN"].index))
 
     return {k: _clip(v, start, end) for k, v in out.items()}
 
@@ -672,29 +749,232 @@ def _macro_pit_map(conn, idx, mapping: dict) -> dict:
     return out
 
 
-def _credit_impulse(conn, idx) -> pd.Series:
-    """信贷脉冲代理：12M 滚动社融增量的同比变化率(%)，按 PIT 填充到交易日。
+def _pit_fill(idx, points: list) -> pd.Series:
+    """[(release_time, value)] → 按 PIT 前向填充到交易日（口径同 `_macro_pit_map`）。
 
-    真值口径（社融存量/GDP 的二阶导）需存量数据，当前源只有月度增量 → 用滚动和近似，
-    并在指标字典 formula/remark 注明。
+    用于**计算得出**的序列（产出缺口、美林时钟）：这些序列不在 macro_series 里，
+    但同样必须按「源观测的 release_time」推进，否则季频输入会以 period_date 提前可见（前视）。
     """
-    df = _q(conn, """SELECT period_date, release_time, value FROM regime.macro_series
-                     WHERE series_code='CN.SHRZGM_INC' AND revision=0 ORDER BY period_date""")
-    if df.empty:
+    if not points:
         return pd.Series(np.nan, index=idx)
-    s = _series_from_df(df, "period_date", "value")
-    roll = s.rolling(12, min_periods=12).sum()
-    imp = (roll / roll.shift(12) - 1) * 100
-    if imp.dropna().empty:
-        return pd.Series(np.nan, index=idx)
-    right = pd.DataFrame({
-        "rel": _naive_local(df["release_time"]).to_numpy(),
-        "v": imp.to_numpy(),
-    }).dropna(subset=["rel"]).sort_values("rel")
     left = pd.DataFrame({"t": [pd.Timestamp(datetime.datetime.combine(d, datetime.time(23, 59)))
                                for d in idx]}).sort_values("t").reset_index(drop=True)
+    rel = _naive_local(pd.Series([p[0] for p in points]))
+    right = pd.DataFrame({"rel": rel.to_numpy(), "v": [float(p[1]) for p in points]})
+    right = right.dropna(subset=["rel"]).sort_values("rel")
+    if right.empty:
+        return pd.Series(np.nan, index=idx)
     merged = pd.merge_asof(left, right, left_on="t", right_on="rel", direction="backward")
     return pd.Series(merged["v"].to_numpy(), index=idx)
+
+
+_HP_LAMBDA = 1600.0      # HP 滤波 λ：标准季频「水平」序列取值
+_GAP_MIN_Q = 12          # 产出缺口前 12 个季度不出值（HP 在极短样本上不稳）
+
+
+def _hp_trend(y: np.ndarray, lam: float = _HP_LAMBDA) -> np.ndarray:
+    """Hodrick-Prescott 趋势（scipy 稀疏三对角解；本环境未装 statsmodels）。"""
+    n = len(y)
+    if n < 3:
+        return np.asarray(y, dtype=float).copy()
+    from scipy import sparse
+    from scipy.sparse.linalg import spsolve
+    eye = sparse.eye(n, format="csc")
+    d = sparse.diags([1.0, -2.0, 1.0], [0, 1, 2], shape=(n - 2, n), format="csc")
+    return np.asarray(spsolve((eye + lam * (d.T @ d)).tocsc(),
+                              np.asarray(y, dtype=float))).ravel()
+
+
+def _output_gap_points(conn) -> list:
+    """产出缺口（水平口径 %）→ [(release_time, gap)]。
+
+    · 实际水平：用 NBS **已季调**的单季环比（`CN.GDP_QOQ`）链成水平指数
+      （基期任取 —— 缺口是「相对潜在水平的百分比」，与基期无关）；
+    · 潜在水平：**单边** HP（λ=1600）—— 对第 i 期只用 `lv[:i+1]` 重算并取末点。
+      ⚠ HP 默认是**双边**滤波（用到未来期），全样本跑一遍取趋势 = 前视，必须逐期重算；
+    · 样本不足 12 个季度不出值（季频 → 因此缺口自 2014Q1 起有值）。
+    """
+    df = _q(conn, """SELECT release_time, value FROM regime.macro_series
+                     WHERE series_code='CN.GDP_QOQ' AND revision=0 ORDER BY release_time""")
+    if df.empty:
+        return []
+    qoq = pd.to_numeric(df["value"], errors="coerce").to_numpy(dtype=float)
+    qoq = np.where(np.isnan(qoq), 0.0, qoq)
+    lv = 100.0 * np.cumprod(1.0 + qoq / 100.0)
+    out = []
+    for i in range(_GAP_MIN_Q - 1, len(lv)):
+        pot = float(_hp_trend(lv[: i + 1])[-1])
+        if pot:
+            out.append((df["release_time"].iloc[i], (lv[i] - pot) / pot * 100.0))
+    return out
+
+
+def _clock_map(growth_up: bool, infl_up: bool) -> int:
+    """美林投资时钟四象限：1=复苏(增长↑/通胀↓) 2=过热(↑/↑) 3=滞胀(↓/↑) 4=衰退(↓/↓)。"""
+    if growth_up:
+        return 1 if not infl_up else 2
+    return 3 if infl_up else 4
+
+
+def _clock_points(conn, gap_pts: list) -> list:
+    """美林四象限 → [(release_time, 1..4)]。
+
+    增长轴 = 产出缺口的方向（本季 vs 上季）；通胀轴 = CPI 同比的**6 个月**方向（去掉单月噪声）。
+    两条轴各按自己的源 release_time 推进，任一轴更新时重算象限 → 无前视。
+    """
+    if len(gap_pts) < 2:
+        return []
+    cpi = _q(conn, """SELECT release_time, value FROM regime.macro_series
+                      WHERE series_code='CN.CPI_YOY' AND revision=0 ORDER BY release_time""")
+    if len(cpi) < 7:
+        return []
+    cvals = pd.to_numeric(cpi["value"], errors="coerce").to_numpy(dtype=float)
+    events = [(gap_pts[i][0], "g", gap_pts[i][1] - gap_pts[i - 1][1] > 0)
+              for i in range(1, len(gap_pts))]
+    events += [(cpi["release_time"].iloc[k], "i", cvals[k] - cvals[k - 6] > 0)
+               for k in range(6, len(cvals))]
+    events.sort(key=lambda x: x[0])
+    cur_g = cur_i = None
+    out = []
+    for rel, kind, up in events:
+        if kind == "g":
+            cur_g = up
+        else:
+            cur_i = up
+        if cur_g is not None and cur_i is not None:
+            out.append((rel, float(_clock_map(cur_g, cur_i))))
+    return out
+
+
+def _align_close(src: pd.Series, idx) -> pd.Series:
+    """源日历上的收盘序列 → 对齐到本市场交易日（merge_asof backward，无前视）。
+
+    注意：两侧时间列必须**统一精度**（`merge_asof` 要求 dtype 完全一致；本市场索引建出来是
+    `M8[us]`、`pd.to_datetime(date 索引)` 是 `M8[s]` → 不统一会报 incompatible merge keys）。
+    """
+    if src.empty:
+        return pd.Series(np.nan, index=idx)
+    left = pd.DataFrame({"t": pd.to_datetime(
+        [pd.Timestamp(datetime.datetime.combine(d, datetime.time(23, 59))) for d in idx]
+    ).astype("datetime64[ns]")}).sort_values("t").reset_index(drop=True)
+    right = pd.DataFrame({"rel": pd.to_datetime(src.index).astype("datetime64[ns]"),
+                          "v": src.to_numpy(dtype=float)})
+    right = right.dropna(subset=["rel"]).sort_values("rel")
+    merged = pd.merge_asof(left, right, left_on="t", right_on="rel", direction="backward")
+    return pd.Series(merged["v"].to_numpy(), index=idx)
+
+
+def _global_block(conn, idx) -> dict:
+    """§3.4 外部环境 + §5.4 跨资产成分（**零新增采集**：daily_benchmark 每小时已在采、
+    CMDTY.* 日频行情已在库）。
+
+    · 水平类：美元指数双口径（ICE DXY 2016+ / Fed 贸易加权 2006+）、VIX（1990+）、
+      有效联邦基金利率（2001+）；
+    · 动量类：标普 500 / 铜 / 黄金的 **20 个交易日**动量。
+      ⚠ 动量必须在**各自源市场的交易日**上算（20 个交易日 = s/s.shift(20)−1），再对齐到本市场：
+      直接用本市场日历 shift 一个含外盘假期 NaN 的序列会错位（美/港/内地假期不同）。
+    """
+    out: dict = {}
+
+    def _bench(code):
+        df = _q(conn, """SELECT trade_date, last_price FROM daily_benchmark
+                         WHERE bench_code = %s ORDER BY trade_date""", [code])
+        if df.empty:
+            return pd.Series(dtype=float)
+        s = pd.Series(pd.to_numeric(df["last_price"], errors="coerce").to_numpy(),
+                      index=pd.to_datetime(df["trade_date"]))
+        return s[~s.index.duplicated(keep="last")].sort_index()
+
+    for code, src in (("MACRO.DXY", "US.DXY"), ("MACRO.DTWEXBGS", "US.DTWEXBGS"),
+                      ("MACRO.FED_FUNDS", "US.EFFR"), ("RISK.VIX", "US.VIXCLS"),
+                      ("MACRO.BREAKEVEN_10Y", "US.T10YIE")):
+        out[code] = _align_close(_bench(src), idx)
+
+    def _macro(src):
+        df = _q(conn, """SELECT period_date, value FROM regime.macro_series
+                         WHERE series_code = %s AND revision = 0 ORDER BY period_date""", [src])
+        if df.empty:
+            return pd.Series(dtype=float)
+        s = pd.Series(pd.to_numeric(df["value"], errors="coerce").to_numpy(),
+                      index=pd.to_datetime(df["period_date"]))
+        return s[~s.index.duplicated(keep="last")].sort_index()
+
+    for code, src, loader in (("MACRO.SPX_MOM20", "US.SP500", _bench),
+                              ("MACRO.COPPER_MOM20", "CMDTY.COPPER", _macro),
+                              ("MACRO.GOLD_MOM20", "CMDTY.GOLD", _macro)):
+        s = loader(src)
+        mom = (s / s.shift(20) - 1) * 100 if len(s) > 20 else pd.Series(dtype=float)
+        out[code] = _align_close(mom, idx)
+    return out
+
+
+def _credit_impulse(conn, idx) -> pd.Series:
+    """信贷脉冲（Biggs/Mayer 口径）：**信用流量/GDP 比率的同比变化**（pp of GDP）。
+
+    impulse_t = F_t/GDP_ttm_t − F_{t−12}/GDP_ttm_{t−12}，其中 F_t = 存量_t − 存量_{t−12}
+    （滚动 12 个月的新增信用流量）。即「新增信用占 GDP 的比重」相对**一年前**的变化。
+
+    量级自检（口径选择的关键）：中国年度信用流量约占 GDP 的 23-30%，
+    · 若用「比率同比变化」（本实现）→ 典型区间 **±3~8pp**，2020 放水大幅转正、2021 转负 ✓ 有周期含义；
+    · 若用「存量/GDP 比率的同比变化」→ 常年 +10pp（跟随 330% 的比率水平）✗ 无周期含义；
+    · 若用「流量/GDP 比率的月度变化」→ 仅 ±1.5pp、噪声主导 ✗ 量级过小。
+
+    · 存量：央行直连 `CN.TSF_STOCK`，**仅取 2019-01 起**——2018 及更早为旧口径（不含国债/
+      地方政府债），跨断点差分会出现假跳变（实测 2018-12 → 2019-01 水平跳升 20%）；
+    · GDP_ttm：`CN.GDP`（年内累计名义值）**差分回单季**后取滚动 4 季合计；
+    · PIT：逐月按存量 release_time 推进；每个时点只取「截至该时点已发布」的 GDP 单季，
+      且 t 与 t−1 两个比率用**同一 GDP vintage** 计算（不使用未来修订）。
+    · 旧实现为「12M 滚动社融增量的同比变化率」代理（只有增量时的近似，且增量源已停更）。
+    """
+    st = _q(conn, """SELECT period_date, release_time, value FROM regime.macro_series
+                     WHERE series_code='CN.TSF_STOCK' AND revision=0
+                       AND period_date >= DATE '2019-01-01' ORDER BY period_date""")
+    gdp = _q(conn, """SELECT period_date, release_time, value FROM regime.macro_series
+                      WHERE series_code='CN.GDP' AND revision=0 ORDER BY period_date""")
+    if st.empty or len(gdp) < 8:
+        return pd.Series(np.nan, index=idx)
+    # ① GDP 年内累计 → 单季（同一日历年内与前一个累计点相减，年初首个点即 Q1 自身）
+    gdp = gdp.sort_values("period_date")
+    rel_g = _naive_local(gdp["release_time"]).to_numpy()
+    gd = []
+    for i, r in enumerate(gdp.itertuples()):
+        d = pd.Timestamp(r.period_date).date()
+        v = float(r.value)
+        same_year = [x for x in gd if x[0].year == d.year]
+        base = same_year[-1][1] if same_year else 0.0
+        gd.append((d, v - base, rel_g[i]))
+
+    def _prev_month(d):
+        return (d.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
+
+    def _ratio(dd, flow12, avail):
+        """F/GDP_ttm × 100 —— 取「截至 dd 的最近 4 个已发布单季」为分母。"""
+        q = [x for x in avail if x[0] <= dd]
+        if len(q) < 4:
+            return None
+        ttm = sum(x[1] for x in q[-4:])
+        return flow12 / ttm * 100 if ttm > 0 else None
+
+    # ② 逐月推进：t 与 t−12 两个比率都用「截至该时点已发布」的 GDP vintage（同口径比较）
+    stock = [(pd.Timestamp(r.period_date).date(), r.release_time, float(r.value))
+             for r in st.itertuples()]
+    by_month = {d: v for d, _, v in stock}
+    points = []
+    for d, rel, v in stock:
+        rel_n = _naive_local(pd.Series([rel])).iloc[0]
+        avail = [(dd, sv) for dd, sv, rl in gd if rl <= rel_n]
+        d12 = d.replace(year=d.year - 1)
+        d24 = d12.replace(year=d12.year - 1)
+        v12, v24 = by_month.get(d12), by_month.get(d24)
+        if None in (v12, v24):           # 需要 24 个月历史 → 存量自 2019-01 起 → 脉冲自 2021-01 起
+            continue
+        r_now, r_prev = _ratio(d, v - v12, avail), _ratio(d12, v12 - v24, avail)
+        if r_now is None or r_prev is None:
+            continue
+        points.append((rel, r_now - r_prev))
+    if not points:
+        return pd.Series(np.nan, index=idx)
+    return _pit_fill(idx, points)
 
 
 def _forecast_indicators(conn, idx, lookback_days: int = 400) -> dict:
@@ -1049,6 +1329,23 @@ def build_composites(pct: pd.DataFrame, raw: pd.DataFrame, market: str) -> pd.Da
     out["risk_score"] = _score(COMPOSITES["risk_score"]["members"])
     out["fsi"] = _score(COMPOSITES["fsi"]["members"])
 
+    # 跨资产风险偏好指数（§5.4）：成分各自分位化、方向统一为「高分 = 风险偏好高」，再等权。
+    #   VIX(−) / 美元 DXY(−) / AAA 信用利差(−) / 信用等级利差 AA−AAA(−)
+    #   / 标普动量(+) / 铜动量(+) / 黄金(−) → 0-100：>80 极度 Risk-On · <20 极度 Risk-Off。
+    #   ⚠ 文档 §5.4 原列 7 项，本实现 7 项（含信用两个口径），未落两项：
+    #     ①「股债相对表现」缺债券**总回报**序列（库里只有国债收益率）；
+    #     ②「EM vs DM 相对表现」缺 MSCI EM 等 EM 指数。
+    #   ⚠ 信用用**两个口径**：AAA 绝对利差（长历史、稳）+ AA−AAA 等级利差
+    #     （更纯的风险偏好读数，但源只保留最近 3 个交易日 → 历史仅逐日累积的少数点，
+    #      故只作近期补充，不能只靠它）。
+    #   ⚠ 分位按**各市场自身历史**展开（与其他合成一致：thermometer/fsi 亦然）→
+    #     同一时点 CN/HK 数值**可能略有差异**（CN 样本 1990 起、HK 2019 起）；同市场内可比。
+    out["risk_appetite"] = _score([
+        ("RISK.VIX", -1), ("MACRO.DXY", -1),
+        ("RISK.CREDIT_SPREAD", -1), ("RISK.GRADE_SPREAD", -1),
+        ("MACRO.SPX_MOM20", 1), ("MACRO.COPPER_MOM20", 1), ("MACRO.GOLD_MOM20", -1),
+    ])
+
     # 季节（v2 规则版：估值水位 + 宽度水位/趋势 + 信用脉冲；ERP 分位维度待接入）
     # 规则来自 market_profile.md §8.1：冲突时以宽度趋势为准；「春」必须信用脉冲转正。
     v = pct.get("VAL.PE_TTM_MEDIAN", pd.Series(np.nan, index=pct.index))
@@ -1102,15 +1399,28 @@ def build_composites(pct: pd.DataFrame, raw: pd.DataFrame, market: str) -> pd.Da
 
 # ── 落库 ────────────────────────────────────────────────────────────────────
 def _ensure_dict(conn):
+    # 列宽上限（indicator_dict）：name 80 / dimension 24 / unit 16 / direction 12 /
+    #   source 64 / remark 200 → 超长会直接抛 StringDataRightTruncation 打断整轮计算，
+    #   故在写库前**截断**（remark 最容易写长；宁截断也不让采集轮次失败）。
+    lim = {"indicator_name": 80, "dimension": 24, "market_scope": 16, "unit": 16,
+           "direction": 12, "freq": 8, "source": 64, "remark": 200}
+
+    def _cut(key, val):
+        if isinstance(val, str) and len(val) > lim.get(key, 10 ** 9):
+            return val[:lim[key]]
+        return val
+
     rows = []
     for meta in INDICATORS:
         rows.append({
-            "indicator_code": meta["code"], "indicator_name": meta["name"],
-            "layer": meta["layer"], "dimension": meta["dimension"],
-            "market_scope": meta["market_scope"], "unit": meta["unit"],
-            "direction": meta["direction"], "freq": meta["freq"],
-            "source": meta.get("source", ""), "formula": meta["formula"],
-            "is_active": meta.get("active", True), "remark": meta.get("remark"),
+            "indicator_code": meta["code"], "indicator_name": _cut("indicator_name", meta["name"]),
+            "layer": meta["layer"], "dimension": _cut("dimension", meta["dimension"]),
+            "market_scope": _cut("market_scope", meta["market_scope"]),
+            "unit": _cut("unit", meta["unit"]),
+            "direction": _cut("direction", meta["direction"]),
+            "freq": _cut("freq", meta["freq"]),
+            "source": _cut("source", meta.get("source", "")), "formula": meta["formula"],
+            "is_active": meta.get("active", True), "remark": _cut("remark", meta.get("remark")),
             "updated_at": datetime.datetime.now(TZ_CN),
         })
     bulk_upsert(conn, "regime.indicator_dict", rows, conflict_cols=["indicator_code"],
@@ -1155,8 +1465,10 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
             combined[c] = np.nan
     combined = combined.sort_index()
 
-    pct = pd.DataFrame({c: _expanding_percentile(combined[c]) for c in combined.columns},
-                       index=combined.index)
+    # 分类/编码类指标不做分位（如美林象限 1-4 是**类别标签**，分位没有意义）
+    pct = pd.DataFrame({c: (_expanding_percentile(combined[c]) if c not in NO_PERCENTILE
+                            else pd.Series(np.nan, index=combined.index))
+                        for c in combined.columns}, index=combined.index)
     comp = build_composites(pct, combined, market)
 
     write_idx = [d for d in combined.index if isinstance(d, datetime.date) and d >= start]
@@ -1196,7 +1508,7 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
             "trade_date": d, "market": market,
             "thermometer": _r2(r["thermometer"]), "season": r["season"],
             "season_score": _r2(r["season_score"]), "risk_score": _r2(r["risk_score"]),
-            "fsi": _r2(r["fsi"]), "risk_appetite": None,
+            "fsi": _r2(r["fsi"]), "risk_appetite": _r2(r.get("risk_appetite")),
             "top_signal_cnt": int(r["top_signal_cnt"]), "bottom_signal_cnt": int(r["bottom_signal_cnt"]),
             "detail": detail, "updated_at": now,
         })

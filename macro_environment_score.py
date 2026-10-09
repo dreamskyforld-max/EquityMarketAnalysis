@@ -60,7 +60,7 @@ INDICATOR_TEMPLATES: List[Dict] = [
      "momentum": True,  "mom_window": 20, "level_w": 0.6, "mom_w": 0.4},
     {"bench": "US.DXY",      "name": "美元指数",    "dim": "liq",  "kind": "zscore", "window": 120,
      "momentum": True,  "mom_window": 20, "level_w": 0.6, "mom_w": 0.4},
-    {"bench": "FX.USDCNY",   "name": "离岸人民币",  "dim": "liq",  "kind": "zscore", "window": 120,
+    {"bench": "FX.USDCNY",   "name": "在岸人民币",  "dim": "liq",  "kind": "zscore", "window": 120,
      "momentum": True,  "mom_window": 20, "level_w": 0.6, "mom_w": 0.4},
     # 估值分母（折现率 + 美元 + 期限利差）
     {"bench": "US.DGS10",    "name": "美债10Y",     "dim": "val",  "kind": "zscore", "window": 120},

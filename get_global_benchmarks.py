@@ -60,12 +60,16 @@ ALL_BENCHMARKS: List[Dict] = [
     {"code": "US.VIXCLS",      "name": "VIX恐慌指数",        "source": "fred", "fred_ticker": "VIXCLS"},
     {"code": "US.DTWEXBGS",    "name": "美元指数(贸易加权)", "source": "fred", "fred_ticker": "DTWEXBGS"},
     {"code": "US.EFFR",         "name": "有效联邦基金利率",   "source": "fred", "fred_ticker": "EFFR", "is_rate": True},
+    # 10 年期盈亏平衡通胀率 = 通胀预期（§3.3 唯一缺口；FRED 自 2003-01 起）
+    {"code": "US.T10YIE",       "name": "通胀预期(10Y盈亏平衡)", "source": "fred", "fred_ticker": "T10YIE", "is_rate": True},
     # ── Yahoo Finance（ICE DXY；大陆 IP 被风控需代理，服务器香港直连，见 _yahoo_proxy）──
     {"code": "US.DXY",         "name": "美元指数(ICE DXY)", "source": "yfinance", "yf_code": "DX-Y.NYB"},
     # ── AKShare ──
     {"code": "US.DGS10",       "name": "美国10年期国债收益率", "source": "akshare", "ak_func": "bond"},
     {"code": "US.DGS2",        "name": "美国2年期国债收益率",  "source": "akshare", "ak_func": "bond"},
-    {"code": "FX.USDCNY",      "name": "离岸人民币(USD/CNY)", "source": "akshare", "ak_func": "currency"},
+    # ⚠ 口径订正（2026-10-09）：源 currency_boc_safe = **中国银行外汇牌价（在岸）**，
+    #   原 name 写成「离岸人民币」有误（离岸 CNH 无稳定免费源：东财源断连、中行新浪源停更 2023-11）。
+    {"code": "FX.USDCNY",      "name": "在岸人民币(中行折算价)", "source": "akshare", "ak_func": "currency"},
     # ── 国际指数（AKShare 新浪源，东财接口不稳故改用新浪）──
     # sina_name 为 AKShare index_global_hist_sina 的键（中文全名）
     {"code": "JP.N225",       "name": "日经225指数",       "source": "sina", "sina_name": "日经225指数"},

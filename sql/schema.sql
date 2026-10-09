@@ -1915,7 +1915,7 @@ CREATE TABLE IF NOT EXISTS regime.market_regime_daily (
     season_score        NUMERIC(6,2),
     risk_score          NUMERIC(6,2),                  -- 风险指数 0-100
     fsi                 NUMERIC(6,2),                  -- 金融压力指数 0-100
-    risk_appetite       NUMERIC(6,2),                  -- 跨资产风险偏好 0-100（GLOBAL 维度，暂空）
+    risk_appetite       NUMERIC(6,2),                  -- 跨资产风险偏好 0-100（§5.4：6 成分等权，2026-10-09 起有值）
     top_signal_cnt      SMALLINT,                      -- 顶部信号命中数
     bottom_signal_cnt   SMALLINT,
     detail              JSONB,                         -- 分项/成员明细
@@ -1927,3 +1927,4 @@ CREATE TABLE IF NOT EXISTS regime.market_regime_daily (
 COMMENT ON TABLE  regime.market_regime_daily                IS '市场状态合成表（温度计/季节/风险/FSI），由计算层 market_state_daily.py 写入';
 COMMENT ON COLUMN regime.market_regime_daily.season         IS '春=熊末牛初 / 夏=牛市中段 / 秋=牛市末段 / 冬=熊市中后段（v1 规则版，信用脉冲维度待接入）';
 COMMENT ON COLUMN regime.market_regime_daily.top_signal_cnt IS '顶部预警信号命中数（见 market_profile.md §8.2）';
+COMMENT ON COLUMN regime.market_regime_daily.risk_appetite IS '跨资产风险偏好指数 0-100（market_profile.md §5.4）：7 成分等权（VIX/美元/AAA 信用利差/AA-AAA 等级利差 取反 + 标普/铜/黄金 20 日动量）；>80 极度 Risk-On，<20 极度 Risk-Off。注：分位按各市场自身历史展开 → CN/HK 数值可能略有差异';

@@ -12,7 +12,7 @@
   · regime.indicator_dict      指标字典（口径/方向/频率/来源）
   · regime.indicator_value     指标时序长表（原始值 + 历史分位）
   · public.trading_calendar    交易日历（共享工具表，A股/港股分别维护）
-  · regime.market_regime_daily 合成层（温度计/季节/风险/FSI）
+  · regime.market_regime_daily 合成层（温度计/季节/风险/FSI/**跨资产风险偏好**）
 
 P1 已落地（随采集脚本）：
   · regime.analyst_forecast_snapshot  一致预期逐日快照（差分依赖）
@@ -353,7 +353,7 @@ CREATE TABLE IF NOT EXISTS regime.market_regime_daily (
     season_score        NUMERIC(6,2),
     risk_score          NUMERIC(6,2),                  -- 风险指数 0-100
     fsi                 NUMERIC(6,2),                  -- 金融压力指数 0-100
-    risk_appetite       NUMERIC(6,2),                  -- 跨资产风险偏好 0-100（GLOBAL 维度，暂空）
+    risk_appetite       NUMERIC(6,2),                  -- 跨资产风险偏好 0-100（§5.4：6 成分等权，2026-10-09 起有值）
     top_signal_cnt      SMALLINT,                      -- 顶部信号命中数
     bottom_signal_cnt   SMALLINT,
     detail              JSONB,                         -- 分项/成员明细
