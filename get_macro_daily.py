@@ -24,7 +24,9 @@ import argparse
 import datetime
 import sys
 
-from db import get_conn, bulk_upsert
+from db import get_conn
+from regime_schema import (upsert_macro_series, seed_series_meta,
+                           load_series_defs, apply_series_defs)
 
 TABLE = "regime.macro_series"
 CONFLICT = ["series_code", "period_date", "revision"]
@@ -76,6 +78,9 @@ PRICES = [
     ("CN.VEG_BASKET_YOY", "菜篮子批发价格指数-近1年涨跌幅", "macro_china_vegetable_basket", "近1年涨跌幅"),
 ]
 
+# 猪价源未标注单位（数值量级=元/公斤）；源窗口约 7.5 个月 → 登记进 meta.remark（不逐行重复）
+PORK_REMARK = "猪价源未标注单位（数值量级=元/公斤）；源窗口约 7.5 个月"
+
 # 跨表派生：(code, 名称, 左序列, 右序列, 单位, 说明)
 #   序列写法 "macro:CODE"（regime.macro_series）/ "bench:CODE"（daily_benchmark）。
 #   为什么单独一类：中美利差需要**中债曲线（macro_series）− 美债（daily_benchmark，FRED 源）**
@@ -88,7 +93,50 @@ CROSS_DERIVED = [
 ]
 
 
-def _rate_rows() -> list:
+def _specs() -> list:
+    """五张清单 → 完整序列清单（**采集契约**），登记进 macro_series_meta。"""
+    specs = []
+    for code, name, market, symbol, indicator in RATES:
+        specs.append(dict(series_code=code, series_name=name, unit="pct", freq="day",
+                          market=code[:2],
+                          source=f"akshare:rate_interbank:{market}/{symbol}/{indicator}",
+                          lag_days=0,
+                          collect_params={"kind": "rate", "market": market,
+                                          "symbol": symbol, "indicator": indicator}))
+    for code, name, sina, unit in COMMODITIES:
+        specs.append(dict(series_code=code, series_name=name, unit=unit, freq="day",
+                          market="CMDTY", source=f"akshare:futures_zh_daily_sina:{sina}",
+                          lag_days=0,
+                          collect_params={"kind": "commodity", "symbol": sina, "field": "close"}))
+    for code, name, func, col in PRICES:
+        specs.append(dict(series_code=code, series_name=name, freq="day", market="CN",
+                          unit="index" if "指数" in name else "cny_per_kg",
+                          source=f"akshare:{func}", lag_days=0,
+                          # 口径备注上提到 meta（原来逐行写进 extra，8 千多行各存一份）
+                          remark=(PORK_REMARK if code == "CN.PORK_PRICE" else None),
+                          collect_params={"kind": "price", "func": func, "col": col}))
+    for code, name, a, b, unit, remark in DERIVED:
+        specs.append(dict(series_code=code, series_name=name, unit=unit, freq="day",
+                          market="CN", source="derived:get_macro_daily", lag_days=0,
+                          remark=remark,
+                          collect_params={"kind": "derived", "left": a, "right": b}))
+    for code, name, a, b, unit, remark in CROSS_DERIVED:
+        specs.append(dict(series_code=code, series_name=name, unit=unit, freq="day",
+                          market=a.split(":", 1)[1][:2],
+                          source="derived:get_macro_daily:cross", lag_days=0, remark=remark,
+                          collect_params={"kind": "cross", "left": a, "right": b}))
+    return specs
+
+
+def _defs() -> dict:
+    """播种序列契约 → 读回「库里生效的定义」（库里的值覆盖代码，改库即改采集）。"""
+    specs = _specs()
+    with get_conn() as conn:
+        seed_series_meta(conn, specs)
+        return load_series_defs(conn, codes=[s["series_code"] for s in specs])
+
+
+def _rate_rows(defs: dict) -> list:
     import warnings
     warnings.filterwarnings("ignore")
     import akshare as ak
@@ -96,6 +144,10 @@ def _rate_rows() -> list:
 
     rows = []
     for code, name, market, symbol, indicator in RATES:
+        p = (defs.get(code) or {}).get("params") or {}
+        market = p.get("market", market)
+        symbol = p.get("symbol", symbol)
+        indicator = p.get("indicator", indicator)
         try:
             df = ak.rate_interbank(market=market, symbol=symbol, indicator=indicator)
         except Exception as e:
@@ -124,7 +176,7 @@ def _rate_rows() -> list:
     return rows
 
 
-def _commodity_rows() -> list:
+def _commodity_rows(defs: dict) -> list:
     import warnings
     warnings.filterwarnings("ignore")
     import akshare as ak
@@ -132,6 +184,9 @@ def _commodity_rows() -> list:
 
     rows = []
     for code, name, sina, unit in COMMODITIES:
+        p = (defs.get(code) or {}).get("params") or {}
+        sina = p.get("symbol", sina)
+        field = p.get("field", "close")
         try:
             df = ak.futures_zh_daily_sina(symbol=sina)
         except Exception as e:
@@ -139,7 +194,7 @@ def _commodity_rows() -> list:
             continue
         n = 0
         for _, r in df.iterrows():
-            v = pd.to_numeric(r.get("close"), errors="coerce")
+            v = pd.to_numeric(r.get(field), errors="coerce")
             d = pd.to_datetime(r.get("date"), errors="coerce")
             if pd.isna(v) or pd.isna(d):
                 continue
@@ -149,7 +204,7 @@ def _commodity_rows() -> list:
                 "value": round(float(v), 4), "unit": unit, "freq": "day", "market": "CMDTY",
                 "source": f"akshare:futures_zh_daily_sina:{sina}",
                 "release_time": datetime.datetime.combine(dd, datetime.time(18, 0), tzinfo=TZ_CN),
-                "revision": 0, "extra": {"contract": sina, "field": "close"},
+                "revision": 0, "extra": {"contract": sina, "field": field},
                 "updated_at": datetime.datetime.now(TZ_CN),
             })
             n += 1
@@ -158,12 +213,14 @@ def _commodity_rows() -> list:
     return rows
 
 
-def _derived_rows(conn) -> list:
+def _derived_rows(conn, defs: dict) -> list:
     """利差派生：从已入库的中债曲线同日做差。"""
     import pandas as pd
 
     rows = []
     for code, name, a, b, unit, remark in DERIVED:
+        p = (defs.get(code) or {}).get("params") or {}
+        a, b = p.get("left", a), p.get("right", b)
         df = pd.read_sql_query(
             """SELECT x.period_date, (x.value - y.value) AS v
                FROM regime.macro_series x JOIN regime.macro_series y
@@ -180,7 +237,7 @@ def _derived_rows(conn) -> list:
                 "value": round(float(r["v"]), 4), "unit": unit, "freq": "day", "market": "CN",
                 "source": "derived:get_macro_daily",
                 "release_time": datetime.datetime.combine(dd, datetime.time(18, 0), tzinfo=TZ_CN),
-                "revision": 0, "extra": {"expr": f"{a} - {b}", "remark": remark},
+                "revision": 0, "extra": {"expr": f"{a} - {b}"},   # remark 已上提到 meta
                 "updated_at": datetime.datetime.now(TZ_CN),
             })
             n += 1
@@ -188,11 +245,12 @@ def _derived_rows(conn) -> list:
     return rows
 
 
-def _price_rows() -> list:
+def _price_rows(defs: dict) -> list:
     """通胀高频价格序列（猪价 / 菜篮子指数 + 同比）：日频，幂等刷新。
 
-    口径注意：猪价源**未标注单位**（数值量级符合元/公斤），已在 extra.remark 注明；
-    猪价源只有约 7.5 个月滚动窗口 → 历史靠逐日累积（不像菜篮子有 2005 起的完整历史）。
+    口径注意：猪价源**未标注单位**（数值量级符合元/公斤）→ 该口径备注已**上提到
+    macro_series_meta.remark**（不再逐行写进 extra）；猪价源只有约 7.5 个月滚动窗口
+    → 历史靠逐日累积（不像菜篮子有 2005 起的完整历史）。
     """
     import warnings
     warnings.filterwarnings("ignore")
@@ -202,6 +260,9 @@ def _price_rows() -> list:
     cache: dict = {}
     rows = []
     for code, name, func, col in PRICES:
+        p = (defs.get(code) or {}).get("params") or {}
+        func = p.get("func", func)
+        col = p.get("col", col)
         if func not in cache:
             try:
                 cache[func] = getattr(ak, func)()
@@ -225,9 +286,7 @@ def _price_rows() -> list:
                 "unit": "index" if "指数" in name else "cny_per_kg",
                 "freq": "day", "market": "CN", "source": f"akshare:{func}",
                 "release_time": datetime.datetime.combine(dd, datetime.time(18, 0), tzinfo=TZ_CN),
-                "revision": 0,
-                "extra": {"remark": "猪价源未标注单位（数值量级=元/公斤）；源窗口约 7.5 个月"
-                           if code == "CN.PORK_PRICE" else None},
+                "revision": 0, "extra": {"col": col},
                 "updated_at": datetime.datetime.now(TZ_CN),
             })
             n += 1
@@ -235,7 +294,7 @@ def _price_rows() -> list:
     return rows
 
 
-def _cross_derived_rows(conn) -> list:
+def _cross_derived_rows(conn, defs: dict) -> list:
     """跨表派生（macro_series ↔ daily_benchmark）：中美利差、美债期限利差。
 
     口径：按**同日**做差（两源都是交易日序列，取交集；任一缺失则该日不产出，
@@ -258,6 +317,8 @@ def _cross_derived_rows(conn) -> list:
 
     rows = []
     for code, name, left, right, unit, remark in CROSS_DERIVED:
+        p = (defs.get(code) or {}).get("params") or {}
+        left, right = p.get("left", left), p.get("right", right)
         la, rb = _load(left), _load(right)
         n = 0
         for dd in sorted(set(la) & set(rb)):
@@ -268,7 +329,7 @@ def _cross_derived_rows(conn) -> list:
                 "market": code.split(".")[0],
                 "source": "derived:get_macro_daily:cross",
                 "release_time": datetime.datetime.combine(dd, datetime.time(18, 0), tzinfo=TZ_CN),
-                "revision": 0, "extra": {"expr": f"{left} - {right}", "remark": remark},
+                "revision": 0, "extra": {"expr": f"{left} - {right}"},   # remark 已上提到 meta
                 "updated_at": datetime.datetime.now(TZ_CN),
             })
             n += 1
@@ -278,26 +339,28 @@ def _cross_derived_rows(conn) -> list:
 
 def run(codes=None, ctx=None, dry_run: bool = False):
     """采集入口：全量幂等刷新。"""
+    defs = _defs()                        # 一次加载「库里生效的定义」，全部子模块共用
     print("  ── 拆借利率 ──")
-    rows = _rate_rows()
+    rows = _rate_rows(defs)
     print("  ── 商品 ──")
-    rows += _commodity_rows()
+    rows += _commodity_rows(defs)
     print("  ── 通胀高频（猪价/菜篮子）──")
-    rows += _price_rows()
+    rows += _price_rows(defs)
 
     with get_conn() as conn:
         print("  ── 利差派生 ──")
-        drows = _derived_rows(conn)
-        drows += _cross_derived_rows(conn)
+        drows = _derived_rows(conn, defs)
+        drows += _cross_derived_rows(conn, defs)
         if dry_run:
             print("  --dry-run：不写库")
             return len(rows) + len(drows)
         rows += drows
-        bulk_upsert(conn, TABLE, rows, conflict_cols=CONFLICT, skip_null_updates=True)
+        apply_series_defs(rows, defs)     # 生效的名称/单位/契约/备注贴到行 → 拆进 meta
+        upsert_macro_series(conn, rows)
         print(f"  ✅ 写入 {len(rows)} 条")
         with conn.cursor() as cur:
             cur.execute("""SELECT split_part(series_code,'.',1) ns, count(DISTINCT series_code), count(*)
-                           FROM regime.macro_series
+                           FROM regime.v_macro_series
                            WHERE source LIKE 'akshare:rate_interbank%'
                               OR source LIKE 'akshare:futures_zh_daily_sina%'
                               OR source = 'derived:get_macro_daily'

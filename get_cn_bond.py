@@ -21,7 +21,9 @@ import datetime
 import sys
 import time
 
-from db import get_conn, bulk_upsert
+from db import get_conn
+from regime_schema import (upsert_macro_series, seed_series_meta,
+                           load_series_defs, apply_series_defs)
 
 SOURCE = "akshare:bond_china_yield"
 TABLE = "regime.macro_series"
@@ -152,11 +154,37 @@ def _fetch(start: datetime.date, end: datetime.date) -> list:
     return _to_rows(df)
 
 
-def _save(rows: list) -> int:
+def _specs() -> list:
+    """曲线 × 期限 → 完整序列清单（**采集契约**），登记进 macro_series_meta。"""
+    specs = [dict(series_code=f"{prefix}_{ten_code}",
+                  series_name=f"中债{label}收益率曲线-{ten_col}",
+                  unit="pct", freq="day", market="CN", source=SOURCE, lag_days=0,
+                  collect_params={"curve": curve, "tenor": ten_col})
+             for curve, (prefix, label) in CURVES.items()
+             for ten_col, ten_code in TENORS.items()]
+    specs += [dict(series_code=f"CN.MTN_AA_{code}",
+                   series_name=f"中债中短期票据(AA)收益率曲线-{code}",
+                   unit="pct", freq="day", market="CN", source=AA_SOURCE, lag_days=0,
+                   collect_params={"curve": AA_SYMBOL, "tenor_year": yr})
+              for yr, code in AA_TENORS.items()]
+    return specs
+
+
+def _defs() -> dict:
+    """播种序列契约 → 读回「库里生效的定义」（库里的值可覆盖代码，改库即改采集）。"""
+    specs = _specs()
+    with get_conn() as conn:
+        seed_series_meta(conn, specs)
+        return load_series_defs(conn, codes=[s["series_code"] for s in specs])
+
+
+def _save(rows: list, defs: dict = None) -> int:
     if not rows:
         return 0
+    # 行是循环生成的，这里统一用库登记值覆盖（名称/单位/契约/备注）
+    apply_series_defs(rows, defs if defs is not None else _defs())
     with get_conn() as conn:
-        bulk_upsert(conn, TABLE, rows, conflict_cols=CONFLICT, skip_null_updates=True)
+        upsert_macro_series(conn, rows)
     return len(rows)
 
 
@@ -164,12 +192,13 @@ def run(codes=None, ctx=None, days: int = 30):
     """采集入口：增量拉取最近 days 天（默认 30，覆盖长假 + 源延迟）+ AA 档（源仅 3 日窗）。"""
     end = datetime.date.today()
     start = end - datetime.timedelta(days=days)
+    defs = _defs()                       # 一次加载生效定义，两处写入共用
     rows = _fetch(start, end)
-    n = _save(rows)
+    n = _save(rows, defs)
     print(f"  ✅ 增量 {start} ~ {end}: 写入 {n} 条")
     aa_rows = _fetch_aa(end)
     if aa_rows:
-        n_aa = _save(aa_rows)
+        n_aa = _save(aa_rows, defs)
         days_aa = sorted({r["period_date"] for r in aa_rows})
         print(f"  ✅ AA 中票曲线: {n_aa} 条（源仅最近 3 个交易日）{' ~ '.join(str(d) for d in days_aa[-1:])}")
     return n + (len(aa_rows) if aa_rows else 0)
@@ -217,7 +246,7 @@ def _main() -> int:
             cur.execute("""SELECT split_part(series_code, '_', 1) AS ns, count(*),
                                   min(period_date), max(period_date),
                                   count(DISTINCT series_code)
-                           FROM regime.macro_series
+                           FROM regime.v_macro_series
                            WHERE source = %s GROUP BY 1 ORDER BY 1""", (SOURCE,))
             print("\n── 库内覆盖核对 ──")
             for ns, cnt, mn, mx, nser in cur.fetchall():

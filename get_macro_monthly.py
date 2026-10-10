@@ -30,7 +30,8 @@ import re
 import sys
 import time
 
-from db import get_conn, bulk_upsert
+from db import get_conn
+from regime_schema import upsert_macro_series, seed_series_meta, load_series_defs
 
 TABLE = "regime.macro_series"
 CONFLICT = ["series_code", "period_date", "revision"]
@@ -662,6 +663,20 @@ def _parse_period(raw, freq_hint: str):
     return datetime.date(year, 1, 1)
 
 
+_CONTRACT_KEYS = ("func", "col", "date_col", "nbs", "sdmx", "pbc",
+                  "use_release_col", "row_filter", "release_from_date")
+"""序列定义中属于「采集契约」的键 → 存 macro_series_meta.collect_params。
+
+存下来是为了让 `macro_series_meta` 成为序列注册表的唯一真相源：从库里就能重建出完整
+的采集定义（见 _load_defs），改契约不必翻代码。"""
+
+
+def _contract_params(defn: dict):
+    """序列定义 → 采集契约参数（JSONB）。无契约键时返回 None。"""
+    p = {k: defn[k] for k in _CONTRACT_KEYS if defn.get(k) is not None}
+    return p or None
+
+
 def _mk_row(defn: dict, d, v, rel=None, basis=None) -> dict:
     """macro_series 行模板（akshare 与 NBS 两条采集路径共用）。"""
     if rel is None:
@@ -675,8 +690,11 @@ def _mk_row(defn: dict, d, v, rel=None, basis=None) -> dict:
         "unit": defn["unit"], "freq": defn["freq"],
         "market": defn.get("market") or defn["code"].split(".")[0],
         "source": defn.get("source") or f"akshare:{defn.get('func')}",
+        # 采集契约 + 口径备注 → 维度表 macro_series_meta（不逐行重复）
+        "lag_days": defn["lag"], "collect_params": _contract_params(defn),
+        "remark": defn.get("remark"),
         "release_time": rel, "revision": 0,
-        "extra": {"release_basis": basis, "remark": defn.get("remark")},
+        "extra": {"release_basis": basis},
         "updated_at": datetime.datetime.now(TZ_CN),
     }
 
@@ -772,7 +790,9 @@ def _build_derived(conn) -> list:
                 "market": "CN", "source": "derived:get_macro_monthly",
                 "release_time": datetime.datetime.combine(dd + datetime.timedelta(days=45),
                                                           datetime.time(18, 0), tzinfo=TZ_CN),
-                "revision": 0, "extra": {"expr": f"{a} - {b}", "remark": d.get("remark")},
+                "lag_days": d.get("lag", 45), "collect_params": {"expr": f"{a} - {b}"},
+                "remark": d.get("remark"),
+                "revision": 0, "extra": {"release_basis": "period+45d"},
                 "updated_at": datetime.datetime.now(TZ_CN),
             })
         print(f"    · {d['code']}: {len(rows)} 条累计（派生）")
@@ -796,12 +816,53 @@ def _dedupe(rows: list) -> list:
     return sorted(out, key=lambda r: (r["series_code"], r["period_date"]))
 
 
+def _seed_series_meta(conn) -> int:
+    """把代码 SERIES 的定义播种进 macro_series_meta（只补空缺，不覆盖；见 seed_series_meta）。"""
+    return seed_series_meta(conn, [{
+        "series_code": d["code"], "series_name": d["name"], "unit": d["unit"],
+        "freq": d["freq"], "market": d.get("market") or d["code"].split(".")[0],
+        "source": d.get("source") or f"akshare:{d.get('func')}",
+        "lag_days": d["lag"], "collect_params": _contract_params(d),
+        "remark": d.get("remark"),
+    } for d in SERIES])
+
+
+def _load_defs(conn) -> list:
+    """从 macro_series_meta 重建采集定义（**DB 为唯一真相源**）。
+
+    · 代码 SERIES 只决定「有哪些序列 + 顺序」；
+    · 库里有该序列 → 库的值覆盖代码（契约/单位/备注/滞后）；库里没有 → 用代码兜底。
+    """
+    db = load_series_defs(conn, codes=[d["code"] for d in SERIES])
+    out = []
+    for d in SERIES:
+        m = db.get(d["code"])
+        if not m:
+            out.append(d)
+            continue
+        merged = dict(d)
+        for k, v in (("name", m["name"]), ("unit", m["unit"]), ("freq", m["freq"]),
+                     ("market", m["market"]), ("source", m["source"]),
+                     ("lag", m["lag_days"]), ("remark", m["remark"])):
+            if v is not None:                     # 库里为空的字段不覆盖代码
+                merged[k] = v
+        merged.update(m["params"])                # 采集契约参数（func/col/nbs/sdmx/pbc...）
+        out.append(merged)
+    return out
+
+
 def run(codes=None, ctx=None, dry_run: bool = False):
     """采集入口：全量刷新（幂等；月频数据量小）。"""
+    global _SDMX_AREAS
+    with get_conn() as conn:
+        _seed_series_meta(conn)
+        defs = _load_defs(conn)
+    # OECD CLI 一次请求取全部经济体 → 区域并集须按**最终生效的定义**重算（库可覆盖 ref_area）
+    _SDMX_AREAS = [d["sdmx"]["ref_area"] for d in defs if d.get("sdmx")]
     cache: dict = {}
     all_rows = []
     print("  ── 原始序列 ──")
-    for defn in SERIES:
+    for defn in defs:
         try:
             rows = _collect_one(defn, cache)
         except Exception as e:
@@ -819,15 +880,15 @@ def run(codes=None, ctx=None, dry_run: bool = False):
         if dry_run:
             print("  --dry-run：不写库")
             return len(all_rows)
-        bulk_upsert(conn, TABLE, all_rows, conflict_cols=CONFLICT, skip_null_updates=True)
+        upsert_macro_series(conn, all_rows)
         print(f"  ── 派生序列 ──")
         drows = _build_derived(conn)
         if drows:
-            bulk_upsert(conn, TABLE, drows, conflict_cols=CONFLICT, skip_null_updates=True)
+            upsert_macro_series(conn, drows)
         print(f"  ✅ 写入 {len(all_rows)} + 派生 {len(drows)} 条")
         with conn.cursor() as cur:
             cur.execute("""SELECT count(DISTINCT series_code), count(*), max(updated_at)
-                           FROM regime.macro_series WHERE source LIKE 'akshare:macro%'
+                           FROM regime.v_macro_series WHERE source LIKE 'akshare:macro%'
                               OR source LIKE 'derived:get_macro_monthly'""")
             n, cnt, upd = cur.fetchone()
             print(f"  宏观包序列 {n} 个 / {cnt:,} 行，最后更新 {upd}")

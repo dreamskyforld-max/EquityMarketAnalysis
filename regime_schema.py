@@ -31,17 +31,29 @@ import sys
 _DDL = {
     "schema": "CREATE SCHEMA IF NOT EXISTS regime",
 
+    "macro_series_meta": """
+CREATE TABLE IF NOT EXISTS regime.macro_series_meta (
+    series_code     VARCHAR(40)     PRIMARY KEY,
+    series_name     VARCHAR(80)     NOT NULL,
+    unit            VARCHAR(16),                        -- pct / bp / index / yi_yuan / count ...
+    freq            VARCHAR(8)      NOT NULL,           -- day / month / quarter
+    market          VARCHAR(8)      NOT NULL DEFAULT 'CN',  -- CN / HK / US / GLOBAL / CMDTY
+    source          VARCHAR(48),                        -- 采集来源（含通道+接口名），如 akshare:bond_china_yield / pbc:social-financing
+    lag_days        INT,                                -- 发布滞后天数：release_time = period_date + lag_days（PIT 输入，宁晚勿早）
+    collect_params  JSONB,                              -- 采集契约参数：{func,col,date_col,nbs,sdmx,pbc,use_release_col,row_filter,release_from_date}
+    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
+    remark          TEXT,                               -- 序列级口径备注（**不逐行重复**，旧版曾放在 fact.extra 里）
+    created_at      TIMESTAMPTZ     DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     DEFAULT NOW()
+)
+""",
+
     "macro_series": """
 CREATE TABLE IF NOT EXISTS regime.macro_series (
     id              BIGSERIAL       PRIMARY KEY,
-    series_code     VARCHAR(40)     NOT NULL,           -- 序列编码，如 CN.BOND_10Y / CN.VAL_PE_MEDIAN / US.DGS10
-    series_name     VARCHAR(80)     NOT NULL,
-    period_date     DATE            NOT NULL,           -- 数据所属期（月频取统计月份对应日期，口径见 extra/remark）
+    series_code     VARCHAR(40)     NOT NULL REFERENCES regime.macro_series_meta(series_code),
+    period_date     DATE            NOT NULL,           -- 数据所属期（月频取统计月份对应日期，口径见 meta.remark）
     value           NUMERIC(20,6),
-    unit            VARCHAR(16),                        -- pct / bp / index / yi_yuan / count ...
-    freq            VARCHAR(8)      NOT NULL,           -- day / month / quarter
-    market          VARCHAR(8)      NOT NULL DEFAULT 'CN',  -- CN / HK / US / GLOBAL
-    source          VARCHAR(48),                        -- 采集来源，如 akshare:bond_china_yield / legulegu
     release_time    TIMESTAMPTZ,                        -- 实际可得时间（PIT，防前视）
     revision        INT             NOT NULL DEFAULT 0, -- 修订版本（同 period 多次修订各存一行）
     extra           JSONB,
@@ -59,6 +71,14 @@ FROM regime.macro_series
 ORDER BY series_code, period_date, revision DESC
 """,
 
+    "macro_series_wide_view": """
+CREATE OR REPLACE VIEW regime.v_macro_series AS
+SELECT m.series_code, m.series_name, m.unit, m.freq, m.market, m.source,
+       s.period_date, s.value, s.release_time, s.revision, s.extra,
+       s.created_at, s.updated_at
+FROM regime.macro_series s JOIN regime.macro_series_meta m USING (series_code)
+""",
+
     "macro_series_idx": """
 CREATE INDEX IF NOT EXISTS idx_macro_series_code_date
     ON regime.macro_series (series_code, period_date DESC)
@@ -68,7 +88,7 @@ CREATE INDEX IF NOT EXISTS idx_macro_series_code_date
 CREATE TABLE IF NOT EXISTS regime.indicator_dict (
     indicator_code  VARCHAR(48)     PRIMARY KEY,       -- 如 BREADTH.ADV_RATIO / VAL.PE_MEDIAN / FSI.COMPOSITE
     indicator_name  VARCHAR(80)     NOT NULL,
-    layer           SMALLINT        NOT NULL,          -- 1=宏观 2=资产配置 3=市场状态 4=行业
+    scope           VARCHAR(16)     NOT NULL,          -- 分析域作用域（**非架构分层**）：MACRO=外生宏观/跨市场 ALLOC=资产配置 MARKET=市场自身 SECTOR=行业
     dimension       VARCHAR(24)     NOT NULL,          -- 宽度/估值/情绪/资金/风险偏好/金融压力/风格/宏观/景气
     market_scope    VARCHAR(16)     NOT NULL,          -- CN / HK / CN+HK / GLOBAL
     unit            VARCHAR(16),                       -- pct / ratio / count / bp / score_0_100 ...
@@ -366,8 +386,18 @@ CREATE TABLE IF NOT EXISTS regime.market_regime_daily (
 
 # 与 sql/schema.sql 对应的 COMMENT（单独执行，保证既有库补注释）
 _COMMENTS = [
+    ("TABLE", "regime.macro_series_meta",
+     "原始序列注册表（维度表）：series_code 的身份/口径/出处；macro_series 为纯事实表（只存观测值+PIT）"),
+    ("COLUMN", "regime.macro_series_meta.unit",
+     "pct=百分比 / bp=基点 / index=指数点 / yi_yuan=亿元 / count=计数；"
+     "⚠ 单位换算（如万亿→亿元）属**显式迁移**：须同步 UPDATE 历史 value，本列只表达当前口径"),
+    ("COLUMN", "regime.macro_series_meta.lag_days",
+     "发布滞后天数：release_time = period_date + lag_days（**PIT 输入**，宁晚勿早）；改此值即改该序列的可得时点"),
+    ("COLUMN", "regime.macro_series_meta.collect_params",
+     "采集契约参数（JSONB）：{func,col,date_col,nbs,sdmx,pbc,use_release_col,row_filter,release_from_date}；"
+     "配合 lag_days 可从本表重建完整采集定义"),
     ("TABLE", "regime.macro_series",
-     "宏观/资产配置时序长表（采集层原始值，PIT：release_time + revision）"),
+     "宏观/资产配置时序**事实表**（采集层原始值，PIT：release_time + revision；元数据见 macro_series_meta）"),
     ("COLUMN", "regime.macro_series.series_code",
      "序列编码（命名空间：CN./HK./US./FX./CMDTY.）"),
     ("COLUMN", "regime.macro_series.period_date",
@@ -376,10 +406,11 @@ _COMMENTS = [
      "数据实际可得时间，PIT 回测按此过滤，禁止用 period_date 代替"),
     ("COLUMN", "regime.macro_series.revision",
      "修订版本号，0=首次发布；宏观数据修订时新增行而非覆盖"),
-    ("COLUMN", "regime.macro_series.unit",
-     "pct=百分比 / bp=基点 / index=指数点 / yi_yuan=亿元 / count=计数"),
     ("TABLE", "regime.indicator_dict",
      "指标字典：所有指标的口径/方向/频率登记（新增指标须先进字典）"),
+    ("COLUMN", "regime.indicator_dict.scope",
+     "分析域作用域：MACRO=外生宏观/跨市场 ALLOC=资产配置 MARKET=市场自身 SECTOR=行业；"
+     "**非 ODS/DW/ADS 架构分层**（架构分层由表承载，见 macro_series→indicator_value→market_regime_daily）"),
     ("COLUMN", "regime.indicator_dict.direction",
      "high_risk=越高越危险 / high_good=越高越好 / neutral；分位化与合成按此统一方向"),
     ("COLUMN", "regime.indicator_dict.formula",
@@ -447,6 +478,149 @@ _COMMENTS = [
     ("COLUMN", "trading_calendar.src",
      "来源：derived:*=从现有表派生 / akshare / manual=人工修正"),
 ]
+
+
+META_COLS = ("series_name", "unit", "freq", "market", "source",
+             "lag_days", "collect_params", "remark")
+"""macro_series 事实表已剥离的「元数据 + 采集契约」列 → 维度表 macro_series_meta。"""
+
+
+def upsert_macro_series(conn, rows, conflict_cols=None, skip_null_updates=True) -> int:
+    """写 regime.macro_series：**元数据与采集契约拆进维度表，事实表只留观测本身**。
+
+    采集器按「一行带齐元数据」的方式构造 rows，本函数负责拆分：
+      ① series_name/unit/freq/market/source/lag_days/collect_params/remark
+         → upsert `macro_series_meta`（按 series_code 去重）；
+      ② 其余列 → 写 `macro_series` 事实表。
+
+    · **remark 自动上提**：若采集器仍把口径备注写在 `extra.remark`（历史写法），此处
+      自动搬到 meta.remark 并从 extra 剥离 —— 避免同一段备注在每一行重复存储。
+    ⚠ 事实表有 FK → meta，故**必须先写 meta 再写 fact**（本函数已保证顺序）。
+    """
+    from db import bulk_upsert
+
+    if not rows:
+        return 0
+    conflict_cols = conflict_cols or ["series_code", "period_date", "revision"]
+    meta: dict = {}
+    fact = []
+    for r in rows:
+        code = r.get("series_code")
+        extra = r.get("extra")
+        remark = r.get("remark")
+        if not remark and isinstance(extra, dict) and extra.get("remark"):
+            remark = extra.pop("remark")            # 上提：extra → meta
+        if code:
+            m = {c: r[c] for c in META_COLS if r.get(c) is not None}
+            if remark:
+                m["remark"] = remark
+            if code in meta:
+                meta[code].update(m)
+            else:
+                meta[code] = dict(m, series_code=code)
+        fact.append({k: v for k, v in r.items()
+                     if k not in META_COLS and k != "remark"})
+    if meta:
+        bulk_upsert(conn, "regime.macro_series_meta", list(meta.values()),
+                    conflict_cols=["series_code"], skip_null_updates=True)
+    bulk_upsert(conn, "regime.macro_series", fact,
+                conflict_cols=conflict_cols, skip_null_updates=skip_null_updates)
+    return len(fact)
+
+
+def seed_series_meta(conn, specs) -> int:
+    """把采集器代码里的序列定义播种进 macro_series_meta（**只补空缺，不覆盖**）。
+
+    specs: [{"series_code","series_name","unit","freq","market","source",
+             "lag_days","collect_params","remark"}, ...]
+
+    → 已在库里的序列**以库为准**（改契约/单位/滞后/备注直接改库，不必改代码重启）；
+      新序列由代码播种一次，此后同样归库管。
+
+    ⚠ 不能用 bulk_upsert(do_nothing=True)：meta 行往往已存在（身份回填阶段建的），
+      DO NOTHING 会全部跳过、契约永远写不进去；也不能用 skip_null_updates=True
+      （那是「新值覆盖」，会把库里的人工调整冲掉）。这里要的是「只补空缺」。
+    """
+    from psycopg2.extras import Json
+
+    rows = [(
+        s["series_code"], s["series_name"], s.get("unit"), s.get("freq", "day"),
+        s.get("market") or s["series_code"].split(".")[0], s.get("source"),
+        s.get("lag_days"),
+        Json(s["collect_params"]) if s.get("collect_params") else None,
+        s.get("remark"),
+    ) for s in specs]
+    with conn.cursor() as cur:
+        cur.executemany("""INSERT INTO regime.macro_series_meta
+            (series_code, series_name, unit, freq, market, source,
+             lag_days, collect_params, remark)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (series_code) DO UPDATE SET
+                series_name    = COALESCE(macro_series_meta.series_name,    EXCLUDED.series_name),
+                unit           = COALESCE(macro_series_meta.unit,           EXCLUDED.unit),
+                freq           = COALESCE(macro_series_meta.freq,           EXCLUDED.freq),
+                market         = COALESCE(macro_series_meta.market,         EXCLUDED.market),
+                source         = COALESCE(macro_series_meta.source,         EXCLUDED.source),
+                lag_days       = COALESCE(macro_series_meta.lag_days,       EXCLUDED.lag_days),
+                collect_params = COALESCE(macro_series_meta.collect_params, EXCLUDED.collect_params),
+                remark         = COALESCE(macro_series_meta.remark,         EXCLUDED.remark)""",
+            rows)
+    return len(rows)
+
+
+def load_series_defs(conn, codes=None, source_prefix=None) -> dict:
+    """读「生效定义」→ {series_code: {name, unit, freq, market, source, lag_days, params, remark}}。
+
+    采集器用它把自己的代码清单与库登记合并：**库里有 → 以库为准**；没有 → 用代码兜底。
+    """
+    import json
+
+    sql = """SELECT series_code, series_name, unit, freq, market, source,
+                    lag_days, collect_params, remark
+             FROM regime.macro_series_meta WHERE is_active"""
+    args = []
+    if codes:
+        sql += " AND series_code = ANY(%s)"
+        args.append(list(codes))
+    elif source_prefix:
+        sql += " AND source LIKE %s"
+        args.append(source_prefix + "%")
+    with conn.cursor() as cur:
+        cur.execute(sql, args)
+        rows = cur.fetchall()
+    out = {}
+    for code, name, unit, freq, market, source, lag, params, remark in rows:
+        if isinstance(params, str):          # psycopg2 有时返回 JSON 字符串
+            params = json.loads(params) if params else None
+        out[code] = dict(name=name, unit=unit, freq=freq, market=market, source=source,
+                         lag_days=lag, params=params or {}, remark=remark)
+    return out
+
+
+def apply_series_defs(rows: list, defs: dict) -> list:
+    """把 load_series_defs 读到的「生效定义」贴回每个 fact 行。
+
+    适用于代码里按循环生成 series_code 的采集器（如中债曲线 = 曲线 × 期限）：行已按代码
+    清单构造好，这里统一用库里登记的值覆盖名称/单位/契约/备注，再由 upsert_macro_series
+    拆进 macro_series_meta。**库里没有该序列时原样保留**（用代码兜底）。
+    """
+    for r in rows:
+        m = defs.get(r.get("series_code"))
+        if not m:
+            continue
+        # ⚠ 不覆盖 `source`：它表示「这次实际从哪取的数」，应由采集代码按**生效参数**现算，
+        #   否则改了 DB 里的 symbol/indicator，source 会留在旧值上造成登记失真。
+        for k, col in (("name", "series_name"), ("unit", "unit"),
+                       ("freq", "freq"), ("market", "market")):
+            if m.get(k) is not None:
+                r[col] = m[k]
+        if m.get("lag_days") is not None:
+            r["lag_days"] = m["lag_days"]
+        if m.get("params"):
+            r["collect_params"] = m["params"]
+        if m.get("remark"):
+            r["remark"] = m["remark"]
+    return rows
 
 
 def ensure_schema(conn=None, verbose: bool = False) -> None:

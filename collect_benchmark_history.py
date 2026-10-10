@@ -515,10 +515,11 @@ def collect_bond(bench_code, bench_name):
 
 
 def collect_currency(bench_code, bench_name):
-    """离岸人民币兑美元中间价（AKShare currency_boc_safe，国家外汇管理局全历史）。
+    """在岸人民币兑美元（AKShare currency_boc_safe = 中国银行外汇牌价全历史）。
 
-    返回 8022+ 行全历史中间价，"美元"列即 USD/CNY。注意这是外汇管理局在岸中间价，
-    非严格离岸 CNH，但作为人民币兑美元基准足够。
+    返回 8000+ 行全历史牌价，"美元"列（单位：分）÷100 即 USD/CNY。
+    ⚠ 这是**在岸**口径（中行折算价），**不是离岸 CNH** —— CNH 无稳定免费源
+      （东财源断连、中行新浪源 2023-11 停更），故本项目不采 CNH；勿把本序列当 CNH 用。
     """
     import warnings
     warnings.filterwarnings("ignore")

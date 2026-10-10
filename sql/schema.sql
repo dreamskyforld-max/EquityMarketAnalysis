@@ -1574,16 +1574,33 @@ CREATE INDEX IF NOT EXISTS idx_company_rev_break_stock
 CREATE SCHEMA IF NOT EXISTS regime;
 
 -- 1. 宏观与时序指标长表（月/季/日频统一承载；长表避免 30+ 张单指标表）
-CREATE TABLE IF NOT EXISTS regime.macro_series (
-    id              BIGSERIAL       PRIMARY KEY,
-    series_code     VARCHAR(40)     NOT NULL,           -- 序列编码，如 CN.BOND_10Y / CN.VAL_PE_MEDIAN / US.DGS10
+-- 1a. 原始序列注册表（**维度表**）：series_code 的身份 / 口径 / 出处
+CREATE TABLE IF NOT EXISTS regime.macro_series_meta (
+    series_code     VARCHAR(40)     PRIMARY KEY,
     series_name     VARCHAR(80)     NOT NULL,
-    period_date     DATE            NOT NULL,           -- 数据所属期（月频取统计月份对应日期，口径见 extra/remark）
-    value           NUMERIC(20,6),
     unit            VARCHAR(16),                        -- pct / bp / index / yi_yuan / count ...
     freq            VARCHAR(8)      NOT NULL,           -- day / month / quarter
-    market          VARCHAR(8)      NOT NULL DEFAULT 'CN',  -- CN / HK / US / GLOBAL
-    source          VARCHAR(48),                        -- 采集来源，如 akshare:bond_china_yield / legulegu
+    market          VARCHAR(8)      NOT NULL DEFAULT 'CN',  -- CN / HK / US / GLOBAL / CMDTY
+    source          VARCHAR(48),                        -- 采集来源（含通道+接口名），如 akshare:bond_china_yield / pbc:social-financing
+    lag_days        INT,                                -- 发布滞后天数：release_time = period_date + lag_days（PIT 输入，宁晚勿早）
+    collect_params  JSONB,                              -- 采集契约参数：{func,col,date_col,nbs,sdmx,pbc,use_release_col,row_filter,release_from_date}
+    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
+    remark          TEXT,                               -- 序列级口径备注（**不逐行重复**，旧版曾放在 fact.extra 里）
+    created_at      TIMESTAMPTZ     DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     DEFAULT NOW()
+);
+
+COMMENT ON TABLE  regime.macro_series_meta          IS '原始序列注册表（维度表）：series_code 的身份/口径/出处；macro_series 为纯事实表（只存观测值+PIT）';
+COMMENT ON COLUMN regime.macro_series_meta.unit     IS 'pct=百分比 / bp=基点 / index=指数点 / yi_yuan=亿元 / count=计数；⚠ 单位换算（如万亿→亿元）属**显式迁移**：须同步 UPDATE 历史 value，本列只表达当前口径';
+COMMENT ON COLUMN regime.macro_series_meta.lag_days IS '发布滞后天数：release_time = period_date + lag_days（**PIT 输入**，宁晚勿早）；改此值即改该序列的可得时点';
+COMMENT ON COLUMN regime.macro_series_meta.collect_params IS '采集契约参数（JSONB）：{func,col,date_col,nbs,sdmx,pbc,use_release_col,row_filter,release_from_date}；配合 lag_days 可从本表重建完整采集定义';
+
+-- 1b. 时序**事实表**（瘦身后）：只存观测本身，元数据一律走 macro_series_meta
+CREATE TABLE IF NOT EXISTS regime.macro_series (
+    id              BIGSERIAL       PRIMARY KEY,
+    series_code     VARCHAR(40)     NOT NULL REFERENCES regime.macro_series_meta(series_code),
+    period_date     DATE            NOT NULL,           -- 数据所属期（月频取统计月份对应日期，口径见 meta.remark）
+    value           NUMERIC(20,6),
     release_time    TIMESTAMPTZ,                        -- 实际可得时间（PIT，防前视）
     revision        INT             NOT NULL DEFAULT 0, -- 修订版本（同 period 多次修订各存一行）
     extra           JSONB,
@@ -1593,12 +1610,11 @@ CREATE TABLE IF NOT EXISTS regime.macro_series (
     UNIQUE (series_code, period_date, revision)
 );
 
-COMMENT ON TABLE  regime.macro_series              IS '宏观/资产配置时序长表（采集层原始值，PIT：release_time + revision）';
+COMMENT ON TABLE  regime.macro_series              IS '宏观/资产配置时序**事实表**（采集层原始值，PIT：release_time + revision；元数据见 macro_series_meta）';
 COMMENT ON COLUMN regime.macro_series.series_code  IS '序列编码（命名空间：CN./HK./US./FX./CMDTY.）';
 COMMENT ON COLUMN regime.macro_series.period_date  IS '数据所属期；月/季频为统计期，不含发布日期';
 COMMENT ON COLUMN regime.macro_series.release_time IS '数据实际可得时间，PIT 回测按此过滤，禁止用 period_date 代替';
 COMMENT ON COLUMN regime.macro_series.revision     IS '修订版本号，0=首次发布；宏观数据修订时新增行而非覆盖';
-COMMENT ON COLUMN regime.macro_series.unit         IS 'pct=百分比 / bp=基点 / index=指数点 / yi_yuan=亿元 / count=计数';
 
 CREATE INDEX IF NOT EXISTS idx_macro_series_code_date
     ON regime.macro_series (series_code, period_date DESC);
@@ -1609,11 +1625,18 @@ SELECT DISTINCT ON (series_code, period_date) *
 FROM regime.macro_series
 ORDER BY series_code, period_date, revision DESC;
 
+-- 宽视图：事实 + 维度（等价旧的单表形态；消费方需要 unit/name/source 时走它）
+CREATE OR REPLACE VIEW regime.v_macro_series AS
+SELECT m.series_code, m.series_name, m.unit, m.freq, m.market, m.source,
+       s.period_date, s.value, s.release_time, s.revision, s.extra,
+       s.created_at, s.updated_at
+FROM regime.macro_series s JOIN regime.macro_series_meta m USING (series_code);
+
 -- 2. 指标字典（口径/方向/频率/来源登记，禁止口径漂移）
 CREATE TABLE IF NOT EXISTS regime.indicator_dict (
     indicator_code  VARCHAR(48)     PRIMARY KEY,       -- 如 BREADTH.ADV_RATIO / VAL.PE_MEDIAN / FSI.COMPOSITE
     indicator_name  VARCHAR(80)     NOT NULL,
-    layer           SMALLINT        NOT NULL,          -- 1=宏观 2=资产配置 3=市场状态 4=行业
+    scope           VARCHAR(16)     NOT NULL,          -- 分析域作用域（**非架构分层**）：MACRO=外生宏观/跨市场 ALLOC=资产配置 MARKET=市场自身 SECTOR=行业
     dimension       VARCHAR(24)     NOT NULL,          -- 宽度/估值/情绪/资金/风险偏好/金融压力/风格/宏观/景气
     market_scope    VARCHAR(16)     NOT NULL,          -- CN / HK / CN+HK / GLOBAL
     unit            VARCHAR(16),                       -- pct / ratio / count / bp / score_0_100 ...
@@ -1628,6 +1651,7 @@ CREATE TABLE IF NOT EXISTS regime.indicator_dict (
 );
 
 COMMENT ON TABLE  regime.indicator_dict             IS '指标字典：所有指标的口径/方向/频率登记（新增指标须先进字典）';
+COMMENT ON COLUMN regime.indicator_dict.scope       IS '分析域作用域：MACRO=外生宏观/跨市场 ALLOC=资产配置 MARKET=市场自身 SECTOR=行业；**非 ODS/DW/ADS 架构分层**（架构分层由表承载）';
 COMMENT ON COLUMN regime.indicator_dict.direction   IS 'high_risk=越高越危险 / high_good=越高越好 / neutral；分位化与合成按此统一方向';
 COMMENT ON COLUMN regime.indicator_dict.formula     IS '计算口径描述（引用实现函数），保证可解释、可追溯';
 
