@@ -1641,7 +1641,7 @@ CREATE TABLE IF NOT EXISTS regime.indicator_dict (
     market_scope    VARCHAR(16)     NOT NULL,          -- CN / HK / CN+HK / GLOBAL
     unit            VARCHAR(16),                       -- pct / ratio / count / bp / score_0_100 ...
     direction       VARCHAR(12)     NOT NULL,          -- high_risk / high_good / neutral（分位化方向统一依据）
-    freq            VARCHAR(8)      NOT NULL,          -- day / week / month / quarter
+    freq            VARCHAR(8)      NOT NULL,          -- 源频率 day/week/month/quarter（**非存储粒度**：月季频读数 PIT 填充到每个交易日后仍记源频率）
     source          VARCHAR(64),                       -- 依赖表/数据源
     formula         TEXT,                              -- 计算口径（引用实现函数）
     is_active       BOOLEAN         NOT NULL DEFAULT TRUE,

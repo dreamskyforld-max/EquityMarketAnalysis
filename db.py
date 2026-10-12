@@ -195,8 +195,13 @@ def write_full_tick(conn, data_list, columns):
         extras.execute_values(cur, query.as_string(conn), values_list, page_size=1000)
 
 
+# 审计/时间戳列：`only_if_changed` 判定「值是否变化」时必须排除——
+# 它们恒为 NOW()，纳入判定会让 WHERE 永远成立、优化彻底失效。
+_AUDIT_COLS = frozenset({"updated_at", "created_at", "update_time", "snapshot_time"})
+
+
 def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False,
-                skip_null_updates=False):
+                skip_null_updates=False, only_if_changed=False):
     """
     批量 INSERT ... ON CONFLICT DO UPDATE / DO NOTHING
     data_list: dict 列表
@@ -206,6 +211,19 @@ def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False,
                 False(默认) → 冲突时整行覆盖（EXCLUDED.col 无条件覆盖原值）。
                 True → 冲突时仅用有值的字段覆盖：col = COALESCE(EXCLUDED.col, 原值)，
                        新值为 NULL 的字段保留库中已有值（不回写成 NULL）。
+    only_if_changed: 仅当**数据列**真的变了才执行 UPDATE
+                （`DO UPDATE SET ... WHERE tbl.c IS DISTINCT FROM EXCLUDED.c OR ...`）。
+                适用于「源是月/季频、但按 PIT 填充成日频网格」的**计算层**表
+                （regime.indicator_value / regime.market_regime_daily）：
+                  ① 值没变的行**完全不写** → 不再把同一行反复重写（省行版本膨胀 / WAL /
+                     autovacuum 负担；实测 indicator_value 全表 31.5% 的行是重复值）；
+                  ② updated_at 恢复「值最后变化时间」的语义（原先被刷新成「最后一次被跑到」，
+                     导致无法用它判断「月频指标一个月没变」这种本该告警的情形）。
+                ⚠ 审计时间列（_AUDIT_COLS）不参与变化判定——它们恒为 NOW()，
+                  纳入会让 WHERE 永远成立、优化失效。
+                ⚠ **绝不能用于采集层**（如 regime.macro_series）：那里的断供监控正是靠
+                  updated_at 被反复刷新判断「采集在跑」（见各 get_*.py 的显式注释），
+                  月频序列值不变时也必须刷新。
 
     自动对齐所有 record 的 keys：不同数据源构造的 record 可能字段不一致
     （如富途带 volume/turnover，FRED 不带），用 data_list[0].keys() 取列名
@@ -265,14 +283,24 @@ def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False,
                 sql.SQL("{col} = EXCLUDED.{col}").format(col=sql.Identifier(c))
                 for c in update_cols
             ])
+        # only_if_changed：按**数据列**判定是否真的变了；审计时间列排除（见 _AUDIT_COLS）
+        where_sql = sql.SQL("")
+        if only_if_changed:
+            chg = [c for c in update_cols if c not in _AUDIT_COLS]
+            if chg:
+                where_sql = sql.SQL(" WHERE {cond}").format(cond=sql.SQL(" OR ").join([
+                    sql.SQL("{tbl}.{col} IS DISTINCT FROM EXCLUDED.{col}").format(
+                        col=sql.Identifier(c), tbl=_table_alias(table))
+                    for c in chg]))
         query = sql.SQL(
             "INSERT INTO {table} ({cols}) VALUES %s "
-            "ON CONFLICT ({conflict}) DO UPDATE SET {update_set}"
+            "ON CONFLICT ({conflict}) DO UPDATE SET {update_set}{where}"
         ).format(
             table=_table_ident(table),
             cols=col_identifiers,
             conflict=conflict_target,
             update_set=update_set,
+            where=where_sql,
         )
 
     values_list = [tuple(_adapt_value(d[c]) for c in columns) for d in data_list]

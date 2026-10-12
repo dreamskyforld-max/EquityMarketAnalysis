@@ -154,61 +154,61 @@ INDICATORS: list[dict] = [
          remark="⚠ 源约 7.5 个月滚动窗口 + 未标注单位（量级=元/公斤）→ 历史逐日累积，早期分位无意义",
          formula="源 spot_hog_year_trend_soozhu「价格」"),
     dict(code="MACRO.CORE_CPI_YOY", name="核心CPI同比(剔除食品能源)", scope="MACRO", dimension="通胀",
-         market_scope="CN", unit="pct", direction="high_risk", freq="day",
+         market_scope="CN", unit="pct", direction="high_risk", freq="month",
          remark="核心通胀=真实需求侧通胀黏性（剔除食品/能源扰动）；⚠ 源库仅 2021-01 起有该口径 "
                 "→ 分位样本约 5 年；与 MACRO.VEG_BASKET_YOY（食品项）对照看结构性通胀",
          formula="CN.CORE_CPI_YOY（源：国家统计局「国家数据」月度库，官方名「不包括食品和能源"
                  "居民消费价格指数(上年同月=100)」，指数−100 → 同比%）"),
     dict(code="MACRO.CLI_CN", name="OECD 综合领先指标(中国)", scope="MACRO", dimension="景气",
-         market_scope="CN", unit="index", direction="high_good", freq="day",
+         market_scope="CN", unit="index", direction="high_good", freq="month",
          remark="100=长期趋势，高于 100 = 扩张；**领先经济拐点约 3-6 个月**（不入合成，作周期定位"
                 "的独立读数）；1992-05 起 413 个月无缺口，源：OECD SDMX（发布滞后按月初+45 天保守估）",
          formula="CN.CLI（OECD Composite leading indicators，振幅调整口径）"),
     dict(code="MACRO.CLI_GLOBAL", name="OECD 综合领先指标(G20)", scope="MACRO", dimension="景气",
-         market_scope="GLOBAL", unit="index", direction="high_good", freq="day",
+         market_scope="GLOBAL", unit="index", direction="high_good", freq="month",
          remark="全球周期（含新兴市场）宽口径；与 MACRO.CLI_CN 对照可分离「国内 vs 外部」驱动力",
          formula="GLOBAL.CLI_G20（OECD SDMX）"),
     # —— CN 宏观月频补接（2026-10-10）：此前只在采集层 regime.macro_series，未进指标层 ——
     #   全部**不入合成**（独立读数）；方向判据写在各自 remark 里。
     dict(code="MACRO.CPI_YOY", name="CPI 同比", scope="MACRO", dimension="通胀",
-         market_scope="CN", unit="pct", direction="high_risk", freq="day",
+         market_scope="CN", unit="pct", direction="high_risk", freq="month",
          remark="通胀上行 → 货币紧缩风险（贴现率/估值承压）；与 CORE_CPI_YOY 对照分离食品能源扰动",
          formula="CN.CPI_YOY（akshare macro_china_cpi「全国-同比增长」）"),
     dict(code="MACRO.CPI_MOM", name="CPI 环比", scope="MACRO", dimension="通胀",
-         market_scope="CN", unit="pct", direction="high_risk", freq="day",
+         market_scope="CN", unit="pct", direction="high_risk", freq="month",
          remark="**通胀动能**（月度环比，比同比更早反映拐点）；与同表同比同源",
          formula="CN.CPI_MOM（akshare macro_china_cpi「全国-环比增长」）"),
     dict(code="MACRO.PPI_YOY", name="PPI 同比", scope="MACRO", dimension="通胀",
-         market_scope="CN", unit="pct", direction="high_good", freq="day",
+         market_scope="CN", unit="pct", direction="high_good", freq="month",
          remark="**顺周期盈利口径**：PPI 回升对应名义增长与上游盈利改善 → high_good"
                 "（与 CPI 的紧缩含义相反）；⚠ 若视作成本冲击则应反向，此处取 A 股主流用法",
          formula="CN.PPI_YOY（akshare macro_china_ppi「当月同比增长」）"),
     dict(code="MACRO.PPI_CPI_SCISSOR", name="PPI−CPI 剪刀差", scope="MACRO", dimension="通胀",
-         market_scope="CN", unit="pp", direction="neutral", freq="day",
+         market_scope="CN", unit="pp", direction="neutral", freq="month",
          remark="PPI−CPI（pp）：利润在**上游 vs 下游**的分配 → 对整体市场无单一方向；"
                 "走阔=上游相对占优，收敛=中下游成本压力缓解",
          formula="CN.PPI_CPI_SCISSOR（derived:get_macro_monthly，PPI_YOY − CPI_YOY）"),
     dict(code="MACRO.M1_YOY", name="M1 同比", scope="MACRO", dimension="资金",
-         market_scope="CN+HK", unit="pct", direction="high_good", freq="day",
+         market_scope="CN+HK", unit="pct", direction="high_good", freq="month",
          remark="狭义货币：**资金活化**程度（交易性存款）；历史上领先企业盈利与股市。"
                 "CN/HK 双侧接入（港股流动性受内地信用与资金活化影响）",
          formula="CN.M1_YOY（akshare macro_china_money_supply「货币(M1)-同比增长」）"),
     dict(code="MACRO.M2_YOY", name="M2 同比", scope="MACRO", dimension="资金",
-         market_scope="CN+HK", unit="pct", direction="high_good", freq="day",
+         market_scope="CN+HK", unit="pct", direction="high_good", freq="month",
          remark="广义货币：流动性总量；单独读数信息量低于 M1−M2 剪刀差，建议对照看",
          formula="CN.M2_YOY（akshare macro_china_money_supply）"),
     dict(code="MACRO.M1_M2_SCISSOR", name="M1−M2 剪刀差", scope="MACRO", dimension="资金",
-         market_scope="CN+HK", unit="pp", direction="high_good", freq="day",
+         market_scope="CN+HK", unit="pp", direction="high_good", freq="month",
          remark="M1−M2（pp）：**资金活化程度**——走阔=存款活期化、交易与投资意愿回升，"
                 "A 股顺周期的经典领先读数；收窄=资金定期化淤积",
          formula="CN.M1_M2_SCISSOR（derived:get_macro_monthly，M1_YOY − M2_YOY）"),
     dict(code="MACRO.LPR_1Y", name="LPR 1年期", scope="MACRO", dimension="资金",
-         market_scope="CN", unit="pct", direction="high_risk", freq="day",
+         market_scope="CN", unit="pct", direction="high_risk", freq="month",
          remark="贷款市场报价利率(1Y)：政策利率锚，**上行=收紧** → high_risk；"
                 "2013-10 起（2019-08 起改 LPR 报价口径，此前为 1Y 贷款基准）",
          formula="CN.LPR_1Y（akshare macro_china_lpr，日频重复报价按月取当月最后一次）"),
     dict(code="MACRO.LPR_5Y", name="LPR 5年期", scope="MACRO", dimension="资金",
-         market_scope="CN", unit="pct", direction="high_risk", freq="day",
+         market_scope="CN", unit="pct", direction="high_risk", freq="month",
          remark="5Y LPR = **房贷利率锚**，对地产链与居民中长贷更敏感；2019-08 起 86 个月"
                 "（分位样本约 6 年）",
          formula="CN.LPR_5Y（akshare macro_china_lpr）"),
@@ -218,31 +218,31 @@ INDICATORS: list[dict] = [
                 "→ 常与 ERP 联读；⚠ 亦是 VAL.ERP 与 RISK.TERM_SPREAD 的输入；2006-03 起",
          formula="CN.BOND_10Y（akshare bond_china_yield 中债国债收益率曲线-10年）"),
     dict(code="MACRO.PMI_MFG", name="制造业 PMI", scope="MACRO", dimension="景气",
-         market_scope="CN+HK", unit="index", direction="high_good", freq="day",
+         market_scope="CN+HK", unit="index", direction="high_good", freq="month",
          remark="制造业 PMI（50=荣枯线）：官方月度景气**领先**指标（采购经理调查，早于硬数据）",
          formula="CN.PMI_MFG（akshare macro_china_pmi「制造业-指数」）"),
     dict(code="MACRO.PMI_NONMFG", name="非制造业 PMI", scope="MACRO", dimension="景气",
-         market_scope="CN", unit="index", direction="high_good", freq="day",
+         market_scope="CN", unit="index", direction="high_good", freq="month",
          remark="非制造业（服务+建筑）PMI：中国服务业占比已过半 → 与制造业 PMI 常分化，"
                 "背离时更能定位内需强弱",
          formula="CN.PMI_NONMFG（akshare macro_china_pmi「非制造业-指数」）"),
     dict(code="MACRO.PMI_NEW_ORDERS", name="制造业 PMI 新订单", scope="MACRO", dimension="景气",
-         market_scope="CN+HK", unit="index", direction="high_good", freq="day",
+         market_scope="CN+HK", unit="index", direction="high_good", freq="month",
          remark="PMI 分项中**前瞻性最强**（订单先于生产）；2005-01 起 261 个月，"
                 "历史长于制造业 PMI 总指数（走 NBS 月度库，akshare 接口无分项）",
          formula="CN.PMI_NEW_ORDERS（nbs:stream/esData PMI 新订单指数）"),
     dict(code="MACRO.INDUSTRIAL_PROFIT_YOY", name="工业企业利润累计同比", scope="MACRO", dimension="景气",
-         market_scope="CN", unit="pct", direction="high_good", freq="day",
+         market_scope="CN", unit="pct", direction="high_good", freq="month",
          remark="规上工业企业利润累计同比：**A 股盈利的宏观代理**（同向、略领先）。"
                 "⚠ 累计口径非单月；1 月每年缺（1-2 月合并发布）",
          formula="CN.INDUSTRIAL_PROFIT_YOY（nbs:stream/esData）"),
     dict(code="MACRO.POWER_GEN_YOY", name="发电量同比", scope="MACRO", dimension="景气",
-         market_scope="CN", unit="pct", direction="high_good", freq="day",
+         market_scope="CN", unit="pct", direction="high_good", freq="month",
          remark="发电量同比：**实体活动量硬指标**（克强指数成分），不受价格干扰。"
                 "⚠ 口径为规上工业发电量，与 ELECTRICITY_YOY（全社会用电量）不可互替",
          formula="CN.POWER_GEN_YOY（nbs:stream/esData）"),
     dict(code="MACRO.FREIGHT_YOY", name="货运量同比", scope="MACRO", dimension="景气",
-         market_scope="CN", unit="pct", direction="high_good", freq="day",
+         market_scope="CN", unit="pct", direction="high_good", freq="month",
          remark="货运量合计同比：同属克强指数口径的**实物量指标**，与发电量互为印证；2000-01 起",
          formula="CN.FREIGHT_YOY（akshare macro_china_society_traffic_volume，row_filter 合计）"),
     dict(code="MACRO.OIL_MOM20", name="原油 20日动量", scope="MACRO", dimension="跨资产",
@@ -294,13 +294,13 @@ INDICATORS: list[dict] = [
          remark="避险需求（金强 = risk-off；作为 §5.4 成分**取反**）",
          formula="CMDTY.GOLD 收盘 20 日变动 %"),
     dict(code="MACRO.OUTPUT_GAP", name="产出缺口(实际−潜在 GDP)", scope="MACRO", dimension="景气",
-         market_scope="CN", unit="pct", direction="high_good", freq="day",
+         market_scope="CN", unit="pct", direction="high_good", freq="quarter",
          remark="**水平口径**：(实际 GDP − 潜在 GDP)/潜在 GDP。实际水平由 NBS **已季调**的单季环比"
                 "（CN.GDP_QOQ）链成；潜在 = **单边** HP（λ=1600，逐期只用已发布样本重算 → 无前视）。"
                 "⚠ 源链自 2011Q1 起、前 12 季为滤波暖机 → **2014Q1 起有值**（约 50 个季度）",
          formula="(lv − HP单边(lv, λ=1600))/HP × 100；lv = 100·Π(1+CN.GDP_QOQ/100)"),
     dict(code="MACRO.CLOCK_QUADRANT", name="美林投资时钟象限", scope="MACRO", dimension="景气",
-         market_scope="CN", unit="code", direction="neutral", freq="day",
+         market_scope="CN", unit="code", direction="neutral", freq="quarter",
          remark="**分类值**：1=复苏(增长↑/通胀↓) 2=过热(↑/↑) 3=滞胀(↓/↑) 4=衰退(↓/↓)；"
                 "增长轴=产出缺口方向（本季 vs 上季），通胀轴=CPI 同比 6 个月方向；"
                 "⚠ 分类值**不分位**（percentile 恒为空，勿当连续指标用）",
@@ -1607,8 +1607,12 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
                 "percentile": None if p is None or pd.isna(p) else round(float(p), 2),
                 "updated_at": now,
             })
+    # only_if_changed=True：月/季频指标被 PIT 填充到每个交易日，值没变的行**不写**
+    #   → 不再反复重写同一行；updated_at 恢复「值最后变化时间」语义（配合 indicator_dict.freq
+    #     即可判断「月频指标一个月没变」是否异常）。⚠ 仅计算层可用，采集层禁用（见 bulk_upsert）
     bulk_upsert(conn, IV_TABLE, iv_rows,
-                conflict_cols=["indicator_code", "market", "trade_date"], skip_null_updates=True)
+                conflict_cols=["indicator_code", "market", "trade_date"], skip_null_updates=True,
+                only_if_changed=True)
 
     mr_rows = []
     for d in write_idx:
@@ -1626,7 +1630,9 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
             "top_signal_cnt": int(r["top_signal_cnt"]), "bottom_signal_cnt": int(r["bottom_signal_cnt"]),
             "detail": detail, "updated_at": now,
         })
-    bulk_upsert(conn, MR_TABLE, mr_rows, conflict_cols=["trade_date", "market"])
+    # 同 IV_TABLE：合成值未变则不重写（保守起见合成层也走同一语义）
+    bulk_upsert(conn, MR_TABLE, mr_rows, conflict_cols=["trade_date", "market"],
+                only_if_changed=True)
     return {"rows": len(iv_rows), "dates": len(write_idx), "composite_rows": len(mr_rows)}
 
 
