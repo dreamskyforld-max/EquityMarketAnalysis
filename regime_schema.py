@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS regime.indicator_dict (
     source          VARCHAR(64),                       -- 依赖表/数据源
     formula         TEXT,                              -- 计算口径（引用实现函数）
     is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
-    remark          VARCHAR(200),
+    remark          TEXT,                              -- 规范化三段式：【定义】是什么 /【判读】怎么看 /【数据】样本与断点
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
     updated_at      TIMESTAMPTZ     DEFAULT NOW()
 )
