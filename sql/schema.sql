@@ -1654,6 +1654,7 @@ COMMENT ON TABLE  regime.indicator_dict             IS '指标字典：所有指
 COMMENT ON COLUMN regime.indicator_dict.scope       IS '分析域作用域：MACRO=外生宏观/跨市场 ALLOC=资产配置 MARKET=市场自身 SECTOR=行业；**非 ODS/DW/ADS 架构分层**（架构分层由表承载）';
 COMMENT ON COLUMN regime.indicator_dict.direction   IS 'high_risk=越高越危险 / high_good=越高越好 / neutral；分位化与合成按此统一方向';
 COMMENT ON COLUMN regime.indicator_dict.formula     IS '计算口径描述（引用实现函数），保证可解释、可追溯';
+COMMENT ON COLUMN regime.indicator_dict.source      IS '本指标引用的**原始源编码**：无前缀=regime.macro_series（查 macro_series_meta）、bench:=public.daily_benchmark（查 bench_code）；由 market_state_daily 的接线映射（PIT_MAP_*/BENCH_MAP/MOM_MAP）派生、每轮全量重写，故为空表示「由公式从多源计算」（来源见 formula），**不是遗漏**；接线校验见 tests/test_indicator_sources.py';
 
 -- 3. 指标时序长表（原始值 + 历史分位同表；200 指标 × 2 市场 × 250 日 ≈ 10 万行/年）
 CREATE TABLE IF NOT EXISTS regime.indicator_value (

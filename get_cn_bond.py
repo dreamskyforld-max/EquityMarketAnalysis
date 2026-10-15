@@ -81,63 +81,85 @@ def _to_rows(df) -> list:
     return rows
 
 
-# AA 档中短期票据：**必须走独立接口** `bond_china_close_return` ——
-# `bond_china_yield` 默认只返回 国债 + 中票(AAA) + 商业银行(AAA) 三条曲线，**没有 AA**。
+# 低评级中短期票据：**必须走独立接口** `bond_china_close_return` ——
+# `bond_china_yield` 默认只返回 国债 + 中票(AAA) + 商业银行(AAA) 三条曲线，**没有 AA 及以下**。
 # ⚠ 实测（2026-10-08）：该接口只返回**最近 3 个交易日**的滚动窗口
 #   （传 2026-08 月窗口 → 只回 08-27~08-31；传 2025 年窗口 → 直接报错 newDateValue）
 #   → **无法回填历史**，只能逐日累积；断档即永久缺失（与行业资金流/一致预期快照同类约束）。
-AA_SYMBOL = "中短期票据(AA)"
+# ⚠ 实测（2026-10-15）本接口可用的**最低**档位 = 中短期票据(AA-) —— 即本项目对「高收益债」
+#   的可得近似（企业债(AA)/企业债(AA-)/二级资本债(AA+)/商业银行普通债(AA) 等 symbol 一律
+#   IndexError 不可用；见 _probe_macro_sources 同类探测结论）。
 AA_SOURCE = "akshare:bond_china_close_return"
 AA_TENORS = {0.25: "3M", 0.5: "6M", 1.0: "1Y", 3.0: "3Y", 5.0: "5Y", 10.0: "10Y"}
+# (源 symbol, series_code 中缀, 中文档位标签)
+AA_GRADES = (
+    ("中短期票据(AA)", "AA", "AA"),
+    ("中短期票据(AA-)", "AA_MINUS", "AA−"),
+)
 
 
-def _fetch_aa(today: datetime.date) -> list:
-    """AA 档中短票到期收益率（长表：日期/期限/到期收益率）→ macro_series 行。"""
-    import warnings
-    warnings.filterwarnings("ignore")
-    import akshare as ak
-    import pandas as pd
+def _fetch_aa_symbol(ak, symbol: str, today: datetime.date):
+    """拉取某一档位的滚动窗口（返回 DataFrame 或 None）。
 
-    # 窗口必须覆盖「源最后有数据的那天」：源只保留最近 3 个交易日，且**无数据窗口会直接报错**
-    # （实测长假后：窗口 10-01~10-08 → KeyError: 'newDateValue'）→ 逐步放宽回看天数重试。
-    df, last_err = None, None
+    窗口必须覆盖「源最后有数据的那天」：源只保留最近 3 个交易日，且**无数据窗口会直接报错**
+    （实测长假后：窗口 10-01~10-08 → KeyError: 'newDateValue'）→ 逐步放宽回看天数重试。
+    """
+    last_err = None
     for lookback in (7, 14, 30, 45, 60):
         start = today - datetime.timedelta(days=lookback)
         try:
-            df = ak.bond_china_close_return(symbol=AA_SYMBOL,
+            df = ak.bond_china_close_return(symbol=symbol,
                                             start_date=start.strftime("%Y%m%d"),
                                             end_date=today.strftime("%Y%m%d"))
         except Exception as e:
             last_err = e
             continue
         if df is not None and len(df):
-            break
-    if df is None or len(df) == 0:
-        print(f"    ⚠️ AA 中票曲线无数据（回看 60 天内均失败）: "
-              f"{type(last_err).__name__ if last_err else 'Empty'}: {str(last_err)[:60]}")
-        return []
+            return df
+    print(f"    ⚠️ {symbol} 曲线无数据（回看 60 天内均失败）: "
+          f"{type(last_err).__name__ if last_err else 'Empty'}: {str(last_err)[:60]}")
+    return None
+
+
+def _fetch_aa(today: datetime.date) -> list:
+    """低评级中短票到期收益率（长表：日期/期限/到期收益率）→ macro_series 行（各档位）。
+
+    ⚠ 源只保留最近 3 个交易日 → 每次采集都把窗口内全部日期重新 upsert（幂等）；断档即永久
+      缺失，故须每日跑。AA- 与 AA 走同一接口，仅 symbol 不同。
+    """
+    import warnings
+    warnings.filterwarnings("ignore")
+    import akshare as ak
+    import pandas as pd
+
     rows = []
-    for _, r in df.iterrows():
-        ten = pd.to_numeric(r.get("期限"), errors="coerce")
-        if pd.isna(ten):
+    for symbol, infix, label in AA_GRADES:
+        df = _fetch_aa_symbol(ak, symbol, today)
+        if df is None:
             continue
-        code = AA_TENORS.get(round(float(ten), 3))
-        if not code:
-            continue
-        v = pd.to_numeric(r.get("到期收益率"), errors="coerce")
-        dt = pd.to_datetime(r.get("日期"), errors="coerce")
-        if pd.isna(v) or pd.isna(dt):
-            continue
-        dd = dt.date()
-        rows.append({
-            "series_code": f"CN.MTN_AA_{code}",
-            "series_name": f"中债中短期票据(AA)收益率曲线-{code}",
-            "period_date": dd, "value": round(float(v), 4), "unit": "pct", "freq": "day",
-            "market": "CN", "source": AA_SOURCE,
-            "release_time": datetime.datetime.combine(dd, datetime.time(18, 0), tzinfo=TZ_CN),
-            "revision": 0, "extra": {"tenor_year": round(float(ten), 3)},
-            "updated_at": datetime.datetime.now(TZ_CN),
-        })
+        n0 = len(rows)
+        for _, r in df.iterrows():
+            ten = pd.to_numeric(r.get("期限"), errors="coerce")
+            if pd.isna(ten):
+                continue
+            code = AA_TENORS.get(round(float(ten), 3))
+            if not code:
+                continue
+            v = pd.to_numeric(r.get("到期收益率"), errors="coerce")
+            dt = pd.to_datetime(r.get("日期"), errors="coerce")
+            if pd.isna(v) or pd.isna(dt):
+                continue
+            dd = dt.date()
+            rows.append({
+                "series_code": f"CN.MTN_{infix}_{code}",
+                "series_name": f"中债中短期票据({label})收益率曲线-{code}",
+                "period_date": dd, "value": round(float(v), 4), "unit": "pct", "freq": "day",
+                "market": "CN", "source": AA_SOURCE,
+                "release_time": datetime.datetime.combine(dd, datetime.time(18, 0), tzinfo=TZ_CN),
+                "revision": 0, "extra": {"tenor_year": round(float(ten), 3)},
+                "updated_at": datetime.datetime.now(TZ_CN),
+            })
+        print(f"    · {label} 中票: {len(rows) - n0} 条")
     return rows
 
 
@@ -162,10 +184,12 @@ def _specs() -> list:
                   collect_params={"curve": curve, "tenor": ten_col})
              for curve, (prefix, label) in CURVES.items()
              for ten_col, ten_code in TENORS.items()]
-    specs += [dict(series_code=f"CN.MTN_AA_{code}",
-                   series_name=f"中债中短期票据(AA)收益率曲线-{code}",
+    specs += [dict(series_code=f"CN.MTN_{infix}_{code}",
+                   series_name=f"中债中短期票据({label})收益率曲线-{code}",
                    unit="pct", freq="day", market="CN", source=AA_SOURCE, lag_days=0,
-                   collect_params={"curve": AA_SYMBOL, "tenor_year": yr})
+                   collect_params={"curve": symbol, "tenor_year": yr},
+                   remark="源仅回最近 3 个交易日 → 逐日累积，断档即永久缺失")
+              for symbol, infix, label in AA_GRADES
               for yr, code in AA_TENORS.items()]
     return specs
 
@@ -189,10 +213,10 @@ def _save(rows: list, defs: dict = None) -> int:
 
 
 def run(codes=None, ctx=None, days: int = 30):
-    """采集入口：增量拉取最近 days 天（默认 30，覆盖长假 + 源延迟）+ AA 档（源仅 3 日窗）。"""
+    """采集入口：增量拉取最近 days 天（默认 30，覆盖长假 + 源延迟）+ 低评级档（源仅 3 日窗）。"""
     end = datetime.date.today()
     start = end - datetime.timedelta(days=days)
-    defs = _defs()                       # 一次加载生效定义，两处写入共用
+    defs = _defs()                       # 一次加载生效定义，三处写入共用
     rows = _fetch(start, end)
     n = _save(rows, defs)
     print(f"  ✅ 增量 {start} ~ {end}: 写入 {n} 条")
@@ -200,7 +224,8 @@ def run(codes=None, ctx=None, days: int = 30):
     if aa_rows:
         n_aa = _save(aa_rows, defs)
         days_aa = sorted({r["period_date"] for r in aa_rows})
-        print(f"  ✅ AA 中票曲线: {n_aa} 条（源仅最近 3 个交易日）{' ~ '.join(str(d) for d in days_aa[-1:])}")
+        print(f"  ✅ 低评级中票曲线(AA/AA−): {n_aa} 条"
+              f"（源仅最近 3 个交易日）{' ~ '.join(str(d) for d in days_aa[-1:])}")
     return n + (len(aa_rows) if aa_rows else 0)
 
 

@@ -161,6 +161,27 @@ INDICATORS: list[dict] = [
          market_scope="CN", unit="pp", direction="high_risk", freq="day",
          remark="定义：AA 级中短期票据与同期限国债收益率差，低等级绝对信用利差　·　判读：走阔=低等级信用风险定价上升；比 AAA 口径更敏感但更嘈杂　·　数据：⚠ 源只保留最近 3 个交易日，历史靠逐日累积，早期分位无意义；仅 CN",
          formula="CN.MTN_AA_5Y − CN.BOND_5Y（源：get_cn_bond AA 档 + get_macro_daily 派生）"),
+    # —— 低评级档 AA−（4.2「高收益债利差」的可得近似；源为 bond_china_close_return 的最低档）——
+    dict(code="VAL.BUFFETT", name="巴菲特指标(总市值/GDP)", scope="ALLOC", dimension="估值",
+         market_scope="CN", unit="pct", direction="high_risk", freq="day",
+         remark="定义：沪深股票总市值 / GDP_ttm × 100（%）——**极长期估值锚**，衡量股市相对实体经济的体量　·　判读：>100% 为警戒区（股市相对经济过热），<50% 为深度低估区；**慢变量，只用于定位长期位置，不做择时信号**　·　数据：⚠ 受沪市源限制自 2022-02 起（深市单独可到 2010），且**历史段为周频降采样**（两所接口无批量历史、逐日回填易被限流挂起），2026-10 起为日频；仅 CN",
+         formula="CN.MKT_CAP_TOTAL / GDP_ttm × 100（GDP_ttm = CN.GDP 差分回单季后滚动 4 季合计，PIT）"),
+    dict(code="VAL.DIV_SPREAD", name="股息利差(中证全指股息率−国债10Y)", scope="ALLOC", dimension="估值",
+         market_scope="CN", unit="pp", direction="high_good", freq="day",
+         remark="定义：中证全指股息率 − 中债 10Y 国债收益率（pp）——**保守型估值锚**，股息是股东**实得现金流**、与债券票息同质，故两者可比　·　判读：利差走高=股票相对债券的现金回报更有吸引力（高股息/红利策略的配置窗口）；利差为负即「买股不如买债」　·　⚠ 与 VAL.ERP 同属股债性价比但口径不同（ERP 用**盈利**收益率、本项用**已实现股息**），二者背离时说明分红率在变　·　数据：⚠ 股息率源只回最近 20 个交易日 → 逐日累积，**早期分位无意义**；仅 CN",
+         formula="CN.IDX_DIV_YIELD − CN.BOND_10Y（源：get_cn_index_dividend + get_macro_daily 派生）"),
+    dict(code="RISK.CREDIT_SPREAD_AA_MINUS", name="信用利差(中票AA− 5Y−国债5Y)", scope="MACRO", dimension="风险",
+         market_scope="CN", unit="pp", direction="high_risk", freq="day",
+         remark="定义：AA− 级中短期票据与同期限国债收益率差——**本表可采的最低评级**，最接近「高收益债利差」　·　判读：走阔=违约担忧与流动性收缩（领先股票调整）；比 AA 口径更早反映信用压力，但更嘈杂、样本更短　·　数据：⚠ 源只保留最近 3 个交易日，历史靠逐日累积，**早期分位无意义**；仅 CN",
+         formula="CN.MTN_AA_MINUS_5Y − CN.BOND_5Y（源：get_cn_bond AA− 档 + get_macro_daily 派生）"),
+    dict(code="RISK.GRADE_SPREAD_AA_MINUS", name="信用等级利差(AA− 5Y−AA 5Y)", scope="MACRO", dimension="风险",
+         market_scope="CN", unit="pp", direction="high_risk", freq="day",
+         remark="定义：同期限 AA− 与 AA 中票收益率差（低评级段等级利差）　·　判读：**低评级段的纯风险偏好读数**——同期限仅差半档评级，走阔=资金向高等级避险；比绝对利差更少受无风险利率干扰，是信用收缩的最早读数之一　·　数据：⚠ 源只保留最近 3 个交易日，历史逐日累积；仅 CN",
+         formula="CN.MTN_AA_MINUS_5Y − CN.MTN_AA_5Y"),
+    dict(code="MACRO.STOCK_BOND_CORR", name="股债相关性(60日)", scope="MACRO", dimension="风险",
+         market_scope="CN", unit="corr", direction="high_risk", freq="day",
+         remark="定义：60 日滚动 corr(上证指数日收益, −中债10Y 日变化)；取 −Δyield 是为对齐「债券**价格**」口径（库里存的是收益率，上行=债价跌）　·　判读：**负值=常态**（避险主导，股跌债涨、股债对冲有效）；**转正/持续上行=宏观主导**（股债同跌，增长或流动性冲击 → 对冲失效，应提高现金与防守仓位）　·　数据：受中债10Y 起点限制自 2006 起；窗口 60 交易日，序列前 60 日无值；仅 CN",
+         formula="rolling_corr(100·Δln(SH.000001), −Δ(CN.BOND_10Y), 60)"),
     dict(code="RISK.GRADE_SPREAD", name="信用等级利差(AA−AAA 5Y)", scope="MACRO", dimension="风险",
          market_scope="CN", unit="pp", direction="high_risk", freq="day",
          remark="定义：同期限 AA 与 AAA 中票收益率差（等级利差）　·　判读：**纯风险偏好读数**——同期限同信用环境仅等级不同，走阔=风险偏好收缩；比绝对信用利差更少受无风险利率干扰　·　数据：源只保留最近 3 个交易日，历史逐日累积；已纳入 FSI；仅 CN",
@@ -204,6 +225,32 @@ INDICATORS: list[dict] = [
          market_scope="CN", unit="pp", direction="neutral", freq="month",
          remark="定义：PPI 同比 − CPI 同比（pp）　·　判读：刻画利润在上下游的分配——走阔=上游（资源/材料）相对占优，收敛=中下游成本压力缓解；对整体市场无单一方向，故 direction=neutral　·　数据：由 CPI_YOY 与 PPI_YOY 派生",
          formula="CN.PPI_CPI_SCISSOR（derived:get_macro_monthly，PPI_YOY − CPI_YOY）"),
+    # —— 央行企业商品价格指数 CGPI（§3.3 通胀维度；先于 CPI/PPI 变动的早期读数）——
+    dict(code="MACRO.CGPI_YOY", name="企业商品价格指数-总指数同比", scope="MACRO", dimension="通胀",
+         market_scope="CN", unit="pct", direction="high_risk", freq="month",
+         remark="定义：企业间交易商品价格总指数同比（**不含服务与消费品零售**，央行 CGPI）　·　"
+                "判读：上行=企业成本端通胀压力累积，通常**领先 CPI/PPI 数月**；持续为负=工业品通缩、"
+                "企业毛利受压　·　数据：2009-01 起 212 个月；源为央行 CGPI 年度 htm 附件"
+                "（源表「上年同月=100」已减 100 转同比）",
+         formula="CN.CGPI_YOY（pbc:cgpi 总指数列，值−100）"),
+    dict(code="MACRO.CGPI_AGRI_YOY", name="企业商品价格指数-农产品同比", scope="MACRO", dimension="通胀",
+         market_scope="CN", unit="pct", direction="high_risk", freq="month",
+         remark="定义：CGPI 农产品分项同比，企业购入的初级农产品价格　·　"
+                "判读：**食品类成本的先行读数**，领先 CPI 食品项；与菜篮子批发价（MACRO.VEG_BASKET_YOY）"
+                "互为验证　·　数据：2009-01 起；实测近年持续为负（农产品价格低迷）",
+         formula="CN.CGPI_AGRI_YOY（pbc:cgpi 农产品列，值−100）"),
+    dict(code="MACRO.CGPI_MINING_YOY", name="企业商品价格指数-矿产品同比", scope="MACRO", dimension="通胀",
+         market_scope="CN", unit="pct", direction="high_risk", freq="month",
+         remark="定义：CGPI 矿产品分项同比，上游资源品价格　·　"
+                "判读：与 PPI 采掘工业高度相关，是**上游涨价压力的最早读数**；走阔通常先于 PPI 回升　·　"
+                "数据：2009-01 起；近年明显高于总指数（上游强于中下游）",
+         formula="CN.CGPI_MINING_YOY（pbc:cgpi 矿产品列，值−100）"),
+    dict(code="MACRO.CGPI_ENERGY_YOY", name="企业商品价格指数-煤油电同比", scope="MACRO", dimension="通胀",
+         market_scope="CN", unit="pct", direction="high_risk", freq="month",
+         remark="定义：CGPI 煤油电分项同比，能源购进价格　·　"
+                "判读：**双重性**——对上游能源企业是收入端利好，对中下游制造业是成本冲击；"
+                "读它要区分站在产业链哪一环　·　数据：2009-01 起",
+         formula="CN.CGPI_ENERGY_YOY（pbc:cgpi 煤油电列，值−100）"),
     dict(code="MACRO.M1_YOY", name="M1 同比", scope="MACRO", dimension="资金",
          market_scope="CN+HK", unit="pct", direction="high_good", freq="month",
          remark="定义：狭义货币 M1 同比（%）　·　判读：**资金活化**读数——M1 高增=企业与居民交易性存款活跃，历史上领先企业盈利与股市　·　数据：2008-01 起；月频；CN/HK 双市场接入",
@@ -270,6 +317,15 @@ INDICATORS: list[dict] = [
          remark="定义：美元兑人民币**在岸**汇率（中国银行折算价）　·　判读：**上行=人民币贬值** → 外资流出压力与风险偏好下降；与中美利差同看（利差走阔叠加汇率贬值=资本外流组合）　·　数据：1994 起长样本；⚠ 离岸 CNH 无稳定免费源未采，勿把本序列当 CNH 用",
          formula="daily_benchmark FX.USDCNY（akshare currency_boc_safe「美元」列÷100，"
                  "get_global_benchmarks 采；口径订正见该文件 §3.4 注释）"),
+    # —— 避险货币（4.2 汇率：避险货币走强 → 新兴市场承压）——
+    dict(code="MACRO.JPYCNY", name="日元兑人民币(百日元)", scope="MACRO", dimension="资金",
+         market_scope="GLOBAL", unit="cny_per_100jpy", direction="high_risk", freq="day",
+         remark="定义：100 日元兑人民币（中国银行折算价，中行挂牌惯例口径）　·　判读：**上行=日元升值（避险资金流入）→ risk-off**，与 VIX、黄金同向；⚠ 是**兑人民币**的交叉盘，同时含人民币自身强弱 → 须与 MACRO.USDCNY 联读（日元升值 + 人民币贬值 = 避险主导）　·　数据：1994 起长样本",
+         formula="daily_benchmark FX.JPYCNY（akshare currency_boc_safe「日元」列÷100×100）"),
+    dict(code="MACRO.CHFCNY", name="瑞郎兑人民币", scope="MACRO", dimension="资金",
+         market_scope="GLOBAL", unit="cny_per_chf", direction="high_risk", freq="day",
+         remark="定义：1 瑞郎兑人民币（中国银行折算价）　·　判读：**上行=瑞郎升值（避险/欧元区风险外溢）→ risk-off**；瑞郎对欧债危机等欧洲风险事件最敏感，是欧元区压力的早期读数　·　数据：⚠ 2015-11 起（中行表 2015 年才纳入瑞郎），约 11 年样本",
+         formula="daily_benchmark FX.CHFCNY（akshare currency_boc_safe「瑞士法郎」列÷100）"),
     dict(code="MACRO.FED_FUNDS", name="有效联邦基金利率(EFFR)", scope="MACRO", dimension="资金",
          market_scope="GLOBAL", unit="pct", direction="high_risk", freq="day",
          remark="定义：有效联邦基金利率（EFFR），美联储政策利率的实际成交口径　·　判读：高位=全球紧缩环境，压制风险资产估值与新兴市场流动性；政策转向（首次降息）往往是全球流动性拐点信号　·　数据：2001-12 起；日频但变动不频繁（政策会议驱动）",
@@ -294,6 +350,20 @@ INDICATORS: list[dict] = [
          market_scope="GLOBAL", unit="pct", direction="high_risk", freq="day",
          remark="定义：沪金连续近 20 个交易日动量（%）　·　判读：黄金=避险资产，**金强=risk-off**，风险偏好指数中取反　·　数据：2018-03 起",
          formula="CMDTY.GOLD 收盘 20 日变动 %"),
+    # —— 商品**价格水平**（4.2 跨资产：此前只登记了 20 日动量，水平值虽在库却取不到分位）——
+    # 方向与其动量口径对齐（铜 high_good / 金 high_risk / 油 neutral），便于水平与方向联读。
+    dict(code="MACRO.COPPER", name="沪铜连续价格", scope="MACRO", dimension="跨资产",
+         market_scope="GLOBAL", unit="cny_per_ton", direction="high_good", freq="day",
+         remark="定义：沪铜连续期货收盘价（元/吨），全球需求侧最纯的商品　·　判读：**高分位=再通胀交易已打得较满**——价格水平反映「需求预期兑现程度」，方向性看 MACRO.COPPER_MOM20；与 MACRO.GOLD 的比值可看「铜强金弱」的 risk-on 结构　·　数据：2005-01 起长样本",
+         formula="CMDTY.COPPER 收盘价（akshare futures_zh_daily_sina:CU0）"),
+    dict(code="MACRO.GOLD", name="沪金连续价格", scope="MACRO", dimension="跨资产",
+         market_scope="GLOBAL", unit="cny_per_gram", direction="high_risk", freq="day",
+         remark="定义：沪金连续期货收盘价（元/克）　·　判读：**黄金与实际利率互为反面**——价格高分位常对应避险需求高企/实际利率下行，对股票是 risk-off 信号（方向取反）；与美债 10Y、美元指数联读可分离「避险」与「美元弱」两种驱动　·　数据：2008-01 起",
+         formula="CMDTY.GOLD 收盘价（akshare futures_zh_daily_sina:AU0）"),
+    dict(code="MACRO.OIL", name="原油连续价格", scope="MACRO", dimension="跨资产",
+         market_scope="GLOBAL", unit="cny_per_barrel", direction="neutral", freq="day",
+         remark="定义：上期能源原油连续期货收盘价（元/桶）　·　判读：**无单一方向**——既是通胀源头（高位→紧缩压力）也是需求读数（上行→景气改善）；须与 MACRO.OIL_MOM20、CPI/PPI 联读　·　数据：⚠ 2018-03 起，样本约 8 年，长周期分位参考价值有限",
+         formula="CMDTY.OIL 收盘价（akshare futures_zh_daily_sina:SC0）"),
     dict(code="MACRO.OUTPUT_GAP", name="产出缺口(实际−潜在 GDP)", scope="MACRO", dimension="景气",
          market_scope="CN", unit="pct", direction="high_good", freq="quarter",
          remark="定义：(实际 GDP − 潜在 GDP)/潜在 GDP，经济冷热的水平读数　·　判读：>0 实际产出高于潜在（过热、通胀压力），<0 产出不足（衰退、失业压力）；是美林时钟的增长轴　·　数据：⚠ 2014Q1 起有值（源链自 2011Q1 + 前 12 季滤波暖机），约 50 个季度；季频",
@@ -302,13 +372,21 @@ INDICATORS: list[dict] = [
          market_scope="CN", unit="code", direction="neutral", freq="quarter",
          remark="定义：产出缺口方向 × CPI 同比 6 个月方向组合出的美林时钟象限（分类标签，非连续值）　·　判读：**1=复苏（增长↑通胀↓）→股 / 2=过热（↑↑）→商品 / 3=滞胀（↓/通胀↑）→现金 / 4=衰退（↓↓）→债**；增长轴取产出缺口环比方向，通胀轴取 CPI 同比 6 个月方向（去单月噪声）　·　数据：⚠ **分类值不做历史分位**（percentile 恒为空），勿当连续指标用；季频",
          formula="quadrant(sign(ΔMACRO.OUTPUT_GAP), sign(CPI_YOY(t) − CPI_YOY(t−6)))"),
+    dict(code="MACRO.US_10Y", name="美债10年期收益率", scope="MACRO", dimension="资金",
+         market_scope="GLOBAL", unit="pct", direction="neutral", freq="day",
+         remark="定义：美国 10 年期国债收益率（%），全球资产定价的无风险利率锚　·　判读：**无单一方向**（同 MACRO.BOND_10Y 的双重性质）——既是全球贴现率（上行压估值）也是增长/通胀预期（上行反映景气）；须与美元指数、VIX 联读以辨识驱动来源　·　数据：1990-12 起长样本；⚠ 美债休市日（如哥伦布日）源无报价，属正常非缺采；亦是 HK VAL.ERP 的无风险利率输入",
+         formula="daily_benchmark US.DGS10（akshare 美国国债收益率10年）"),
+    dict(code="MACRO.US_2Y", name="美债2年期收益率", scope="MACRO", dimension="资金",
+         market_scope="GLOBAL", unit="pct", direction="neutral", freq="day",
+         remark="定义：美国 2 年期国债收益率（%），对美联储政策路径最敏感的期限　·　判读：**无单一方向**——更贴政策预期（上行=市场计入更紧的紧缩路径），但也会因增长预期改善而上行；带方向含义的曲线信号看 MACRO.US_TERM_SPREAD　·　数据：1990-12 起长样本，与美债10Y 同日成交",
+         formula="daily_benchmark US.DGS2（akshare 美国国债收益率2年）"),
     dict(code="MACRO.CN_US_SPREAD", name="中美利差(中债10Y−美债10Y)", scope="MACRO", dimension="资金",
          market_scope="CN+HK", unit="pp", direction="neutral", freq="day",
          remark="定义：中债 10Y − 美债 10Y（pp），中美利差　·　判读：倒挂=利差为负，人民币承压、外资流出压力；走阔通常利好人民币与外资流入——但若因美债风险溢价飙升而走阔则相反，须结合美元指数与汇率解读，故无单一方向　·　数据：日频，双源同日对齐",
          formula="CN.BOND_10Y − US.DGS10（同日，源：get_macro_daily 跨表派生）"),
     dict(code="MACRO.US_TERM_SPREAD", name="美债期限利差(10Y−2Y)", scope="MACRO", dimension="风险",
          market_scope="GLOBAL", unit="pp", direction="high_good", freq="day",
-         remark="定义：美债 10Y − 2Y（pp），美债曲线陡峭度　·　判读：**倒挂为经典衰退预警**（全球流动性与风险偏好的领先信号）；走阔=复苏预期；CN/HK 双侧均接入　·　数据：2006 起长样本",
+         remark="定义：美债 10Y − 2Y（pp），美债曲线陡峭度　·　判读：**倒挂为经典衰退预警**（全球流动性与风险偏好的领先信号）；走阔=复苏预期；CN/HK 双侧均接入　·　数据：1990-12 起长样本（与美债 10Y / 2Y 同覆盖）",
          formula="US.DGS10 − US.DGS2（同日，源：get_macro_daily 跨表派生）"),
     dict(code="FLOW.HIBOR_3M", name="HIBOR 3月(港币流动性)", scope="MACRO", dimension="资金",
          remark="定义：香港银行同业 3 个月港元拆借利率　·　判读：**上行=港元资金面收紧** → 港股估值与流动性承压（温度计中取反）；HIBOR 急升常伴套息交易平仓与港元弱方兑换保证触发　·　数据：仅 HK；日频",
@@ -552,6 +630,135 @@ def _per_stock_windows(conn, market: str, w_start: datetime.date, end: datetime.
     return agg.astype(int) if agg is not None else pd.DataFrame()
 
 
+# ── 指标数据来源映射（**代码即真相源**）────────────────────────────────────────
+# 指标层有两条入湖通路，映射一律在此声明（提为模块常量，供自检与 indicator_dict.source
+# 派生使用）：
+#   ① PIT_MAP_CN / PIT_MAP_HK：regime.macro_series → 指标（月/季频按 release_time PIT 填充）
+#   ② BENCH_MAP / MOM_MAP    ：public.daily_benchmark → 指标（市场报价，同日对齐，无发布滞后）
+#
+# ⚠ 改 value（源编码）**必须**确认该编码已注册：macro 侧查 macro_series_meta、bench 侧查
+#   daily_benchmark.bench_code —— 写错的后果是**静默产出空指标**（不抛错、只是没数据）。
+#   该风险由 tests/test_indicator_sources.py 兜住（注册校验 + 端到端覆盖）。
+# ⚠ 映射留在代码而非入库：它是「信号怎么算」的计算逻辑，与 formula 同源；入库的是它的
+#   **投影**（indicator_dict.source，每轮由 _ensure_dict 全量重写，不会漂移）。
+
+PIT_MAP_CN = {
+    "RISK.CREDIT_SPREAD": "CN.CREDIT_SPREAD_MTN_AAA_10Y",
+    "RISK.TERM_SPREAD": "CN.TERM_SPREAD_10Y_1Y",
+    "MACRO.CN_US_SPREAD": "CN.US_SPREAD_10Y",      # 中美利差（外资机会成本）
+    "MACRO.US_TERM_SPREAD": "US.TERM_SPREAD_10Y_2Y",   # 美债期限结构（全球风险偏好）
+    "RISK.CREDIT_SPREAD_AA": "CN.CREDIT_SPREAD_MTN_AA_5Y",   # AA 绝对信用利差
+    "RISK.GRADE_SPREAD": "CN.GRADE_SPREAD_AA_AAA_5Y",        # 等级利差（风险偏好）
+    "RISK.CREDIT_SPREAD_AA_MINUS": "CN.CREDIT_SPREAD_MTN_AA_MINUS_5Y",  # AA− 低评级绝对利差
+    "RISK.GRADE_SPREAD_AA_MINUS": "CN.GRADE_SPREAD_AA_MINUS_AA_5Y",     # AA− 低评级等级利差
+    "VAL.DIV_SPREAD": "CN.DIV_SPREAD",                # 股息利差（§4.1 股债性价比）
+    "MACRO.VEG_BASKET_YOY": "CN.VEG_BASKET_YOY",   # CPI 食品项高频
+    "MACRO.PORK_PRICE": "CN.PORK_PRICE",           # 猪价（通胀高频）
+    "MACRO.CORE_CPI_YOY": "CN.CORE_CPI_YOY",       # 核心CPI（剔除食品能源；源仅 2021 起）
+    "MACRO.TSF_STOCK_YOY": "CN.TSF_STOCK_YOY",     # 社融存量同比（央行直连）
+    "MACRO.CLI_CN": "CN.CLI",                      # OECD 领先指标（中国）
+    "MACRO.CLI_GLOBAL": "GLOBAL.CLI_G20",          # OECD 领先指标（G20，全球周期）
+    # —— CN 宏观月频补接（2026-10-10；不入合成，作独立读数）——
+    "MACRO.CPI_YOY": "CN.CPI_YOY",                 # 通胀（紧缩风险口径）
+    "MACRO.CPI_MOM": "CN.CPI_MOM",                 # 通胀动能（环比）
+    "MACRO.PPI_YOY": "CN.PPI_YOY",                 # 顺周期盈利口径
+    "MACRO.PPI_CPI_SCISSOR": "CN.PPI_CPI_SCISSOR",  # 上下游利润分配（neutral）
+    "MACRO.CGPI_YOY": "CN.CGPI_YOY",                # 企业商品价格总指数（先于CPI/PPI）
+    "MACRO.CGPI_AGRI_YOY": "CN.CGPI_AGRI_YOY",      # CGPI 农产品分项
+    "MACRO.CGPI_MINING_YOY": "CN.CGPI_MINING_YOY",  # CGPI 矿产品分项（上游）
+    "MACRO.CGPI_ENERGY_YOY": "CN.CGPI_ENERGY_YOY",  # CGPI 煤油电分项（能源成本）
+    "MACRO.M1_YOY": "CN.M1_YOY",                   # 资金活化
+    "MACRO.M2_YOY": "CN.M2_YOY",                   # 流动性总量
+    "MACRO.M1_M2_SCISSOR": "CN.M1_M2_SCISSOR",     # 资金活化程度（顺周期领先）
+    "MACRO.LPR_1Y": "CN.LPR_1Y",                   # 政策利率锚
+    "MACRO.LPR_5Y": "CN.LPR_5Y",                   # 房贷利率锚（地产链）
+    "MACRO.BOND_10Y": "CN.BOND_10Y",               # 10Y 国债（neutral；ERP/期限利差输入）
+    "MACRO.PMI_MFG": "CN.PMI_MFG",                 # 制造业景气
+    "MACRO.PMI_NONMFG": "CN.PMI_NONMFG",           # 非制造业景气
+    "MACRO.PMI_NEW_ORDERS": "CN.PMI_NEW_ORDERS",   # PMI 最领先分项
+    "MACRO.INDUSTRIAL_PROFIT_YOY": "CN.INDUSTRIAL_PROFIT_YOY",   # A 股盈利宏观代理
+    "MACRO.POWER_GEN_YOY": "CN.POWER_GEN_YOY",     # 实体活动量（克强口径）
+    "MACRO.FREIGHT_YOY": "CN.FREIGHT_YOY",         # 实体活动量（克强口径）
+}
+
+PIT_MAP_HK = {
+    "FLOW.HIBOR_3M": "HK.HIBOR_3M",
+    # 外部变量对港股解释力更高（market_profile §3.4 港股特殊性）→ 同样接入
+    "MACRO.CN_US_SPREAD": "CN.US_SPREAD_10Y",
+    "MACRO.US_TERM_SPREAD": "US.TERM_SPREAD_10Y_2Y",
+    # 中国信用（绝对利差 + 等级利差）：既是中国信用周期的读数，也是 §5.4 风险偏好指数的成分
+    #   —— 该指数成分以 GLOBAL 为主，若 HK 侧缺信用成分会与 CN 侧口径不一致
+    "RISK.CREDIT_SPREAD": "CN.CREDIT_SPREAD_MTN_AAA_10Y",
+    "RISK.GRADE_SPREAD": "CN.GRADE_SPREAD_AA_AAA_5Y",
+    "MACRO.TSF_STOCK_YOY": "CN.TSF_STOCK_YOY",     # 社融存量同比（中国信用扩张读数）
+    # —— CN 宏观月频补接（market_scope=CN+HK 者；不入合成，作独立读数）——
+    "MACRO.M1_YOY": "CN.M1_YOY",                   # 资金活化
+    "MACRO.M2_YOY": "CN.M2_YOY",                   # 流动性总量
+    "MACRO.M1_M2_SCISSOR": "CN.M1_M2_SCISSOR",     # 资金活化程度（顺周期领先）
+    "MACRO.PMI_MFG": "CN.PMI_MFG",                 # 制造业景气
+    "MACRO.PMI_NEW_ORDERS": "CN.PMI_NEW_ORDERS",   # PMI 最领先分项
+}
+
+# 水平值直连：(指标, 源编码, 源所在层)。取**水平值**，同日对齐到本市场交易日 —— 因源都是
+#   市场报价（无发布滞后）故不走 PIT 填充。kind 决定从哪层读：
+#     "bench" → public.daily_benchmark（bench_code）
+#     "macro" → regime.macro_series（series_code，商品期货收盘价等）
+LEVEL_MAP = (
+    ("MACRO.DXY", "US.DXY", "bench"),
+    ("MACRO.DTWEXBGS", "US.DTWEXBGS", "bench"),
+    ("MACRO.FED_FUNDS", "US.EFFR", "bench"),
+    ("RISK.VIX", "US.VIXCLS", "bench"),
+    ("MACRO.BREAKEVEN_10Y", "US.T10YIE", "bench"),
+    # 美债 10Y/2Y：与 MACRO.BOND_10Y（中债 10Y）对称，使美债曲线全段可分位化。
+    # 此前只有利差（MACRO.US_TERM_SPREAD）入库，两腿水平值仅存于 daily_benchmark。
+    ("MACRO.US_10Y", "US.DGS10", "bench"),
+    ("MACRO.US_2Y", "US.DGS2", "bench"),
+    ("MACRO.USDCNY", "FX.USDCNY", "bench"),
+    # 避险货币（§4.2 汇率：避险货币走强 → 新兴市场承压）。⚠ 兑人民币交叉盘 → 含人民币
+    #   自身强弱，判读须与 MACRO.USDCNY 联读（见各自的 remark）。
+    ("MACRO.JPYCNY", "FX.JPYCNY", "bench"),
+    ("MACRO.CHFCNY", "FX.CHFCNY", "bench"),
+    # 商品**价格水平**（4.2 跨资产）：此前只登记了 20 日动量（MOM_MAP），水平值虽已在库却
+    #   取不到分位 —— 「铜价历史高位」这类读数缺了就没法判断。
+    ("MACRO.COPPER", "CMDTY.COPPER", "macro"),
+    ("MACRO.GOLD", "CMDTY.GOLD", "macro"),
+    ("MACRO.OIL", "CMDTY.OIL", "macro"),
+)
+
+# 动量类：(指标, 源编码, 源所在层)。⚠ 动量必须在**源市场交易日**上算（20 交易日 =
+#   s/s.shift(20)−1），再对齐本市场：直接用本市场日历 shift 一个含外盘假期 NaN 的序列会错位。
+MOM_MAP = (
+    ("MACRO.SPX_MOM20", "US.SP500", "bench"),
+    ("MACRO.COPPER_MOM20", "CMDTY.COPPER", "macro"),
+    ("MACRO.GOLD_MOM20", "CMDTY.GOLD", "macro"),
+    ("MACRO.OIL_MOM20", "CMDTY.OIL", "macro"),
+)
+
+
+def _build_indicator_sources() -> dict:
+    """指标 → 原始源编码（INDICATOR_SOURCES 的构造；供 indicator_dict.source 填充）。
+
+    跨市场差异：同一指标在 CN/HK 两侧源不同时以 " / " 并列（当前无此情况）。
+    `bench:` 前缀标明源在 public.daily_benchmark；无前缀者在 regime.macro_series。
+    """
+    out: dict = {}
+    for mp in (PIT_MAP_CN, PIT_MAP_HK):
+        for ind, src in mp.items():
+            if ind in out and out[ind] != src:
+                out[ind] = f"{out[ind]} / {src}"
+            else:
+                out.setdefault(ind, src)
+    for ind, src, kind in LEVEL_MAP:
+        out[ind] = f"bench:{src}" if kind == "bench" else src
+    for ind, src, kind in MOM_MAP:
+        out[ind] = src if kind == "macro" else f"bench:{src}"
+    return out
+
+
+INDICATOR_SOURCES = _build_indicator_sources()
+"""代码侧声明的「指标 → 源序列」映射（45 条；其余指标由公式从多源计算，见 formula）。"""
+
+
 # ── 计算：CN ────────────────────────────────────────────────────────────────
 def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 400) -> dict:
     """A 股指标计算（宽度/估值/资金/风险），返回 {code: Series}。"""
@@ -652,38 +859,8 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     b10s = _series_from_df(b10, "period_date", "value").reindex(out["VAL.PE_TTM_MEDIAN"].index).ffill()
     out["VAL.ERP"] = 1.0 / out["VAL.PE_TTM_MEDIAN"].replace(0, np.nan) * 100 - b10s
 
-    # ⑦ 宏观接入（PIT 填充到交易日）：信用利差 / 期限利差 / 信贷脉冲代理
-    out.update(_macro_pit_map(conn, out["BREADTH.ADV_RATIO"].index, {
-        "RISK.CREDIT_SPREAD": "CN.CREDIT_SPREAD_MTN_AAA_10Y",
-        "RISK.TERM_SPREAD": "CN.TERM_SPREAD_10Y_1Y",
-        "MACRO.CN_US_SPREAD": "CN.US_SPREAD_10Y",      # 中美利差（外资机会成本）
-        "MACRO.US_TERM_SPREAD": "US.TERM_SPREAD_10Y_2Y",   # 美债期限结构（全球风险偏好）
-        "RISK.CREDIT_SPREAD_AA": "CN.CREDIT_SPREAD_MTN_AA_5Y",   # AA 绝对信用利差
-        "RISK.GRADE_SPREAD": "CN.GRADE_SPREAD_AA_AAA_5Y",        # 等级利差（风险偏好）
-        "MACRO.VEG_BASKET_YOY": "CN.VEG_BASKET_YOY",   # CPI 食品项高频
-        "MACRO.PORK_PRICE": "CN.PORK_PRICE",           # 猪价（通胀高频）
-        "MACRO.CORE_CPI_YOY": "CN.CORE_CPI_YOY",       # 核心CPI（剔除食品能源；源仅 2021 起）
-        "MACRO.TSF_STOCK_YOY": "CN.TSF_STOCK_YOY",     # 社融存量同比（央行直连）
-        "MACRO.CLI_CN": "CN.CLI",                      # OECD 领先指标（中国）
-        "MACRO.CLI_GLOBAL": "GLOBAL.CLI_G20",          # OECD 领先指标（G20，全球周期）
-        # —— CN 宏观月频补接（2026-10-10；不入合成，作独立读数）——
-        "MACRO.CPI_YOY": "CN.CPI_YOY",                 # 通胀（紧缩风险口径）
-        "MACRO.CPI_MOM": "CN.CPI_MOM",                 # 通胀动能（环比）
-        "MACRO.PPI_YOY": "CN.PPI_YOY",                 # 顺周期盈利口径
-        "MACRO.PPI_CPI_SCISSOR": "CN.PPI_CPI_SCISSOR",  # 上下游利润分配（neutral）
-        "MACRO.M1_YOY": "CN.M1_YOY",                   # 资金活化
-        "MACRO.M2_YOY": "CN.M2_YOY",                   # 流动性总量
-        "MACRO.M1_M2_SCISSOR": "CN.M1_M2_SCISSOR",     # 资金活化程度（顺周期领先）
-        "MACRO.LPR_1Y": "CN.LPR_1Y",                   # 政策利率锚
-        "MACRO.LPR_5Y": "CN.LPR_5Y",                   # 房贷利率锚（地产链）
-        "MACRO.BOND_10Y": "CN.BOND_10Y",               # 10Y 国债（neutral；ERP/期限利差输入）
-        "MACRO.PMI_MFG": "CN.PMI_MFG",                 # 制造业景气
-        "MACRO.PMI_NONMFG": "CN.PMI_NONMFG",           # 非制造业景气
-        "MACRO.PMI_NEW_ORDERS": "CN.PMI_NEW_ORDERS",   # PMI 最领先分项
-        "MACRO.INDUSTRIAL_PROFIT_YOY": "CN.INDUSTRIAL_PROFIT_YOY",   # A 股盈利宏观代理
-        "MACRO.POWER_GEN_YOY": "CN.POWER_GEN_YOY",     # 实体活动量（克强口径）
-        "MACRO.FREIGHT_YOY": "CN.FREIGHT_YOY",         # 实体活动量（克强口径）
-    }))
+    # ⑦ 宏观接入（PIT 填充到交易日）：信用利差 / 期限利差 / 信贷脉冲代理（映射见 PIT_MAP_CN）
+    out.update(_macro_pit_map(conn, out["BREADTH.ADV_RATIO"].index, PIT_MAP_CN))
     out["MACRO.CREDIT_IMPULSE"] = _credit_impulse(conn, out["BREADTH.ADV_RATIO"].index)
 
     # ⑧ 分析师一致预期（修正宽度 / 评级乐观度）
@@ -703,6 +880,13 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
 
     # ⑫ §3.4 外部环境 + §5.4 跨资产成分（复用已采序列；供风险偏好指数用）
     out.update(_global_block(conn, out["BREADTH.ADV_RATIO"].index))
+
+    # ⑬ 股债相关性（§4.2 相关性异常）：60 日滚动 corr(上证日收益, −中债10Y 日变化)
+    #    —— 负值=避险主导（常态），转正=宏观主导（股债对冲失效）
+    out["MACRO.STOCK_BOND_CORR"] = _stock_bond_corr(conn, out["BREADTH.ADV_RATIO"].index)
+
+    # ⑭ 巴菲特指标（§4.1 极长期估值锚）：沪深总市值 / GDP_ttm
+    out["VAL.BUFFETT"] = _buffett_ratio(conn, out["BREADTH.ADV_RATIO"].index)
 
     return {k: _clip(v, start, end) for k, v in out.items()}
 
@@ -793,23 +977,8 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     out["VAL.ERP"] = 1.0 / out["VAL.PE_TTM_MEDIAN"].replace(0, np.nan) * 100 - dgs_s
 
     # 宏观接入：HIBOR 3M（港元流动性）+ 中国信用脉冲（HK 用其作为边际驱动代理），PIT 填充
-    out.update(_macro_pit_map(conn, out["VAL.PE_TTM_MEDIAN"].index, {
-        "FLOW.HIBOR_3M": "HK.HIBOR_3M",
-        # 外部变量对港股解释力更高（market_profile §3.4 港股特殊性）→ 同样接入
-        "MACRO.CN_US_SPREAD": "CN.US_SPREAD_10Y",
-        "MACRO.US_TERM_SPREAD": "US.TERM_SPREAD_10Y_2Y",
-        # 中国信用（绝对利差 + 等级利差）：既是中国信用周期的读数，也是 §5.4 风险偏好指数的成分
-        #   —— 该指数成分以 GLOBAL 为主，若 HK 侧缺信用成分会与 CN 侧口径不一致
-        "RISK.CREDIT_SPREAD": "CN.CREDIT_SPREAD_MTN_AAA_10Y",
-        "RISK.GRADE_SPREAD": "CN.GRADE_SPREAD_AA_AAA_5Y",
-        "MACRO.TSF_STOCK_YOY": "CN.TSF_STOCK_YOY",     # 社融存量同比（中国信用扩张读数）
-        # —— CN 宏观月频补接（market_scope=CN+HK 者；不入合成，作独立读数）——
-        "MACRO.M1_YOY": "CN.M1_YOY",                   # 资金活化
-        "MACRO.M2_YOY": "CN.M2_YOY",                   # 流动性总量
-        "MACRO.M1_M2_SCISSOR": "CN.M1_M2_SCISSOR",     # 资金活化程度（顺周期领先）
-        "MACRO.PMI_MFG": "CN.PMI_MFG",                 # 制造业景气
-        "MACRO.PMI_NEW_ORDERS": "CN.PMI_NEW_ORDERS",   # PMI 最领先分项
-    }))
+    #   （映射见 PIT_MAP_HK）
+    out.update(_macro_pit_map(conn, out["VAL.PE_TTM_MEDIAN"].index, PIT_MAP_HK))
     out["MACRO.CREDIT_IMPULSE"] = _credit_impulse(conn, out["VAL.PE_TTM_MEDIAN"].index)
 
     # §3.4 外部环境 + §5.4 跨资产成分（GLOBAL 口径 → 双市场同算，风险偏好指数才能各自落地）
@@ -970,13 +1139,45 @@ def _align_close(src: pd.Series, idx) -> pd.Series:
     return pd.Series(merged["v"].to_numpy(), index=idx)
 
 
+_CORR_WINDOW = 60          # 股债相关性的滚动窗口（交易日）
+
+
+def _stock_bond_corr(conn, idx, stock_code: str = "SH.000001",
+                     bond_series: str = "CN.BOND_10Y") -> pd.Series:
+    """60 日滚动「股债相关性」= corr(股指日收益, −债券收益率日变化)（§4.2 相关性异常）。
+
+    为什么取 −Δyield：文献里的「股债相关性」指**价格**相关性，而库里存的是**收益率**
+    （yield 上行 = 债券价格下跌）→ 只有取负号才是价格口径。于是：
+      · 负值（常态）= 避险主导：股跌债涨（flight to quality）；
+      · 转正/持续上行 = 宏观主导：股债同跌（增长或流动性冲击），股债对冲失效、须警惕。
+    ⚠ 两腿日历不同（股指交易日 vs 国债收益率交易日）→ 各自算日变化后仅在**共同**日期上
+      算相关，缺失日不进窗口（不做 ffill —— 用陈旧收益率拼接会伪造相关性）。
+    """
+    px = _q(conn, """SELECT trade_date, last_price FROM daily_benchmark
+                     WHERE bench_code = %s ORDER BY trade_date""", [stock_code])
+    yl = _q(conn, """SELECT period_date, value FROM regime.macro_series
+                     WHERE series_code = %s AND revision = 0 ORDER BY period_date""", [bond_series])
+    if px.empty or yl.empty:
+        return pd.Series(np.nan, index=idx)
+    sp = pd.Series(pd.to_numeric(px["last_price"], errors="coerce").to_numpy(),
+                   index=pd.to_datetime(px["trade_date"])).dropna()
+    yv = pd.Series(pd.to_numeric(yl["value"], errors="coerce").to_numpy(),
+                   index=pd.to_datetime(yl["period_date"])).dropna()
+    # DataFrame 构造即按索引对齐 → dropna 后只剩两腿**共同**的日期
+    pair = pd.DataFrame({"ret": sp.pct_change() * 100.0, "dneg": -yv.diff()}).dropna()
+    if len(pair) < _CORR_WINDOW:
+        return pd.Series(np.nan, index=idx)
+    corr = pair["ret"].rolling(_CORR_WINDOW).corr(pair["dneg"]).dropna()
+    return _align_close(corr, idx)
+
+
 def _global_block(conn, idx) -> dict:
     """§3.4 外部环境 + §5.4 跨资产成分（**零新增采集**：daily_benchmark 每小时已在采、
     CMDTY.* 日频行情已在库）。
 
-    · 水平类：美元指数双口径（ICE DXY 2016+ / Fed 贸易加权 2006+）、VIX（1990+）、
-      有效联邦基金利率（2001+）；
-    · 动量类：标普 500 / 铜 / 黄金的 **20 个交易日**动量。
+    · 水平类：美元指数双口径（ICE DXY / Fed 贸易加权）、VIX、有效联邦基金利率、
+      美债 10Y·2Y、盈亏平衡通胀、在岸人民币、商品价格水平（铜/金/油）（映射见 LEVEL_MAP）；
+    · 动量类：标普 500 / 铜 / 黄金 / 原油的 **20 个交易日**动量（映射见 MOM_MAP）。
       ⚠ 动量必须在**各自源市场的交易日**上算（20 个交易日 = s/s.shift(20)−1），再对齐到本市场：
       直接用本市场日历 shift 一个含外盘假期 NaN 的序列会错位（美/港/内地假期不同）。
     """
@@ -991,12 +1192,6 @@ def _global_block(conn, idx) -> dict:
                       index=pd.to_datetime(df["trade_date"]))
         return s[~s.index.duplicated(keep="last")].sort_index()
 
-    for code, src in (("MACRO.DXY", "US.DXY"), ("MACRO.DTWEXBGS", "US.DTWEXBGS"),
-                      ("MACRO.FED_FUNDS", "US.EFFR"), ("RISK.VIX", "US.VIXCLS"),
-                      ("MACRO.BREAKEVEN_10Y", "US.T10YIE"),
-                      ("MACRO.USDCNY", "FX.USDCNY")):
-        out[code] = _align_close(_bench(src), idx)
-
     def _macro(src):
         df = _q(conn, """SELECT period_date, value FROM regime.macro_series
                          WHERE series_code = %s AND revision = 0 ORDER BY period_date""", [src])
@@ -1006,13 +1201,40 @@ def _global_block(conn, idx) -> dict:
                       index=pd.to_datetime(df["period_date"]))
         return s[~s.index.duplicated(keep="last")].sort_index()
 
-    for code, src, loader in (("MACRO.SPX_MOM20", "US.SP500", _bench),
-                              ("MACRO.COPPER_MOM20", "CMDTY.COPPER", _macro),
-                              ("MACRO.GOLD_MOM20", "CMDTY.GOLD", _macro),
-                              ("MACRO.OIL_MOM20", "CMDTY.OIL", _macro)):
-        s = loader(src)
+    loader = {"bench": _bench, "macro": _macro}
+    for code, src, kind in LEVEL_MAP:
+        out[code] = _align_close(loader[kind](src), idx)
+
+    for code, src, kind in MOM_MAP:
+        s = loader[kind](src)
         mom = (s / s.shift(20) - 1) * 100 if len(s) > 20 else pd.Series(dtype=float)
         out[code] = _align_close(mom, idx)
+    return out
+
+
+def _gdp_single_quarters(conn) -> list:
+    """`CN.GDP`（年内累计名义值）→ 逐季**单季值**，返回 [(period_date, 单季值, 可得时间)]。
+
+    ⚠ 差分基线必须是**前一条的累计值**，不能是「前一条的单季值」——后者会让同一年内第 3 个
+      及以后的累计点重复扣除（实测 2025-07 被算成 672,573 亿，而正确值 = 1,013,968 − 659,862
+      = 354,106 亿，多扣了 Q2 的单季值 341,396）→ GDP_ttm 被放大约 1.9 倍。
+      该 bug 曾同时存在于 `_credit_impulse` 与 `_buffett_ratio`，故抽为本函数统一修正。
+    · `period_date` 语义 = **末季度起始月**（见 macro_series_meta.CN.GDP.remark）：
+      2025-10 = Q4 起始月 → 该行是 Q1~Q4 的全年累计。
+    """
+    gdp = _q(conn, """SELECT period_date, release_time, value FROM regime.macro_series
+                      WHERE series_code='CN.GDP' AND revision=0 ORDER BY period_date""")
+    if gdp.empty:
+        return []
+    gdp = gdp.sort_values("period_date")
+    rel = _naive_local(gdp["release_time"]).to_numpy()
+    out, prev_year, prev_cum = [], None, 0.0
+    for i, r in enumerate(gdp.itertuples()):
+        d = pd.Timestamp(r.period_date).date()
+        v = float(r.value)
+        base = prev_cum if d.year == prev_year else 0.0     # 年初首个点即 Q1 自身
+        out.append((d, v - base, rel[i]))
+        prev_year, prev_cum = d.year, v
     return out
 
 
@@ -1037,20 +1259,9 @@ def _credit_impulse(conn, idx) -> pd.Series:
     st = _q(conn, """SELECT period_date, release_time, value FROM regime.macro_series
                      WHERE series_code='CN.TSF_STOCK' AND revision=0
                        AND period_date >= DATE '2019-01-01' ORDER BY period_date""")
-    gdp = _q(conn, """SELECT period_date, release_time, value FROM regime.macro_series
-                      WHERE series_code='CN.GDP' AND revision=0 ORDER BY period_date""")
-    if st.empty or len(gdp) < 8:
+    gd = _gdp_single_quarters(conn)                 # 见该函数：差分基线必须是**累计值**
+    if st.empty or len(gd) < 8:
         return pd.Series(np.nan, index=idx)
-    # ① GDP 年内累计 → 单季（同一日历年内与前一个累计点相减，年初首个点即 Q1 自身）
-    gdp = gdp.sort_values("period_date")
-    rel_g = _naive_local(gdp["release_time"]).to_numpy()
-    gd = []
-    for i, r in enumerate(gdp.itertuples()):
-        d = pd.Timestamp(r.period_date).date()
-        v = float(r.value)
-        same_year = [x for x in gd if x[0].year == d.year]
-        base = same_year[-1][1] if same_year else 0.0
-        gd.append((d, v - base, rel_g[i]))
 
     def _prev_month(d):
         return (d.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
@@ -1080,6 +1291,38 @@ def _credit_impulse(conn, idx) -> pd.Series:
         if r_now is None or r_prev is None:
             continue
         points.append((rel, r_now - r_prev))
+    if not points:
+        return pd.Series(np.nan, index=idx)
+    return _pit_fill(idx, points)
+
+
+def _buffett_ratio(conn, idx) -> pd.Series:
+    """巴菲特指标 = 沪深股票总市值 / GDP_ttm × 100（%，§4.1 极长期估值锚）。
+
+    · 分子：`CN.MKT_CAP_TOTAL`（沪深两市**股票**总市值，亿元；交易所每日公布）
+    · 分母：`CN.GDP`（年内累计名义 GDP，亿元）→ 差分回单季 → 滚动 4 季合计（TTM）
+    · PIT：分母只取「截至该市值观测**可得时点**已发布」的最近 4 个单季（与 _credit_impulse
+      同一纪律，不用未来修订）；市值本身按 release_time 前向填充到交易日。
+    · 量级自检：A 股总市值/GDP 长期约 60~100%（2015 牛市峰值逾 100%、2018 底约 50%），
+      与「>100% 警戒」的通行判读一致。
+    """
+    cap = _q(conn, """SELECT period_date, release_time, value FROM regime.macro_series
+                      WHERE series_code='CN.MKT_CAP_TOTAL' AND revision=0 ORDER BY period_date""")
+    quarters = _gdp_single_quarters(conn)           # 见该函数：差分基线必须是**累计值**
+    if cap.empty or len(quarters) < 4:
+        return pd.Series(np.nan, index=idx)
+
+    # ② 逐「市值观测」算比率：分母用与分子同一可得时点（同口径 vintage）
+    points = []
+    for r in cap.itertuples():
+        rel_n = _naive_local(pd.Series([r.release_time])).iloc[0]
+        q = [x for x in quarters if x[2] <= rel_n]
+        if len(q) < 4:
+            continue
+        ttm = sum(x[1] for x in q[-4:])
+        if ttm <= 0:
+            continue
+        points.append((r.release_time, float(r.value) / ttm * 100))
     if not points:
         return pd.Series(np.nan, index=idx)
     return _pit_fill(idx, points)
@@ -1528,7 +1771,11 @@ def _ensure_dict(conn):
             "unit": _cut("unit", meta["unit"]),
             "direction": _cut("direction", meta["direction"]),
             "freq": _cut("freq", meta["freq"]),
-            "source": _cut("source", meta.get("source", "")), "formula": meta["formula"],
+            # source = 「本指标引用的原始源编码」（bench: 前缀=基准层）。**由接线映射派生**，
+            #   不手工维护、每轮全量重写 → 库内是代码的投影，不会漂移。由多源计算的指标
+            #   （如 VAL.ERP = PE + 中债10Y）不在此列，其来源见 formula。
+            "source": _cut("source", meta.get("source") or INDICATOR_SOURCES.get(meta["code"], "")),
+            "formula": meta["formula"],
             "is_active": meta.get("active", True), "remark": _cut("remark", meta.get("remark")),
             "updated_at": datetime.datetime.now(TZ_CN),
         })

@@ -296,19 +296,49 @@ PBC_INDEX = f"{PBC_BASE}/diaochatongjisi/116219/116319/index.html"
 _PBC_CACHE: dict = {}
 
 
-def _pbc_get(url: str, attach: bool = False) -> str:
-    """取页面/附件文本。页面是 UTF-8；附件编码新旧不一 → 用关键字自动判定。"""
+# PBoC 附件编码判定用的高频中文字（该站附件 GBK / UTF-8 混用；乱码版本这些字几乎不出现）
+_CN_PROBE = "的是年在月国有指数价格人民银统计企业商品总农产品"
+
+
+def _decode_pbc(b: bytes) -> str:
+    """PBoC 附件编码**通用**判定（不依赖特定表的关键字）。
+
+    实测该站附件编码混用：社融存量表与 CGPI 表是 GBK，个别年份的储户表是 UTF-8。
+    旧实现靠「社会融资规模存量」关键字探测 → 对其它表全部误判成乱码（CGPI 就中招）。
+    改为用高频中文字计数打分，取分高者。
+    """
+    best, best_score = b.decode("utf-8", "ignore"), -1
+    for enc in ("utf-8", "gb18030"):
+        t = b.decode(enc, "ignore")
+        score = sum(t.count(ch) for ch in _CN_PROBE)
+        if score > best_score:
+            best, best_score = t, score
+    return best
+
+
+def _pbc_get(url: str, attach: bool = False, _tries: int = 3) -> str:
+    """取页面/附件文本。页面固定 UTF-8；附件编码用 _decode_pbc 通用判定。
+
+    ⚠ PBoC 附件有**间歇性限流**（同一 URL 连续抓取会随机失败或返回空/风控页，
+      实测聚合 10 个年份时重试 3 次仍可能漏）→ 内置重试，len 过小视为失败页。
+    """
+    import time
     import requests
-    r = requests.get(url, timeout=40, verify=False, headers={
-        "User-Agent": NBS_UA, "Accept": "text/html,application/xhtml+xml,*/*"})
-    r.raise_for_status()
-    if not attach:
-        return r.content.decode("utf-8", "ignore")
-    for enc in ("gb18030", "utf-8"):
-        t = r.content.decode(enc, "ignore")
-        if "社会融资规模存量" in t or "社会融资规模增量" in t:
-            return t
-    return r.content.decode("utf-8", "ignore")
+
+    last = None
+    for k in range(_tries):
+        try:
+            r = requests.get(url, timeout=40, verify=False, headers={
+                "User-Agent": NBS_UA, "Accept": "text/html,application/xhtml+xml,*/*"})
+            r.raise_for_status()
+            t = r.content.decode("utf-8", "ignore") if not attach else _decode_pbc(r.content)
+            if len(t) > 200:                       # 空页 / 风控页 → 重试
+                return t
+            last = f"len={len(t)}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {str(e)[:60]}"
+        time.sleep(1.2 + k * 1.5)
+    raise RuntimeError(f"PBoC 取数失败（重试 {_tries} 次）{url}：{last}")
 
 
 def _pbc_year_map() -> dict:
@@ -413,6 +443,116 @@ def _pbc_fetch(spec: dict) -> dict:
     return dict(sorted(out.items()))
 
 
+# ── 央行「企业商品价格指数（CGPI）」直连 ────────────────────────────────────────
+# 口径：源表「以上年同月=100」→ **减 100 转同比 %**；四条序列（总指数/农产品/矿产品/煤油电）。
+# 取数路径与社融同源（统计数据索引页 → 按年配对的 CGPI 子页 → htm 附件），**每年一份附件
+# 覆盖当年 1-12 月**；实测 2008-2026 共 19 个年份页可取。
+# 意义：企业间交易的商品价格（**不含服务与消费品零售**），**先于 CPI/PPI 变动** →
+#   通胀的早期同步/领先读数，补 §3.3 通胀维度。
+_CGPI_COLS = {"总指数": "CN.CGPI_YOY", "农产品": "CN.CGPI_AGRI_YOY",
+              "矿产品": "CN.CGPI_MINING_YOY", "煤油电": "CN.CGPI_ENERGY_YOY"}
+_CGPI_CACHE: dict = {}
+
+
+def _pbc_cgpi_year_map() -> dict:
+    """{年份: CGPI 子页 URL} —— 从索引页把「企业商品价格（CGPI）指数」配到最近的年份标签。"""
+    idx = _pbc_get(PBC_INDEX)
+    ypos = [(int(m.group(1)), m.start()) for m in re.finditer(r"(\d{4})年统计数据", idx)]
+    spos = [(m.group(1), m.start()) for m in
+            re.finditer(r"href=[\"']([^\"']+)[\"'][^>]*>\s*企业商品价格（CGPI）指数\s*</a>", idx)]
+    out, seen = {}, set()
+    for href, sp in spos:
+        prev = [y for y, yp in ypos if yp < sp]
+        if prev and prev[-1] not in seen:
+            seen.add(prev[-1])
+            out[prev[-1]] = href
+    return out
+
+
+def _pbc_cgpi_parse(txt: str) -> dict:
+    """CGPI htm → {series_code: {(年,月): 同比%}}。
+
+    表形态：**月份行 × 项目列**，列依次 总指数/农产品/矿产品/煤油电；源值「上年同月=100」
+    → 减 100 得同比 %。
+    ⚠ 两个实测坑：
+      · 旧年份表（2017 及更早）每行前面多一个**空白占位列**，`年月`/`YYYY.M` 不在 cells[0]
+        → 必须**按内容定位**，不能写死 cells[0]（否则早年全部解析为空）；
+      · 按**位置**取值，不可先过滤空值再配对（会错位）。
+    """
+    rows = _pbc_rows(txt)
+    hdr = None
+    for cells in rows:
+        for j, c in enumerate(cells):
+            if c.strip() == "年月" and j + 1 < len(cells):
+                hdr = [x.strip() for x in cells[j + 1:]]
+                break
+        if hdr:
+            break
+    if not hdr:
+        return {}
+    out: dict = {}
+    for cells in rows:
+        at = next((j for j, c in enumerate(cells)
+                   if re.fullmatch(r"\d{4}\.\d{1,2}", c.strip())), None)
+        if at is None:
+            continue
+        m = re.fullmatch(r"(\d{4})\.(\d{1,2})", cells[at].strip())
+        for i, name in enumerate(hdr):
+            code = _CGPI_COLS.get(name)
+            if not code:
+                continue
+            k = at + 1 + i
+            if k >= len(cells) or not cells[k]:
+                continue
+            try:
+                out.setdefault(code, {})[(int(m.group(1)), int(m.group(2)))] = \
+                    round(float(cells[k]) - 100, 4)          # 上年同月=100 → 同比%
+            except ValueError:
+                continue
+    return out
+
+
+def _pbc_page_htm(url: str, name_prefix: str) -> str:
+    """年份子页 → 目标条目的 htm 附件链接（**兼容两种链接形式**）。
+
+    · 新式（2015+）：`class="titp20"` 分块 + `/diaochatongjisi/attachDir/...`
+    · 旧式（≤2014）：无分块，链接为 `/eportal/fileDir/.../cms/YYYY/MM/YYYYsNN.htm`，
+      且条目名在 `<a>` 的 `title=` 属性里（出现在 href **之后**）→ 向后找名字。
+    返回绝对 URL；找不到返回 ""。
+    """
+    t = _pbc_get(url)
+    for part in t.split('class="titp20"')[1:]:
+        nm = re.sub(r"[^\u4e00-\u9fa5]", "", part.split("<")[0].split(">")[-1])
+        if not nm.startswith(name_prefix):
+            continue
+        m = re.search(r"href=[\"']([^\"']+\.htm)[\"']", part)
+        if m:
+            link = m.group(1)
+            return link if link.startswith("http") else PBC_BASE + link
+    for m in re.finditer(r"href=[\"']([^\"']*cms/[^\"']+\.htm)[\"']", t):
+        if name_prefix in t[m.start():m.start() + 500]:      # 条目名在 title= 里
+            return m.group(1)
+    return ""
+
+
+def _pbc_cgpi_fetch(kind: str) -> dict:
+    """CGPI 单列 → {period_date: 同比%}。四条序列共用一次全年份抓取（进 _CGPI_CACHE）。"""
+    if not _CGPI_CACHE:
+        ymap = _pbc_cgpi_year_map()
+        used = 0
+        for y in sorted(ymap):
+            link = _pbc_page_htm(PBC_BASE + ymap[y], "企业商品价格指数")
+            if not link:
+                continue
+            data = _pbc_cgpi_parse(_pbc_get(link, attach=True))
+            used += 1
+            for code, pts in data.items():
+                _CGPI_CACHE.setdefault(code, {}).update(
+                    {datetime.date(yy, mm, 1): v for (yy, mm), v in pts.items()})
+        print(f"    · 央行 CGPI：解析 {used}/{len(ymap)} 个年度文件，共 {len(_CGPI_CACHE)} 个序列")
+    return dict(sorted(_CGPI_CACHE.get(_CGPI_COLS[kind], {}).items()))
+
+
 # ── 序列定义：code / 名称 / 接口 / 取值列 / 单位 / 频率 / 发布滞后(天)
 SERIES = [
     # 货币与信用
@@ -448,6 +588,24 @@ SERIES = [
          remark="央行「社会融资规模增量统计表」当月合计（亿元）；**替换已停更的 CN.SHRZGM_INC**"
                 "（其源为商务部镜像、冻结于 2026-04）",
          pbc=dict(kind="flow", from_year=2016)),
+    # —— 央行「企业商品价格指数（CGPI）」直连（补 §3.3 通胀维度；源表「上年同月=100」→ 减 100）——
+    dict(code="CN.CGPI_YOY", name="企业商品价格指数-总指数同比", unit="pct", freq="month", lag=45,
+         source="pbc:cgpi",
+         remark="企业间交易商品价格总指数同比（**不含服务与消费品零售**）→ 先于 CPI/PPI 变动，"
+                "通胀的早期同步/领先读数；实测 2008 起 19 个年度附件",
+         pbc_cgpi="总指数"),
+    dict(code="CN.CGPI_AGRI_YOY", name="企业商品价格指数-农产品同比", unit="pct", freq="month", lag=45,
+         source="pbc:cgpi",
+         remark="CGPI 农产品分项 → 食品类成本的先行读数，领先 CPI 食品项",
+         pbc_cgpi="农产品"),
+    dict(code="CN.CGPI_MINING_YOY", name="企业商品价格指数-矿产品同比", unit="pct", freq="month", lag=45,
+         source="pbc:cgpi",
+         remark="CGPI 矿产品分项 → 上游资源品价格，与 PPI 采掘工业高度相关",
+         pbc_cgpi="矿产品"),
+    dict(code="CN.CGPI_ENERGY_YOY", name="企业商品价格指数-煤油电同比", unit="pct", freq="month", lag=45,
+         source="pbc:cgpi",
+         remark="CGPI 煤油电分项 → 能源成本：对上游是正向、对中下游毛利是负向冲击",
+         pbc_cgpi="煤油电"),
     dict(code="CN.NEW_LOAN", name="新增人民币贷款(月)", func="macro_china_new_financial_credit",
          col="当月", unit="yi_yuan", freq="month", lag=45),
     dict(code="CN.M2_YOY", name="M2 同比", func="macro_china_money_supply",
@@ -462,11 +620,15 @@ SERIES = [
          col="流通中的现金(M0)-同比增长", unit="pct", freq="month", lag=45,
          remark="M0=流通中现金；与 M1/M2 同源同表（akshare macro_china_money_supply）；"
                 "M0 高增常伴随后续 M1 回升（资金活化前奏）"),
+    # 【更正 2026-10-14】lag 由 1 改为 31。LPR 走 release_from_date（release_time = 源的报价日），
+    #   lag 只在源日期解析失败时兜底；原值 1 会让兜底算出 period_date+1 天（= 月初次日），
+    #   实测真实滞后 19~30 天（2019 前为日频报价、按月末取值，滞至 30 天）→ 一旦兜底触发即前视
+    #   最多 29 天。取 31（> 观测上限 30）确保「宁晚勿早」。
     dict(code="CN.LPR_1Y", name="LPR 1年期", func="macro_china_lpr",
-         col="LPR1Y", unit="pct", freq="month", date_col="TRADE_DATE", lag=1,
+         col="LPR1Y", unit="pct", freq="month", date_col="TRADE_DATE", lag=31,
          release_from_date=True, remark="源为日频重复报价 → 按月去重保留当月最后一次发布"),
     dict(code="CN.LPR_5Y", name="LPR 5年期", func="macro_china_lpr",
-         col="LPR5Y", unit="pct", freq="month", date_col="TRADE_DATE", lag=1,
+         col="LPR5Y", unit="pct", freq="month", date_col="TRADE_DATE", lag=31,
          release_from_date=True, remark="同上"),
     # 通胀与价格
     # 【更正 2026-10-08】此前记为「中国核心 CPI 无免费可得源」——**该结论错误**（详见文首 NBS_* 说明）。
@@ -663,6 +825,28 @@ def _parse_period(raw, freq_hint: str):
     return datetime.date(year, 1, 1)
 
 
+def _parse_day(raw):
+    """把日期解析为**具体某一天**（date 对象 / `YYYY-MM-DD` / `YYYY年MM月DD日` / `YYYYMMDD`）。
+
+    ⚠ `_parse_period` 一律返回**统计期首日**（月→1 日），无法表达真实发布日 →
+      release_from_date / use_release_col 这两类「用源日期当可得时点」的序列必须走本函数。
+      历史 bug：曾误用 `_parse_period(..., "day")`，结果 release_time 被压成月首日
+      → LPR 前视 19 天（156 个月中 25 个月有实际变动）。
+    """
+    if isinstance(raw, datetime.datetime):
+        return raw.date()
+    if isinstance(raw, datetime.date):
+        return raw
+    t = str(raw or "").strip()
+    m = re.search(r"(\d{4})\D*(\d{1,2})\D*(\d{1,2})", t)
+    if not m:
+        return None
+    try:
+        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
 _CONTRACT_KEYS = ("func", "col", "date_col", "nbs", "sdmx", "pbc",
                   "use_release_col", "row_filter", "release_from_date")
 """序列定义中属于「采集契约」的键 → 存 macro_series_meta.collect_params。
@@ -710,6 +894,9 @@ def _collect_one(defn: dict, cache: dict) -> list:
     if defn.get("pbc"):
         # 央行「社会融资规模」直连（htm 附件解析；见文首 PBC_* 说明）
         return [_mk_row(defn, d, v) for d, v in _pbc_fetch(defn["pbc"]).items()]
+    if defn.get("pbc_cgpi"):
+        # 央行「企业商品价格指数 CGPI」直连（四条序列共用一次全年份抓取）
+        return [_mk_row(defn, d, v) for d, v in _pbc_cgpi_fetch(defn["pbc_cgpi"]).items()]
     fn = defn["func"]
     if fn not in cache:
         import warnings
@@ -746,23 +933,31 @@ def _collect_one(defn: dict, cache: dict) -> list:
         if pd.isna(v):
             skipped += 1
             continue
-        d = _parse_period(r.get(dcol), defn["freq"])
+        raw_d = r.get(dcol)
+        d = _parse_period(raw_d, defn["freq"])
         if d is None:
             skipped += 1
             continue
-        rel = None
+        rel, basis = None, None
         if defn.get("release_from_date"):
-            # 真实发布时间就是数据日期本身（如 LPR 报价日）→ 直接用作 release_time
-            rel = datetime.datetime.combine(d, datetime.time(9, 0), tzinfo=TZ_CN)
+            # 真实发布时间 = 源里的**报价日**（如 LPR 每月 20 日），必须日级解析原始日期
+            rd = _parse_day(raw_d)
+            if rd and rd > d:
+                rel = datetime.datetime.combine(rd, datetime.time(9, 0), tzinfo=TZ_CN)
+                basis = "source_date"
         if rel is None and rel_col and r.get(rel_col) is not None:
-            rd = _parse_period(r.get(rel_col), "day")
-            if rd:
+            rd = _parse_day(r.get(rel_col))
+            if rd and rd > d:
                 rel = datetime.datetime.combine(rd, datetime.time(18, 0), tzinfo=TZ_CN)
+                basis = "source"
         if rel is None:
+            # 兜底 = period + lag 天（保守上限）。**必须晚于 period_date**，否则就是源给的
+            # 伪日期：实测 CN.IP_YOY 源的「发布时间」列本身就等于月首日（工业增加值实际要
+            # 次月中旬才发布）→ 若照用会前视约 45 天，故此处强制回退到 lag。
             rel = datetime.datetime.combine(
                 d + datetime.timedelta(days=defn["lag"]), datetime.time(18, 0), tzinfo=TZ_CN)
-        rows.append(_mk_row(defn, d, v, rel,
-                            "source" if (rel_col and rel) else f"period+{defn['lag']}d"))
+            basis = f"period+{defn['lag']}d"
+        rows.append(_mk_row(defn, d, v, rel, basis))
     if skipped:
         print(f"    · {defn['code']}: {len(rows)} 条（跳过空值 {skipped}）")
     return rows

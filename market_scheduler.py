@@ -253,6 +253,14 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     # 全A 市场级估值（乐咕乐股，月频序列但月内滚动更新）：19:10 刷新。
     ("全A市场估值", "get_macro_valuation.py",
      {"hour": 19, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 中证全指股息率/估值（§4.1 股息利差的数据基础）：19:20。
+    # ⚠ 源只回最近 20 个交易日 → **须每个交易日采到**，漏采即永久缺失（同行业估值快照）。
+    # ⚠ 发布时点无法确证是 T 日盘后还是 T+1 日 → 采集器按「T+1」记 release_time（宁晚勿早）。
+    ("中证指数股息率", "get_cn_index_dividend.py",
+     {"hour": 19, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 沪深股票总市值（§4.1 巴菲特指标的分子）：19:20。两所统计盘后发布。
+    ("沪深总市值", "get_market_cap.py",
+     {"hour": 19, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
     # 交易日历维护（A股 AKShare 预排 + 港股由成交额表派生）：交易日 08:45 盘前刷新。
     ("交易日历维护", "init_trading_calendar.py",
      {"hour": 8, "minute": 45, "day_of_week": "mon-fri"}, None, True, None, 300),

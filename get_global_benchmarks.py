@@ -70,6 +70,16 @@ ALL_BENCHMARKS: List[Dict] = [
     # ⚠ 口径订正（2026-10-09）：源 currency_boc_safe = **中国银行外汇牌价（在岸）**，
     #   原 name 写成「离岸人民币」有误（离岸 CNH 无稳定免费源：东财源断连、中行新浪源停更 2023-11）。
     {"code": "FX.USDCNY",      "name": "在岸人民币(中行折算价)", "source": "akshare", "ak_func": "currency"},
+    # 避险货币（§4.2 跨资产：避险货币走强 → 新兴市场承压）。同源同表，无需新依赖。
+    #   口径同 FX.USDCNY = 元/1 外币单位（源为分，÷100）。⚠ 是**兑人民币**的交叉盘，
+    #   故同时含人民币自身强弱 → 判读时须与 FX.USDCNY 联读。
+    # ⚠ 日元取「**百日元**兑人民币」= 中行挂牌惯例。源列 4.2472 本可 ÷100 得 0.042472 元/日元，
+    #   但 daily_benchmark.last_price 是 NUMERIC(12,4) → 0.0425 只剩 2 位有效数字，
+    #   20 日动量会被量化到 ~2.4% 而失真，故用 fx_scale=100 保留 5 位有效数字。
+    {"code": "FX.JPYCNY",      "name": "日元兑人民币(百日元)", "source": "akshare",
+     "ak_func": "currency", "fx_col": "日元", "fx_scale": 100},
+    {"code": "FX.CHFCNY",      "name": "瑞郎兑人民币(中行折算价)", "source": "akshare",
+     "ak_func": "currency", "fx_col": "瑞士法郎"},
     # ── 国际指数（AKShare 新浪源，东财接口不稳故改用新浪）──
     # sina_name 为 AKShare index_global_hist_sina 的键（中文全名）
     {"code": "JP.N225",       "name": "日经225指数",       "source": "sina", "sina_name": "日经225指数"},
@@ -280,35 +290,41 @@ def _collect_akshare(items: list) -> list:
         except Exception as e:
             print(f"  [AKShare] ❌ bond_zh_us_rate: {type(e).__name__}: {e}")
 
-    # ── 汇率：currency_boc_safe ──
+    # ── 汇率：currency_boc_safe（中国银行外汇牌价，在岸折算价）──
     if fx_items:
         try:
             df = ak.currency_boc_safe()
-            # 列: ['日期', '美元', '欧元', ...] 美元值为 100美元兑人民币(分)，如 680.54 = 6.8054
-            col = "美元"
-            if col in df.columns:
+            # 列: ['日期', '美元', '欧元', '日元', '港元', '瑞士法郎', ...]，列值 = 汇率×100：
+            #   美元 672.53 → 6.7253 元/美元；瑞士法郎 805.88 → 8.0588 元/瑞郎。
+            # → ÷100 得「元 per 1 外币单位」，再乘 item 的 fx_scale（缺省 1；日元取 100 以免
+            #   在 NUMERIC(12,4) 下丢有效数字，见 ALL_BENCHMARKS 注释）。
+            # 币种列由 item 的 fx_col 指定（缺省 美元），故新增避险货币无需改本函数。
+            for it in fx_items:
+                col = it.get("fx_col", "美元")
+                scale = float(it.get("fx_scale", 1))
+                if col not in df.columns:
+                    print(f"  [AKShare] ❌ currency 列 '{col}' 不存在（{it['name']}）")
+                    continue
                 sub = df[["日期", col]].dropna()
-                for it in fx_items:
-                    if len(sub) < 2:
-                        print(f"  [AKShare] ⚠️ {it['name']} 数据不足")
-                        continue
-                    last = sub.iloc[-1]
-                    prev = sub.iloc[-2]
-                    td = date.fromisoformat(str(last['日期'])[:10])
-                    last_val = float(last[col]) / 100.0   # 分 → 元
-                    prev_val = float(prev[col]) / 100.0
-                    change = (last_val / prev_val - 1) * 100
-                    close_20d = _r(float(sub.iloc[-21][col]) / 100.0) if len(sub) >= 21 else None
-                    records.append({
-                        "bench_code": it["code"], "bench_name": it["name"],
-                        "trade_date": td,
-                        "update_time": datetime.combine(td, datetime.min.time()),
-                        "last_price": _r(last_val), "prev_close": _r(prev_val),
-                        "change_pct": _r(change), "close_20d_ago": close_20d,
-                    })
-                    print(f"  [AKShare] ✅ {it['name']}  {last_val:.4f}  ({change:+.4f}%)  {td}")
-            else:
-                print(f"  [AKShare] ❌ currency 列 '{col}' 不存在")
+                if len(sub) < 2:
+                    print(f"  [AKShare] ⚠️ {it['name']} 数据不足")
+                    continue
+                last = sub.iloc[-1]
+                prev = sub.iloc[-2]
+                td = date.fromisoformat(str(last['日期'])[:10])
+                last_val = float(last[col]) / 100.0 * scale   # → 元 per 1 外币单位（×scale）
+                prev_val = float(prev[col]) / 100.0 * scale
+                change = (last_val / prev_val - 1) * 100
+                close_20d = (_r(float(sub.iloc[-21][col]) / 100.0 * scale)
+                             if len(sub) >= 21 else None)
+                records.append({
+                    "bench_code": it["code"], "bench_name": it["name"],
+                    "trade_date": td,
+                    "update_time": datetime.combine(td, datetime.min.time()),
+                    "last_price": _r(last_val), "prev_close": _r(prev_val),
+                    "change_pct": _r(change), "close_20d_ago": close_20d,
+                })
+                print(f"  [AKShare] ✅ {it['name']}  {last_val:.4f}  ({change:+.4f}%)  {td}")
         except Exception as e:
             print(f"  [AKShare] ❌ currency_boc_safe: {type(e).__name__}: {e}")
 

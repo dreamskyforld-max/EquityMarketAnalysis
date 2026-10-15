@@ -58,6 +58,10 @@ BENCHMARKS = {
     # 在岸人民币兑美元（AKShare currency_boc_safe，中行牌价全历史）
     # 注：**不是在岸 vs 离岸之别**——本条**在岸**（中国银行折算价/中间价）；离岸 CNH 无稳定免费源。
     "FX.USDCNY":      ("在岸人民币(中行折算价)", "currency"),
+    # 避险货币（§4.2 跨资产：避险货币走强 → 新兴市场承压）。同源同表，全历史可回填。
+    # ⚠ 均为**兑人民币**的交叉盘 → 同时含人民币自身强弱，判读须联读 FX.USDCNY。
+    "FX.JPYCNY":      ("日元兑人民币(百日元)", "currency"),
+    "FX.CHFCNY":      ("瑞郎兑人民币(中行折算价)", "currency"),
     # 美债收益率（AKShare bond_zh_us_rate，中美利率总表）
     "US.DGS10":       ("美国10年期国债收益率", "bond"),
     "US.DGS2":        ("美国2年期国债收益率",  "bond"),
@@ -66,6 +70,11 @@ BENCHMARKS = {
 SINA_NAME = {
     "JP.N225": "日经225指数", "KR.KS11": "首尔综合指数", "DE.GDAXI": "德国DAX 30种股价指数",
 }
+
+# currency 源的取列与比例：(表列名, scale)。列值 = 汇率×100，÷100 得「元 per 1 外币单位」，
+#   再 ×scale 即入库口径。日元取 100（「百日元兑人民币」的中行挂牌惯例）以免在
+#   daily_benchmark.last_price NUMERIC(12,4) 下只剩 2 位有效数字而失真。
+CURRENCY_SPECS = {"FX.USDCNY": ("美元", 1), "FX.JPYCNY": ("日元", 100), "FX.CHFCNY": ("瑞士法郎", 1)}
 
 SINA_A_CODE = {
     "SH.000001": "sh000001", "SZ.399001": "sz399001",
@@ -515,9 +524,11 @@ def collect_bond(bench_code, bench_name):
 
 
 def collect_currency(bench_code, bench_name):
-    """在岸人民币兑美元（AKShare currency_boc_safe = 中国银行外汇牌价全历史）。
+    """外币兑人民币（AKShare currency_boc_safe = 中国银行外汇牌价全历史）。
 
-    返回 8000+ 行全历史牌价，"美元"列（单位：分）÷100 即 USD/CNY。
+    返回 8000+ 行全历史牌价；`CURRENCY_COLS` 指定该 bench 取哪一列，列值单位 = **分**，
+    ÷100 即「元/1 外币单位」（美元 672.53→6.7253；瑞郎 805.88→8.0588；
+    日元 4.2472→0.042472，源为「每 100 日元」的分值，同样 ÷100）。
     ⚠ 这是**在岸**口径（中行折算价），**不是离岸 CNH** —— CNH 无稳定免费源
       （东财源断连、中行新浪源 2023-11 停更），故本项目不采 CNH；勿把本序列当 CNH 用。
     """
@@ -525,6 +536,11 @@ def collect_currency(bench_code, bench_name):
     warnings.filterwarnings("ignore")
     import akshare as ak
 
+    spec = CURRENCY_SPECS.get(bench_code)
+    if not spec:
+        print(f"  ❌ {bench_code} 未在 CURRENCY_SPECS 登记币种列")
+        return 0
+    col, scale = spec
     try:
         df = ak.currency_boc_safe()
     except Exception as e:
@@ -534,16 +550,19 @@ def collect_currency(bench_code, bench_name):
         print(f"  ⚠️ 数据为空")
         return 0
 
-    df = df.dropna(subset=["日期", "美元"]).reset_index(drop=True)
+    if col not in df.columns:
+        print(f"  ❌ 源表无列 '{col}'（可用: {[c for c in df.columns if c != '日期'][:8]}...）")
+        return 0
+    df = df.dropna(subset=["日期", col]).reset_index(drop=True)
     recs = []
     for i in range(len(df)):
         td = df.iloc[i]["日期"]
         if not isinstance(td, datetime.date):
             td = datetime.date.fromisoformat(str(td)[:10])
-        mid = float(df.iloc[i]["美元"]) / 100.0  # 外汇局单位为「每100外币兑人民币」
-        prev = float(df.iloc[i - 1]["美元"]) / 100.0 if i > 0 else mid
+        mid = float(df.iloc[i][col]) / 100.0 * scale    # → 元 per 1 外币单位（×scale）
+        prev = float(df.iloc[i - 1][col]) / 100.0 * scale if i > 0 else mid
         chg = round((mid / prev - 1) * 100, 4) if (prev and prev != 0) else None
-        c20 = (float(df.iloc[i - 20]["美元"]) / 100.0) if i >= 20 else None
+        c20 = (float(df.iloc[i - 20][col]) / 100.0 * scale) if i >= 20 else None
         recs.append({
             "bench_code": bench_code, "bench_name": bench_name,
             "trade_date": td,

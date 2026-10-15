@@ -260,7 +260,8 @@ def _migrate_monitor_config():
 _REGIME_TABLE_CONFIG = [
     # (db_name, table_name, time_column, period, expect_lag, refresh_weekday, remark, active)
     ("regime", "macro_series", "updated_at", "lowfreq", 3, 0,
-     "get_cn_bond(日) + get_macro_valuation(月) + 各宏观采集", True),
+     "get_cn_bond(日) + get_macro_valuation(月) + get_cn_index_dividend(日) + get_market_cap(日) "
+     "+ 各宏观采集", True),
     ("regime", "indicator_dict", "updated_at", "lowfreq", 30, 0,
      "指标字典（market_state_daily 每次运行同步）", True),
     ("regime", "indicator_value", "updated_at", "day", 1, 0,

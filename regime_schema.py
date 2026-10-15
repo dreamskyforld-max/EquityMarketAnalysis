@@ -415,6 +415,11 @@ _COMMENTS = [
      "high_risk=越高越危险 / high_good=越高越好 / neutral；分位化与合成按此统一方向"),
     ("COLUMN", "regime.indicator_dict.formula",
      "计算口径描述（引用实现函数），保证可解释、可追溯"),
+    ("COLUMN", "regime.indicator_dict.source",
+     "本指标引用的**原始源编码**：无前缀=regime.macro_series（查 macro_series_meta）、"
+     "bench:=public.daily_benchmark（查 bench_code）；由 market_state_daily 的接线映射"
+     "（PIT_MAP_*/BENCH_MAP/MOM_MAP）派生、每轮全量重写，故为空表示「由公式从多源计算」"
+     "（来源见 formula），**不是遗漏**；接线校验见 tests/test_indicator_sources.py"),
     ("TABLE", "regime.analyst_forecast_snapshot",
      "分析师一致预期每日快照（修正宽度的差分依赖；必须逐日采集，历史不可回溯重建）"),
     ("COLUMN", "regime.analyst_forecast_snapshot.snapshot_date",
