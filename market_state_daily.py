@@ -94,9 +94,17 @@ INDICATORS: list[dict] = [
          market_scope="CN+HK", unit="pct", direction="high_good", freq="day",
          formula="PB < 1 的家数 / PB > 0 的家数 * 100（底部信号）"),
     dict(code="VAL.ERP", name="股权风险溢价 ERP", scope="ALLOC", dimension="估值",
-         remark="定义：股权风险溢价 = 盈利收益率 − 无风险利率（1/PE中位数 − 10Y 国债），股相对债的性价比　·　判读：ERP 越高=股票相对债券越有吸引力，分位 >80 对应历史性底部区域；CN 用中债 10Y、HK 用美债 10Y，两市场不可直接比数值　·　数据：依赖 PE 中位数 → CN 2018 / HK 2019 起",
+         remark="定义：股权风险溢价 = 盈利收益率 − 无风险利率（1/PE中位数 − 10Y 国债），股相对债的性价比　·　判读：ERP 越高=股票相对债券越有吸引力，分位 >80 对应历史性底部区域；CN 用中债 10Y、HK 用美债 10Y，两市场不可直接比数值　·　数据：日频口径，依赖个股聚合 PE 中位数 → CN 2018 / HK 2019 起；**长周期（2006 起）位置请看 VAL.ERP_LG**（乐咕乐股口径，两者刻意不拼接，原因见该指标）",
          market_scope="CN+HK", unit="pct", direction="high_good", freq="day",
          formula="1/PE中位数*100 − 无风险利率（CN 用中债国债10Y；HK 用美债10Y）"),
+    dict(code="VAL.ERP_LG", name="股权风险溢价 ERP(乐咕乐股口径,月频)", scope="ALLOC", dimension="估值",
+         remark="定义：同 VAL.ERP（E/P − 10Y 国债），但分子用**乐咕乐股全A PE-TTM 中位数**（月频，2006-03 起）——提供**口径一致的 20 年长历史**，覆盖 2008/2015/2018 三轮周期　·　判读：与 VAL.ERP 同向；**看长周期位置用它**（样本约 250 个月），看当下日频变化用 VAL.ERP　·　⚠ **刻意不与 VAL.ERP 拼接**：两口径 PE 的比值**不稳定**（实测 2018→2026 从 0.73 单调漂到 1.08，8 年漂移 48%），ERP 之差达均值 0.44pp / 标准差 0.40pp —— 已接近 VAL.ERP 自身波动（σ=0.50pp）；拼接会同时引入水平跳变与**伪趋势**，且用重叠段定校准系数会前视　·　数据：仅 CN",
+         market_scope="CN", unit="pct", direction="high_good", freq="month",
+         formula="100/CN.VAL_PE_MEDIAN − CN.BOND_10Y（乐咕乐股全A PE-TTM 中位数，月频；债券取当日或之前最近值）"),
+    dict(code="VAL.ERP_Z", name="ERP 标准化偏离(z-score)", scope="ALLOC", dimension="估值",
+         remark="定义：(ERP − ERP 自身历史均值) / ERP 自身历史标准差 —— Fed Model 的**「与历史均值比较」**口径（ERP = E/P − 无风险利率）　·　判读：>0 = 股债性价比优于自身历史中枢（越高越有利于股票），>+2 为历史极值区　·　**与 VAL.ERP 的分位互补**：分位看排位（对分布形状不敏感），z-score 看偏离幅度（对极值敏感），两者显著背离时提示分布偏斜　·　数据：均值/标准差用**扩展窗口**（只用当日及之前，无前视），min_periods=250 → 自 ~2019-01 起有值；⚠ **不做历史分位**（二次标准化无意义）；⚠ 只基于日频口径的 VAL.ERP（不含乐咕乐股段）",
+         market_scope="CN+HK", unit="sigma", direction="high_good", freq="day",
+         formula="(VAL.ERP − expanding_mean(VAL.ERP)) / expanding_std(VAL.ERP)，min_periods=250"),
     # —— 资金 / 情绪 Flow ——
     dict(code="FLOW.TURNOVER_RATIO", name="市场换手率", scope="MARKET", dimension="资金",
          remark="定义：成交额占流通市值（CN）/总市值（HK）的比例，即市场换手率　·　判读：升温=资金活跃、情绪上行（温度计成分 sign +1）；分位 >80 偏过热、<20 缩量地量　·　数据：依赖市值字段 → CN 2018 起",
@@ -150,8 +158,8 @@ INDICATORS: list[dict] = [
          remark="定义：社会融资规模存量的同比增长（%），中国信用扩张的总量读数　·　判读：持续上行=信用扩张周期；与信贷脉冲同向但更平滑（一个是存量增速、一个是边际变化），脉冲拐点通常领先存量同比　·　数据：2016-01 起；源按当期口径重算上年同期，跨 2019 口径断点的可比性优于水平值",
          formula="CN.TSF_STOCK_YOY（源：中国人民银行 统计数据 → 社会融资规模，htm 附件直连）"),
     dict(code="RISK.CREDIT_SPREAD", name="信用利差(中票AAA 10Y−国债10Y)", scope="MACRO", dimension="风险",
-         remark="定义：AAA 级中短期票据与同期限国债的收益率差，信用风险的绝对定价　·　判读：走阔=违约担忧上升/风险偏好收缩，收窄=信用环境改善；与等级利差对照可分离「整体信用环境」与「纯风险偏好」　·　数据：长历史且稳定，是风险指数成分；仅 CN",
-         market_scope="CN", unit="pp", direction="high_risk", freq="day",
+         remark="定义：AAA 级中短期票据与同期限国债的收益率差，信用风险的绝对定价　·　判读：走阔=违约担忧上升/风险偏好收缩，收窄=信用环境改善；与等级利差对照可分离「整体信用环境」与「纯风险偏好」　·　数据：长历史且稳定，是风险指数成分；**CN+HK**——HK 侧同样接入（§5.4 风险偏好指数的成分以 GLOBAL 为主，若 HK 缺信用成分会与 CN 侧口径不一致），但读数本身是中国信用环境",
+         market_scope="CN+HK", unit="pp", direction="high_risk", freq="day",
          formula="CN.CREDIT_SPREAD_MTN_AAA_10Y；利差走阔=违约担忧/风险偏好下降（源：get_macro_daily 派生）"),
     dict(code="RISK.TERM_SPREAD", name="期限利差(国债 10Y−1Y)", scope="MACRO", dimension="风险",
          remark="定义：国债 10Y 与 1Y 收益率之差（曲线陡峭度）　·　判读：**倒挂（低/负）为经典衰退预警**；走阔=复苏预期升温；风险指数中取反　·　数据：仅 CN",
@@ -166,10 +174,10 @@ INDICATORS: list[dict] = [
          market_scope="CN", unit="pct", direction="high_risk", freq="day",
          remark="定义：沪深股票总市值 / GDP_ttm × 100（%）——**极长期估值锚**，衡量股市相对实体经济的体量　·　判读：>100% 为警戒区（股市相对经济过热），<50% 为深度低估区；**慢变量，只用于定位长期位置，不做择时信号**　·　数据：⚠ 受沪市源限制自 2022-02 起（深市单独可到 2010），且**历史段为周频降采样**（两所接口无批量历史、逐日回填易被限流挂起），2026-10 起为日频；仅 CN",
          formula="CN.MKT_CAP_TOTAL / GDP_ttm × 100（GDP_ttm = CN.GDP 差分回单季后滚动 4 季合计，PIT）"),
-    dict(code="VAL.DIV_SPREAD", name="股息利差(中证全指股息率−国债10Y)", scope="ALLOC", dimension="估值",
-         market_scope="CN", unit="pp", direction="high_good", freq="day",
-         remark="定义：中证全指股息率 − 中债 10Y 国债收益率（pp）——**保守型估值锚**，股息是股东**实得现金流**、与债券票息同质，故两者可比　·　判读：利差走高=股票相对债券的现金回报更有吸引力（高股息/红利策略的配置窗口）；利差为负即「买股不如买债」　·　⚠ 与 VAL.ERP 同属股债性价比但口径不同（ERP 用**盈利**收益率、本项用**已实现股息**），二者背离时说明分红率在变　·　数据：⚠ 股息率源只回最近 20 个交易日 → 逐日累积，**早期分位无意义**；仅 CN",
-         formula="CN.IDX_DIV_YIELD − CN.BOND_10Y（源：get_cn_index_dividend + get_macro_daily 派生）"),
+    dict(code="VAL.DIV_SPREAD", name="股息利差(股息率−无风险利率)", scope="ALLOC", dimension="估值",
+         market_scope="CN+HK", unit="pp", direction="high_good", freq="day",
+         remark="定义：股票股息率 − 同市场无风险利率（pp）——**保守型估值锚**，股息是股东**实得现金流**、与债券票息同质，故两者可比　·　判读：利差走高=股票相对债券的现金回报更有吸引力（高股息/红利策略的配置窗口）；利差为负即「买股不如买债」　·　⚠ 与 VAL.ERP 同属股债性价比但口径不同（ERP 用**盈利**收益率、本项用**已实现股息**），二者背离时说明分红率在变　·　两市场口径不同**不可直接比数值**：**CN** = 沪深A股股息率（乐咕沪/深等权，日频）− 中债10Y，自 **2006-03** 起（受中债10Y 起点限制）；**HK** = 恒指股息率（乐咕，**月频**）− 美债10Y，自 2019 起（受 HK 指标索引起点限制，约 85 个月频点）　·　数据：中证全指口径的 `CN.DIV_SPREAD` 仍在采集层留存（仅 20 日窗口累积），与乐咕口径水平差 0.4~0.7pp **不可拼接**",
+         formula="CN：CN.DIV_YIELD_LG − CN.BOND_10Y；HK：HK.DIV_YIELD_HSI − US.DGS10（美债腿 asof；源 get_dividend_yield_lg + get_macro_daily 派生）"),
     dict(code="RISK.CREDIT_SPREAD_AA_MINUS", name="信用利差(中票AA− 5Y−国债5Y)", scope="MACRO", dimension="风险",
          market_scope="CN", unit="pp", direction="high_risk", freq="day",
          remark="定义：AA− 级中短期票据与同期限国债收益率差——**本表可采的最低评级**，最接近「高收益债利差」　·　判读：走阔=违约担忧与流动性收缩（领先股票调整）；比 AA 口径更早反映信用压力，但更嘈杂、样本更短　·　数据：⚠ 源只保留最近 3 个交易日，历史靠逐日累积，**早期分位无意义**；仅 CN",
@@ -183,8 +191,8 @@ INDICATORS: list[dict] = [
          remark="定义：60 日滚动 corr(上证指数日收益, −中债10Y 日变化)；取 −Δyield 是为对齐「债券**价格**」口径（库里存的是收益率，上行=债价跌）　·　判读：**负值=常态**（避险主导，股跌债涨、股债对冲有效）；**转正/持续上行=宏观主导**（股债同跌，增长或流动性冲击 → 对冲失效，应提高现金与防守仓位）　·　数据：受中债10Y 起点限制自 2006 起；窗口 60 交易日，序列前 60 日无值；仅 CN",
          formula="rolling_corr(100·Δln(SH.000001), −Δ(CN.BOND_10Y), 60)"),
     dict(code="RISK.GRADE_SPREAD", name="信用等级利差(AA−AAA 5Y)", scope="MACRO", dimension="风险",
-         market_scope="CN", unit="pp", direction="high_risk", freq="day",
-         remark="定义：同期限 AA 与 AAA 中票收益率差（等级利差）　·　判读：**纯风险偏好读数**——同期限同信用环境仅等级不同，走阔=风险偏好收缩；比绝对信用利差更少受无风险利率干扰　·　数据：源只保留最近 3 个交易日，历史逐日累积；已纳入 FSI；仅 CN",
+         market_scope="CN+HK", unit="pp", direction="high_risk", freq="day",
+         remark="定义：同期限 AA 与 AAA 中票收益率差（等级利差）　·　判读：**纯风险偏好读数**——同期限同信用环境仅等级不同，走阔=风险偏好收缩；比绝对信用利差更少受无风险利率干扰　·　数据：源只保留最近 3 个交易日，历史逐日累积；已纳入 FSI；**CN+HK**（与 RISK.CREDIT_SPREAD 同理，HK 侧也接入以保持 §5.4 风险偏好指数两侧口径一致）",
          formula="CN.MTN_AA_5Y − CN.MTN_AAA_5Y"),
     dict(code="MACRO.VEG_BASKET_YOY", name="菜篮子批发价同比(CPI 高频)", scope="MACRO", dimension="通胀",
          market_scope="CN", unit="pct", direction="high_risk", freq="day",
@@ -465,8 +473,19 @@ INDICATORS: list[dict] = [
          formula="Σ 近5个交易日 SECTOR.FLOW_NET"),
 ]
 
-# 不做历史分位的指标：分类/编码类（分位对类别标签无意义，写入时 percentile 置空）
-NO_PERCENTILE = {"MACRO.CLOCK_QUADRANT"}
+# 不做历史分位的指标：
+#   · 分类/编码类（分位对类别标签无意义）
+#   · VAL.ERP_Z 是 ERP 的**二次标准化**（z-score）→ 再取其分位无信息量
+NO_PERCENTILE = {"MACRO.CLOCK_QUADRANT", "VAL.ERP_Z"}
+
+ERP_Z_MIN_PERIODS = 250
+"""ERP 标准化偏离（VAL.ERP_Z）的扩展窗口最小样本数。
+
+取 250 ≈ 1 年交易日：z-score 的均值/标准差需要足够样本才稳定。VAL.ERP 自 2018-01 起（日频），
+故 ERP_Z 自 ~2019-01 起有值（约 1,880 个交易日样本）。
+（原方案曾取 60 以便让「2018 前的月频段」也出值；改为两口径独立成序列后该动机消失，
+  60 对日频序列的统计意义不足，故提到 250。）
+"""
 
 # 合成指数：成员 = (indicator_code, sign)；sign=+1 高分贡献高，-1 取 100−分位
 COMPOSITES = {
@@ -651,7 +670,10 @@ PIT_MAP_CN = {
     "RISK.GRADE_SPREAD": "CN.GRADE_SPREAD_AA_AAA_5Y",        # 等级利差（风险偏好）
     "RISK.CREDIT_SPREAD_AA_MINUS": "CN.CREDIT_SPREAD_MTN_AA_MINUS_5Y",  # AA− 低评级绝对利差
     "RISK.GRADE_SPREAD_AA_MINUS": "CN.GRADE_SPREAD_AA_MINUS_AA_5Y",     # AA− 低评级等级利差
-    "VAL.DIV_SPREAD": "CN.DIV_SPREAD",                # 股息利差（§4.1 股债性价比）
+    # 股息利差（§4.1 股债性价比）：源为**乐咕口径**（长历史，2006-03 起）—— 原中证全指口径
+    #   仅 20 日窗口、逐日累积，历史太短无法支撑分位；两口径序列都在采集层保留
+    #   （CN.DIV_SPREAD / CN.DIV_SPREAD_LG），指标层只用后者，应用层无需感知。
+    "VAL.DIV_SPREAD": "CN.DIV_SPREAD_LG",
     "MACRO.VEG_BASKET_YOY": "CN.VEG_BASKET_YOY",   # CPI 食品项高频
     "MACRO.PORK_PRICE": "CN.PORK_PRICE",           # 猪价（通胀高频）
     "MACRO.CORE_CPI_YOY": "CN.CORE_CPI_YOY",       # 核心CPI（剔除食品能源；源仅 2021 起）
@@ -690,6 +712,7 @@ PIT_MAP_HK = {
     #   —— 该指数成分以 GLOBAL 为主，若 HK 侧缺信用成分会与 CN 侧口径不一致
     "RISK.CREDIT_SPREAD": "CN.CREDIT_SPREAD_MTN_AAA_10Y",
     "RISK.GRADE_SPREAD": "CN.GRADE_SPREAD_AA_AAA_5Y",
+    "VAL.DIV_SPREAD": "HK.DIV_SPREAD",             # 股息利差（港股：恒指股息率 − 美债10Y，月频）
     "MACRO.TSF_STOCK_YOY": "CN.TSF_STOCK_YOY",     # 社融存量同比（中国信用扩张读数）
     # —— CN 宏观月频补接（market_scope=CN+HK 者；不入合成，作独立读数）——
     "MACRO.M1_YOY": "CN.M1_YOY",                   # 资金活化
@@ -759,6 +782,75 @@ INDICATOR_SOURCES = _build_indicator_sources()
 """代码侧声明的「指标 → 源序列」映射（45 条；其余指标由公式从多源计算，见 formula）。"""
 
 
+# ── 覆盖度门禁（2026-10-14 事故驱动）─────────────────────────────────────────
+# 事故：hk_daily_quote 当日只落了监控池 77 只（全市场采集因单只复牌股量比溢出
+#   整批失败，见 get_hk_market_turnover._save_quotes），calc_hk 不设门禁照算
+#   → 港股 PE 13.6 / PB 2.72 / 破净 14.3% / 涨跌家数 27.3% 等被写进
+#   regime.indicator_value，还进了分位与合成；且 only_if_changed 不会自己覆盖，
+#   要等下一次重算才可能修好 → 静默错一整天。
+# 判据：当日样本数 < 近 _COVERAGE_WINDOW 日中位数 × _COVERAGE_MIN_RATIO。
+# 阈值实测（2025-06 起 337 个交易日，A/HK 双市场）：正常日 p05 = 0.95、最低 0.79
+#   （半日市）；塌陷日为 0.20~0.25（10-02 / 10-06 / 10-07 / 10-14），
+#   隔壁 09-25 = 0.75（轻微缺口）。取 0.6 落在 0.25 与 0.75 的空隙正中：
+#   **只作废灾难日，不误伤半日市与轻微缺口**；后者由 monitor_collector 的
+#   data_coverage 告警提醒人工回补（见该文件 _check_coverage）。
+_COVERAGE_WINDOW = 20            # 中位数窗口（交易日）
+_COVERAGE_MIN_PERIODS = 5        # 窗口最小样本（冷启动/分块首段）
+_COVERAGE_MIN_RATIO = 0.6        # 低于此比值 → 该日横截面整体作废
+_COVERAGE_WARN_RATIO = 0.9       # 低于此比值 → 仅打印告警（不作废）
+
+# 口径依赖「当日全市场横截面」的指标：覆盖度塌陷日必须整体作废（值置 NaN 且清库）。
+# 不在列的指标（基准指数波动/宏观 PIT/资金流外部源等）与当日样本数无关，照常计算。
+_CROSS_SECTIONAL_CODES = (
+    "BREADTH.ADV_RATIO", "BREADTH.MCCLELLAN", "BREADTH.ADV_MINUS_DEC", "BREADTH.LIMIT_NET",
+    "BREADTH.NEW_HIGH_LOW_60", "BREADTH.PCT_ABOVE_MA60", "BREADTH.PCT_ABOVE_MA200",
+    "BREADTH.EQ_VS_CAP_20D",
+    "VAL.PE_TTM_MEDIAN", "VAL.PB_MEDIAN", "VAL.PCT_BELOW_PB_1", "VAL.ERP",
+    "RISK.EXTREME_DOWN_PCT", "RISK.SYNC_DOWN_20D",
+    "FLOW.TURNOVER_RATIO", "FLOW.MARGIN_RATIO",
+)
+
+_INVALID_DATES_KEY = "__invalid_dates__"
+"""calc_cn / calc_hk → _write_market 的**带外通道**：覆盖度塌陷的交易日集合。
+
+放在返回 dict 里（而不是改函数签名/新增返回值）以保持既有调用与测试接口不变；
+_write_market 会先 pop 掉这个键，它不会进入指标 DataFrame。
+"""
+
+
+def _coverage_gate(df: pd.DataFrame, label: str, count_col: str = "n") -> set:
+    """把「横截面样本塌陷」的交易日在 df 上整行置 NaN，返回这些日期。
+
+    置 NaN 而不是只把输出序列改掉：滚动/EMA 派生序列（RISK.SYNC_DOWN_20D、
+    BREADTH.MCCLELLAN）必须在**输入层**就看不到脏日，否则污染会顺延 ~20 个交易日。
+    """
+    if df is None or df.empty or count_col not in df.columns:
+        return set()
+    n = pd.to_numeric(df[count_col], errors="coerce")
+    med = n.rolling(_COVERAGE_WINDOW, min_periods=_COVERAGE_MIN_PERIODS).median()
+    ratio = n / med.replace(0, np.nan)
+    bad = (ratio.notna() & (ratio < _COVERAGE_MIN_RATIO))
+    warn = (ratio.notna() & (ratio < _COVERAGE_WARN_RATIO) & ~bad)
+    for d in df.index[warn]:
+        print(f"    ⚠ {label} {d} 横截面样本偏低：{int(n[d])} 只"
+              f"（近{_COVERAGE_WINDOW}日中位 {med[d]:.0f}，比 {ratio[d]:.2f}）→ 不作废，但建议回补")
+    if not bad.any():
+        return set()
+    for d in df.index[bad]:
+        print(f"    ❌ {label} {d} 横截面样本塌陷：{int(n[d])} 只"
+              f"（近{_COVERAGE_WINDOW}日中位 {med[d]:.0f}，比 {ratio[d]:.2f}）"
+              f"→ 该日横截面指标与合成整体作废，并清除库内旧值")
+    df.loc[bad, :] = np.nan
+    return set(df.index[bad])
+
+
+def _mask_days(s, days: set):
+    """把 days（date 集合）对应的点置 NaN（供 wdf 派生、无滚动传播的序列用）。"""
+    if not days or s is None or len(s) == 0:
+        return s
+    return s.mask(s.index.isin(days))
+
+
 # ── 计算：CN ────────────────────────────────────────────────────────────────
 def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 400) -> dict:
     """A 股指标计算（宽度/估值/资金/风险），返回 {code: Series}。"""
@@ -810,6 +902,9 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     idx = pd.to_datetime(df["trade_date"]).dt.date
     df = df.set_index(idx)
 
+    # 覆盖度门禁：样本塌陷日整行置 NaN（在建序列之前 → 滚动/EMA 派生也看不到脏日）
+    bad_days = _coverage_gate(df, "CN")
+
     out["BREADTH.ADV_RATIO"] = df["adv"] / df["n"] * 100
     adv_minus_dec = df["adv"] - df["dec"]
     out["BREADTH.MCCLELLAN"] = (adv_minus_dec.ewm(span=19, adjust=False).mean()
@@ -827,9 +922,12 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     # ② 逐股窗口（60/200 日新高新低、MA 上下占比）—— 见 _per_stock_windows 的性能说明
     wdf = _per_stock_windows(conn, "CN", w_start, end)
     if not wdf.empty:
-        out["BREADTH.NEW_HIGH_LOW_60"] = (wdf["nh60"] - wdf["nl60"]) / wdf["ok60"].replace(0, np.nan) * 100
-        out["BREADTH.PCT_ABOVE_MA60"] = wdf["ab60"] / wdf["ok60"].replace(0, np.nan) * 100
-        out["BREADTH.PCT_ABOVE_MA200"] = wdf["ab200"] / wdf["ok200"].replace(0, np.nan) * 100
+        out["BREADTH.NEW_HIGH_LOW_60"] = _mask_days(
+            (wdf["nh60"] - wdf["nl60"]) / wdf["ok60"].replace(0, np.nan) * 100, bad_days)
+        out["BREADTH.PCT_ABOVE_MA60"] = _mask_days(
+            wdf["ab60"] / wdf["ok60"].replace(0, np.nan) * 100, bad_days)
+        out["BREADTH.PCT_ABOVE_MA200"] = _mask_days(
+            wdf["ab200"] / wdf["ok200"].replace(0, np.nan) * 100, bad_days)
 
     # ③ 两融占比（余额 / 流通市值）
     mdf = _q(conn, """
@@ -852,12 +950,26 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
              [w_start, end])
     out.update(_risk_from_index(bdf, "trade_date", "last_price", "CN"))
 
-    # ⑥ ERP = 1/PE − 中国10Y国债（国债收益率日频，取同日/最近前值）
+    # ⑥ ERP = 1/PE − 中国10Y国债（日频口径：个股聚合 PE 中位数，自 2018）
+    #    债券腿取全历史（~5000 行，开销可忽略），以便同时服务 VAL.ERP 与 VAL.ERP_LG。
     b10 = _q(conn, """SELECT period_date, value FROM regime.macro_series
-                      WHERE series_code='CN.BOND_10Y' AND period_date BETWEEN %s AND %s
-                      ORDER BY period_date""", [w_start, end])
-    b10s = _series_from_df(b10, "period_date", "value").reindex(out["VAL.PE_TTM_MEDIAN"].index).ffill()
+                      WHERE series_code='CN.BOND_10Y' ORDER BY period_date""")
+    b10_all = _series_from_df(b10, "period_date", "value")
+    b10s = b10_all.reindex(out["VAL.PE_TTM_MEDIAN"].index).ffill()
     out["VAL.ERP"] = 1.0 / out["VAL.PE_TTM_MEDIAN"].replace(0, np.nan) * 100 - b10s
+
+    # ⑥b ERP_LG（乐咕乐股口径，月频，2006-03 起）：提供**口径一致的长历史**。
+    #    ⚠ **刻意不与 VAL.ERP 拼接** —— 实测（2026-10-16）两口径 PE 的比值并不稳定：
+    #      2018→2026 从 0.73 单调漂移到 1.08（8 年漂移 48%），ERP 之差 = 均值 0.44pp /
+    #      标准差 0.40pp，已接近 VAL.ERP 自身波动（σ=0.50pp）。拼接会同时引入**水平跳变**
+    #      与**伪趋势**（单一校准常数无法吸收单调漂移）；而用重叠段定校准系数又会前视。
+    #      → 两口径各自独立成序列，跨口径比较由使用方自行判断。
+    pe_lg = _q(conn, """SELECT period_date, value FROM regime.macro_series
+                        WHERE series_code='CN.VAL_PE_MEDIAN' ORDER BY period_date""")
+    if not pe_lg.empty:
+        lg = _series_from_df(pe_lg, "period_date", "value")
+        # 月频观测日常落在非交易日 → reindex 后 ffill 取「当日或之前最近」的收益率
+        out["VAL.ERP_LG"] = 1.0 / lg.replace(0, np.nan) * 100 - b10_all.reindex(lg.index).ffill()
 
     # ⑦ 宏观接入（PIT 填充到交易日）：信用利差 / 期限利差 / 信贷脉冲代理（映射见 PIT_MAP_CN）
     out.update(_macro_pit_map(conn, out["BREADTH.ADV_RATIO"].index, PIT_MAP_CN))
@@ -888,7 +1000,10 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     # ⑭ 巴菲特指标（§4.1 极长期估值锚）：沪深总市值 / GDP_ttm
     out["VAL.BUFFETT"] = _buffett_ratio(conn, out["BREADTH.ADV_RATIO"].index)
 
-    return {k: _clip(v, start, end) for k, v in out.items()}
+    clipped = {k: _clip(v, start, end) for k, v in out.items()}
+    if bad_days:
+        clipped[_INVALID_DATES_KEY] = bad_days
+    return clipped
 
 
 # ── 计算：HK ────────────────────────────────────────────────────────────────
@@ -928,6 +1043,9 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
         return {}
     df = df.set_index(pd.to_datetime(df["trade_date"]).dt.date)
 
+    # 覆盖度门禁：样本塌陷日整行置 NaN（2026-10-14：全市场落库失败，只剩监控池 77 只）
+    bad_days = _coverage_gate(df, "HK")
+
     out["BREADTH.ADV_RATIO"] = df["adv"] / df["n"] * 100
     adv_minus_dec = df["adv"] - df["dec"]
     out["BREADTH.MCCLELLAN"] = (adv_minus_dec.ewm(span=19, adjust=False).mean()
@@ -943,9 +1061,12 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     # 逐股窗口（60/200 日）
     wdf = _per_stock_windows(conn, "HK", w_start, end)
     if not wdf.empty:
-        out["BREADTH.NEW_HIGH_LOW_60"] = (wdf["nh60"] - wdf["nl60"]) / wdf["ok60"].replace(0, np.nan) * 100
-        out["BREADTH.PCT_ABOVE_MA60"] = wdf["ab60"] / wdf["ok60"].replace(0, np.nan) * 100
-        out["BREADTH.PCT_ABOVE_MA200"] = wdf["ab200"] / wdf["ok200"].replace(0, np.nan) * 100
+        out["BREADTH.NEW_HIGH_LOW_60"] = _mask_days(
+            (wdf["nh60"] - wdf["nl60"]) / wdf["ok60"].replace(0, np.nan) * 100, bad_days)
+        out["BREADTH.PCT_ABOVE_MA60"] = _mask_days(
+            wdf["ab60"] / wdf["ok60"].replace(0, np.nan) * 100, bad_days)
+        out["BREADTH.PCT_ABOVE_MA200"] = _mask_days(
+            wdf["ab200"] / wdf["ok200"].replace(0, np.nan) * 100, bad_days)
 
     # 南向净流入（亿港元）
     sdf = _q(conn, """SELECT trade_date, sum(est_net_inflow) AS net FROM daily_ggt_hold
@@ -984,7 +1105,10 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     # §3.4 外部环境 + §5.4 跨资产成分（GLOBAL 口径 → 双市场同算，风险偏好指数才能各自落地）
     out.update(_global_block(conn, out["VAL.PE_TTM_MEDIAN"].index))
 
-    return {k: _clip(v, start, end) for k, v in out.items()}
+    clipped = {k: _clip(v, start, end) for k, v in out.items()}
+    if bad_days:
+        clipped[_INVALID_DATES_KEY] = bad_days
+    return clipped
 
 
 def _naive_local(series) -> pd.Series:
@@ -1137,6 +1261,18 @@ def _align_close(src: pd.Series, idx) -> pd.Series:
     right = right.dropna(subset=["rel"]).sort_values("rel")
     merged = pd.merge_asof(left, right, left_on="t", right_on="rel", direction="backward")
     return pd.Series(merged["v"].to_numpy(), index=idx)
+
+
+def _expanding_zscore(s: pd.Series, min_periods: int) -> pd.Series:
+    """扩展窗口 z-score = (x − 累计均值) / 累计标准差（只用 t 及之前，无前视）。
+
+    与 `_expanding_percentile` 对称：都必须在**全历史**上算（增量运行时只看窗口会算错
+    均值/标准差），故调用点在 `_write_market` 的 combined 上，而非 calc_* 内部。
+    样本不足 min_periods 个有效观测时为 NaN；标准差为 0 时也返回 NaN（避免除零爆值）。
+    """
+    m = s.expanding(min_periods=min_periods).mean()
+    sd = s.expanding(min_periods=min_periods).std()
+    return (s - m) / sd.replace(0, np.nan)
 
 
 _CORR_WINDOW = 60          # 股债相关性的滚动窗口（交易日）
@@ -1802,7 +1938,12 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
 
     增量正确性：分位与需要前 20/250 日窗口的合成（季节趋势、顶底信号）都必须建立在
     **全历史**上，因此把已入库 raw_value 与本次新算值拼接后再算，只写 [start, end] 段。
+
+    覆盖度塌陷日（_INVALID_DATES_KEY）：横截面指标值已是 NaN → 不会写；但库内**旧值
+    必须显式删**（bulk_upsert 是 skip_null_updates，NULL 不覆盖旧值），合成行整行作废
+    （成分置 NaN 后 build_composites 会退化成「剩余成分平均」，仍是错的）。
     """
+    invalid = series_map.pop(_INVALID_DATES_KEY, None) or set()
     new_raw = pd.DataFrame({c: s for c, s in series_map.items() if s is not None and len(s)})
     if new_raw.empty:
         return {"rows": 0, "dates": 0}
@@ -1821,6 +1962,13 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
             combined[c] = np.nan
     combined = combined.sort_index()
 
+    # VAL.ERP_Z（Fed Model 的「与历史均值比较」口径）：**必须建立在全历史上** ——
+    #   与分位同理，增量运行时只看窗口会算错均值/标准差，故与分位同处计算。放在 pct 构造
+    #   **之前**，使其进入 pct 的列集合（并在 NO_PERCENTILE 里置空分位）。
+    if "VAL.ERP" in combined.columns:
+        combined["VAL.ERP_Z"] = _expanding_zscore(
+            combined["VAL.ERP"].astype(float), ERP_Z_MIN_PERIODS)
+
     # 分类/编码类指标不做分位（如美林象限 1-4 是**类别标签**，分位没有意义）
     pct = pd.DataFrame({c: (_expanding_percentile(combined[c]) if c not in NO_PERCENTILE
                             else pd.Series(np.nan, index=combined.index))
@@ -1832,6 +1980,22 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
         last = write_idx[-1] if write_idx else None
         return {"rows": 0, "dates": len(write_idx),
                 "preview": (last, comp.loc[last].to_dict() if last else None)}
+
+    # 覆盖度塌陷日清库：bulk_upsert(skip_null_updates=True) 不会用 NULL 覆盖旧值，
+    # 不显式删就会把上一轮算错的垃圾永久留下（2026-10-14 的事故值即此机制留下）。
+    bad_dates = sorted(d for d in invalid
+                       if isinstance(d, datetime.date) and d >= start)
+    if bad_dates:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM regime.indicator_value "
+                        "WHERE market=%s AND trade_date = ANY(%s) AND indicator_code = ANY(%s)",
+                        (market, bad_dates, list(_CROSS_SECTIONAL_CODES)))
+            n_iv = cur.rowcount
+            cur.execute("DELETE FROM regime.market_regime_daily "
+                        "WHERE market=%s AND trade_date = ANY(%s)", (market, bad_dates))
+            n_mr = cur.rowcount
+        print(f"    ⚠ {market} 覆盖度塌陷日 {[str(d) for d in bad_dates]}："
+              f"作废横截面指标 {n_iv} 行 + 合成 {n_mr} 行（数据补齐后重跑即恢复）")
 
     now = datetime.datetime.now(TZ_CN)
     iv_rows = []
@@ -1858,6 +2022,8 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
 
     mr_rows = []
     for d in write_idx:
+        if d in invalid:
+            continue        # 覆盖度塌陷日：合成整体作废（见函数头说明）
         r = comp.loc[d]
         detail = {
             "top": r["_top_hits"], "bottom": r["_bottom_hits"],

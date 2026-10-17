@@ -211,8 +211,8 @@ _DDL = {
             change_pct NUMERIC(12,4),
             volume BIGINT,
             amount NUMERIC(22,2),
-            turnover_rate NUMERIC(8,4),
-            volume_ratio NUMERIC(8,4),
+            turnover_rate NUMERIC(12,4),
+            volume_ratio NUMERIC(12,4),
             high_52w NUMERIC(12,4),
             low_52w NUMERIC(12,4),
             total_market_val NUMERIC(22,2),
@@ -220,7 +220,7 @@ _DDL = {
             pe_ratio NUMERIC(12,4),
             pe_ttm_ratio NUMERIC(12,4),
             pb_ratio NUMERIC(12,4),
-            dividend_ratio_ttm NUMERIC(8,4),
+            dividend_ratio_ttm NUMERIC(12,4),
             update_time TIMESTAMPTZ,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE (stock_code, trade_date)
@@ -233,6 +233,7 @@ def _ensure_table(table):
     ddl = _DDL.get(table)
     if not ddl:
         return
+    from db import widen_numeric_columns, _PERCENT_COLS_12_4
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(ddl)
@@ -240,6 +241,9 @@ def _ensure_table(table):
             if table in ("a_daily_quote",):
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS prev_close NUMERIC(12,4);")
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS change_pct NUMERIC(12,4);")
+        # 列宽自愈：老库的百分比列仍可能是 NUMERIC(8,4)（上限 < 10^4），
+        # 复牌/无量股的量比可上万 → 整批 INSERT 溢出（2026-10-14 港股同款事故）。
+        widen_numeric_columns(conn, table, {c: (12, 4) for c in _PERCENT_COLS_12_4})
         conn.commit()
 
 
@@ -260,15 +264,46 @@ def save_to_db(rec):
 
 
 def _save_quotes(quote_rows):
+    """个股日线落库：越界净化 → 分块事务 → 逐块失败转逐行 → 汇总日志。
+
+    与 get_hk_market_turnover._save_quotes 同款护栏（2026-10-14 港股全市场日线
+    被单只复牌股量比溢出打掉，A 股池表同结构同风险，故一并加固）。
+    """
     if not quote_rows:
         return
-    _ensure_table("a_daily_quote")
+    from db import sanitize_numeric_rows
+    table = "a_daily_quote"
+    _ensure_table(table)
     batch = 2000
+    saved, failed = 0, []
+    total = len(quote_rows)
     with get_conn() as conn:
+        quote_rows, dropped = sanitize_numeric_rows(conn, table, quote_rows)
+        if dropped:
+            log.warning(f"越界值已置空 {len(dropped)} 处（列宽护栏）：{dropped[:5]}"
+                        + ("…" if len(dropped) > 5 else ""))
         for i in range(0, len(quote_rows), batch):
-            bulk_upsert(conn, "a_daily_quote", quote_rows[i:i + batch],
-                        conflict_cols=["stock_code", "trade_date"])
-    log.info(f"个股日线落库 {len(quote_rows)} 条（a_daily_quote）")
+            chunk = quote_rows[i:i + batch]
+            try:
+                with conn:  # 每块一个事务：一块失败不牵连已落库的其它块
+                    bulk_upsert(conn, table, chunk,
+                                conflict_cols=["stock_code", "trade_date"])
+                saved += len(chunk)
+            except Exception as e:
+                log.error(f"批次 {i // batch + 1}（{len(chunk)} 行）落库失败：{e}；转逐行重试")
+                for r in chunk:
+                    try:
+                        with conn:
+                            bulk_upsert(conn, table, [r],
+                                        conflict_cols=["stock_code", "trade_date"])
+                        saved += 1
+                    except Exception as e2:
+                        failed.append(r.get("stock_code"))
+                        log.error(f"  丢弃单行 {r.get('stock_code')}: {e2}")
+    log.info(f"个股日线落库 {saved}/{total} 条（{table}）"
+             + (f"，仍失败 {len(failed)} 只：{failed[:10]}" if failed else ""))
+    if saved == 0:
+        raise RuntimeError(f"{table} 当日 {total} 行全部落库失败（全市场日线断供）")
 
 
 def _print(rec):

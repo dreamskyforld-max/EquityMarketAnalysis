@@ -258,6 +258,10 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     # ⚠ 发布时点无法确证是 T 日盘后还是 T+1 日 → 采集器按「T+1」记 release_time（宁晚勿早）。
     ("中证指数股息率", "get_cn_index_dividend.py",
      {"hour": 19, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 乐咕乐股股息率（长历史口径，§4.1 股息利差的**指标层来源**）：19:20。
+    # 一次取全历史 → 全量刷新、漏跑一天不丢数据（区别于上面那条的 20 日窗口）。
+    ("乐咕股息率", "get_dividend_yield_lg.py",
+     {"hour": 19, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
     # 沪深股票总市值（§4.1 巴菲特指标的分子）：19:20。两所统计盘后发布。
     ("沪深总市值", "get_market_cap.py",
      {"hour": 19, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),

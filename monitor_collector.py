@@ -25,6 +25,7 @@
 """
 import logging
 import os
+import statistics
 import sys
 import time
 import threading
@@ -121,6 +122,9 @@ _DDL = {
             active       BOOLEAN     NOT NULL DEFAULT TRUE,
             market       VARCHAR(8)  NOT NULL DEFAULT 'HK', -- 判停滞用的日历市场：CN=只看 A 股交易日 / HK=港股（默认）
             remark       VARCHAR(120),
+            coverage_ratio   NUMERIC(4,3),                -- 行数覆盖度告警阈值（NULL=不检查）：当日行数 < 近 N 日中位数×该值即告警
+            coverage_date_col VARCHAR(32),                -- 覆盖度按哪个日期列分组计数（如 trade_date）
+            coverage_lookback INT NOT NULL DEFAULT 20,    -- 覆盖度基线：最近 N 个交易日的行数中位数
             UNIQUE (db_name, table_name)
         );
     """,
@@ -154,6 +158,19 @@ def ensure_tables():
                 "ALTER TABLE monitor_table_config "
                 "ADD COLUMN IF NOT EXISTS market VARCHAR(8) NOT NULL DEFAULT 'HK'"
             )
+            # 兼容存量库：行数覆盖度检查（2026-10-16 加，见 _check_coverage）
+            cur.execute(
+                "ALTER TABLE monitor_table_config "
+                "ADD COLUMN IF NOT EXISTS coverage_ratio NUMERIC(4,3)"
+            )
+            cur.execute(
+                "ALTER TABLE monitor_table_config "
+                "ADD COLUMN IF NOT EXISTS coverage_date_col VARCHAR(32)"
+            )
+            cur.execute(
+                "ALTER TABLE monitor_table_config "
+                "ADD COLUMN IF NOT EXISTS coverage_lookback INT NOT NULL DEFAULT 20"
+            )
         conn.commit()
     _seed_table_config()
     _seed_task_config()
@@ -161,6 +178,24 @@ def ensure_tables():
     _migrate_regime_monitor_config()
     _migrate_market_config()
     _migrate_profile_task_config()
+    _migrate_coverage_config()
+
+
+# 行数覆盖度监控配置（2026-10-16，事故驱动）：
+#   (table_name, date_col, ratio, lookback, market, remark)
+# 阈值标定（本地库 2025-06 起实测，A/HK 双市场）：
+#   · 池表正常日「当日行数 / 近 20 日中位数」p05 = 0.95，最低 0.79（半日市）；
+#   · 塌陷日 0.20~0.25（10-02 / 10-06 / 10-07 / 10-14），轻微缺口 0.75（09-25）。
+#   → warn 取 0.75（只放过半日市）、crit 取 0.5（落在 0.25 与 0.75 的空隙）。
+# 为什么 data_stale 兜不住：它看 MAX(update_time) 新鲜度 —— 当天只落监控池 77 只
+# （正常 2200+）也算「新鲜」，识别不出部分覆盖（2026-10-14 正是如此）。
+_COVERAGE_TABLE_CONFIG = [
+    ("hk_daily_quote", "trade_date", 0.75, 20, "HK",
+     "get_hk_market_turnover 全市场快照（只落当日有成交行）"),
+    ("a_daily_quote",  "trade_date", 0.75, 20, "CN",
+     "get_a_market_turnover 全市场快照（只落当日有成交行）"),
+]
+_COVERAGE_CRIT_RATIO = 0.5   # 低于此直接 crit（塌陷），warn~crit 之间是「部分缺口」
 
 
 # 当前真正在采集的表的种子配置（仅在配置表为空时写入）。
@@ -260,8 +295,8 @@ def _migrate_monitor_config():
 _REGIME_TABLE_CONFIG = [
     # (db_name, table_name, time_column, period, expect_lag, refresh_weekday, remark, active)
     ("regime", "macro_series", "updated_at", "lowfreq", 3, 0,
-     "get_cn_bond(日) + get_macro_valuation(月) + get_cn_index_dividend(日) + get_market_cap(日) "
-     "+ 各宏观采集", True),
+     # ⚠ remark 列宽 VARCHAR(120) —— 超长会直接抛错中断配置同步
+     "cn_bond/指数股息率/乐咕股息率/总市值/宏观月频(日)　⚠ 表级：单采集器停跑不告警", True),
     ("regime", "indicator_dict", "updated_at", "lowfreq", 30, 0,
      "指标字典（market_state_daily 每次运行同步）", True),
     ("regime", "indicator_value", "updated_at", "day", 1, 0,
@@ -298,12 +333,18 @@ def _migrate_regime_monitor_config():
     with get_conn() as conn:
         with conn.cursor() as cur:
             for db, tbl, col, period, lag, wd, remark, active in _REGIME_TABLE_CONFIG:
+                # ⚠ 冲突时**同步除 active 外的全部字段**：原为 DO NOTHING，导致代码里改了
+                #   remark / expect_lag 后**永远进不了库**（已存在的配置行不被更新），
+                #   运维看到的是过期文案。active 是人工开关（见下方兜底），故意不覆盖。
                 cur.execute(
                     "INSERT INTO monitor_table_config "
                     "(db_name, table_name, time_column, period, expect_lag, "
                     " refresh_weekday, remark, active) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-                    "ON CONFLICT (db_name, table_name) DO NOTHING",
+                    "ON CONFLICT (db_name, table_name) DO UPDATE SET "
+                    " time_column = EXCLUDED.time_column, period = EXCLUDED.period, "
+                    " expect_lag = EXCLUDED.expect_lag, refresh_weekday = EXCLUDED.refresh_weekday, "
+                    " remark = EXCLUDED.remark",
                     (db, tbl, col, period, lag, wd, remark, active),
                 )
             # 配置修正兜底（幂等）：计算层已上线（2026-09-30 P1），三张表转 active；
@@ -399,6 +440,26 @@ def _migrate_profile_task_config():
                     "INSERT INTO monitor_task_config (task_name, max_interval_min, remark) "
                     "VALUES (%s, %s, %s) ON CONFLICT (task_name) DO NOTHING",
                     (name, max_min, remark),
+                )
+        conn.commit()
+
+
+def _migrate_coverage_config():
+    """行数覆盖度监控登记（幂等）：把 _COVERAGE_TABLE_CONFIG 写进 monitor_table_config。
+
+    与 _migrate_profile_task_config 同模式：ON CONFLICT DO NOTHING —— 人工在库里调过的
+    阈值（coverage_ratio 等）不被代码回写覆盖，只补缺失行。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for tbl, col, ratio, lookback, market, remark in _COVERAGE_TABLE_CONFIG:
+                cur.execute(
+                    "INSERT INTO monitor_table_config "
+                    "(db_name, table_name, coverage_ratio, coverage_date_col, "
+                    " coverage_lookback, market, remark) "
+                    "VALUES ('public', %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (db_name, table_name) DO NOTHING",
+                    (tbl, ratio, col, lookback, market, remark),
                 )
         conn.commit()
 
@@ -1068,6 +1129,83 @@ def _check_grouped_stale(table, col, group_col, period, lag, wd, now, today, act
             _resolve_alert("data_stale", source)
 
 
+def _coverage_verdict(counts: dict, warn_ratio: float, crit_ratio: float,
+                      lookback: int):
+    """覆盖度判定（纯函数，不连库，供单测）：返回 (worst_date, worst_ratio, level)。
+
+    counts: {date: 当日行数}（来自 GROUP BY 日期列的 COUNT(*)）。
+    基线：每个日期取「它之前最近 lookback 个有数据日」的中位数（不含自己）；
+    当日行数 / 基线 < crit_ratio → crit；< warn_ratio → warn；否则 ok。
+    取全窗口最低比值报一次（一条告警覆盖全部缺口日，不刷屏）。
+    """
+    if not counts or len(counts) < 2:
+        return None, None, "ok"
+    dates = sorted(counts)
+    worst_d, worst_r = None, None
+    min_base = max(3, lookback // 4)
+    for i, d in enumerate(dates):
+        base = [counts[x] for x in dates[max(0, i - lookback):i]]
+        if len(base) < min_base:
+            continue
+        med = float(statistics.median(base))
+        if med <= 0:
+            continue
+        r = counts[d] / med
+        if worst_r is None or r < worst_r:
+            worst_d, worst_r = d, r
+    if worst_r is None:
+        return None, None, "ok"
+    level = "crit" if worst_r < crit_ratio else ("warn" if worst_r < warn_ratio else "ok")
+    return worst_d, worst_r, level
+
+
+def _check_coverage():
+    """行数覆盖度监控（2026-10-16 加，见 _COVERAGE_TABLE_CONFIG 的事故背景）。
+
+    与 data_stale 的分工：data_stale 看 MAX(时间列) 新鲜度，当天只落一部分行也算
+    「新鲜」（2026-10-14 港股只剩监控池 77 只，data_stale 全程无感）；本检查看
+    **行数量级**：当日行数相对近 N 日基线塌陷即告警。
+    只对「已有数据的日期」判（今天还没采/盘中半截数据天然不在 counts 里）→ 不会误报。
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT db_name, table_name, coverage_date_col, coverage_ratio, "
+                    "       coverage_lookback, market "
+                    "FROM monitor_table_config "
+                    "WHERE active=true AND coverage_ratio IS NOT NULL "
+                    "  AND coverage_date_col IS NOT NULL "
+                    "ORDER BY db_name, table_name"
+                )
+                cfg = cur.fetchall()
+                counts: dict = {}
+                for db, tbl, col, ratio, lookback, market in cfg:
+                    name = tbl if (db or "public") == "public" else f"{db}.{tbl}"
+                    # 带日期下界（lookback×2 天，覆盖节假日间隔），避免对大表全表扫描
+                    cur.execute(
+                        f"SELECT {col}, count(*) FROM {name} "
+                        f"WHERE {col} >= CURRENT_DATE - %s GROUP BY 1 ORDER BY 1",
+                        (timedelta(days=int(lookback) * 2),),
+                    )
+                    counts[name] = {d: n for d, n in cur.fetchall() if d is not None}
+    except Exception as e:
+        _raise_alert("data_coverage", "warn", "all", f"读取覆盖度配置/行数失败: {e}")
+        return
+
+    for db, tbl, col, ratio, lookback, market in cfg:
+        name = tbl if (db or "public") == "public" else f"{db}.{tbl}"
+        d, r, level = _coverage_verdict(counts.get(name, {}), float(ratio),
+                                        _COVERAGE_CRIT_RATIO, int(lookback))
+        if level == "ok" or d is None:
+            _resolve_alert("data_coverage", name)
+            continue
+        _raise_alert("data_coverage", "crit" if level == "crit" else "warn", name,
+                     f"{name} 行数覆盖度不足：{d} 仅 {counts[name][d]} 行，"
+                     f"为近 {lookback} 个交易日基线的 {r:.0%}（阈值 {float(ratio):.0%}）"
+                     f"→ 全市场采集可能部分失败，横截面指标会被算错，需回补后重算")
+
+
 def run(codes=None, ctx=None):
     """单次巡检（供循环调用 / scheduler 调用 / 手动触发）。
 
@@ -1086,6 +1224,9 @@ def run(codes=None, ctx=None):
         # data_stale 始终检查：日更/低频表是否停采不受盘中活跃期限制，
         # 仅 intraday 表在 _check_data_stale 内部自行跳过非活跃期
         _check_data_stale()
+        # 覆盖度始终检查：与 data_stale 互补（见 _check_coverage），
+        # 盘中/当天未采的日期不在统计里，天然不会误报
+        _check_coverage()
     except Exception as e:
         log.exception(f"巡检异常: {e}")
     log.info("采集层健康巡检完成")

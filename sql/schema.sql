@@ -835,8 +835,8 @@ CREATE TABLE IF NOT EXISTS hk_daily_quote (
     change_pct  NUMERIC(12,4),                      -- 涨跌幅(%) = (close-prev_close)/prev_close*100（基于 QFQ 口径，已消除除权跳空；仙股 合股/拆股 异常日可达上万%，实测 max|chg|≈4738，故用 12,4 留 8 位整数余量）
     volume      BIGINT,                             -- 成交量（股）
     amount      NUMERIC(20,2),                      -- 成交额（港元）
-    turnover_rate       NUMERIC(8,4),               -- 换手率(%)
-    volume_ratio        NUMERIC(8,4),               -- 量比
+    turnover_rate       NUMERIC(12,4),               -- 换手率(%)（无上界百分比：仙股换手率实测 max≈85，复牌/无量股可更高，统一 12,4 留 8 位整数余量，见 db._PERCENT_COLS_12_4）
+    volume_ratio        NUMERIC(12,4),               -- 量比（当日成交量/5日均量；长期无量股复牌可上万，实测 max≈49054，故用 12,4）
     high_52w            NUMERIC(12,4),              -- 52周最高价
     low_52w             NUMERIC(12,4),              -- 52周最低价
     total_market_val    NUMERIC(20,2),              -- 总市值（港元）
@@ -846,7 +846,7 @@ CREATE TABLE IF NOT EXISTS hk_daily_quote (
     pb_ratio            NUMERIC(12,4),              -- 市净率
     -- PS/PCF 两列已于 2026-09 下线：派生值不落事实表，改由画像层
     -- profiling.quantile.load_revenue_ttm(滚动12个月营收/经营现金流) + total_market_val 现算
-    dividend_ratio_ttm  NUMERIC(8,4),               -- 股息率(TTM, %)
+    dividend_ratio_ttm  NUMERIC(12,4),               -- 股息率(TTM, %)（仙股特别股息可上千，实测 max≈543，故用 12,4）
     update_time         TIMESTAMPTZ,                -- 数据更新时间（富途快照的 update_time）
     created_at  TIMESTAMPTZ     DEFAULT NOW(),
 
@@ -1031,8 +1031,8 @@ CREATE TABLE IF NOT EXISTS a_daily_quote (
     change_pct          NUMERIC(12,4),              -- 涨跌幅(%) = (close-prev_close)/prev_close*100（历史借壳/重组跳变可达上千%，用 12,4 留 8 位整数余量）
     volume              BIGINT,
     amount              NUMERIC(22,2),
-    turnover_rate       NUMERIC(8,4),
-    volume_ratio        NUMERIC(8,4),
+    turnover_rate       NUMERIC(12,4),               -- 换手率(%)（无上界百分比，口径同 hk_daily_quote.turnover_rate）
+    volume_ratio        NUMERIC(12,4),               -- 量比（复牌/无量股可上万，口径同 hk_daily_quote.volume_ratio）
     high_52w            NUMERIC(12,4),
     low_52w             NUMERIC(12,4),
     total_market_val    NUMERIC(22,2),
@@ -1041,7 +1041,7 @@ CREATE TABLE IF NOT EXISTS a_daily_quote (
     pe_ttm_ratio        NUMERIC(12,4),
     pb_ratio            NUMERIC(12,4),
     -- PS/PCF 两列已于 2026-09 下线（派生值不落事实表），见 hk_daily_quote 同名注释
-    dividend_ratio_ttm  NUMERIC(8,4),
+    dividend_ratio_ttm  NUMERIC(12,4),               -- 股息率(TTM, %)（口径同 hk_daily_quote.dividend_ratio_ttm）
     update_time         TIMESTAMPTZ,
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
     UNIQUE (stock_code, trade_date)
@@ -1670,7 +1670,8 @@ CREATE TABLE IF NOT EXISTS regime.indicator_value (
 );
 
 COMMENT ON TABLE  regime.indicator_value               IS '指标时序长表：口径见 indicator_dict；raw_value=原始值，percentile=历史分位(0-100)';
-COMMENT ON COLUMN regime.indicator_value.percentile    IS '原始值的历史分位（0-100，expanding 只用当日及之前，无前视；未做方向调整——方向见 indicator_dict.direction，合成/展示由消费方取反）';
+COMMENT ON COLUMN regime.indicator_value.market        IS '**市场键**（主键三列之一）：''CN''=A 股 / ''HK''=港股，语义是「该行由哪个市场的计算产出」（calc_cn / calc_hk），不是标的所在地。同指标可两侧各有一条时序（如 VAL.ERP）；该指标在**哪些市场有数据**由 indicator_dict.market_scope 声明，两者一致性由 tests/test_indicator_dict_consistency.py 校验（声明 CN 却出现 HK 行会被判失败）';
+COMMENT ON COLUMN regime.indicator_value.percentile    IS '原始值的历史分位（0-100，expanding 只用当日及之前，无前视；未做方向调整——方向见 indicator_dict.direction，合成/展示由消费方取反）。⚠ **低频源（月/季）的分位有已知漂移**：这类序列在指标层被 PIT 前向填充成日频行 → 同一取值被**重复计入**扩展样本（实测每个取值占的行数：LPR_1Y 137.7 / PMI_MFG 70.9 / CPI_YOY 43.2，而日频源 ≈1.0），故分位在两次数据更新之间会**缓慢上爬**（约 1~2 分位点/月，样本越大越轻）→ **月内分位斜率不含信息**，不要据此判趋势、也不要算「分位 N 日变化」；跨月/跨期的跳变才是真更新。即本分位实为**按交易日行数加权**的历史排位，非按观测次数';
 
 CREATE INDEX IF NOT EXISTS idx_indicator_value_date
     ON regime.indicator_value (trade_date DESC, market);

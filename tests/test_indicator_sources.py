@@ -36,19 +36,33 @@ SOURCE_MAX_LEN = 64          # indicator_dict.source 列宽（见 _ensure_dict �
 
 
 def _macro_refs() -> dict:
-    """指标 → macro_series 源编码（PIT 映射 + 水平/动量里 kind='macro' 的）。"""
+    """指标 → macro_series 源编码**集合**（PIT 映射 + 水平/动量里 kind='macro' 的）。
+
+    ⚠ 值是集合而非单值：同一指标可在 CN/HK 两侧取**不同源**（如 `VAL.DIV_SPREAD`：CN 用
+    沪深等权股息率、HK 用恒指股息率）—— 若用 dict.update 覆盖，先出现的那条就不被校验了。
+    """
     refs: dict = {}
     for mp in (PIT_MAP_CN, PIT_MAP_HK):
-        refs.update(mp)
-    refs.update({c: s for c, s, kind in LEVEL_MAP if kind == "macro"})
-    refs.update({c: s for c, s, kind in MOM_MAP if kind == "macro"})
+        for ind, src in mp.items():
+            refs.setdefault(ind, set()).add(src)
+    for c, s, kind in LEVEL_MAP:
+        if kind == "macro":
+            refs.setdefault(c, set()).add(s)
+    for c, s, kind in MOM_MAP:
+        if kind == "macro":
+            refs.setdefault(c, set()).add(s)
     return refs
 
 
 def _bench_refs() -> dict:
-    """指标 → daily_benchmark 源编码（水平直连 + 动量里 kind='bench' 的）。"""
-    refs = {c: s for c, s, kind in LEVEL_MAP if kind == "bench"}
-    refs.update({c: s for c, s, kind in MOM_MAP if kind == "bench"})
+    """指标 → daily_benchmark 源编码**集合**（水平直连 + 动量里 kind='bench' 的）。"""
+    refs: dict = {}
+    for c, s, kind in LEVEL_MAP:
+        if kind == "bench":
+            refs.setdefault(c, set()).add(s)
+    for c, s, kind in MOM_MAP:
+        if kind == "bench":
+            refs.setdefault(c, set()).add(s)
     return refs
 
 
@@ -68,7 +82,7 @@ class TestSourceRegistration(unittest.TestCase):
             cur = conn.cursor()
             cur.execute("SELECT series_code FROM regime.macro_series_meta")
             registered = {r[0] for r in cur.fetchall()}
-        missing = {k: v for k, v in refs.items() if v not in registered}
+        missing = {k: sorted(v) for k, v in refs.items() if not v <= registered}
         self.assertEqual(
             missing, {},
             f"以下指标的 macro_series 源编码未注册（写错会静默产出空指标）: {missing}")
@@ -80,7 +94,7 @@ class TestSourceRegistration(unittest.TestCase):
             cur = conn.cursor()
             cur.execute("SELECT DISTINCT bench_code FROM public.daily_benchmark")
             registered = {r[0] for r in cur.fetchall()}
-        missing = {k: v for k, v in refs.items() if v not in registered}
+        missing = {k: sorted(v) for k, v in refs.items() if not v <= registered}
         self.assertEqual(
             missing, {},
             f"以下指标的 daily_benchmark 源编码未注册: {missing}")
@@ -94,13 +108,19 @@ class TestSourceRegistration(unittest.TestCase):
             f"以下映射键不在 INDICATORS 里（孤儿映射，改了指标编码未同步）: {orphans}")
 
     def test_indicator_sources_derivation(self):
-        """INDICATOR_SOURCES 必须是映射的**全集投影**（bench 侧带 bench: 前缀）。"""
-        self.assertEqual(set(INDICATOR_SOURCES), set(_macro_refs()) | set(_bench_refs()))
+        """INDICATOR_SOURCES 必须是映射的**全集投影**（bench 侧带 bench: 前缀）。
+
+        跨市场不同源时投影形如 `"CN.A / HK.B"`（见 `_build_indicator_sources`）—— 解析后
+        两侧都必须与映射**逐一相等**，否则会出现「登记了 A 却漏了 B」的静默缺口。
+        """
+        macro, bench = _macro_refs(), _bench_refs()
+        self.assertEqual(set(INDICATOR_SOURCES), set(macro) | set(bench))
         for code, src in INDICATOR_SOURCES.items():
-            if src.startswith("bench:"):
-                self.assertEqual(src[6:], _bench_refs()[code])
-            else:
-                self.assertEqual(src, _macro_refs()[code])
+            parts = src.split(" / ")
+            got_macro = {p for p in parts if not p.startswith("bench:")}
+            got_bench = {p[6:] for p in parts if p.startswith("bench:")}
+            self.assertEqual(got_macro, macro.get(code, set()), f"{code} 的 macro 源不一致")
+            self.assertEqual(got_bench, bench.get(code, set()), f"{code} 的 bench 源不一致")
 
     def test_source_fits_column(self):
         too_long = {k: v for k, v in INDICATOR_SOURCES.items() if len(v) > SOURCE_MAX_LEN}

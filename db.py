@@ -11,6 +11,7 @@
 """
 import os
 import json
+import math
 import logging
 from contextlib import contextmanager
 
@@ -309,6 +310,308 @@ def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False,
 
 
 # ============================================================================
+# NUMERIC 列范围护栏（2026-10-16，事故驱动，勿删）
+# ----------------------------------------------------------------------------
+# 事故：富途快照对「复牌/长期无量」股给出的 volume_ratio 可达上万（实测
+# HK.00129 = 49054.375），而 hk_daily_quote.volume_ratio 当时是 NUMERIC(8,4)
+# （上限 < 10^4）→ 整批 INSERT 抛 NumericValueOutOfRange，异常冒泡出事务，
+# **当天全市场 2196 只一行都没落**；随后 market_state_daily 用仅剩的监控池 77 只
+# 算横截面，把港股 PE/PB/破净/涨跌家数占比等指标全部算错（2026-10-14）。
+#
+# 两层防护：
+#   ① 结构层：百分比类列放宽到 NUMERIC(12,4)（sql/schema.sql + 各写入脚本 DDL，
+#      老库由 widen_numeric_columns 自愈）；
+#   ② 写入层：sanitize_numeric_rows —— 按 information_schema 里的**真实列宽**把越界值
+#      置 NULL 并回传清单。列宽从库读，所以以后再改列宽不需要动这里。
+#      只对显式调用它的写入路径生效：不塞进 bulk_upsert —— 通用写入层静默置空会掩盖
+#      别处真实的 bug（如单位写错导致整体放大 10^6），宁可让那些地方自己报错。
+# ============================================================================
+
+# 百分比类列的历史事故值域参考：换手率实测 max 85、股息率 max 543、量比 max 49054。
+_PERCENT_COLS_12_4 = ("turnover_rate", "volume_ratio", "dividend_ratio_ttm")
+"""需要 NUMERIC(12,4) 的「无上界百分比」列（换手率 / 量比 / 股息率）。
+
+量比 = 当日成交量 / 近 5 日均量 —— 长期无量的仙股一旦复牌即上万；
+换手率、股息率同理无理论上界（仙股特别股息可上千）。
+三者统一 12,4（留 8 位整数余量），与 change_pct 在池表的宽度一致。
+"""
+
+_NUMERIC_LIMITS_CACHE: "dict[str, dict[str, tuple[int, int]]]" = {}
+
+
+def _parse_table(table: str) -> tuple:
+    """'regime.macro_series' → ('regime', 'macro_series')；裸表名 → ('public', 表名)。"""
+    schema, _, name = table.partition(".")
+    if not name:
+        return "public", schema
+    return schema, name
+
+
+def _read_numeric_limits(conn, table: str) -> dict:
+    """直接读库：{列名: (precision, scale)}，仅 NUMERIC 列。失败返回 {}。"""
+    schema, name = _parse_table(table)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name, numeric_precision, numeric_scale "
+                "FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s AND data_type = 'numeric' "
+                "AND numeric_precision IS NOT NULL",
+                (schema, name),
+            )
+            return {c: (int(p), int(s)) for c, p, s in cur.fetchall()}
+    except Exception as e:
+        logger.warning(f"读取 {table} 的 NUMERIC 列宽失败（本次跳过越界净化）: {e}")
+        return {}
+
+
+def numeric_limits(conn, table: str) -> dict:
+    """列宽（按表进程内缓存）。配置/DDL 变更后需重启进程才刷新。"""
+    if table not in _NUMERIC_LIMITS_CACHE:
+        _NUMERIC_LIMITS_CACHE[table] = _read_numeric_limits(conn, table)
+    return _NUMERIC_LIMITS_CACHE[table]
+
+
+def sanitize_numeric_rows(conn, table: str, rows: list) -> tuple:
+    """把超出列可表示范围的值**就地**置 None，返回 (rows, dropped)。
+
+    dropped: [(stock_code, 列名, 原值), ...] —— 供调用方告警（哪只票哪个字段被丢弃）。
+    范围判定按 PostgreSQL 语义：先按 scale 四舍五入，再要求 |v| < 10^(p-s)。
+    （|v| 恰为 10^(p-s) 如 10000 对 NUMERIC(8,4) 会因进位而溢出，必须一起挡住。）
+    """
+    lim = numeric_limits(conn, table)
+    if not lim or not rows:
+        return rows, []
+    dropped: list = []
+    for r in rows:
+        for col, (p, s) in lim.items():
+            v = r.get(col)
+            if v is None or isinstance(v, (str, bool)):
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(fv) or abs(round(fv, s)) >= 10 ** (p - s):
+                r[col] = None
+                dropped.append((r.get("stock_code"), col, v))
+    return rows, dropped
+
+
+def widen_numeric_columns(conn, table: str, widths: dict) -> list:
+    """需要时把 NUMERIC 列放宽到 widths={列: (p, s)}，返回实际改动的列名。
+
+    只在当前列宽**小于**目标时才 ALTER（已是目标宽度则完全不动，避免无谓表重写）。
+    用途：老库上的 hk_daily_quote.volume_ratio 仍是 NUMERIC(8,4)，新代码 DDL 已改宽
+    → 由各写入脚本的 _ensure_table 调用本函数自愈，不依赖人工迁移。
+
+    ALTER COLUMN TYPE 会被依赖该列的视图/规则硬拦截（实测 v_daily_quote →
+    "cannot alter type of a column used by a view or rule"），且 ALTER 无法 CASCADE
+    掉视图 → 由 _alter_columns_safe 先摘除依赖视图再还原（见其文档）。
+    """
+    have_map = _read_numeric_limits(conn, table)
+    plan = []  # [(col, have, p, s)] —— 仅确需改动的列
+    for col, (p, s) in widths.items():
+        have = have_map.get(col)
+        if have is None or (have[0] >= p and have[1] >= s):
+            continue
+        plan.append((col, have, p, s))
+    if not plan:
+        return []
+    changed = _alter_columns_safe(conn, table, plan)
+    if changed:
+        _NUMERIC_LIMITS_CACHE.pop(table, None)
+    for col, have, p, s in plan:
+        if col in changed:
+            logger.info(f"{table}.{col} 列宽 {have[0]},{have[1]} → {p},{s}（越界值护栏）")
+    return changed
+
+
+# ── 依赖视图保护：ALTER COLUMN TYPE 前的摘除 / 还原 ──────────────────────────
+# 背景：PostgreSQL 禁止 ALTER 被视图/规则引用的列的类型，且 ALTER TABLE 的 CASCADE
+# 只作用于约束，删不掉视图。唯一可行路径是「先 DROP 依赖视图 → ALTER → 原样重建」。
+# 关键安全设计：
+#   · 全程在**调用方同一事务**内执行，并用 SAVEPOINT 包裹：任一步失败即
+#     ROLLBACK TO SAVEPOINT —— PG 的 DDL 是事务性的，视图自动复原，且调用方
+#    事务不会停留在 aborted 状态（2026-09-14 InFailedSqlTransaction 教训）。
+#   · 依赖视图按拓扑序摘除/重建（v_daily_excess_return 依赖 v_daily_quote，
+#     必须先删前者、后建前者），并还原 relacl 授权与表/列注释，尽量无损。
+_VIEW_PRIV_MAP = {"r": "SELECT", "a": "INSERT", "w": "UPDATE", "d": "DELETE",
+                  "D": "TRUNCATE", "x": "REFERENCES", "t": "TRIGGER"}
+
+
+def _dependent_views(cur, table: str) -> list:
+    """返回直接或间接依赖 table 的视图/物化视图（含定义、授权、注释）。"""
+    schema, name = _parse_table(table)
+    cur.execute(
+        """
+        WITH RECURSIVE dep AS (
+            SELECT DISTINCT r.ev_class AS oid
+            FROM pg_depend d
+            JOIN pg_rewrite r  ON r.oid = d.objid
+            JOIN pg_class t    ON t.oid = d.refobjid
+            JOIN pg_namespace tn ON tn.oid = t.relnamespace
+            WHERE d.classid = 'pg_rewrite'::regclass
+              AND d.refclassid = 'pg_class'::regclass
+              AND t.relname = %s AND t.relkind = 'r' AND tn.nspname = %s
+            UNION
+            SELECT DISTINCT r.ev_class AS oid
+            FROM dep
+            JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass
+                           AND d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = dep.oid
+            JOIN pg_rewrite r ON r.oid = d.objid
+        )
+        SELECT c.oid, n.nspname, c.relname, c.relkind,
+               pg_get_viewdef(c.oid, true), c.relacl
+        FROM dep
+        JOIN pg_class c     ON c.oid = dep.oid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind IN ('v', 'm')
+        """,
+        (name, schema),
+    )
+    views = []
+    for oid, nsp, relname, kind, vdef, acl in cur.fetchall():
+        cur.execute(
+            "SELECT objsubid, description FROM pg_description "
+            "WHERE objoid = %s AND classoid = 'pg_class'::regclass",
+            (oid,),
+        )
+        comments = cur.fetchall()
+        views.append({
+            "oid": oid, "schema": nsp, "name": relname, "kind": kind,
+            "def": vdef.strip().rstrip(";").strip(), "acl": acl, "comments": comments,
+        })
+    return views
+
+
+def _view_topo_order(cur, views: list) -> list:
+    """按依赖关系排序：被依赖者在前（重建顺序），其反序即安全摘除顺序。"""
+    by_oid = {v["oid"]: v for v in views}
+    cur.execute(
+        """
+        SELECT DISTINCT r.ev_class AS dependent, d.refobjid AS source
+        FROM pg_depend d
+        JOIN pg_rewrite r ON r.oid = d.objid
+        WHERE d.classid = 'pg_rewrite'::regclass
+          AND d.refclassid = 'pg_class'::regclass
+          AND r.ev_class = ANY(%s) AND d.refobjid = ANY(%s)
+        """,
+        (list(by_oid), list(by_oid)),
+    )
+    deps: dict = {oid: set() for oid in by_oid}
+    for dependent, source in cur.fetchall():
+        if dependent in deps and source in by_oid and source != dependent:
+            deps[dependent].add(source)
+    order, remaining = [], dict(by_oid)
+    while remaining:
+        ready = [v for v in remaining.values() if not (deps[v["oid"]] & set(remaining))]
+        if not ready:  # 防御：PG 不允许视图循环依赖，真出现则按原序硬处理
+            ready = list(remaining.values())
+        for v in ready:
+            order.append(v)
+            remaining.pop(v["oid"])
+    return order
+
+
+def _view_ident(v: dict) -> sql.Composed:
+    return sql.SQL("{}.{}").format(sql.Identifier(v["schema"]), sql.Identifier(v["name"]))
+
+
+def _restore_view_meta(cur, v: dict):
+    """重建视图后还原授权（relacl）与表/列注释（pg_description）。"""
+    for entry in v.get("acl") or []:
+        grantee, _, rest = str(entry).partition("=")
+        privs = rest.split("/")[0]
+        granted = [_VIEW_PRIV_MAP[ch] for ch in privs if ch in _VIEW_PRIV_MAP]
+        if not granted:
+            continue
+        target = sql.SQL("PUBLIC") if grantee == "" else sql.Identifier(grantee)
+        cur.execute(
+            sql.SQL("GRANT {} ON {} TO {}").format(
+                sql.SQL(", ").join(sql.SQL(p) for p in granted), _view_ident(v), target)
+        )
+    for subid, desc in v.get("comments") or []:
+        if subid == 0:
+            cur.execute(
+                sql.SQL("COMMENT ON VIEW {} IS {}").format(
+                    _view_ident(v), sql.Literal(desc))
+            )
+        else:
+            cur.execute(
+                "SELECT a.attname FROM pg_attribute a "
+                "WHERE a.attrelid = %s AND a.attnum = %s",
+                (v["oid"], subid),
+            )
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    sql.SQL("COMMENT ON COLUMN {}.{} IS {}").format(
+                        _view_ident(v), sql.Identifier(row[0]), sql.Literal(desc))
+                )
+
+
+def _alter_columns_safe(conn, table: str, plan: list) -> list:
+    """在 SAVEPOINT 内执行 ALTER COLUMN TYPE，必要时先摘除并还原依赖视图。
+
+    plan: [(col, have, p, s)]。返回成功改动的列名；任何失败都回滚到
+    摘除前状态（视图自动复原、列宽不变）并返回 []，调用方事务保持可用。
+    """
+    sp = "sp_widen_numeric"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SAVEPOINT {sp}")
+            views = _view_topo_order(cur, _dependent_views(cur, table))
+            if views:
+                logger.warning(
+                    f"{table} 列宽调整被视图依赖，将先摘除后还原（单事务，失败自动回滚）: "
+                    + ", ".join(f"{v['schema']}.{v['name']}" for v in views)
+                )
+                for v in reversed(views):
+                    if v["kind"] == "m":
+                        logger.warning(
+                            f"物化视图 {v['schema']}.{v['name']} 被摘除，"
+                            "其数据/索引需重建后人工核对"
+                        )
+                    cur.execute(
+                        sql.SQL("DROP {} IF EXISTS {}").format(
+                            sql.SQL("MATERIALIZED VIEW" if v["kind"] == "m" else "VIEW"),
+                            _view_ident(v))
+                    )
+            for col, _have, p, s in plan:
+                cur.execute(
+                    f"ALTER TABLE {table} ALTER COLUMN {col} TYPE NUMERIC({p},{s})"
+                )
+            for v in views:
+                if v["kind"] == "m":
+                    cur.execute(
+                        sql.SQL("CREATE MATERIALIZED VIEW {} AS {} WITH DATA").format(
+                            _view_ident(v), sql.SQL(v["def"]))
+                    )
+                else:
+                    cur.execute(
+                        sql.SQL("CREATE OR REPLACE VIEW {} AS {}").format(
+                            _view_ident(v), sql.SQL(v["def"]))
+                    )
+                _restore_view_meta(cur, v)
+            cur.execute(f"RELEASE SAVEPOINT {sp}")
+    except Exception as e:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                cur.execute(f"RELEASE SAVEPOINT {sp}")
+        except Exception:
+            pass
+        logger.warning(
+            f"{table} 列宽自愈失败（{str(e).strip()[:200]}），保持现状；"
+            "写入侧 sanitize_numeric_rows 仍会兜底置空越界值"
+        )
+        return []
+    return [c for c, *_ in plan]
+
+
+# ============================================================================
 # 写方双写（daily_quote 合并迁移 · 阶段 1）：daily_quote → 池表
 # ============================================================================
 # 背景：daily_quote 是 active 池的「1 分钟快照 + QUOTE 秒级刷新」表；
@@ -382,6 +685,11 @@ def write_quote_dual(conn, data: dict) -> bool:
     row = _build_pool_row(data)
     if "stock_code" not in row or "trade_date" not in row:
         return False
+    # 越界值净化：单个超出列宽的字段（复牌/无量股的量比可上万）会让整行写入失败，
+    # 这里按真实列宽置 NULL 并告警，保住其余字段（与 2026-10-14 事故同源）。
+    _, dropped = sanitize_numeric_rows(conn, table, [row])
+    if dropped:
+        logger.warning(f"[双写] {row.get('stock_code')} → {table} 越界值已置空: {dropped}")
     with conn.cursor() as cur:
         cur.execute("SAVEPOINT dw_pool")
         try:

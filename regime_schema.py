@@ -474,8 +474,19 @@ _COMMENTS = [
      "净额（亿元）＝流入−流出；**必须收盘后采集**，盘中值不完整"),
     ("TABLE", "regime.indicator_value",
      "指标时序长表：口径见 indicator_dict；raw_value=原始值，percentile=历史分位(0-100)"),
+    ("COLUMN", "regime.indicator_value.market",
+     "**市场键**（主键三列之一）：'CN'=A 股 / 'HK'=港股，语义是「该行由哪个市场的计算产出」"
+     "（calc_cn / calc_hk），不是标的所在地。同指标可两侧各有一条时序（如 VAL.ERP）；"
+     "该指标在**哪些市场有数据**由 indicator_dict.market_scope 声明，两者一致性由 "
+     "tests/test_indicator_dict_consistency.py 校验（声明 CN 却出现 HK 行会被判失败）"),
     ("COLUMN", "regime.indicator_value.percentile",
-     "原始值的历史分位（0-100，expanding 只用当日及之前，无前视；未做方向调整——方向见 indicator_dict.direction，合成/展示由消费方取反）"),
+     "原始值的历史分位（0-100，expanding 只用当日及之前，无前视；未做方向调整——方向见 "
+     "indicator_dict.direction，合成/展示由消费方取反）。"
+     "⚠ **低频源（月/季）的分位有已知漂移**：这类序列在指标层被 PIT 前向填充成日频行 → "
+     "同一取值被**重复计入**扩展样本（实测每个取值占的行数：LPR_1Y 137.7 / PMI_MFG 70.9 / "
+     "CPI_YOY 43.2，而日频源 ≈1.0），故分位在两次数据更新之间会**缓慢上爬**（约 1~2 分位点/月，"
+     "样本越大越轻）→ **月内分位斜率不含信息**，不要据此判趋势、也不要算「分位 N 日变化」；"
+     "跨月/跨期的跳变才是真更新。即本分位实为**按交易日行数加权**的历史排位，非按观测次数"),
     ("TABLE", "trading_calendar",
      "交易日历（A股/港股分别维护；衍生自成交额表 + AKShare 校对）"),
     ("COLUMN", "trading_calendar.is_open",
@@ -661,10 +672,11 @@ def _main() -> int:
                                   ("regime", "indicator_value"), ("public", "trading_calendar")]:
                 cur.execute(f"SELECT COUNT(*) FROM {schema}.{table}")
                 print(f"  {schema}.{table:20s} rows = {cur.fetchone()[0]}")
-            cur.execute("""
-                SELECT table_name FROM information_schema.views
-                WHERE table_schema='regime' AND table_name='v_macro_latest'""")
-            print(f"  regime.v_macro_latest  {'✅ 存在' if cur.fetchone() else '❌ 缺失'}")
+            for vname in ("v_macro_latest", "v_macro_series"):
+                cur.execute("""
+                    SELECT table_name FROM information_schema.views
+                    WHERE table_schema='regime' AND table_name=%s""", (vname,))
+                print(f"  regime.{vname:20s} {'✅ 存在' if cur.fetchone() else '❌ 缺失'}")
     print("\n完成。注意：sql/schema.sql 必须同步登记（部署基准）。")
     return 0
 
