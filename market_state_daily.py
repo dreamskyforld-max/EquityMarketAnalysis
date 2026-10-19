@@ -161,6 +161,10 @@ INDICATORS: list[dict] = [
          remark="定义：AAA 级中短期票据与同期限国债的收益率差，信用风险的绝对定价　·　判读：走阔=违约担忧上升/风险偏好收缩，收窄=信用环境改善；与等级利差对照可分离「整体信用环境」与「纯风险偏好」　·　数据：长历史且稳定，是风险指数成分；**CN+HK**——HK 侧同样接入（§5.4 风险偏好指数的成分以 GLOBAL 为主，若 HK 缺信用成分会与 CN 侧口径不一致），但读数本身是中国信用环境",
          market_scope="CN+HK", unit="pp", direction="high_risk", freq="day",
          formula="CN.CREDIT_SPREAD_MTN_AAA_10Y；利差走阔=违约担忧/风险偏好下降（源：get_macro_daily 派生）"),
+    dict(code="RISK.CREDIT_SPREAD_CHG20", name="信用利差 20日变化", scope="MACRO", dimension="风险",
+         market_scope="CN+HK", unit="pp", direction="high_risk", freq="day",
+         remark="定义：AAA 中票信用利差近 20 个交易日的变化（**pp，不是百分比**——利差本身以 % 计价，百分比变化在低位时会失真，见 MACRO.BOND_10Y_CHG20）　·　判读：**边际方向比水平更重要**——水平分位低说明「宽松已久」，而变化说明「是否仍在改善」；§4.2.1 要求投票一律用边际变化，此即信用组的投票依据　·　与水平指标的分工：水平用于「是否已进入危险区」（阈值判定），变化用于「方向」（投票）　·　数据：2011 起（受利差序列限制）；前 20 个交易日无值",
+         formula="CN.CREDIT_SPREAD_MTN_AAA_10Y − 同序列(t−20)，单位 pp"),
     dict(code="RISK.TERM_SPREAD", name="期限利差(国债 10Y−1Y)", scope="MACRO", dimension="风险",
          remark="定义：国债 10Y 与 1Y 收益率之差（曲线陡峭度）　·　判读：**倒挂（低/负）为经典衰退预警**；走阔=复苏预期升温；风险指数中取反　·　数据：仅 CN",
          market_scope="CN", unit="pp", direction="high_good", freq="day",
@@ -187,9 +191,9 @@ INDICATORS: list[dict] = [
          remark="定义：同期限 AA− 与 AA 中票收益率差（低评级段等级利差）　·　判读：**低评级段的纯风险偏好读数**——同期限仅差半档评级，走阔=资金向高等级避险；比绝对利差更少受无风险利率干扰，是信用收缩的最早读数之一　·　数据：⚠ 源只保留最近 3 个交易日，历史逐日累积；仅 CN",
          formula="CN.MTN_AA_MINUS_5Y − CN.MTN_AA_5Y"),
     dict(code="MACRO.STOCK_BOND_CORR", name="股债相关性(60日)", scope="MACRO", dimension="风险",
-         market_scope="CN", unit="corr", direction="high_risk", freq="day",
-         remark="定义：60 日滚动 corr(上证指数日收益, −中债10Y 日变化)；取 −Δyield 是为对齐「债券**价格**」口径（库里存的是收益率，上行=债价跌）　·　判读：**负值=常态**（避险主导，股跌债涨、股债对冲有效）；**转正/持续上行=宏观主导**（股债同跌，增长或流动性冲击 → 对冲失效，应提高现金与防守仓位）　·　数据：受中债10Y 起点限制自 2006 起；窗口 60 交易日，序列前 60 日无值；仅 CN",
-         formula="rolling_corr(100·Δln(SH.000001), −Δ(CN.BOND_10Y), 60)"),
+         market_scope="CN+HK", unit="corr", direction="high_risk", freq="day",
+         remark="定义：60 日滚动 corr(本市场股指日收益, −本市场无风险利率日变化)；取 −Δyield 是为对齐「债券**价格**」口径（库里存的是收益率，上行=债价跌）　·　判读：**负值=常态**（避险主导，股跌债涨、股债对冲有效）；**转正/持续上行=宏观主导**（股债同跌，增长或流动性冲击 → 对冲失效，应提高现金与防守仓位）　·　两市场口径不同**不可直接比数值**：**CN** = 上证 × 中债10Y（2006 起）；**HK** = 恒指 × 美债10Y（2019 起，香港无本地长端利率，经 HKD 联系汇率以美债为无风险利率）　·　数据：窗口 60 交易日，序列前 60 日无值",
+         formula="CN：rolling_corr(100·Δln(SH.000001), −Δ(CN.BOND_10Y), 60)；HK：同一算法换成 HK.800000 × US.DGS10"),
     dict(code="RISK.GRADE_SPREAD", name="信用等级利差(AA−AAA 5Y)", scope="MACRO", dimension="风险",
          market_scope="CN+HK", unit="pp", direction="high_risk", freq="day",
          remark="定义：同期限 AA 与 AAA 中票收益率差（等级利差）　·　判读：**纯风险偏好读数**——同期限同信用环境仅等级不同，走阔=风险偏好收缩；比绝对信用利差更少受无风险利率干扰　·　数据：源只保留最近 3 个交易日，历史逐日累积；已纳入 FSI；**CN+HK**（与 RISK.CREDIT_SPREAD 同理，HK 侧也接入以保持 §5.4 风险偏好指数两侧口径一致）",
@@ -283,6 +287,10 @@ INDICATORS: list[dict] = [
          market_scope="CN", unit="pct", direction="neutral", freq="day",
          remark="定义：中债国债收益率曲线 10 年期（%），中国无风险利率　·　判读：**无单一方向**——既是贴现率（上行压估值）也是增长/通胀预期（上行反映景气），实务中与 ERP 联读：收益率上行而 ERP 同步走高=盈利驱动，反之则纯估值压制　·　数据：2006-03 起，全库最长样本之一；亦是 VAL.ERP 与 RISK.TERM_SPREAD 的输入",
          formula="CN.BOND_10Y（akshare bond_china_yield 中债国债收益率曲线-10年）"),
+    dict(code="MACRO.BOND_10Y_CHG20", name="中债10Y 20日变化", scope="MACRO", dimension="资金",
+         market_scope="CN+HK", unit="pp", direction="high_risk", freq="day",
+         remark="定义：10 年期国债收益率近 20 个交易日的变化（**pp，非百分比**——收益率本身以 % 计价且可能贴近 0，百分比变化会严重失真：1.65%→1.70% 的「3% 涨幅」实为 +5bp）　·　判读：按 §4.2 的方向性读法——**下行 + 信用利差收窄 = 风险偏好改善**，上行则警惕；⚠ 上行也可能是增长预期驱动（对股票未必坏），须与 MACRO.BREAKEVEN_10Y / 信用利差联读以区分「通胀或紧缩驱动」与「增长驱动」；水平值的双重性质见 MACRO.BOND_10Y　·　数据：2006-03 起（受 CN.BOND_10Y 限制）；前 20 个交易日无值；CN+HK（中国利率是港股分母端的重要外生变量，同 RISK.CREDIT_SPREAD 先例）",
+         formula="CN.BOND_10Y − CN.BOND_10Y(t−20)，单位 pp（源：get_cn_bond，MOM_MAP diff 口径）"),
     dict(code="MACRO.PMI_MFG", name="制造业 PMI", scope="MACRO", dimension="景气",
          market_scope="CN+HK", unit="index", direction="high_good", freq="month",
          remark="定义：制造业采购经理指数，由新订单/生产/就业/库存等分项扩散指数加权而成　·　判读：**50 为荣枯线：>50 扩张、<50 收缩**；连续 3 个月同向穿越荣枯线才算趋势，单月波动勿过度解读　·　数据：2008-01 起；月频",
@@ -316,6 +324,10 @@ INDICATORS: list[dict] = [
          market_scope="GLOBAL", unit="index", direction="high_risk", freq="day",
          remark="定义：ICE 美元指数（对一篮子主要货币）　·　判读：**全球流动性总闸门**——强美元压制新兴市场（A股/港股）与大宗商品；风险偏好指数中取反　·　数据：2016-09 起（分位样本约 10 年）；与 DTWEXBGS 互为口径校验",
          formula="daily_benchmark US.DXY 收盘（get_global_benchmarks 每小时采）"),
+    dict(code="MACRO.DXY_CHG20", name="美元指数 20日变化", scope="MACRO", dimension="资金",
+         market_scope="GLOBAL", unit="pct", direction="high_risk", freq="day",
+         remark="定义：ICE 美元指数近 20 个交易日的变化（%）　·　判读：对应 §4.2「**强美元 → 新兴市场承压**」——上行=A 股/港股的资金面逆风与大宗商品压制（风险偏好指数对美元是取反的）　·　数据：2016-09 起（受 US.DXY 限制）；长历史美元周期看 MACRO.DTWEXBGS（2006 起），两者水平口径不同不可直接比",
+         formula="(US.DXY / US.DXY(t−20) − 1) × 100（bench，MOM_MAP pct 口径）"),
     dict(code="MACRO.DTWEXBGS", name="美元指数(Fed 贸易加权)", scope="MACRO", dimension="资金",
          market_scope="GLOBAL", unit="index", direction="high_risk", freq="day",
          remark="定义：美联储广义贸易加权美元指数　·　判读：同 DXY 逻辑但篮子更宽、更贴近美国贸易结构；**样本长于 ICE DXY（2006 起）**，做长周期分位优先用本序列　·　数据：两口径同向但幅值不同，勿混用",
@@ -325,6 +337,10 @@ INDICATORS: list[dict] = [
          remark="定义：美元兑人民币**在岸**汇率（中国银行折算价）　·　判读：**上行=人民币贬值** → 外资流出压力与风险偏好下降；与中美利差同看（利差走阔叠加汇率贬值=资本外流组合）　·　数据：1994 起长样本；⚠ 离岸 CNH 无稳定免费源未采，勿把本序列当 CNH 用",
          formula="daily_benchmark FX.USDCNY（akshare currency_boc_safe「美元」列÷100，"
                  "get_global_benchmarks 采；口径订正见该文件 §3.4 注释）"),
+    dict(code="MACRO.USDCNY_CHG20", name="人民币 20日变化(在岸)", scope="MACRO", dimension="资金",
+         market_scope="CN+HK", unit="pct", direction="high_risk", freq="day",
+         remark="定义：USDCNY（在岸）近 20 个交易日的变化（%）　·　判读：**上行 = 人民币贬值 → 资本外流压力、北向承压**，故高分=风险；⚠ 方向与「人民币强弱」相反（这里是「美元兑人民币」的涨跌）　·　与 MACRO.CN_US_SPREAD 联读：**利差走阔 + 汇率贬值 = 典型资本外流组合**（§4.2 汇率维度的核心确认）　·　数据：1994 起；CN+HK",
+         formula="(FX.USDCNY / FX.USDCNY(t−20) − 1) × 100（bench，MOM_MAP pct 口径）"),
     # —— 避险货币（4.2 汇率：避险货币走强 → 新兴市场承压）——
     dict(code="MACRO.JPYCNY", name="日元兑人民币(百日元)", scope="MACRO", dimension="资金",
          market_scope="GLOBAL", unit="cny_per_100jpy", direction="high_risk", freq="day",
@@ -346,6 +362,10 @@ INDICATORS: list[dict] = [
          market_scope="GLOBAL", unit="index", direction="high_risk", freq="day",
          remark="定义：标普 500 期权隐含波动率（恐慌指数）　·　判读：>20 进入高波动/恐慌区，>30 为极端恐慌（常对应阶段性底部）；风险偏好指数中取反　·　数据：1990 起长样本",
          formula="daily_benchmark US.VIXCLS（FRED）"),
+    dict(code="RISK.VIX_CHG20", name="VIX 20日变化", scope="MACRO", dimension="风险",
+         market_scope="GLOBAL", unit="index", direction="high_risk", freq="day",
+         remark="定义：标普 500 期权隐含波动率近 20 个交易日的变化（**按「点」读**——波动率惯例以点数而非百分比计，如「VIX 上升 5 点」）　·　判读：**波动率抬头先于风险事件**，且能捕捉水平分位滞后的问题——典型如 VIX 水平分位仍中性（45）而 20 日已 +25%，正是 2020-03 / 2024-08 的形态　·　与水平指标的分工：水平用于「是否已在高波动区」（>20 / >30 阈值），变化用于「方向」（§4.2.1 的投票）　·　⚠ 同步性提示：VIX 由标普期权定价，与股票**基本同步**，故它更适合作为「状态描述」而非「独立的领先确认」（见 §4.2.1 第九节）　·　数据：1990 起；前 20 个交易日无值",
+         formula="US.VIXCLS − US.VIXCLS(t−20)，单位波动率点数"),
     dict(code="MACRO.SPX_MOM20", name="标普500 20日动量", scope="MACRO", dimension="跨资产",
          market_scope="GLOBAL", unit="pct", direction="high_good", freq="day",
          remark="定义：标普 500 近 20 个**美股**交易日的动量（%）　·　判读：全球权益风险偏好的代理——正动量=risk-on；风险偏好指数成分（sign +1）　·　数据：动量在源市场交易日上算后再对齐本市场，避免假期错位",
@@ -388,6 +408,10 @@ INDICATORS: list[dict] = [
          market_scope="GLOBAL", unit="pct", direction="neutral", freq="day",
          remark="定义：美国 2 年期国债收益率（%），对美联储政策路径最敏感的期限　·　判读：**无单一方向**——更贴政策预期（上行=市场计入更紧的紧缩路径），但也会因增长预期改善而上行；带方向含义的曲线信号看 MACRO.US_TERM_SPREAD　·　数据：1990-12 起长样本，与美债10Y 同日成交",
          formula="daily_benchmark US.DGS2（akshare 美国国债收益率2年）"),
+    dict(code="MACRO.US_10Y_CHG20", name="美债10Y 20日变化", scope="MACRO", dimension="资金",
+         market_scope="GLOBAL", unit="pp", direction="high_risk", freq="day",
+         remark="定义：美债 10 年期收益率近 20 个交易日的变化（**pp，非百分比**，理由同 MACRO.BOND_10Y_CHG20）　·　判读：**全球折现率的方向**——上行=估值端逆风（尤其是港股等外资定价市场），下行=分母端顺风；⚠ 与 MACRO.BOND_10Y_CHG20 的**方向差**是重要读数（美债上而中债下=中美利差走阔，对应资本外流与人民币压力）　·　数据：1990-12 起（受 US.DGS10 限制）；美债休市日无值，属正常",
+         formula="US.DGS10 − US.DGS10(t−20)，单位 pp（bench，MOM_MAP diff 口径）"),
     dict(code="MACRO.CN_US_SPREAD", name="中美利差(中债10Y−美债10Y)", scope="MACRO", dimension="资金",
          market_scope="CN+HK", unit="pp", direction="neutral", freq="day",
          remark="定义：中债 10Y − 美债 10Y（pp），中美利差　·　判读：倒挂=利差为负，人民币承压、外资流出压力；走阔通常利好人民币与外资流入——但若因美债风险溢价飙升而走阔则相反，须结合美元指数与汇率解读，故无单一方向　·　数据：日频，双源同日对齐",
@@ -748,13 +772,30 @@ LEVEL_MAP = (
     ("MACRO.OIL", "CMDTY.OIL", "macro"),
 )
 
-# 动量类：(指标, 源编码, 源所在层)。⚠ 动量必须在**源市场交易日**上算（20 交易日 =
-#   s/s.shift(20)−1），再对齐本市场：直接用本市场日历 shift 一个含外盘假期 NaN 的序列会错位。
+# 动量/变化类：(指标, 源编码, 源所在层, 变化口径)。窗口统一 MOM_WINDOW 个交易日。
+#   口径两种：
+#     · "pct"  百分比变化 —— 适用于价格/指数/汇率水平（s/s.shift(N)−1 ×100）；
+#     · "diff" 绝对变化   —— **适用于收益率**：它本身以 % 计价且可能贴近 0，「百分比变化」
+#       会严重失真（1.65%→1.70% 的 "3% 涨幅" 实为 +5bp；若收益率从 0.2%→0.3% 更是 "50% 涨幅"）
+#       → 一律记 **pp**。
+#   ⚠ 变化必须在**源市场交易日**上算，再对齐本市场：直接用本市场日历 shift 一个含外盘假期
+#     NaN 的序列会错位（美/港/内地假期不同）。
+MOM_WINDOW = 20
 MOM_MAP = (
-    ("MACRO.SPX_MOM20", "US.SP500", "bench"),
-    ("MACRO.COPPER_MOM20", "CMDTY.COPPER", "macro"),
-    ("MACRO.GOLD_MOM20", "CMDTY.GOLD", "macro"),
-    ("MACRO.OIL_MOM20", "CMDTY.OIL", "macro"),
+    ("MACRO.SPX_MOM20", "US.SP500", "bench", "pct"),
+    ("MACRO.COPPER_MOM20", "CMDTY.COPPER", "macro", "pct"),
+    ("MACRO.GOLD_MOM20", "CMDTY.GOLD", "macro", "pct"),
+    ("MACRO.OIL_MOM20", "CMDTY.OIL", "macro", "pct"),
+    # ── §4.2「10Y 收益率方向」与「强美元 / 人民币」：此前只有水平值，方向需消费方自算 ──
+    ("MACRO.BOND_10Y_CHG20", "CN.BOND_10Y", "macro", "diff"),   # pp（中国利率）
+    ("MACRO.US_10Y_CHG20", "US.DGS10", "bench", "diff"),        # pp（全球无风险利率）
+    ("MACRO.DXY_CHG20", "US.DXY", "bench", "pct"),              # %（强美元 → EM 承压）
+    ("MACRO.USDCNY_CHG20", "FX.USDCNY", "bench", "pct"),        # %（上行 = 人民币贬值）
+    # ── §4.2.1 要求「投票一律用边际变化」：信用与波动率两组此前**只有水平序列**，
+    #    按规格须降级标注；补这两条变化序列后即可按变化口径投票（它们是经济学上
+    #    预测力最强的两组 —— 信用利差领先股票调整、波动率抬头先于跳空风险）。
+    ("RISK.CREDIT_SPREAD_CHG20", "CN.CREDIT_SPREAD_MTN_AAA_10Y", "macro", "diff"),  # pp
+    ("RISK.VIX_CHG20", "US.VIXCLS", "bench", "diff"),           # 波动率点数（VIX 惯例按"点"读）
 )
 
 
@@ -773,7 +814,7 @@ def _build_indicator_sources() -> dict:
                 out.setdefault(ind, src)
     for ind, src, kind in LEVEL_MAP:
         out[ind] = f"bench:{src}" if kind == "bench" else src
-    for ind, src, kind in MOM_MAP:
+    for ind, src, kind, _mode in MOM_MAP:
         out[ind] = src if kind == "macro" else f"bench:{src}"
     return out
 
@@ -1091,10 +1132,19 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     out.update(_risk_from_index(bdf, "trade_date", "last_price", "HK"))
 
     # ERP = 1/PE − 美债10Y
+    #   ⚠ **前视修正**：美债（美股标的）T 日收盘在北京时间 T+1 上午才可得。原实现用
+    #     `reindex(港股交易日).ffill()`（同日对齐）——实时运行时因库里还没有当天美债行而
+    #     自然退化到前值（碰巧正确），但**回填时**当天行已在库里 → 港股 T 日用上了 T 日
+    #     美债收盘（实为 T+1 凌晨才发生）→ 前视 1 天，且回填历史与实盘口径不一致。
+    #     改为：把美债索引平移到「可得日」(T+1)，再用 merge_asof 向后对齐——周末/假期
+    #     的近似值由 asof 自然落到前一个可得日，不需要逐日 reindex。
     dgs = _q(conn, """SELECT trade_date, last_price FROM daily_benchmark
                       WHERE bench_code='US.DGS10' AND trade_date BETWEEN %s AND %s ORDER BY 1""",
              [w_start, end])
-    dgs_s = _series_from_df(dgs, "trade_date", "last_price").reindex(out["VAL.PE_TTM_MEDIAN"].index).ffill()
+    dgs_s = _series_from_df(dgs, "trade_date", "last_price")
+    if not dgs_s.empty:
+        dgs_s.index = [d + datetime.timedelta(days=US_BENCH_LAG_DAYS) for d in dgs_s.index]
+    dgs_s = _align_close(dgs_s, out["VAL.PE_TTM_MEDIAN"].index)
     out["VAL.ERP"] = 1.0 / out["VAL.PE_TTM_MEDIAN"].replace(0, np.nan) * 100 - dgs_s
 
     # 宏观接入：HIBOR 3M（港元流动性）+ 中国信用脉冲（HK 用其作为边际驱动代理），PIT 填充
@@ -1104,6 +1154,13 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
 
     # §3.4 外部环境 + §5.4 跨资产成分（GLOBAL 口径 → 双市场同算，风险偏好指数才能各自落地）
     out.update(_global_block(conn, out["VAL.PE_TTM_MEDIAN"].index))
+
+    # §4.2 相关性异常（HK）：60 日滚动 corr(恒指日收益, −美债10Y 日变化)。
+    #   香港无本地长端利率，美债 10Y（经 HKD 联系汇率）才是港股的实际无风险利率
+    #   → 与 CN 侧「上证 × 中债10Y」同构，但债券腿在基准层。
+    out["MACRO.STOCK_BOND_CORR"] = _stock_bond_corr(
+        conn, out["VAL.PE_TTM_MEDIAN"].index,
+        stock_code="HK.800000", bond_series="US.DGS10", bond_kind="bench")
 
     clipped = {k: _clip(v, start, end) for k, v in out.items()}
     if bad_days:
@@ -1275,11 +1332,23 @@ def _expanding_zscore(s: pd.Series, min_periods: int) -> pd.Series:
     return (s - m) / sd.replace(0, np.nan)
 
 
+US_BENCH_LAG_DAYS = 1
+"""美股标的（`US.*` 基准）的可得滞后（自然日）。
+
+美东交易日 T 的收盘在北京时间 **T+1 上午**才可得（夏令时约 04:00、冬令时约 05:00，
+FRED 再滞后约 15 分钟）。凡把美股基准当作「T 日本市场可得」的地方都必须 +1 天，
+否则回填历史时会把「T+1 凌晨才发生的事」算进 T 日的指标 —— 即前视。
+
+⚠ 与 `get_macro_daily.US_BENCH_LAG_DAYS` **必须一致**（两处各自定义，因为两个文件
+   不互相 import；改一处务必改另一处）。
+"""
+
 _CORR_WINDOW = 60          # 股债相关性的滚动窗口（交易日）
 
 
 def _stock_bond_corr(conn, idx, stock_code: str = "SH.000001",
-                     bond_series: str = "CN.BOND_10Y") -> pd.Series:
+                     bond_series: str = "CN.BOND_10Y",
+                     bond_kind: str = "macro") -> pd.Series:
     """60 日滚动「股债相关性」= corr(股指日收益, −债券收益率日变化)（§4.2 相关性异常）。
 
     为什么取 −Δyield：文献里的「股债相关性」指**价格**相关性，而库里存的是**收益率**
@@ -1288,11 +1357,22 @@ def _stock_bond_corr(conn, idx, stock_code: str = "SH.000001",
       · 转正/持续上行 = 宏观主导：股债同跌（增长或流动性冲击），股债对冲失效、须警惕。
     ⚠ 两腿日历不同（股指交易日 vs 国债收益率交易日）→ 各自算日变化后仅在**共同**日期上
       算相关，缺失日不进窗口（不做 ffill —— 用陈旧收益率拼接会伪造相关性）。
+    `bond_kind`: 债券腿来源 —— "macro"（regime.macro_series，如 CN.BOND_10Y）或
+      "bench"（public.daily_benchmark，如 US.DGS10）。HK 侧用「恒指 × 美债10Y」：
+      香港无本地长端利率，美债 10Y 才是港股的实际无风险利率（HKD 联系汇率）。
+      ⚠ 美股标的的可得时点实为北京次日凌晨，本函数按同日取用 → 60 日滚动相关受影响很小
+        （仅一条腿单日错位），但与「严格 PIT」有细微偏差，跨市场比较时注意。
     """
     px = _q(conn, """SELECT trade_date, last_price FROM daily_benchmark
                      WHERE bench_code = %s ORDER BY trade_date""", [stock_code])
-    yl = _q(conn, """SELECT period_date, value FROM regime.macro_series
-                     WHERE series_code = %s AND revision = 0 ORDER BY period_date""", [bond_series])
+    if bond_kind == "bench":
+        yl = _q(conn, """SELECT trade_date AS period_date, last_price AS value
+                         FROM daily_benchmark WHERE bench_code = %s ORDER BY trade_date""",
+                [bond_series])
+    else:
+        yl = _q(conn, """SELECT period_date, value FROM regime.macro_series
+                         WHERE series_code = %s AND revision = 0 ORDER BY period_date""",
+                [bond_series])
     if px.empty or yl.empty:
         return pd.Series(np.nan, index=idx)
     sp = pd.Series(pd.to_numeric(px["last_price"], errors="coerce").to_numpy(),
@@ -1316,6 +1396,15 @@ def _global_block(conn, idx) -> dict:
     · 动量类：标普 500 / 铜 / 黄金 / 原油的 **20 个交易日**动量（映射见 MOM_MAP）。
       ⚠ 动量必须在**各自源市场的交易日**上算（20 个交易日 = s/s.shift(20)−1），再对齐到本市场：
       直接用本市场日历 shift 一个含外盘假期 NaN 的序列会错位（美/港/内地假期不同）。
+
+    ⚠ **已知口径（未修，勿误认为已 PIT 正确）**：本节全部按「同日对齐」（`_align_close`）——
+      对**A 股/港股/中债/在岸汇率**成立（本地市场，当日盘后即掌握）；但对 `US.*` 基准
+      **不成立**：其 T 日收盘在北京时间 T+1 上午才可得（见 `US_BENCH_LAG_DAYS`），
+      故 `MACRO.US_10Y` / `MACRO.VIX` / `MACRO.DXY` 等在 CN/HK 的 T 日读数实际上是
+      「T+1 凌晨才发生的事」→ 回填历史时前视 1 天。
+      本轮只修了**宣称 PIT 的三处**（派生层三条跨表派生 + HK 的 `VAL.ERP`）；
+      本节之所以暂不修：会平移约 15 个指标的双侧历史与全部合成分（温度计/风险/FSI/风险偏好），
+      属独立变更，需单独评估影响面后再动。
     """
     out: dict = {}
 
@@ -1341,10 +1430,14 @@ def _global_block(conn, idx) -> dict:
     for code, src, kind in LEVEL_MAP:
         out[code] = _align_close(loader[kind](src), idx)
 
-    for code, src, kind in MOM_MAP:
+    for code, src, kind, mode in MOM_MAP:
         s = loader[kind](src)
-        mom = (s / s.shift(20) - 1) * 100 if len(s) > 20 else pd.Series(dtype=float)
-        out[code] = _align_close(mom, idx)
+        if len(s) <= MOM_WINDOW:
+            out[code] = pd.Series(dtype=float)
+            continue
+        # diff 用于收益率（pp）：百分比变化在低利率/贴近 0 时失真，见 MOM_MAP 注释
+        chg = (s - s.shift(MOM_WINDOW)) if mode == "diff" else (s / s.shift(MOM_WINDOW) - 1) * 100
+        out[code] = _align_close(chg, idx)
     return out
 
 

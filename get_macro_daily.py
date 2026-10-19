@@ -116,6 +116,19 @@ CROSS_DERIVED = [
            "周末/美国假期，严格同日会丢掉约 30% 的月份（实测 346 → 242）"),
 ]
 
+# ── 美股标的的可得时点（PIT）───────────────────────────────────────────────
+# 美东交易日 T 的收盘，在北京时间 **T+1 上午**才可得：
+#   夏令时 16:00 ET = 04:00 北京(T+1)；冬令时 = 05:00 北京(T+1)；FRED 再滞后约 15 分钟。
+#   取 06:00 保守（宁可晚一小时，不可早一小时）。
+# ⚠ 只适用于 `US.*` 基准；A 股/港股/中债/在岸汇率都是本地市场、当日盘后即可得，
+#   若误用于它们会把整段 PIT 无端推后一天。
+# ⚠ 这是**口径修正**：修前 `CN.US_SPREAD_10Y` / `US.TERM_SPREAD_10Y_2Y` 的 100% 行都记成
+#   同日可得（前视 1 天）。修正后其「可见日」整体后移 1 天 —— 依赖它们的
+#   `MACRO.CN_US_SPREAD` / `MACRO.US_TERM_SPREAD` 历史值会相应平移。
+US_BENCH_PREFIX = "US."
+US_BENCH_LAG_DAYS = 1
+US_BENCH_AVAIL_HOUR = 6
+
 # 派生序列的 freq / lag_days 覆盖（默认 day / 0）。以下两种情况须显式声明：
 #   · 驱动腿是**月频**（freq=month）；
 #   · 两腿中较晚的可得时点**晚于当日**（lag_days>0，即 release_time 落在 period_date 之后）。
@@ -383,12 +396,16 @@ def _cross_derived_rows(conn, defs: dict) -> list:
         for _, r in df.iterrows():
             if r["value"] is None or pd.isna(r["value"]):
                 continue
-            # ⚠ 基准腿的可得时点按「收盘日 18:00」近似。对**美股标的**这是乐观的（其收盘
-            #   实为北京次日凌晨）；本函数**刻意不改**其语义，以免平移既有的
-            #   CN.US_SPREAD_10Y / US.TERM_SPREAD_10Y_2Y 的 PIT 可见性（若要修，需单独评估）。
+            # 基准腿的可得时点：本地市场（A 股/港股/中债/在岸汇率）当日盘后 18:00 可得；
+            #   **美股标的**的收盘在北京时间次日凌晨才可得 → 按 T+1 06:00 记（见常量注释）。
             rel = r["release_time"] if "release_time" in df.columns else None
             if rel is None or pd.isna(rel):
-                rel = datetime.datetime.combine(r["period_date"], datetime.time(18, 0), tzinfo=TZ_CN)
+                if kind == "bench" and code.startswith(US_BENCH_PREFIX):
+                    rel = datetime.datetime.combine(
+                        r["period_date"] + datetime.timedelta(days=US_BENCH_LAG_DAYS),
+                        datetime.time(US_BENCH_AVAIL_HOUR), tzinfo=TZ_CN)
+                else:
+                    rel = datetime.datetime.combine(r["period_date"], datetime.time(18, 0), tzinfo=TZ_CN)
             elif hasattr(rel, "to_pydatetime"):
                 rel = rel.to_pydatetime()
             out[r["period_date"]] = (float(r["value"]), rel)

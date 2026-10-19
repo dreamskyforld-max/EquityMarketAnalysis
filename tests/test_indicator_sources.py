@@ -3,7 +3,8 @@
 背景：指标层有两条入湖通路，映射以**模块常量**声明在 `market_state_daily.py`：
 
   · `PIT_MAP_CN` / `PIT_MAP_HK`：`regime.macro_series` → 指标（月/季频按 `release_time` PIT 填充）
-  · `BENCH_MAP` / `MOM_MAP`    ：`public.daily_benchmark` → 指标（市场报价，同日对齐）
+  · `BENCH_MAP` / `MOM_MAP`    ：`public.daily_benchmark` → 指标（市场报价，同日对齐；
+     `MOM_MAP` 含 20 日变化，pct=百分比 / diff=收益率的绝对 pp 变化）
   · 其余 42 个指标由公式从多源计算（来源见 `indicator_dict.formula`）
 
 **源编码写错是静默故障**：`_macro_pit_map` / `_bench` 查不到就返回空序列，指标照常登记进
@@ -48,7 +49,7 @@ def _macro_refs() -> dict:
     for c, s, kind in LEVEL_MAP:
         if kind == "macro":
             refs.setdefault(c, set()).add(s)
-    for c, s, kind in MOM_MAP:
+    for c, s, kind, _mode in MOM_MAP:
         if kind == "macro":
             refs.setdefault(c, set()).add(s)
     return refs
@@ -60,7 +61,7 @@ def _bench_refs() -> dict:
     for c, s, kind in LEVEL_MAP:
         if kind == "bench":
             refs.setdefault(c, set()).add(s)
-    for c, s, kind in MOM_MAP:
+    for c, s, kind, _mode in MOM_MAP:
         if kind == "bench":
             refs.setdefault(c, set()).add(s)
     return refs
@@ -156,7 +157,8 @@ class TestWiredSourcesReturnData(unittest.TestCase):
         with get_conn() as conn:
             out = _global_block(conn, idx)
         empty = {}
-        for code, src, _ in tuple(LEVEL_MAP) + tuple(MOM_MAP):
+        # LEVEL_MAP 3 元组、MOM_MAP 4 元组（含变化口径）→ 取前两位即可
+        for code, src, *_ in tuple(LEVEL_MAP) + tuple(MOM_MAP):
             s = out.get(code)
             if s is None or not s.notna().any():
                 empty[code] = src
