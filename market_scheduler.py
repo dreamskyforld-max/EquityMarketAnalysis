@@ -250,6 +250,12 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     # 中债收益率曲线（国债 + 中短期票据AAA + 商业银行普通债AAA，官方盘后发布）：19:00 取。
     ("中债收益率曲线", "get_cn_bond.py",
      {"hour": 19, "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 中债指数（综合 / 国债，**总回报口径**）：19:05。与上面同源同发布节奏，错开 5 分钟。
+    #   → §4.3.1 的 σ_b 与组合波动率完整式、§4.4.1 的 60/40 债腿（此前这三处都因债券端
+    #     只有收益率曲线、无价格序列而做不了）。
+    #   ⚠ 一次取全历史 → 全量刷新、漏跑一天不丢数据（不同于 get_cn_index_dividend）。
+    ("中债指数", "get_bond_index_cbond.py",
+     {"hour": 19, "minute": 5, "day_of_week": "mon-fri"}, None, True, None, 300),
     # 全A 市场级估值（乐咕乐股，月频序列但月内滚动更新）：19:10 刷新。
     ("全A市场估值", "get_macro_valuation.py",
      {"hour": 19, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 300),

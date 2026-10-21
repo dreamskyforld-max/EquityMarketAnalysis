@@ -135,6 +135,26 @@ INDICATORS: list[dict] = [
          remark="定义：指数近 60 日已实现波动率（年化）　·　判读：同 RV20 但更平滑，反映中期波动 regime；RV20 明显高于 RV60=波动正在放大　·　数据：基准同 RV20；需 60 日以上历史",
          market_scope="CN+HK", unit="pct", direction="high_risk", freq="day",
          formula="std(log收益, 60) * sqrt(252) * 100"),
+    dict(code="RISK.BOND_RV60", name="中债综合指数60日波动率(年化)", scope="MACRO", dimension="风险",
+         market_scope="CN+HK", unit="pct", direction="high_risk", freq="day",
+         remark="定义：中债-综合指数（**总回报口径**）近 60 日对数收益的年化波动率　·　判读：**σ_b——§4.3.1 完整组合波动式里缺的那一项**；实测全样本约 **1.9%**（远低于股票 14.6%，故近似误差主要来自协方差而非漏掉 σ_b）；当前 0.50% / 分位 6 → 债市波动被压到历史极低　·　高分位=债市自身波动放大（利率急动/流动性冲击）　·　数据：2002-01 起（受 CN.BOND_INDEX 限制）；⚠ 源序列的 percentile 恒 100 不适用，但**本指标的波动率分位有效**；CN+HK（中国债市波动是港股分母端的外生变量，同 RISK.CREDIT_SPREAD 先例）",
+         formula="std(log(CN.BOND_INDEX 日收益), 60) * sqrt(252) * 100"),
+    dict(code="RISK.COPPER_RV60", name="铜价60日波动率(年化)", scope="MACRO", dimension="风险",
+         market_scope="CN+HK", unit="pct", direction="high_risk", freq="day",
+         remark="定义：沪铜连续近 60 日对数收益的年化波动率　·　判读：商品腿的 σ（§4.4.1 风险平价）；铜是需求侧最纯的商品，其波动率放大常对应宏观预期剧烈重定价　·　数据：2005-01 起；窗口 60 日（风险估计用长窗口，快速读数用本市场指数的 RISK.RV20）",
+         formula="std(log(CMDTY.COPPER 日收益), 60) * sqrt(252) * 100"),
+    dict(code="RISK.GOLD_RV60", name="金价60日波动率(年化)", scope="MACRO", dimension="风险",
+         market_scope="CN+HK", unit="pct", direction="high_risk", freq="day",
+         remark="定义：COMEX 黄金近 60 日对数收益的年化波动率　·　判读：商品腿的 σ；⚠ 金与美元高度相关（见 §4.2.1 商品组的降权说明），其波动率里含美元因素　·　数据：2008 前后起（受 CMDTY.GOLD 限制）",
+         formula="std(log(CMDTY.GOLD 日收益), 60) * sqrt(252) * 100"),
+    dict(code="RISK.OIL_RV60", name="油价60日波动率(年化)", scope="MACRO", dimension="风险",
+         market_scope="CN+HK", unit="pct", direction="high_risk", freq="day",
+         remark="定义：Brent 原油近 60 日对数收益的年化波动率　·　判读：商品腿的 σ；⚠ 油是**双面**指标（既可能是需求也可能是供给冲击），§4.2.1 的商品组已把它降权，波动率同样不宜单独解读　·　数据：2018 起（受 CMDTY.OIL 限制，样本较短）",
+         formula="std(log(CMDTY.OIL 日收益), 60) * sqrt(252) * 100"),
+    dict(code="RISK.SPX_RV60", name="标普500 60日波动率(年化)", scope="MACRO", dimension="风险",
+         market_scope="GLOBAL", unit="pct", direction="high_risk", freq="day",
+         remark="定义：标普 500 近 60 日对数收益的**已实现**年化波动率　·　判读：与 RISK.VIX（**隐含**）口径不同——VIX 是前瞻定价、本项是后向实现；两者之差（VIX−RV）即「波动率风险溢价」，可判市场是否在为尚未发生的波动付费　·　数据：1990s 起；⚠ 美股收盘 T+1 上午才可得，回填历史时前视 1 天（见 _global_block 口径注释）",
+         formula="std(log(US.SP500 日收益), 60) * sqrt(252) * 100"),
     dict(code="RISK.MAXDD_250", name="近250日最大回撤", scope="MARKET", dimension="风险",
          remark="定义：近 250 个交易日内的最大回撤（负值）　·　判读：越接近 0 越健康；深度回撤（如 <-25%）=趋势受损，修复需要时间　·　数据：需 250 日历史；风险指数成分",
          market_scope="CN+HK", unit="pct", direction="high_risk", freq="day",
@@ -287,6 +307,18 @@ INDICATORS: list[dict] = [
          market_scope="CN", unit="pct", direction="neutral", freq="day",
          remark="定义：中债国债收益率曲线 10 年期（%），中国无风险利率　·　判读：**无单一方向**——既是贴现率（上行压估值）也是增长/通胀预期（上行反映景气），实务中与 ERP 联读：收益率上行而 ERP 同步走高=盈利驱动，反之则纯估值压制　·　数据：2006-03 起，全库最长样本之一；亦是 VAL.ERP 与 RISK.TERM_SPREAD 的输入",
          formula="CN.BOND_10Y（akshare bond_china_yield 中债国债收益率曲线-10年）"),
+    dict(code="MACRO.BOND_INDEX", name="中债-综合指数(总回报)", scope="MACRO", dimension="资金",
+         market_scope="CN", unit="index", direction="high_good", freq="day",
+         remark="定义：中债-综合指数点位，**总回报（全价/财富）口径，非净价**——覆盖国债+政金+信用全市场，代表「买入债券资产」的实际回报　·　⚠ **percentile 恒为 100、无信息**：总回报指数单调递增（票息不断滚入），每个值都是历史最大值 → 分位列**不可用，消费方必须忽略**；要看「债券贵不贵」请用 MACRO.BOND_10Y 的分位（那是收益率水平，也正是 §4.4.1 债券战略分的正解）　·　本指标真正用途是**算 σ_b**（年化波动 1.7%）与股债相关性，供 §4.3.1 的组合波动率完整式与 §4.4.1 的 60/40 债腿　·　⚠ 与 MACRO.BOND_10Y（到期收益率 %）**不是同一东西**：换算需久期假设，不互换、不拼接　·　数据：2002-01 起（实测年化 +4.03%、最大回撤 −3.55%、年化波动 1.71%）；仅 CN",
+         formula="CN.BOND_INDEX（akshare bond_composite_index_cbond，中国债券信息网中债指数）"),
+    dict(code="MACRO.BOND_TREASURY_INDEX", name="中债-国债指数(总回报)", scope="MACRO", dimension="资金",
+         market_scope="CN", unit="index", direction="high_good", freq="day",
+         remark="定义：中债-国债指数点位，**总回报口径**（只含国债）　·　判读：无风险资产的**已实现**总回报，可与 MACRO.BOND_10Y（到期收益率）对照看「carry 实现程度」——指数涨幅持续高于当前收益率说明历史票息再投资贡献大　·　数据：2008-01 起（实测年化 +4.16%、年化波动 1.86%）；与 CN.BOND_INDEX 的差别是**只含国债**（无信用溢价）；仅 CN",
+         formula="CN.BOND_TREASURY_INDEX（akshare bond_treasury_index_cbond）"),
+    dict(code="MACRO.BOND_INDEX_CHG20", name="中债综合指数 20日回报", scope="MACRO", dimension="资金",
+         market_scope="CN+HK", unit="pct", direction="high_good", freq="day",
+         remark="定义：中债-综合指数近 20 个交易日的**回报**（%，总回报口径）　·　判读：§4.4.1 债券**战术分**的直接输入——衰退象限 + 正回报 = 资本利得占优；⚠ 与 MACRO.BOND_10Y_CHG20（收益率变化 pp）**不是一回事**：收益率下行不等于债市回报为正（还受久期、票息再投资、曲线平移影响），故两个口径都要　·　数据：2002-01 起；前 20 个交易日无值；CN+HK",
+         formula="(CN.BOND_INDEX / CN.BOND_INDEX(t−20) − 1) × 100（MOM_MAP pct 口径）"),
     dict(code="MACRO.BOND_10Y_CHG20", name="中债10Y 20日变化", scope="MACRO", dimension="资金",
          market_scope="CN+HK", unit="pp", direction="high_risk", freq="day",
          remark="定义：10 年期国债收益率近 20 个交易日的变化（**pp，非百分比**——收益率本身以 % 计价且可能贴近 0，百分比变化会严重失真：1.65%→1.70% 的「3% 涨幅」实为 +5bp）　·　判读：按 §4.2 的方向性读法——**下行 + 信用利差收窄 = 风险偏好改善**，上行则警惕；⚠ 上行也可能是增长预期驱动（对股票未必坏），须与 MACRO.BREAKEVEN_10Y / 信用利差联读以区分「通胀或紧缩驱动」与「增长驱动」；水平值的双重性质见 MACRO.BOND_10Y　·　数据：2006-03 起（受 CN.BOND_10Y 限制）；前 20 个交易日无值；CN+HK（中国利率是港股分母端的重要外生变量，同 RISK.CREDIT_SPREAD 先例）",
@@ -384,6 +416,18 @@ INDICATORS: list[dict] = [
          market_scope="GLOBAL", unit="cny_per_ton", direction="high_good", freq="day",
          remark="定义：沪铜连续期货收盘价（元/吨），全球需求侧最纯的商品　·　判读：**高分位=再通胀交易已打得较满**——价格水平反映「需求预期兑现程度」，方向性看 MACRO.COPPER_MOM20；与 MACRO.GOLD 的比值可看「铜强金弱」的 risk-on 结构　·　数据：2005-01 起长样本",
          formula="CMDTY.COPPER 收盘价（akshare futures_zh_daily_sina:CU0）"),
+    dict(code="MACRO.SH000001", name="上证指数", scope="MACRO", dimension="跨资产",
+         market_scope="CN+HK", unit="index", direction="high_good", freq="day",
+         remark="定义：上证综合指数收盘点位　·　判读：A 股的价格基准；**分位本身不是贵贱信号**（指数点位无均值回归含义），贵贱看 §4.1 的 ERP　·　真正用途：**让前端能自算收益序列与资产间相关性矩阵**（§4.4.1 风险平价需要）——此前库里只有动量/波动率派生量、没有水平值，前端拿不到原始序列　·　数据：1990s 起；⚠ 美股式同日对齐口径见 _global_block 注释（A 股本地市场，当日盘后即得，无此问题）",
+         formula="daily_benchmark SH.000001 收盘"),
+    dict(code="MACRO.HSI", name="恒生指数", scope="MACRO", dimension="跨资产",
+         market_scope="CN+HK", unit="index", direction="high_good", freq="day",
+         remark="定义：恒生指数收盘点位　·　判读：同 MACRO.SH000001——价格基准，不作贵贱信号；用于前端自算港股收益与相关性　·　数据：港股交易日；HK 本市场指数的已实现波动率已由 RISK.RV20/RV60 覆盖，此处只补水平值",
+         formula="daily_benchmark HK.800000 收盘"),
+    dict(code="MACRO.SPX", name="标普500", scope="MACRO", dimension="跨资产",
+         market_scope="GLOBAL", unit="index", direction="high_good", freq="day",
+         remark="定义：标普 500 收盘点位　·　判读：同 MACRO.SH000001——价格基准；⚠ **美股收盘在北京时间 T+1 上午才可得**，故本指标的 T 日读数实为 T+1 凌晨发生的事（回填历史时前视 1 天，见 _global_block 的口径注释）　·　真正用途：前端自算美股收益与跨市场相关性；已实现波动率见 RISK.SPX_RV60（VIX 是隐含、口径不同）　·　数据：1990s 起",
+         formula="daily_benchmark US.SP500 收盘"),
     dict(code="MACRO.GOLD", name="沪金连续价格", scope="MACRO", dimension="跨资产",
          market_scope="GLOBAL", unit="cny_per_gram", direction="high_risk", freq="day",
          remark="定义：沪金连续期货收盘价（元/克）　·　判读：**黄金与实际利率互为反面**——价格高分位常对应避险需求高企/实际利率下行，对股票是 risk-off 信号（方向取反）；与美债 10Y、美元指数联读可分离「避险」与「美元弱」两种驱动　·　数据：2008-01 起",
@@ -719,6 +763,10 @@ PIT_MAP_CN = {
     "MACRO.LPR_1Y": "CN.LPR_1Y",                   # 政策利率锚
     "MACRO.LPR_5Y": "CN.LPR_5Y",                   # 房贷利率锚（地产链）
     "MACRO.BOND_10Y": "CN.BOND_10Y",               # 10Y 国债（neutral；ERP/期限利差输入）
+    # 债券资产的总回报指数（§4.3.1 的 σ_b、§4.4.1 的 60/40 债腿）。⚠ 是**指数点位**，
+    #   与 CN.BOND_10Y（到期收益率 %）不是同一东西、不互换；且为**总回报**口径非净价。
+    "MACRO.BOND_INDEX": "CN.BOND_INDEX",
+    "MACRO.BOND_TREASURY_INDEX": "CN.BOND_TREASURY_INDEX",
     "MACRO.PMI_MFG": "CN.PMI_MFG",                 # 制造业景气
     "MACRO.PMI_NONMFG": "CN.PMI_NONMFG",           # 非制造业景气
     "MACRO.PMI_NEW_ORDERS": "CN.PMI_NEW_ORDERS",   # PMI 最领先分项
@@ -770,6 +818,13 @@ LEVEL_MAP = (
     ("MACRO.COPPER", "CMDTY.COPPER", "macro"),
     ("MACRO.GOLD", "CMDTY.GOLD", "macro"),
     ("MACRO.OIL", "CMDTY.OIL", "macro"),
+    # 三大股指**水平值**（此前库里只有动量/波动率派生量，前端拿不到原始序列）：
+    #   §4.4.1 的风险平价/全天候需要资产间相关性矩阵，而相关性的输入是**日收益序列**，
+    #   必须先有水平值才能算 → 这三条是「让前端能自算相关性」的前提。
+    #   ⚠ 指数点位的分位**不是贵贱信号**（无均值回归含义），贵贱看 §4.1 的 ERP。
+    ("MACRO.SH000001", "SH.000001", "bench"),
+    ("MACRO.HSI", "HK.800000", "bench"),
+    ("MACRO.SPX", "US.SP500", "bench"),
 )
 
 # 动量/变化类：(指标, 源编码, 源所在层, 变化口径)。窗口统一 MOM_WINDOW 个交易日。
@@ -788,6 +843,11 @@ MOM_MAP = (
     ("MACRO.OIL_MOM20", "CMDTY.OIL", "macro", "pct"),
     # ── §4.2「10Y 收益率方向」与「强美元 / 人民币」：此前只有水平值，方向需消费方自算 ──
     ("MACRO.BOND_10Y_CHG20", "CN.BOND_10Y", "macro", "diff"),   # pp（中国利率）
+    ("MACRO.BOND_INDEX_CHG20", "CN.BOND_INDEX", "macro", "pct"),
+    # 债券资产的 20 日回报（§4.4.1 债券战术分：资本利得方向）。⚠ 与 BOND_10Y_CHG20 不同
+    #   口径：那个是**收益率**变化（pp），这个是**指数回报**（%）—— 收益率下行≠债市回报为正
+    #   （还受久期与票息再投资影响），故两者都要。
+    ("MACRO.BOND_INDEX_CHG20", "CN.BOND_INDEX", "macro", "pct"),
     ("MACRO.US_10Y_CHG20", "US.DGS10", "bench", "diff"),        # pp（全球无风险利率）
     ("MACRO.DXY_CHG20", "US.DXY", "bench", "pct"),              # %（强美元 → EM 承压）
     ("MACRO.USDCNY_CHG20", "FX.USDCNY", "bench", "pct"),        # %（上行 = 人民币贬值）
@@ -796,6 +856,23 @@ MOM_MAP = (
     #    预测力最强的两组 —— 信用利差领先股票调整、波动率抬头先于跳空风险）。
     ("RISK.CREDIT_SPREAD_CHG20", "CN.CREDIT_SPREAD_MTN_AAA_10Y", "macro", "diff"),  # pp
     ("RISK.VIX_CHG20", "US.VIXCLS", "bench", "diff"),           # 波动率点数（VIX 惯例按"点"读）
+)
+
+# 各资产已实现波动率（§4.3.1 的 σ_b、§4.4.1 风险平价/全天候的输入）：(指标, 源, 源所在层)。
+#   · 算法同 `_risk_from_index`：对数收益 → 滚动 std → ×√252 年化。
+#   · 窗口统一 **60 日**（`VOL_WINDOW`）：风险估计要用长窗口——短窗口估计噪声大，
+#     且「波动正在放大」这类快速读数已由本市场指数的 RISK.RV20 承担。
+#   · 本市场**自身指数**的波动率已在 RISK.RV20/RV60 里（CN=上证、HK=恒指），故不重复登记；
+#     这里只补**跨资产**需要的：债券 + 三大商品 + 美股（港股即 HK 本市场指数，已覆盖）。
+#   · 用途：§4.3.1 的完整组合波动式 sqrt(w²σ_e²+(1−w)²σ_b²+2w(1−w)ρσ_eσ_b) 需要 σ_b；
+#     §4.4.1 的风险平价需要每个资产各自的 σ 才能算风险贡献。
+VOL_WINDOW = 60
+VOL_MAP = (
+    ("RISK.BOND_RV60", "CN.BOND_INDEX", "macro"),      # 中债综合指数（总回报）→ σ_b
+    ("RISK.COPPER_RV60", "CMDTY.COPPER", "macro"),     # 铜（需求）
+    ("RISK.GOLD_RV60", "CMDTY.GOLD", "macro"),         # 金（避险/实际利率）
+    ("RISK.OIL_RV60", "CMDTY.OIL", "macro"),           # 油（通胀）
+    ("RISK.SPX_RV60", "US.SP500", "bench"),            # 标普 500（美股已实现；VIX 是隐含，口径不同）
 )
 
 
@@ -1438,6 +1515,18 @@ def _global_block(conn, idx) -> dict:
         # diff 用于收益率（pp）：百分比变化在低利率/贴近 0 时失真，见 MOM_MAP 注释
         chg = (s - s.shift(MOM_WINDOW)) if mode == "diff" else (s / s.shift(MOM_WINDOW) - 1) * 100
         out[code] = _align_close(chg, idx)
+
+    # 各资产已实现波动率（§4.3.1 的 σ_b、§4.4.1 风险平价）：算法同 `_risk_from_index`
+    #   （对数收益 → 滚动 std → 年化）。窗口统一取 **VOL_WINDOW=60**：风险估计用长窗口
+    #   （短窗口估计噪声大，且 20 日口径已由本市场指数的 RISK.RV20 承担"快速读数"角色）。
+    for code, src, kind in VOL_MAP:
+        s = loader[kind](src)
+        if len(s) <= VOL_WINDOW:
+            out[code] = pd.Series(dtype=float)
+            continue
+        r = np.log(s / s.shift(1))
+        out[code] = _align_close(
+            r.rolling(VOL_WINDOW, min_periods=int(VOL_WINDOW * 0.6)).std() * np.sqrt(252) * 100, idx)
     return out
 
 
