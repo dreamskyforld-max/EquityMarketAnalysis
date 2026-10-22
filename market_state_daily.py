@@ -299,6 +299,10 @@ INDICATORS: list[dict] = [
          market_scope="CN", unit="pct", direction="high_risk", freq="month",
          remark="定义：贷款市场报价利率 1 年期（%），实体贷款定价基准　·　判读：**读数下行=宽松**（direction=high_risk，低反而是宽松）；LPR 下调通常利好地产链与整体估值　·　数据：2013-10 起（2019-08 前为贷款基准利率，口径已切换，长周期分位需注意）",
          formula="CN.LPR_1Y（akshare macro_china_lpr，日频重复报价按月取当月最后一次）"),
+    dict(code="MACRO.US_BOND_TR_PROXY", name="美债总回报代理指数", scope="MACRO", dimension="资金",
+         market_scope="GLOBAL", unit="index", direction="high_good", freq="day",
+         remark="定义：美债总回报**代理指数**（久期近似构造，base 100）—— 日回报 = (−8.5×Δy + y/252)/100，其中 y=US.DGS10　·　判读：⚠ **这不是真实指数**：真实的美债总回报指数（ICE BofA）在 FRED，而 FRED 当前停机维护、yfinance 被限流 → 先用久期近似顶上，**待源恢复后必须替换**。已知偏差：年化波动 7.79%（真实约 5~6%，恒定久期不含 roll-down → **高估约 30%**）、最大回撤 −26.88%（偏深）、年化回报 4.83%（基本正确）　·　⚠ **只可用于「相关性」口径**（尺度无关、收益序列形状正确）；**不可用于「波动率」口径**（高估会让 §4.3.1 过度压缩仓位）→ 故本指标**不参与任何 VOL/波动率指标**　·　用途：HK 侧股债相关性矩阵的债腿（§4.4.1 3.1）　·　数据：1990-12 起；⚠ 美股口径，T 日读数在北京 T+1 上午才可得",
+         formula="100 × Π(−8.5×Δ(US.DGS10) + US.DGS10/252)（get_us_bond_tr_proxy 派生）"),
     dict(code="MACRO.SHIBOR_3M", name="Shibor 3个月(货币市场利率)", scope="MACRO", dimension="资金",
          market_scope="CN", unit="pct", direction="high_risk", freq="day",
          remark="定义：上海银行间同业拆放利率 3 个月期（%），**货币市场/现金类资产的真实回报锚**　·　判读：读数下行=银行间流动性宽松；上行=资金面紧张（季末/缴税/监管考核期会跳升，属正常季节性）　·　⚠ **这是 §4.4.1 现金战略分的主口径，不能用 MACRO.LPR_1Y 代替**：LPR 是**贷款**利率，含银行利差与信用风险溢价，投资者拿不到——实测 LPR 1Y 3.00% vs Shibor 3M 1.41%，**差 1.59pp**，用 LPR 会把现金的实际回报严重高估（+2.10% vs 真实的 +0.51%）　·　与 MACRO.BOND_10Y 的关系：Shibor 是短端无风险、10Y 国债是长端无风险，两者之差即**期限利差的短端部分**　·　数据：2006-10 起长样本、日频",
@@ -776,6 +780,10 @@ PIT_MAP_CN = {
     #   Shibor 才是货币市场/现金类资产（货基、同业存单、短债）的真实回报锚。
     "MACRO.SHIBOR_ON": "CN.SHIBOR_ON",             # 隔夜（流动性最敏感）
     "MACRO.SHIBOR_3M": "CN.SHIBOR_3M",             # 3 个月 ← 现金战略分主口径（久期≈货基）
+    # 美债总回报**代理指数**（HK 侧债腿，§4.4.1 的 HK 相关性矩阵）。⚠ 只作水平值供前端
+    #   算相关性；**刻意不进 VOL_MAP**——代理的年化波动 7.79% 高估真实指数约 30%，
+    #   拿去算 σ 会让 §4.3.1 过度压缩仓位（详见序列自身 remark）。
+    "MACRO.US_BOND_TR_PROXY": "US.BOND_TR_PROXY",
     "MACRO.BOND_10Y": "CN.BOND_10Y",               # 10Y 国债（neutral；ERP/期限利差输入）
     # 债券资产的总回报指数（§4.3.1 的 σ_b、§4.4.1 的 60/40 债腿）。⚠ 是**指数点位**，
     #   与 CN.BOND_10Y（到期收益率 %）不是同一东西、不互换；且为**总回报**口径非净价。
@@ -800,6 +808,10 @@ PIT_MAP_HK = {
     "RISK.GRADE_SPREAD": "CN.GRADE_SPREAD_AA_AAA_5Y",
     "VAL.DIV_SPREAD": "HK.DIV_SPREAD",             # 股息利差（港股：恒指股息率 − 美债10Y，月频）
     "MACRO.TSF_STOCK_YOY": "CN.TSF_STOCK_YOY",     # 社融存量同比（中国信用扩张读数）
+    # 美债总回报代理指数（HK 侧债腿，§4.4.1 的 HK 相关性矩阵）。⚠ 只作水平值供前端
+    #   算相关性；**刻意不进 VOL_MAP**——代理的年化波动 7.79% 高估真实指数约 30%，
+    #   拿去算 σ 会让 §4.3.1 过度压缩仓位（详见序列自身 remark）。
+    "MACRO.US_BOND_TR_PROXY": "US.BOND_TR_PROXY",
     # —— CN 宏观月频补接（market_scope=CN+HK 者；不入合成，作独立读数）——
     "MACRO.M1_YOY": "CN.M1_YOY",                   # 资金活化
     "MACRO.M2_YOY": "CN.M2_YOY",                   # 流动性总量

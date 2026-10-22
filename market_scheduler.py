@@ -256,6 +256,13 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     #   ⚠ 一次取全历史 → 全量刷新、漏跑一天不丢数据（不同于 get_cn_index_dividend）。
     ("中债指数", "get_bond_index_cbond.py",
      {"hour": 19, "minute": 5, "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 美债总回报**代理指数**（久期近似）：19:06。HK 侧债腿 —— §4.4.1 的 HK 相关性矩阵需要它。
+    #   ⚠ 真实指数在 FRED（ICE BofA），而 FRED 当前停机维护、yfinance 被限流 → 先用久期
+    #     近似顶上；**待 FRED 恢复后必须替换为真实指数**（备选序列已记在采集器 docstring）。
+    #   ⚠ 只可用于相关性口径，**不可用于波动率口径**（高估约 30%）→ 不接入任何 VOL 指标。
+    #   纯派生（只读 daily_benchmark 的 US.DGS10）→ 漏跑一天不丢数据。
+    ("美债总回报代理", "get_us_bond_tr_proxy.py",
+     {"hour": 19, "minute": 6, "day_of_week": "mon-fri"}, None, True, None, 300),
     # 全A 市场级估值（乐咕乐股，月频序列但月内滚动更新）：19:10 刷新。
     ("全A市场估值", "get_macro_valuation.py",
      {"hour": 19, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 300),
