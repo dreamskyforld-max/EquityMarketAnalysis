@@ -299,6 +299,14 @@ INDICATORS: list[dict] = [
          market_scope="CN", unit="pct", direction="high_risk", freq="month",
          remark="定义：贷款市场报价利率 1 年期（%），实体贷款定价基准　·　判读：**读数下行=宽松**（direction=high_risk，低反而是宽松）；LPR 下调通常利好地产链与整体估值　·　数据：2013-10 起（2019-08 前为贷款基准利率，口径已切换，长周期分位需注意）",
          formula="CN.LPR_1Y（akshare macro_china_lpr，日频重复报价按月取当月最后一次）"),
+    dict(code="MACRO.SHIBOR_3M", name="Shibor 3个月(货币市场利率)", scope="MACRO", dimension="资金",
+         market_scope="CN", unit="pct", direction="high_risk", freq="day",
+         remark="定义：上海银行间同业拆放利率 3 个月期（%），**货币市场/现金类资产的真实回报锚**　·　判读：读数下行=银行间流动性宽松；上行=资金面紧张（季末/缴税/监管考核期会跳升，属正常季节性）　·　⚠ **这是 §4.4.1 现金战略分的主口径，不能用 MACRO.LPR_1Y 代替**：LPR 是**贷款**利率，含银行利差与信用风险溢价，投资者拿不到——实测 LPR 1Y 3.00% vs Shibor 3M 1.41%，**差 1.59pp**，用 LPR 会把现金的实际回报严重高估（+2.10% vs 真实的 +0.51%）　·　与 MACRO.BOND_10Y 的关系：Shibor 是短端无风险、10Y 国债是长端无风险，两者之差即**期限利差的短端部分**　·　数据：2006-10 起长样本、日频",
+         formula="CN.SHIBOR_3M（akshare macro_china_shibor_all / 银行间同业拆借中心）"),
+    dict(code="MACRO.SHIBOR_ON", name="Shibor 隔夜(货币市场利率)", scope="MACRO", dimension="资金",
+         market_scope="CN", unit="pct", direction="high_risk", freq="day",
+         remark="定义：上海银行间同业拆放利率隔夜（%）　·　判读：**对流动性冲击最敏感**的读数——DR007/隔夜利率的跳升常先于资金面紧张传导到股债；季末与长假前跳升属季节性　·　与 MACRO.SHIBOR_3M 的分工：隔夜看「边际资金松紧」，3M 看「现金资产的持有回报」（§4.4.1 现金战略分用 3M 而非隔夜，因久期更接近货基）　·　数据：2006-10 起；⚠ 隔夜波动远大于 3M，分位受极端值影响",
+         formula="CN.SHIBOR_ON（akshare macro_china_shibor_all）"),
     dict(code="MACRO.LPR_5Y", name="LPR 5年期", scope="MACRO", dimension="资金",
          market_scope="CN", unit="pct", direction="high_risk", freq="month",
          remark="定义：贷款市场报价利率 5 年期（%），房贷利率锚　·　判读：读数下行=地产政策放松信号，利好地产链与居民中长贷　·　数据：2019-08 起 86 个月，分位样本约 6 年",
@@ -762,6 +770,12 @@ PIT_MAP_CN = {
     "MACRO.M1_M2_SCISSOR": "CN.M1_M2_SCISSOR",     # 资金活化程度（顺周期领先）
     "MACRO.LPR_1Y": "CN.LPR_1Y",                   # 政策利率锚
     "MACRO.LPR_5Y": "CN.LPR_5Y",                   # 房贷利率锚（地产链）
+    # ── Shibor（**货币市场利率**）：§4.4.1 现金战略分的正确代理 ──
+    #   ⚠ 不能用 LPR 代替：LPR 是**贷款**利率（含银行利差与信用风险溢价），
+    #     投资者拿不到——实测 LPR 1Y 3.00% vs Shibor 3M 1.41%，差 1.59pp。
+    #   Shibor 才是货币市场/现金类资产（货基、同业存单、短债）的真实回报锚。
+    "MACRO.SHIBOR_ON": "CN.SHIBOR_ON",             # 隔夜（流动性最敏感）
+    "MACRO.SHIBOR_3M": "CN.SHIBOR_3M",             # 3 个月 ← 现金战略分主口径（久期≈货基）
     "MACRO.BOND_10Y": "CN.BOND_10Y",               # 10Y 国债（neutral；ERP/期限利差输入）
     # 债券资产的总回报指数（§4.3.1 的 σ_b、§4.4.1 的 60/40 债腿）。⚠ 是**指数点位**，
     #   与 CN.BOND_10Y（到期收益率 %）不是同一东西、不互换；且为**总回报**口径非净价。
