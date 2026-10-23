@@ -60,6 +60,10 @@ INDICATORS: list[dict] = [
          remark="定义：当日涨家数减跌家数的绝对家数（腾落指数的每日增量）　·　判读：>0 涨多于跌；应看其 20 日均值方向而非单日极值　·　数据：A/D Line 累计值由消费方自行累加，本指标只给增量，避免增量重算时口径漂移",
          market_scope="CN+HK", unit="count", direction="high_good", freq="day",
          formula="涨家数 − 跌家数（腾落指数的每日增量；AD Line 累计值由消费方自行累加，避免累计序列在增量重算时口径漂移）"),
+    dict(code="BREADTH.NEW_HIGH_LOW_20", name="20日新高−新低家数差(占比)", scope="MARKET", dimension="宽度",
+         remark="定义：创 20 日新高与创新低的家数净差占有行情家数比例（§5.1「20日/60日新高−新低」的**短窗**）　·　判读：与 60 日版本分工——**20 日是快变量**（1 个月内的动能，拐点先动），**60 日是慢变量**（中期趋势是否健康）；两者背离时最有信息量（如 60 日仍正而 20 日转负 = 中期趋势未破但短期动能衰竭）　·　数据：需 20 日以上个股历史；CN 1991 起 / HK 2019 起；新上市股不计入",
+         market_scope="CN+HK", unit="pct", direction="high_good", freq="day",
+         formula="(20日新高家数 − 20日新低家数) / 有效样本家数 * 100"),
     dict(code="BREADTH.NEW_HIGH_LOW_60", name="60日新高−新低家数差(占比)", scope="MARKET", dimension="宽度",
          remark="定义：创 60 日新高与创新低的家数净差占有行情家数比例　·　判读：>0 创新高者多于创新低者=趋势健康；持续为负而指数走高=内在动能衰竭　·　数据：需 60 日以上历史，新上市股不计入",
          market_scope="CN+HK", unit="pct", direction="high_good", freq="day",
@@ -73,9 +77,21 @@ INDICATORS: list[dict] = [
          market_scope="CN+HK", unit="pct", direction="high_good", freq="day",
          formula="收盘 > MA200 的家数 / 有 200 日以上历史的家数 * 100"),
     dict(code="BREADTH.EQ_VS_CAP_20D", name="等权−市值加权 20日累计收益差", scope="MARKET", dimension="宽度",
-         remark="定义：等权组合与市值加权组合近 20 日累计收益之差　·　判读：>0 小票/等权跑赢（普涨、散户活跃），<0 权重股主导（结构性行情）　·　数据：依赖总市值字段 → 2018 起；仅 CN",
-         market_scope="CN", unit="pct", direction="high_good", freq="day",
+         remark="定义：等权组合与市值加权组合近 20 日累计收益之差　·　判读：>0 小票/等权跑赢（普涨、散户活跃），<0 权重股主导（结构性行情）；与 BREADTH.AMT_CONC_TOP10 联读——**集中度高 + 本指标为负 = 少数权重股撑指数**　·　数据：依赖总市值字段 → CN 2018 起、HK 2019 起；⚠ HK 的市值加权用 total_market_val，对无市值行（约 0.03%）按 NULL 跳过",
+         market_scope="CN+HK", unit="pct", direction="high_good", freq="day",
          formula="Σ20(等权日收益 − 市值加权日收益)；依赖市值字段 → 2018 起"),
+    dict(code="BREADTH.UP_DOWN_STRENGTH", name="涨跌力度比", scope="MARKET", dimension="宽度",
+         remark="定义：**上涨股平均涨幅 ÷ |下跌股平均跌幅|**（§5.1「上涨股均涨幅 vs 下跌股均跌幅」）　·　判读：**1.0 = 力道均衡**；>1 涨得比跌得凶（多头有力），<1 跌得比涨得凶（空头有力）——它是「家数」之外的第二层信息：**涨跌家数相同、力度可能完全相反**　·　为什么要它：ADV_RATIO 只说「多少只涨」，本指标说「涨的有多凶」，两者背离时最有信息量（如家数多但力度弱 = 普涨但虚）　·　为什么用比值不用差值：差值受当日整体波动率驱动（高波动日两侧都大），比值才是「相对力道」　·　数据：CN 1991 起 / HK 2019 起；⚠ **两市场不可横向比**（A 股涨跌停制度会截断尾部，港股无限制）",
+         market_scope="CN+HK", unit="ratio", direction="high_good", freq="day",
+         formula="avg(涨幅 | 涨) / |avg(跌幅 | 跌)|；HK 用 (close/prev_close−1)×100"),
+    dict(code="BREADTH.AMT_CONC_TOP10", name="成交额集中度(TOP10%占比)", scope="MARKET", dimension="宽度",
+         remark="定义：当日成交额排名前 **10%** 的个股，其成交额占全市场成交额的比重（%）（§5.1「成交额集中度」）　·　判读：**高 = 资金抱团在少数股票**（分化、题材炒作、指数由少数权重拉动），低 = 资金分散（普涨普跌、轮动健康）；与 BREADTH.EQ_VS_CAP_20D 联读——集中度高而等权跑输 = 典型的「少数股撑指数」　·　⚠ **两市场不可横向比**：实测近一年 A 股 52~68%（均值 59%）、港股 86~93%（均值 90%）——港股小盘股流动性差，集中度天然远高，只能各自纵向看分位　·　数据：CN 1991 起 / HK 2019 起；港股沿用 HK_MIN_AMOUNT 仙股门槛",
+         market_scope="CN+HK", unit="pct", direction="high_risk", freq="day",
+         formula="ntile(10) 按当日成交额降序分档 → sum(amount | 第1档) / sum(amount) × 100"),
+    dict(code="BREADTH.AVG_CORR_VW", name="平均相关性(方差加权,60日)", scope="MARKET", dimension="宽度",
+         remark="定义：全市场个股两两相关性的**方差加权**平均值（60 日窗口），§5.1「个股平均相关性」　·　判读：**上升 = 分散化失效**（个股同涨同跌、选股无用，系统性风险主导）；低位 = 个股分化、结构性行情活跃　·　它比 RISK.SYNC_DOWN_20D（下跌家数占比的 20 日均值）是真信号：后者只是「同步下跌」的占比代理，本指标才是相关性本身　·　⚠ **口径是「方差加权」，不是文献里的「简单平均」**：实测（A 股 293 只样本，60 日）简单平均 +0.2185、方差加权 +0.3110，差约 0.09 —— 与 average pairwise correlation 不可直接比。选方差加权的理由：组合风险本来由方差加权决定，高波动股的相关性才是「分散化失效」的驱动项　·　⚠ 算法用等权组合方差恒等式（O(N) 而非 O(N²) 逐对），实测对「方差加权」口径可精确还原（误差 0.0000）　·　数据：CN 1991 起 / HK 2019 起；需 60 日以上个股历史",
+         market_scope="CN+HK", unit="corr", direction="high_risk", freq="day",
+         formula="ρ̄ = (σ_p² − V/N) / (S² − V/N)；σ_p²=等权组合60日方差, V=mean(个股60日方差), S=mean(个股60日标准差)"),
     dict(code="BREADTH.LIMIT_NET", name="涨跌停家数差(占比)", scope="MARKET", dimension="宽度",
          remark="定义：涨停与跌停家数净差占有行情家数比例，极端情绪强度　·　判读：大幅为正=情绪亢奋（涨停潮），大幅为负=恐慌；极值后常伴反转　·　数据：涨跌停按板块阈值判定（主板±9.8 / 双创±19.6），ST 未单独处理会被误判；仅 CN",
          market_scope="CN", unit="pct", direction="high_good", freq="day",
@@ -519,10 +535,10 @@ INDICATORS: list[dict] = [
          remark="定义：近 60 日董监高净减持金额（卖出−买入，亿元）　·　判读：内部人净减持=最了解公司的人在卖出，风险信号（风险指数成分）；净增持为正面信号　·　数据：仅事件级临时公告（含成交均价）；源仅滚动近 1 年，历史靠逐日累积；北交所已排除（源侧数量量纲失真）；仅 CN",
          formula="(Σ SELL − Σ BUY) event_value(亿元)，ann_date ∈ (t−60d, t]"),
     # —— 行业层（第④层，独立于市场合成；不做温度计/风险成员）——
-    dict(code="SECTOR.UP_RATIO", name="行业上涨占比(申万一级)", scope="SECTOR", dimension="宽度",
-         market_scope="CN", unit="pct", direction="high_good", freq="day",
-         remark="定义：31 个申万一级行业中当日收涨的占比，行业层宽度　·　判读：>50 多数行业上涨=广度健康；与市场宽度（BREADTH）同向确认，背离时提示指数由少数权重行业拉动　·　数据：分母为当日有行情的行业数；仅 CN",
-         formula="count(行业当日涨幅>0) / count(有行情行业) × 100"),
+    dict(code="SECTOR.UP_RATIO", name="行业上涨占比", scope="SECTOR", dimension="宽度",
+         market_scope="CN+HK", unit="pct", direction="high_good", freq="day",
+         remark="定义：当日收涨的行业数占比，行业层宽度（§5.1「行业参与广度」）　·　判读：>50 多数行业上涨=广度健康；与市场宽度（BREADTH）同向确认，背离时提示指数由少数权重行业拉动　·　⚠ **两市场构造不同、数值不可直接比**：**CN** = 31 个申万一级**行业指数**（官方指数涨跌，1999 起）；**HK** = 恒生**三级 113 个行业**（库里无行业指数 → 用 stock_sector 映射 + 个股 change_pct **等权合成**行业收益，粒度细 3.6 倍、均 24.6 只/行业，2019 起）。两者同义（多少比例行业在涨）但不同构，只能各自看分位（同 MACRO.STOCK_BOND_CORR 先例）　·　数据：分母为当日有行情的行业数；HK 侧受覆盖度门禁遮罩",
+         formula="CN：count(申万一级行业指数当日涨幅>0)/count(有行情行业)×100；HK：同式，行业收益改由个股等权合成"),
     dict(code="SECTOR.MOM_20D_MEDIAN", name="行业20日动量中位数", scope="SECTOR", dimension="动量",
          market_scope="CN", unit="pct", direction="high_good", freq="day",
          remark="定义：31 个申万一级行业 20 日收益的横截面中位数　·　判读：趋势跟随读数——>0 多数行业中期趋势向上；与估值分位配合防过热（高动量+高估值分位=警惕）　·　数据：用中位数抗单行业极端值；仅 CN",
@@ -707,22 +723,28 @@ def _per_stock_windows(conn, market: str, w_start: datetime.date, end: datetime.
 
         # 批内逐股滚动（算法与参数和旧版完全一致，仅数据范围缩小到本批）
         roll = df.groupby("stock_code", sort=False)["close"]
+        n20 = roll.rolling(20, min_periods=1).count().reset_index(level=0, drop=True)
         n60 = roll.rolling(60, min_periods=1).count().reset_index(level=0, drop=True)
         n200 = roll.rolling(200, min_periods=1).count().reset_index(level=0, drop=True)
+        h20 = roll.rolling(20, min_periods=1).max().reset_index(level=0, drop=True)
+        l20 = roll.rolling(20, min_periods=1).min().reset_index(level=0, drop=True)
         h60 = roll.rolling(60, min_periods=1).max().reset_index(level=0, drop=True)
         l60 = roll.rolling(60, min_periods=1).min().reset_index(level=0, drop=True)
         ma60 = roll.rolling(60, min_periods=1).mean().reset_index(level=0, drop=True)
         ma200 = roll.rolling(200, min_periods=1).mean().reset_index(level=0, drop=True)
 
-        ok60, ok200 = n60 >= 60, n200 >= 200
+        ok20, ok60, ok200 = n20 >= 20, n60 >= 60, n200 >= 200
         part = pd.DataFrame({
             "trade_date": df["trade_date"],
-            "ok60": ok60.astype(int), "ok200": ok200.astype(int),
+            "ok20": ok20.astype(int), "ok60": ok60.astype(int), "ok200": ok200.astype(int),
+            "nh20": (ok20 & (df["close"] >= h20)).astype(int),
+            "nl20": (ok20 & (df["close"] <= l20)).astype(int),
             "nh60": (ok60 & (df["close"] >= h60)).astype(int),
             "nl60": (ok60 & (df["close"] <= l60)).astype(int),
             "ab60": (ok60 & (df["close"] > ma60)).astype(int),
             "ab200": (ok200 & (df["close"] > ma200)).astype(int),
-        }).groupby("trade_date")[["ok60", "ok200", "nh60", "nl60", "ab60", "ab200"]].sum()
+        }).groupby("trade_date")[
+            ["ok20", "ok60", "ok200", "nh20", "nl20", "nh60", "nl60", "ab60", "ab200"]].sum()
         # 逐批累加（同一天跨批相加；本批缺失的日期按 0 补 —— 该批当天无有效样本，正确）
         agg = part if agg is None else agg.add(part, fill_value=0)
         del df
@@ -947,8 +969,12 @@ _COVERAGE_WARN_RATIO = 0.9       # 低于此比值 → 仅打印告警（不作�
 # 不在列的指标（基准指数波动/宏观 PIT/资金流外部源等）与当日样本数无关，照常计算。
 _CROSS_SECTIONAL_CODES = (
     "BREADTH.ADV_RATIO", "BREADTH.MCCLELLAN", "BREADTH.ADV_MINUS_DEC", "BREADTH.LIMIT_NET",
-    "BREADTH.NEW_HIGH_LOW_60", "BREADTH.PCT_ABOVE_MA60", "BREADTH.PCT_ABOVE_MA200",
+    "BREADTH.NEW_HIGH_LOW_20", "BREADTH.NEW_HIGH_LOW_60",
+    "BREADTH.PCT_ABOVE_MA60", "BREADTH.PCT_ABOVE_MA200",
     "BREADTH.EQ_VS_CAP_20D",
+    # 以下两项都依赖「当日全市场横截面」：样本塌陷日会让力度比失真（只剩监控池的涨跌）、
+    # 让集中度虚高（分母只剩几十只）→ 必须与上面同列，整体作废。
+    "BREADTH.UP_DOWN_STRENGTH", "BREADTH.AMT_CONC_TOP10", "BREADTH.AVG_CORR_VW",
     "VAL.PE_TTM_MEDIAN", "VAL.PB_MEDIAN", "VAL.PCT_BELOW_PB_1", "VAL.ERP",
     "RISK.EXTREME_DOWN_PCT", "RISK.SYNC_DOWN_20D",
     "FLOW.TURNOVER_RATIO", "FLOW.MARGIN_RATIO",
@@ -986,6 +1012,135 @@ def _coverage_gate(df: pd.DataFrame, label: str, count_col: str = "n") -> set:
               f"→ 该日横截面指标与合成整体作废，并清除库内旧值")
     df.loc[bad, :] = np.nan
     return set(df.index[bad])
+
+
+def _amt_concentration(conn, table: str, start, end, where: str, params: list) -> pd.Series:
+    """TOP 10% 个股成交额占比（%），§5.1「成交额集中度」。
+
+    ⚠ **独立查询**：`ntile()` 是窗口函数，不能与 `GROUP BY` 聚合混在同一层
+      —— 必须先按当日成交额排名分档，再聚合。故不并入 calc_* 的主横截面 SQL。
+    ⚠ `table` / `where` 只由本模块内的字面量拼装，不含任何外部输入。
+
+    口径：按当日成交额降序 `ntile(10)` 分十档，取第 1 档占总成交额比例。
+      实测（近一年）：A 股 52~68%（均值 59%）、港股 86~93%（均值 90%）
+      → ⚠ **两市场不可横向比**：港股小盘股流动性差，集中度天然远高于 A 股。
+    """
+    df = _q(conn, f"""
+        WITH s AS (
+            SELECT trade_date, amount,
+                   ntile(10) OVER (PARTITION BY trade_date ORDER BY amount DESC) AS decile
+            FROM {table}
+            WHERE trade_date BETWEEN %s AND %s AND amount > 0 AND {where}
+        )
+        SELECT trade_date,
+               sum(amount) FILTER (WHERE decile = 1) / nullif(sum(amount), 0) * 100 AS top10
+        FROM s GROUP BY trade_date ORDER BY trade_date
+    """, [start, end] + params)
+    if df.empty:
+        return pd.Series(dtype=float)
+    return pd.Series(
+        pd.to_numeric(df["top10"], errors="coerce").to_numpy(),
+        index=pd.to_datetime(df["trade_date"]).dt.date).sort_index()
+
+
+def _avg_corr_vw(conn, table: str, start, end, where: str, params: list,
+                 window: int = 60) -> pd.Series:
+    """平均相关性（**方差加权**，60 日）—— §5.1「个股平均相关性」的真值。
+
+    ⚠ **为什么不用逐对计算**：5,000 只股票 = 1,250 万对/日，O(N²) 不可行。
+      改用等权组合方差的**恒等式**——只要三条聚合量，复杂度 O(N)：
+
+          σ_p² = (1/N)Σσ_i² + ρ̄·[ mean(σ_i)² − (1/N)Σσ_i² ]
+
+      即等权组合方差 = 平均个股方差(1/N) + 平均两两协方差。
+      解出：  ρ̄ = ( σ_p² − V/N ) / ( S² − V/N )
+        σ_p² = 等权组合（当日全市场平均涨跌幅）的 60 日样本方差
+        V    = 个股 60 日方差的（算术）均值
+        S    = 个股 60 日标准差的均值
+        N    = 当日有效股票数
+
+    ⚠ **口径是「方差加权」，不是「简单平均」**：实测（A 股 293 只样本，60 日）
+        简单平均相关 = +0.2185、方差加权 = +0.3110，两者差约 0.09
+      恒等式能**精确还原方差加权那个**（误差 0.0000，逐对加权验证通过）。
+      选它的理由：组合风险本来就由方差加权决定——高波动股的相关性才是
+      「分散化失效」的真正驱动项。
+      → **与文献里的 average pairwise correlation（简单平均）不可直接比。**
+
+    ⚠ **通用必须用一般形式，不能用等方差简化式**：个股波动率异质性很大
+      （实测 mean(σ²)/mean(σ)² = 2.53 → 简化式会把 ρ̄ 从 0.23 压到 0.09），
+      只有在所有 σ_i 相等时两者才一致。
+
+    ⚠ **公式假设「单一市场因子 + 同质相关」**，是近似：真实相关矩阵有行业簇结构。
+      该近似对「方差加权」口径在样本内无偏，但异质性越高越弱。
+
+    ⚠ `table` / `where` 只由本模块内的字面量拼装，不含任何外部输入；
+      字符串内**不得出现裸 `%`**（psycopg2 会当成占位符）。
+    """
+    df = _q(conn, f"""
+        WITH r AS (
+            SELECT trade_date, stock_code, change_pct
+            FROM {table}
+            WHERE trade_date BETWEEN %s AND %s AND {where}
+        ), v AS (
+            SELECT trade_date, change_pct,
+                   var_samp(change_pct) OVER (PARTITION BY stock_code ORDER BY trade_date
+                                              ROWS BETWEEN {window - 1} PRECEDING
+                                                       AND CURRENT ROW) AS var_i
+            FROM r
+        )
+        SELECT trade_date,
+               count(*) FILTER (WHERE var_i IS NOT NULL)      AS n,
+               avg(change_pct)                                AS eq_ret,
+               avg(var_i) FILTER (WHERE var_i IS NOT NULL)    AS avg_var,
+               avg(sqrt(var_i)) FILTER (WHERE var_i IS NOT NULL) AS avg_std
+        FROM v GROUP BY trade_date ORDER BY trade_date
+    """, [start, end] + params)
+    if df.empty:
+        return pd.Series(dtype=float)
+    d = df.set_index(pd.to_datetime(df["trade_date"]).dt.date)
+    n = pd.to_numeric(d["n"], errors="coerce")
+    v = pd.to_numeric(d["avg_var"], errors="coerce")
+    s = pd.to_numeric(d["avg_std"], errors="coerce")
+    sp2 = (pd.to_numeric(d["eq_ret"], errors="coerce")
+           .rolling(window, min_periods=int(window * 0.6)).var())
+    den = s ** 2 - v / n
+    rho = (sp2 - v / n) / den.where(den > 1e-12, np.nan)
+    return rho.clip(-1, 1).sort_index()
+
+
+def _hk_sector_up_ratio(conn, start, end) -> pd.Series:
+    """港股行业参与广度（%）＝ 当日收益为正的行业数 / 有效行业数 × 100，§5.1「行业参与广度」。
+
+    ⚠ **CN 与 HK 的构造不同，数值不可直接比**：
+      · **CN** 用 `daily_benchmark` 的 **31 个申万一级行业指数**（官方指数涨跌）——见 `_sector_indicators`；
+      · **HK** 库里没有行业指数序列 → 用 `stock_sector`（恒生**三级** 113 个行业）+ 个股
+        `change_pct` **等权合成**行业收益。粒度比申万一级细 3.6 倍（均 24.6 只/行业，107 个 ≥5 只）。
+    故本指标在两侧同义（「多少比例的行业在涨」）但**不同构**，只能各自纵向看分位。
+    （同 `MACRO.STOCK_BOND_CORR` 先例：CN 用中债、HK 用美债，数值不可横向比。）
+
+    ⚠ 依赖当日个股横截面 → 需与 `_coverage_gate` 的 bad_days 一起遮罩（在调用处做）。
+    """
+    df = _q(conn, """
+        WITH s AS (
+            SELECT v.trade_date, ss.sector_name, v.change_pct
+            FROM hk_daily_quote v
+            JOIN stock_sector ss
+              ON ss.stock_code = v.stock_code AND ss.sector_type = 'INDUSTRY'
+            WHERE v.trade_date BETWEEN %s AND %s
+              AND v.change_pct IS NOT NULL AND v.amount >= %s
+        ), g AS (
+            SELECT trade_date, sector_name, avg(change_pct) AS r
+            FROM s GROUP BY trade_date, sector_name
+        )
+        SELECT trade_date,
+               count(*) FILTER (WHERE r > 0) * 100.0 / nullif(count(*), 0) AS up_pct
+        FROM g GROUP BY trade_date ORDER BY trade_date
+    """, [start, end, HK_MIN_AMOUNT])
+    if df.empty:
+        return pd.Series(dtype=float)
+    return pd.Series(
+        pd.to_numeric(df["up_pct"], errors="coerce").to_numpy(),
+        index=pd.to_datetime(df["trade_date"]).dt.date).sort_index()
 
 
 def _mask_days(s, days: set):
@@ -1038,6 +1193,8 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
                sum(amount)                                                   AS amt,
                sum(cmv)                                                      AS cmv,
                avg(change_pct)                                               AS eq_ret,
+               avg(change_pct) FILTER (WHERE change_pct > 0)                 AS up_avg,
+               avg(change_pct) FILTER (WHERE change_pct < 0)                 AS dn_avg,
                sum(change_pct * cmv) / nullif(sum(cmv), 0)                   AS cap_ret
         FROM src
         GROUP BY trade_date ORDER BY trade_date
@@ -1062,10 +1219,24 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     out["RISK.SYNC_DOWN_20D"] = (df["dec"] / df["n"] * 100).rolling(20, min_periods=10).mean()
     out["FLOW.TURNOVER_RATIO"] = df["amt"] / df["cmv"].replace(0, np.nan) * 100
     out["BREADTH.EQ_VS_CAP_20D"] = (df["eq_ret"] - df["cap_ret"]).rolling(20, min_periods=10).sum()
+    # §5.1 涨跌力度比：上涨股均涨幅 ÷ |下跌股均跌幅|
+    #   用**比值**而非差值：差值受当日波动率整体水平驱动（高波动日两侧都大），比值则把
+    #   「涨得比跌得凶多少」直接表达出来（1.0 = 力道均衡）。
+    #   实测近一年比值 0.47~3.40、P1~P99 = 0.54~2.48，且**没有一天 |下跌均幅|<0.05%**
+    #   → 分母不会趋零爆炸，不需要设上限。
+    out["BREADTH.UP_DOWN_STRENGTH"] = df["up_avg"] / df["dn_avg"].abs().replace(0, np.nan)
+    out["BREADTH.AMT_CONC_TOP10"] = _amt_concentration(
+        conn, "a_daily_quote", w_start, end, "left(stock_code,5) <> ALL(%s)", [ex])
+    # §5.1 个股平均相关性（真值，取代 RISK.SYNC_DOWN_20D 的占比代理）
+    out["BREADTH.AVG_CORR_VW"] = _avg_corr_vw(
+        conn, "a_daily_quote", w_start, end,
+        "change_pct IS NOT NULL AND left(stock_code,5) <> ALL(%s)", [ex])
 
     # ② 逐股窗口（60/200 日新高新低、MA 上下占比）—— 见 _per_stock_windows 的性能说明
     wdf = _per_stock_windows(conn, "CN", w_start, end)
     if not wdf.empty:
+        out["BREADTH.NEW_HIGH_LOW_20"] = _mask_days(
+            (wdf["nh20"] - wdf["nl20"]) / wdf["ok20"].replace(0, np.nan) * 100, bad_days)
         out["BREADTH.NEW_HIGH_LOW_60"] = _mask_days(
             (wdf["nh60"] - wdf["nl60"]) / wdf["ok60"].replace(0, np.nan) * 100, bad_days)
         out["BREADTH.PCT_ABOVE_MA60"] = _mask_days(
@@ -1156,9 +1327,15 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     w_start = start - datetime.timedelta(days=warmup_days)
     out: dict[str, pd.Series] = {}
 
+    # ⚠ 必须排除 `prev_close = 0`（全库 950 行 / 0.026 个百分点，单日最多 7 行）。不排除有两个后果：
+    #   ① 新增的「涨跌力度比」要除以 prev_close → PostgreSQL 直接抛 DivisionByZero，**整批计算失败**；
+    #   ② 更隐蔽的是 `close > prev_close` 恒真 → 这些行被**算成上涨**，虚增 ADV_RATIO。
+    #   实测单日最多 7 行，样本影响不足 0.4 个百分点，剔除安全。
+    #   ⚠ 注意：本函数体内的 SQL 字符串中**不得出现裸 `%`**（psycopg2 会当成占位符 → 参数错位报
+    #     IndexError），故上述说明一律写在 Python 注释里。
     df = _q(conn, """
         WITH src AS (
-            SELECT trade_date, close, prev_close, amount,
+            SELECT trade_date, close, prev_close, amount, change_pct,
                    NULLIF(pe_ttm_ratio, 'NaN'::numeric)     AS pe,
                    NULLIF(pb_ratio, 'NaN'::numeric)         AS pb,
                    NULLIF(total_market_val, 'NaN'::numeric) AS tmv
@@ -1166,6 +1343,7 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
             WHERE trade_date BETWEEN %s AND %s
               AND close IS NOT NULL AND prev_close IS NOT NULL
               AND close <> 'NaN'::numeric AND amount >= %s
+              AND prev_close <> 0
         )
         SELECT trade_date,
                count(*) FILTER (WHERE close > prev_close)                 AS adv,
@@ -1179,7 +1357,15 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
                count(*) FILTER (WHERE pb > 0)                              AS pb_n,
                count(*) FILTER (WHERE pb > 0 AND pb < 1)                   AS below1,
                sum(amount)                                                 AS amt,
-               sum(tmv)                                                    AS tmv
+               sum(tmv)                                                    AS tmv,
+               avg(change_pct)                                             AS eq_ret,
+               sum(change_pct * tmv) FILTER (WHERE change_pct IS NOT NULL AND tmv IS NOT NULL)
+                   / nullif(sum(tmv) FILTER (WHERE change_pct IS NOT NULL
+                                               AND tmv IS NOT NULL), 0)    AS cap_ret,
+               avg((close / prev_close - 1) * 100)
+                   FILTER (WHERE close > prev_close)                       AS up_avg,
+               avg((close / prev_close - 1) * 100)
+                   FILTER (WHERE close < prev_close)                       AS dn_avg
         FROM src
         GROUP BY trade_date ORDER BY trade_date
     """, [w_start, end, HK_MIN_AMOUNT])
@@ -1195,6 +1381,22 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     out["BREADTH.MCCLELLAN"] = (adv_minus_dec.ewm(span=19, adjust=False).mean()
                                 - adv_minus_dec.ewm(span=39, adjust=False).mean())
     out["BREADTH.ADV_MINUS_DEC"] = adv_minus_dec
+    # §5.1 涨跌力度比 + 成交额集中度（口径与 CN 对称，见 calc_cn 的注释）
+    #   港股涨跌用 close/prev_close 计算（hk_daily_quote 无 change_pct 的等价列可直接用），
+    #   集中度沿用 HK_MIN_AMOUNT 仙股门槛，与其他宽度指标保持一致。
+    out["BREADTH.UP_DOWN_STRENGTH"] = df["up_avg"] / df["dn_avg"].abs().replace(0, np.nan)
+    out["BREADTH.AMT_CONC_TOP10"] = _amt_concentration(
+        conn, "hk_daily_quote", w_start, end,
+        "close IS NOT NULL AND close <> 'NaN'::numeric AND amount >= %s", [HK_MIN_AMOUNT])
+    out["BREADTH.AVG_CORR_VW"] = _avg_corr_vw(
+        conn, "hk_daily_quote", w_start, end,
+        "change_pct IS NOT NULL AND amount >= %s", [HK_MIN_AMOUNT])
+    # §5.1 等权 − 市值加权（HK 侧此前缺；hk_daily_quote 有 total_market_val 字段）
+    out["BREADTH.EQ_VS_CAP_20D"] = (df["eq_ret"] - df["cap_ret"]).rolling(
+        20, min_periods=10).sum()
+    # §5.1 行业参与广度（HK 侧此前缺；构造与 CN 不同，见 _hk_sector_up_ratio 的说明）
+    out["SECTOR.UP_RATIO"] = _mask_days(
+        _hk_sector_up_ratio(conn, w_start, end), bad_days)
     out["VAL.PE_TTM_MEDIAN"] = df["pe_med"]
     out["VAL.PB_MEDIAN"] = df["pb_med"]
     out["VAL.PCT_BELOW_PB_1"] = df["below1"] / df["pb_n"].replace(0, np.nan) * 100
@@ -1205,6 +1407,8 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     # 逐股窗口（60/200 日）
     wdf = _per_stock_windows(conn, "HK", w_start, end)
     if not wdf.empty:
+        out["BREADTH.NEW_HIGH_LOW_20"] = _mask_days(
+            (wdf["nh20"] - wdf["nl20"]) / wdf["ok20"].replace(0, np.nan) * 100, bad_days)
         out["BREADTH.NEW_HIGH_LOW_60"] = _mask_days(
             (wdf["nh60"] - wdf["nl60"]) / wdf["ok60"].replace(0, np.nan) * 100, bad_days)
         out["BREADTH.PCT_ABOVE_MA60"] = _mask_days(
