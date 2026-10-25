@@ -67,7 +67,11 @@ REMOTE_DB="market_db"
 REMOTE_USER="market_user"
 REMOTE_PASS="$(cd "$(dirname "$0")" && python3 -c "import config; print(config.val('sync_server','password','REMOTE_PASS',''))")"
 
-COMPARE_DAYS=90   # 大表比对最近多少天
+# 大表「按日比对」的窗口（天）。可用环境变量覆盖：COMPARE_DAYS=9999 ./sync_from_server.sh
+#   · 默认 90：只回补近期缺口，避免本地有意保留部分历史时触发大范围重传。
+#   · ⚠ 窗口外的历史差异**永远不会被发现**（实测 trend_snapshot 有 29,195 行在 90 天窗口外）。
+#     需要核对全历史时显式传大值——比对查询本身很轻（每日一行），代价只在真正不一致时的重传。
+COMPARE_DAYS="${COMPARE_DAYS:-90}"
 
 # ── pgpass ────────────────────────────────────────────────────
 PGPASS_LOCAL="$HOME/.pgpass_local"
@@ -240,8 +244,14 @@ sync_small_table_full() {
 # ==================================================================
 LARGE_TABLES=(
     "tick_data|tick_time::DATE|*|stock_code,sequence"
-    "trend_snapshot|snapshot_date|stock_code,snapshot_time,price,super_in_net,big_in_net,small_in_net,buy_sell_ratio,excess_return_pct,buy_levels_str,sell_levels_str,created_at,mid_in_net,volume,turnover|stock_code,snapshot_time"
+    "trend_snapshot|snapshot_date|*|stock_code,snapshot_time"
 )
+# ⚠ trend_snapshot 原来用**硬编码列清单**（14 列），有两个问题：
+#   ① 漏了 updated_at —— 而表上有索引 idx_trend_snapshot_stock_updated(stock_code, updated_at DESC)，
+#      本地 updated_at 会 fallback 到 DEFAULT now()（= 导入时刻），按它排序取「最新快照」会拿错行；
+#   ② 表以后加列会被**静默漏同步**（不报错、只是少一列）。
+#   已改为 `*`：由本地 information_schema 自动取列，同时排除 id（本地序列）与 GENERATED ALWAYS 列
+#   （snapshot_date 是生成列，不可写入）。schema 变化会自动跟上。
 
 sync_large_table() {
     local table="$1"
@@ -253,7 +263,11 @@ sync_large_table() {
     # get local column names (exclude id to avoid conflicts)
     local copy_cols col_spec
     if [[ "$orig_cols" == "*" ]]; then
-        copy_cols=$(run_local_sql "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name='${table}' AND table_schema='public' AND column_name != 'id';" | tr -d ' ')
+        # 排除两类列：
+        #   ① id —— 本地自增序列（DEFAULT nextval），导入后由末尾 setval 重置；同步它会造成主键冲突
+        #   ② GENERATED ALWAYS 生成列 —— 如 trend_snapshot.snapshot_date，**不可写入**，由本地自动计算
+        # ⚠ 不能只排除 id：trend_snapshot 若把生成列一起 COPY 进去，INSERT 会直接报错。
+        copy_cols=$(run_local_sql "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name='${table}' AND table_schema='public' AND column_name <> 'id' AND is_generated = 'NEVER';" | tr -d ' ')
         col_spec="($copy_cols)"
     else
         copy_cols="$orig_cols"

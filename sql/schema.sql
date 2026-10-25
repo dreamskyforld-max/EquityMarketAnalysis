@@ -646,10 +646,16 @@ COMMENT ON COLUMN tick_data.sequence               IS '富途全局唯一逐笔�
 COMMENT ON COLUMN tick_data.tick_type               IS '成交类型：AUTO_MATCH(自动对盘), AUCTION(竞价), ODD_LOT(碎股) 等';
 COMMENT ON COLUMN tick_data.created_at             IS '数据写入数据库的时间';
 
-CREATE INDEX IF NOT EXISTS idx_tick_data_stock_time ON tick_data (stock_code, tick_time DESC);
+-- 单列 tick_time 索引：保留，勿删。当前使用者是 monitor_collector._check_data_stale 的
+-- tick_data 数据停滞巡检：`SELECT MAX(tick_time) FROM tick_data [WHERE tick_time >= 窗口起点]`
+-- （无 stock_code，动态拼接，文本搜不到）。该全局 MAX(tick_time) 只能靠这条单列索引反向
+-- Index Only Scan 取最大值（实测亚毫秒）；删掉会退化成约 3100 万行的全表扫描，每次巡检都扫全表。
+-- 注意：下方复合 dir 索引以 stock_code 打头，服务不了这种不带 stock_code 的全局 MAX 查询。
 CREATE INDEX IF NOT EXISTS idx_tick_data_time       ON tick_data (tick_time);
 -- stock-realtime 高频聚合查询加速：覆盖分钟聚合 / 日粒度指纹 / 四档大单统计 / 量能统计，
 -- WHERE 均为 stock_code + tick_time 范围 + ticker_direction 过滤。INCLUDE 使其成为 Index Only Scan。
+-- （注：旧有的 idx_tick_data_stock_time(stock_code, tick_time DESC) 已删除——它是本索引的前缀，
+--  功能完全被本索引覆盖，属冗余。）
 CREATE INDEX IF NOT EXISTS idx_tick_data_stock_time_dir
   ON tick_data (stock_code, tick_time, ticker_direction)
   INCLUDE (turnover, volume, price);
@@ -1637,7 +1643,9 @@ CREATE TABLE IF NOT EXISTS regime.indicator_dict (
     indicator_code  VARCHAR(48)     PRIMARY KEY,       -- 如 BREADTH.ADV_RATIO / VAL.PE_MEDIAN / FSI.COMPOSITE
     indicator_name  VARCHAR(80)     NOT NULL,
     scope           VARCHAR(16)     NOT NULL,          -- 分析域作用域（**非架构分层**）：MACRO=外生宏观/跨市场 ALLOC=资产配置 MARKET=市场自身 SECTOR=行业
-    dimension       VARCHAR(24)     NOT NULL,          -- 宽度/估值/情绪/资金/风险偏好/金融压力/风格/宏观/景气
+    dimension       VARCHAR(24)     NOT NULL,          -- 【legacy】旧分组（11 取值，语义混杂）；v2.1 起维度归属看 domain
+    domain          VARCHAR(16),                       -- v2.1 维度归属：宽度/估值/情绪/资金/压力/趋势（NULL=宏观条件输入）
+    role            VARCHAR(16)     DEFAULT 'context', -- status=参与状态/预算 · context=背景 · explanation=解释维度
     market_scope    VARCHAR(16)     NOT NULL,          -- CN / HK / CN+HK / GLOBAL
     unit            VARCHAR(16),                       -- pct / ratio / count / bp / score_0_100 ...
     direction       VARCHAR(12)     NOT NULL,          -- high_risk / high_good / neutral（分位化方向统一依据）
@@ -1664,6 +1672,8 @@ CREATE TABLE IF NOT EXISTS regime.indicator_value (
     raw_value       NUMERIC(20,6),
     percentile      NUMERIC(6,2),                      -- 0-100 历史分位（原始值分位，未做方向调整）
     extra           JSONB,                             -- 明细（如顶部信号命中清单）
+    is_final        BOOLEAN         NOT NULL DEFAULT FALSE,  -- FALSE=当日初步值（源未齐），T+1 全链路重算后置 TRUE
+    model_version   VARCHAR(16),                       -- 本行口径（= indicator_dict.params_hash）
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
 
     PRIMARY KEY (indicator_code, market, trade_date)
@@ -1954,3 +1964,260 @@ COMMENT ON TABLE  regime.market_regime_daily                IS '市场状态合�
 COMMENT ON COLUMN regime.market_regime_daily.season         IS '春=熊末牛初 / 夏=牛市中段 / 秋=牛市末段 / 冬=熊市中后段（v1 规则版，信用脉冲维度待接入）';
 COMMENT ON COLUMN regime.market_regime_daily.top_signal_cnt IS '顶部预警信号命中数（见 market_profile.md §8.2）';
 COMMENT ON COLUMN regime.market_regime_daily.risk_appetite IS '跨资产风险偏好指数 0-100（market_profile.md §5.4）：7 成分等权（VIX/美元/AAA 信用利差/AA-AAA 等级利差 取反 + 标普/铜/黄金 20 日动量）；>80 极度 Risk-On，<20 极度 Risk-Off。注：分位按各市场自身历史展开 → CN/HK 数值可能略有差异';
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- v2.1 三层指标架构：原子指标 → 维度指标(L2) → 业务指标(L3) + 横切信号
+--   设计见 doc/market_profile.md §5.0-§5.12；代码侧 DDL 见 regime_schema.py（两者必须逐字一致）
+--   旧合成表 market_regime_daily 保留待迁移，迁移完成后 drop
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- 12. 维度指标字典（L2）：六维的成员/极性/聚合方式/阈值，口径真相源在代码，本表是可版本化投影
+CREATE TABLE IF NOT EXISTS regime.dimension_dict (
+    dimension_code   VARCHAR(24)     PRIMARY KEY,       -- DIM.BREADTH / DIM.VALUATION / ...
+    dimension_name   VARCHAR(40)     NOT NULL,          -- 宽度 / 估值 / 情绪 / 资金 / 压力 / 趋势
+    question         VARCHAR(120),                      -- 该维度回答的业务问题（一句话）
+    polarity         VARCHAR(12)     NOT NULL,          -- high_good=越高越好 / high_risk=越高越危险
+    members          JSONB           NOT NULL,          -- [{code, sign, weight, block}]；sign 统一极性，block 为分族/分块名
+    agg_method       VARCHAR(16)     NOT NULL DEFAULT 'block_equal',
+                                                        -- block_equal=分块等权 / mean_winsor=扁平等权(仅同质) / single_anchor=单锚+校验 / rule=规则判定
+    block_agg        JSONB,                             -- 块内聚合方式 {"块名":"mean"|"max"}（压力维度的信用块取 max=最紧）
+    state_bands      JSONB,                             -- 5 档阈值（默认 [20,40,60,80]）
+    state_labels     JSONB,                             -- 5 档标签（按极性命名，如 极窄/偏窄/中性/偏广/极广）
+    params           JSONB,                             -- {winsor:[2,98],coverage_min:0.6,dispersion_max:30,weight_cap:0.25, K:3(趋势)}
+    params_hash      VARCHAR(16),                       -- 口径指纹：变化必须触发历史重算
+    is_active        BOOLEAN         NOT NULL DEFAULT TRUE,
+    remark           TEXT,
+    updated_at       TIMESTAMPTZ     DEFAULT NOW()
+);
+
+COMMENT ON TABLE  regime.dimension_dict            IS '维度指标字典（L2）：六个维度（宽度/估值/情绪/资金/压力/趋势）的成员、极性、聚合方式与阈值参数';
+COMMENT ON COLUMN regime.dimension_dict.members    IS '成员清单 [{code,sign,weight,block}]；sign 用于统一极性（+1 顺向、-1 取 100−分位），block 为分族/分块名（宽度=4族、情绪=3块、资金=2块、压力=5块）。同一原子指标只能归属一个维度（情绪=意愿、资金=真金白银净流，见 market_profile.md §5.0）';
+COMMENT ON COLUMN regime.dimension_dict.agg_method IS '六维不共用同一算法、只共用框架（market_profile.md §5.7 L2-b）：block_equal=分块等权（情绪/资金/压力）；single_anchor=单锚+校验（估值：ERP 定档，其余只调置信）；mean_winsor=扁平等权（仅成员同质时可用，否则权重会退化成「写了几个指标」）；rule=规则判定（趋势：方向由 L3 判定，本维度的 score 只承载「趋势有多陡」，用单锚 σ 归一化，不做平均）';
+COMMENT ON COLUMN regime.dimension_dict.block_agg  IS '块内聚合方式 {"块名":"mean"|"max"}。默认 mean；压力维度的信用块**取第二紧**（trimmed max）而非 max——AA 系成员源只留近 3 日，max 会被短样本成员永久绑架；块内 coverage < 0.5 时退化为均值并标 low_confidence（market_profile.md §5.5）';
+COMMENT ON COLUMN regime.dimension_dict.params      IS '维度级参数：winsor=[2,98]（**仅用于稳健估计参考分布**，分位结果不截尾）、coverage_min=0.6、dispersion_max=30（对 dispersion_norm=dispersion×sqrt(n/10)）、weight_cap=0.25、K=3（**仅趋势维度**：σ 归一化后「几个标准差算满格」，纯展示参数，单调变换不改排序；趋势维度不出档故改 K 不需重标阈值）';
+COMMENT ON COLUMN regime.dimension_dict.params_hash IS '口径指纹（成员/权重/winsor/阈值/门禁的哈希）。变化即口径变更，必须触发该维度历史重算；消费端读到的 model_version 与本值不等即为旧口径数据';
+
+-- 13. 维度指标日频读数（L2）：一市场一日一维一行
+CREATE TABLE IF NOT EXISTS regime.dimension_value (
+    dimension_code  VARCHAR(24)     NOT NULL,
+    market          VARCHAR(8)      NOT NULL,           -- CN / HK
+    trade_date      DATE            NOT NULL,
+    score           NUMERIC(6,2),                       -- 0-100，方向已统一到该维度极性
+    state           VARCHAR(12),                        -- 定性档；NULL = 覆盖度/分歧不达标，不出档
+    coverage        NUMERIC(5,4),                       -- 有效成员 / 应有成员（0-1）
+    dispersion      NUMERIC(6,2),                       -- 成员分位标准差
+    blocks          JSONB,                              -- 块级分数 {"波动":{"score":..,"coverage":..},...}；SYSTEMIC_STRESS.trigger 依赖本列
+    contrib         JSONB,                              -- {pos:[{code,delta}],neg:[{code,delta}]} 正负各 top3
+    flags           JSONB,                              -- 结构性背离/极端（如 NEW_HIGH_LOW_20 vs _60）
+    confidence      VARCHAR(8),                         -- 高/中/低
+    is_final        BOOLEAN         NOT NULL DEFAULT FALSE, -- FALSE=当日初步值（上游原子未齐）；T+1 全链路重算
+    model_version   VARCHAR(16),                        -- 口径版本（= dimension_dict.params_hash）
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+
+    PRIMARY KEY (dimension_code, market, trade_date)
+);
+
+COMMENT ON TABLE  regime.dimension_value            IS '维度指标日频读数（L2）：一市场一日一维一行，由计算层写入';
+COMMENT ON COLUMN regime.dimension_value.state      IS '定性档（5 档，标签按极性命名：宽度 极窄/偏窄/中性/偏广/极广，压力 极稳/稳健/正常/紧张/危机）。NULL 表示不出档（coverage<0.6 或 dispersion>30）——此时只可读 score，不可读定性结论';
+COMMENT ON COLUMN regime.dimension_value.coverage   IS '有效成员 / 应有成员（0-1）。⚠ 分母按 market 判定（members[].code 联 indicator_dict.market_scope ∈ {当前市场, CN+HK, GLOBAL}）。港股情绪 4/7 ≈ 0.57、资金维度 CN/HK 各 2/5 = 0.4，均必然不出档；缺口是信息，不得按中性处理';
+COMMENT ON COLUMN regime.dimension_value.dispersion IS '成员分位的标准差。内部严重背离（短期动能强、中期未修复）时明显抬升，此时平均分不可直接当结论，必须下钻 contrib/flags。⚠ 门禁用 dispersion_norm = dispersion × sqrt(n/10)（n=有效成员数）——成员数为 2 与 20 时同一绝对阈值的严格程度差一个量级';
+COMMENT ON COLUMN regime.dimension_value.flags      IS '结构性背离与极端标记（NEW_HIGH_LOW_20 与 _60 反向、MA60 与 MA200 分层、等权与市值加权差极端）；这些快慢/结构对照不能被平均分抹掉';
+
+CREATE INDEX IF NOT EXISTS idx_dim_value_date ON regime.dimension_value (market, trade_date DESC);
+
+-- 14. 业务指标字典（L3）：市场状态 / 系统性压力 / 风险预算
+CREATE TABLE IF NOT EXISTS regime.business_dict (
+    biz_code        VARCHAR(32)     PRIMARY KEY,        -- BIZ.MARKET_REGIME / BIZ.SYSTEMIC_STRESS / BIZ.RISK_BUDGET
+    biz_name        VARCHAR(40)     NOT NULL,
+    kind            VARCHAR(16)     NOT NULL,           -- state_machine / band_composite / constraint_min
+    inputs          JSONB           NOT NULL,           -- [{kind:dimension|atom|external, code, sign}]
+    params          JSONB,                              -- 阈值/状态机参数（DEADBAND/CONFIRM_DAYS/MIN_DWELL/bands）
+    params_hash     VARCHAR(16),                        -- 口径指纹：变化必须触发历史重算
+    output_schema   JSONB,                              -- 字段说明（state/level/since/binding_constraint/trigger...）
+    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
+    remark          TEXT,
+    updated_at      TIMESTAMPTZ     DEFAULT NOW()
+);
+
+COMMENT ON TABLE  regime.business_dict            IS '业务指标字典（L3）：市场状态 / 系统性压力 / 风险预算的输入清单、类型与参数';
+COMMENT ON COLUMN regime.business_dict.kind       IS 'state_machine=状态机（趋势三态，带死区/确认天数/最小停留）；band_composite=从维度分分档；constraint_min=多约束取最紧（风险预算）';
+COMMENT ON COLUMN regime.business_dict.inputs     IS '输入清单 [{kind:dimension|atom|external, code, sign}]。kind 不是装饰：连续型从 dimension 取，判定型从 atom 取（规则要精确边界），external 指第②层引用（如 §4.2 跨资产确认度），本层不得重算';
+
+-- 15. 业务指标日频读数（L3）
+CREATE TABLE IF NOT EXISTS regime.business_value (
+    biz_code       VARCHAR(32)     NOT NULL,
+    market         VARCHAR(8)      NOT NULL,
+    trade_date     DATE            NOT NULL,
+    score          NUMERIC(6,2),                        -- 连续读数（纯状态类可空）
+    state          VARCHAR(16),                         -- 上行/震荡/下行；正常/关注/警戒/危机
+    level          SMALLINT,                            -- 档位序号（1 起，便于比较与画图）
+    since_date     DATE,                                -- 进入当前状态的日期（状态机）
+    dwell_days     SMALLINT,                            -- 已在当前状态停留的交易日数
+    status         VARCHAR(12),                         -- 已确认 / 待确认
+    confidence     VARCHAR(8),                          -- 高/中/低（宽度确认等外部调节项写这里）
+    detail         JSONB,                               -- {candidate,evidence,binding_constraint,trigger,spike,missing}
+    is_final       BOOLEAN         NOT NULL DEFAULT FALSE, -- FALSE=当日初步值（源未齐），T+1 重算后置 TRUE
+    model_version  VARCHAR(16),
+    updated_at     TIMESTAMPTZ     DEFAULT NOW(),
+
+    PRIMARY KEY (biz_code, market, trade_date)
+);
+
+COMMENT ON TABLE  regime.business_value          IS '业务指标日频读数（L3）：一市场一日一指标一行';
+COMMENT ON COLUMN regime.business_value.state    IS '状态标签：MARKET_REGIME=上行/震荡/下行；SYSTEMIC_STRESS=正常/关注/警戒/危机；RISK_BUDGET 见 level。状态带 since/dwell，不允许日频翻转（滞后带+确认天数+最小停留）';
+COMMENT ON COLUMN regime.business_value.level    IS '⚠ **多态列，三个 biz_code 的语义互不相容，禁止跨 biz 比较/聚合/同图绘制**：MARKET_REGIME 1=下行/2=震荡/3=上行（升序=越偏多）；SYSTEMIC_STRESS 1=正常…4=危机（升序=越危险）；RISK_BUDGET 1=20%…5=100%（升序=敞口越大）。消费方必须按 biz_code 过滤，并校验 business_dict.output_schema.level_semantics';
+COMMENT ON COLUMN regime.business_value.score    IS '⚠ **同为多态列**：MARKET_REGIME=趋势强度（与方向解耦，= DIM.TREND.score）；SYSTEMIC_STRESS=压力分（= DIM.STRESS.score）；RISK_BUDGET=cap×100（敞口百分比）。禁止跨 biz 比较';
+COMMENT ON COLUMN regime.business_dict.output_schema IS '输出字段说明。⚠ **必须包含 level_semantics 与 score_semantics**（枚举值 + 方向），供消费方在读取 level/score 前校验——没有它，多态列的误用无法在 DB 层被发现（建议消费方按 biz_code 建独立视图，禁止跨 biz 联合查询）';
+COMMENT ON COLUMN regime.business_value.since_date IS '当前状态的首次进入日（状态机产出）；配合 dwell_days 判断状态是否已稳定';
+COMMENT ON COLUMN regime.dimension_value.blocks IS '块级分数 {"块名":{"score":..,"coverage":..}}。SYSTEMIC_STRESS.trigger 的唯一数据来源——成员级 contrib 拿不到「信用块取最紧」的语义，没有本列只能用成员 top3 反推';
+COMMENT ON COLUMN regime.business_value.detail   IS '增量信息集中在此：MARKET_REGIME={candidate,evidence,breadth_confirmation}；SYSTEMIC_STRESS={trigger,spike,blocks}（压力 70 分时「信用在扩」还是「波动在冲」处置不同）；RISK_BUDGET={binding_constraint,raw_cap,inputs,constrained_by,missing}（比数字更有用的是「被什么卡住的」）';
+COMMENT ON COLUMN regime.business_value.is_final IS 'FALSE=当日初步值（18:45 计算时中债/事件类源尚未落库，T 日口径不完整），T+1 重算后置 TRUE。消费端展示终值、调试看初步值；不得把 is_final=FALSE 的值当定论';
+
+CREATE INDEX IF NOT EXISTS idx_biz_value_date ON regime.business_value (market, trade_date DESC);
+
+-- 16. 反转风险信号字典（顶部/底部条件清单，正文见 market_profile.md §8.2/§8.3）
+CREATE TABLE IF NOT EXISTS regime.signal_dict (
+    signal_code    VARCHAR(40)     PRIMARY KEY,         -- SIG.REVERSAL.TOP_* / _BOTTOM_*
+    signal_name    VARCHAR(60)     NOT NULL,
+    direction      VARCHAR(8)      NOT NULL,            -- TOP / BOTTOM
+    category       VARCHAR(16),                         -- 宽度/估值/情绪/资金/宏观/基本面
+    market_scope   VARCHAR(16)     NOT NULL DEFAULT 'CN+HK',  -- CN / HK / CN+HK（无源市场不登记该族，见 v_signal_summary.unavailable_families）
+    expr           TEXT,                                -- 条件的人可读描述（非可执行 DSL）
+    inputs         JSONB,                               -- 引用的原子指标清单
+    params         JSONB,                               -- 阈值参数（**唯一真源**：不得写在代码里）
+    params_hash    VARCHAR(16),                         -- 口径指纹：params/inputs 变化必须触发该信号历史重算
+    is_active      BOOLEAN         NOT NULL DEFAULT TRUE,
+    remark         TEXT,
+    updated_at     TIMESTAMPTZ     DEFAULT NOW()
+);
+
+COMMENT ON TABLE  regime.signal_dict            IS '反转风险信号字典：顶部/底部条件清单（清单正文见 market_profile.md §8.2/§8.3）';
+COMMENT ON COLUMN regime.signal_dict.params     IS '阈值唯一真源（如 {pct_high:90}、{drawdown_pp:10,window:20}）。⚠ 不得写在代码里——否则与 §5.7 的 params_hash 体系脱节，调阈值不触发重算';
+COMMENT ON COLUMN regime.signal_dict.params_hash IS '口径指纹。signal_value.model_version 取本值；变化即口径变更，必须重算该信号的历史命中（与 dimension_dict / business_dict 同规则）';
+COMMENT ON COLUMN regime.signal_dict.market_scope IS '该信号在哪些市场有源。港股无涨跌停/两融 → 对应信号只登记 CN；该族在 HK 因此进 unavailable_families、不进 family_cnt 分母';
+
+-- 17. 反转风险信号日频命中
+CREATE TABLE IF NOT EXISTS regime.signal_value (
+    signal_code    VARCHAR(40)     NOT NULL,
+    market         VARCHAR(8)      NOT NULL,
+    trade_date     DATE            NOT NULL,
+    hit            BOOLEAN         NOT NULL,            -- 当日是否命中
+    days           SMALLINT,                            -- 已连续命中交易日数
+    strength       NUMERIC(12,4),                       -- 命中强度（如背离幅度 pp），可空
+    detail         JSONB,
+    model_version  VARCHAR(16),
+    updated_at     TIMESTAMPTZ     DEFAULT NOW(),
+
+    PRIMARY KEY (signal_code, market, trade_date)
+);
+
+COMMENT ON TABLE  regime.signal_value      IS '信号日频命中记录。信号不得并入任何维度分或业务指标——它是条件命中，不是程度读数';
+COMMENT ON COLUMN regime.signal_value.days IS '已连续命中交易日数。「站上 MA200 比例回落 3 天」与「回落 40 天」是完全不同的信息，单给计数会抹掉这个差别，故本列必填';
+
+CREATE INDEX IF NOT EXISTS idx_signal_value_date ON regime.signal_value (trade_date DESC, market, hit);
+
+-- 17b. 信号汇总视图（market_profile.md §5.11 ⑥：族去重后的顶/底计数）
+--      ⚠ 汇总用视图表达，**不新建业务指标**——信号是条件命中，不是程度读数，不得并入任何合成。
+CREATE OR REPLACE VIEW regime.v_signal_summary AS
+WITH markets AS (
+    SELECT DISTINCT market FROM regime.signal_value
+),
+fam AS (          -- 「市场 × 族」是否有可用信号：无源族（如港股无涨跌停/两融）进 unavailable_families
+    SELECT m.market,
+           d.category,
+           COUNT(d.signal_code) AS n_sig
+    FROM markets m
+    JOIN regime.signal_dict d
+      ON d.is_active
+     AND (d.market_scope IS NULL
+          OR d.market_scope = 'CN+HK'
+          OR d.market_scope = 'GLOBAL'
+          OR d.market_scope = m.market)
+    GROUP BY m.market, d.category
+),
+unavail AS (
+    SELECT market,
+           ARRAY_AGG(category ORDER BY category) AS unavailable_families,
+           COUNT(*) FILTER (WHERE n_sig > 0)     AS available_family_cnt
+    FROM fam
+    GROUP BY market
+),
+agg AS (
+    SELECT v.market,
+           v.trade_date,
+           (COUNT(*) FILTER (WHERE d.direction = 'TOP'    AND v.hit))::int AS top_cnt,
+           (COUNT(*) FILTER (WHERE d.direction = 'BOTTOM' AND v.hit))::int AS bottom_cnt,
+           (COUNT(DISTINCT d.category) FILTER (WHERE d.direction = 'TOP'    AND v.hit))::int AS top_family_cnt,
+           (COUNT(DISTINCT d.category) FILTER (WHERE d.direction = 'BOTTOM' AND v.hit))::int AS bottom_family_cnt,
+           COALESCE(ARRAY_AGG(DISTINCT d.category) FILTER (WHERE d.direction = 'TOP'    AND v.hit), ARRAY[]::varchar[]) AS top_families,
+           COALESCE(ARRAY_AGG(DISTINCT d.category) FILTER (WHERE d.direction = 'BOTTOM' AND v.hit), ARRAY[]::varchar[]) AS bottom_families
+    FROM regime.signal_value v
+    JOIN regime.signal_dict  d ON d.signal_code = v.signal_code
+    WHERE d.is_active
+    GROUP BY v.market, v.trade_date
+)
+SELECT a.market,
+       a.trade_date,
+       a.top_cnt,
+       a.top_family_cnt,
+       a.bottom_cnt,
+       a.bottom_family_cnt,
+       a.top_families,
+       a.bottom_families,
+       COALESCE(u.unavailable_families, ARRAY[]::varchar[]) AS unavailable_families,
+       u.available_family_cnt
+FROM agg a
+LEFT JOIN unavail u ON u.market = a.market;
+
+COMMENT ON VIEW  regime.v_signal_summary IS '信号汇总（§5.11 ⑥）：top_family_cnt / bottom_family_cnt 为**族去重**后的计数（同族命中多条只计 1 票），判读用族数、条数只作参考。unavailable_families 为**登记层面**的无源族（如港股无涨跌停/两融），它们不进 family_cnt 的分母，否则港股永远达不到「≥4 族」';
+COMMENT ON COLUMN regime.v_signal_summary.available_family_cnt IS '该市场有源族数（判读阈值的分母）。⚠ 阈值必须按「可用族数」重标（§5.11 ③ C5）：可用族数不同的市场不得共用同一绝对阈值';
+
+-- 18. indicator_dict v2.1 增量列（既有库自愈；新建库已在上方 CREATE TABLE 中带上）
+ALTER TABLE regime.indicator_dict ADD COLUMN IF NOT EXISTS domain VARCHAR(16);
+ALTER TABLE regime.indicator_dict ADD COLUMN IF NOT EXISTS role   VARCHAR(16) DEFAULT 'context';
+
+COMMENT ON COLUMN regime.indicator_dict.domain    IS 'v2.1 维度归属（L2）：宽度/估值/情绪/资金/压力/趋势。NULL = 宏观条件输入（不属任何维度、不参与维度聚合），由业务指标按需直接引用';
+COMMENT ON COLUMN regime.indicator_dict.role      IS '指标在架构中的角色：status=参与状态/预算判定 · context=仅作背景与解释 · explanation=解释维度成员（有信号级消费者、无决策级消费者，如情绪与资金维度）';
+COMMENT ON COLUMN regime.indicator_dict.dimension IS '【legacy】旧分组字段（11 个取值，「资金」混入 M1/LPR/DXY 等宏观利率、「趋势」为 0），仅作浏览分组；v2.1 起维度归属一律看 domain。计划在计算层迁移时改名 theme';
+COMMENT ON TABLE  regime.market_regime_daily      IS '【v2.1 已废弃，保留待迁移】旧合成层：温度计/季节/风险/FSI/跨资产风险偏好。继任者 dimension_value + business_value + signal_value；旧字段口径（如 season 实际只由 PCT_ABOVE_MA200 的 25 分位决定）不再维护';
+
+-- 19. v2.1.1 增量列（评审整改；既有库自愈，新建库已在上方 CREATE TABLE 中带上）
+--     B2 口径指纹    B3 初步值标记    B10 制度断点
+ALTER TABLE regime.indicator_dict  ADD COLUMN IF NOT EXISTS params_hash VARCHAR(16);
+ALTER TABLE regime.indicator_dict  ADD COLUMN IF NOT EXISTS breaks      JSONB;
+ALTER TABLE regime.signal_dict     ADD COLUMN IF NOT EXISTS market_scope VARCHAR(16) NOT NULL DEFAULT 'CN+HK';
+ALTER TABLE regime.signal_dict     ADD COLUMN IF NOT EXISTS params_hash  VARCHAR(16);
+ALTER TABLE regime.indicator_value ADD COLUMN IF NOT EXISTS is_final      BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE regime.indicator_value ADD COLUMN IF NOT EXISTS model_version VARCHAR(16);
+ALTER TABLE regime.dimension_value ADD COLUMN IF NOT EXISTS is_final      BOOLEAN NOT NULL DEFAULT FALSE;
+
+COMMENT ON COLUMN regime.indicator_dict.params_hash  IS '原子指标口径指纹（分位窗口 / min_periods / 极性 / 公式版本）。变化必须触发该指标历史重算；与 dimension_dict.params_hash / business_dict.params_hash 同为「口径变更」的唯一信号';
+COMMENT ON COLUMN regime.indicator_dict.breaks       IS '制度/源断点 [{date, reason}]（注册制、涨跌幅规则变更、北向 2024-08 停披露、港股卖空 2026-06 起等）。断点前后的分位**不可比**，前端须按断点分段显示；不登记的断点会被使用者误读成市场信号';
+COMMENT ON COLUMN regime.indicator_value.is_final    IS 'FALSE=当日初步值（T 日 18:45 计算时中债/事件类源尚未落库）。⚠ T+1 源补齐后必须沿 L1→L2→L3 **全链路**重算并覆盖——只重算 business_value 会让维度分与业务值来自不同口径';
+COMMENT ON COLUMN regime.indicator_value.model_version IS '本行所用原子口径（= indicator_dict.params_hash）';
+COMMENT ON COLUMN regime.dimension_value.is_final    IS 'FALSE=当日初步值（上游原子为初步值）。同 indicator_value.is_final：T+1 必须全链路重算';
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 20. 多空力量回合日表（force dynamics）
+--     生产：build_force_rounds.py（market_scheduler 每交易日 16:40 跑；范围 = realtime_collect_target.collect_tick）
+--     消费：stock-realtime 分时图「攻守状态 / 博弈结果」两个 grid
+--     口径：stock-realtime/docs/force_dynamics_design.md（§1 回合相位 / §2 指标 / §5.1 跨票校准）
+--     计算：EquityMarketAnalysis/force_dynamics.py（纯函数状态机）
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS force_round_daily (
+    stock_code    text NOT NULL,
+    trade_date    date NOT NULL,
+    rounds        jsonb NOT NULL,     -- 当日回合全指标：t0/t1/minutes/side/attack_vol/counter_vol/
+                                       -- net_vol/defend_max/impact/keep_ratio/eff/eff_pct/lq/win/end/is_main
+    lambda_median numeric,            -- 当日主回合 λ_pct 中位数；ref_lambda = 近 20 行取中位数（在线毫秒级）
+    applicable    boolean NOT NULL DEFAULT false,  -- 近 20 个已落库交易日主回合合计 ≥20 才为 true；
+                                       -- false 时前端只提示「该标的无显著博弈结构」，不画散点
+    updated_at    timestamp with time zone DEFAULT now(),
+    PRIMARY KEY (stock_code, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_force_round_daily_lookup
+    ON force_round_daily (stock_code, trade_date DESC);
+
+COMMENT ON TABLE  force_round_daily      IS '多空力量回合日表（一票一日一行，回合明细在 rounds jsonb）。由 build_force_rounds.py 盘后跑批生成；四档阈值取 fund_flow_settings.thresholds_json（线上生效口径，与分时图同源）。';
+COMMENT ON COLUMN force_round_daily.rounds IS '回合列表。λ_pct=每亿元投入推动的百分点（跨票口径，阈值须按票用自身历史中位数校准）；lq=守方四档总投入÷攻方特大+大；keep_ratio=冲击÷最终位移；win 按留存率分档（≥50%胜/15-50%弱/<15%负）。';
+COMMENT ON COLUMN force_round_daily.applicable IS '适用性：近 20 个已落库交易日主回合合计 ≥20。大盘股/ETF 资金流分散、无回合结构（SH.600941/SH.520900 恒为 false），不得输出博弈结论。';

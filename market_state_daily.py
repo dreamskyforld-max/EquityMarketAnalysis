@@ -20,7 +20,7 @@
 
 用法:
     python3 market_state_daily.py                     # 增量（最近 30 个交易日，默认两市场）
-    python3 market_state_daily.py --backfill          # 全历史回填（CN 1990 起 / HK 2019 起）
+    python3 market_state_daily.py --backfill          # 全历史回填（CN 1990 起 / HK 2000 起）
     python3 market_state_daily.py --market CN --start 2026-01-01
     python3 market_state_daily.py --no-write          # 只打印不写库（调试）
 """
@@ -1354,10 +1354,12 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
                    FILTER (WHERE pe > 0)                                   AS pe_med,
                percentile_cont(0.5) WITHIN GROUP (ORDER BY pb)
                    FILTER (WHERE pb > 0)                                   AS pb_med,
+               count(*) FILTER (WHERE pe > 0)                              AS pe_n,
                count(*) FILTER (WHERE pb > 0)                              AS pb_n,
                count(*) FILTER (WHERE pb > 0 AND pb < 1)                   AS below1,
                sum(amount)                                                 AS amt,
                sum(tmv)                                                    AS tmv,
+               count(tmv)                                                  AS tmv_n,
                avg(change_pct)                                             AS eq_ret,
                sum(change_pct * tmv) FILTER (WHERE change_pct IS NOT NULL AND tmv IS NOT NULL)
                    / nullif(sum(tmv) FILTER (WHERE change_pct IS NOT NULL
@@ -1392,14 +1394,23 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
         conn, "hk_daily_quote", w_start, end,
         "change_pct IS NOT NULL AND amount >= %s", [HK_MIN_AMOUNT])
     # §5.1 等权 − 市值加权（HK 侧此前缺；hk_daily_quote 有 total_market_val 字段）
-    out["BREADTH.EQ_VS_CAP_20D"] = (df["eq_ret"] - df["cap_ret"]).rolling(
+    #   ⚠ 市值字段覆盖门禁：2000 年仅 6 个百分点、2001 约 6 成、2002 起 97 个百分点以上。
+    #     覆盖不足时「市值加权收益」只由极少数大票决定 → 差值失真，故置 NaN。
+    _cap_ok = df["tmv_n"] >= df["n"] * 0.5
+    out["BREADTH.EQ_VS_CAP_20D"] = (df["eq_ret"] - df["cap_ret"].where(_cap_ok)).rolling(
         20, min_periods=10).sum()
     # §5.1 行业参与广度（HK 侧此前缺；构造与 CN 不同，见 _hk_sector_up_ratio 的说明）
     out["SECTOR.UP_RATIO"] = _mask_days(
         _hk_sector_up_ratio(conn, w_start, end), bad_days)
-    out["VAL.PE_TTM_MEDIAN"] = df["pe_med"]
-    out["VAL.PB_MEDIAN"] = df["pb_med"]
-    out["VAL.PCT_BELOW_PB_1"] = df["below1"] / df["pb_n"].replace(0, np.nan) * 100
+    # ⚠ **字段级门禁**：HK 行情已回填到 2000，但 `pe_ttm_ratio`/`pb_ratio` 在 2000 年仅覆盖
+    #   2 个百分点、2001 约 5 成，2002 起才达 96 个百分点以上。不加门禁时，2000 年的
+    #   「全市场 PE 中位数」会由约 11 只票算出 —— 数值本身无意义，还会污染分位与 risk_score。
+    #   判据：有该字段的个股数 < 当日有效样本的一半 → 置 NaN。
+    _half = df["n"] * 0.5
+    _pe_ok, _pb_ok = df["pe_n"] >= _half, df["pb_n"] >= _half
+    out["VAL.PE_TTM_MEDIAN"] = df["pe_med"].where(_pe_ok)
+    out["VAL.PB_MEDIAN"] = df["pb_med"].where(_pb_ok)
+    out["VAL.PCT_BELOW_PB_1"] = (df["below1"] / df["pb_n"].replace(0, np.nan) * 100).where(_pb_ok)
     out["RISK.EXTREME_DOWN_PCT"] = df["extdown"] / df["n"] * 100
     out["RISK.SYNC_DOWN_20D"] = (df["dec"] / df["n"] * 100).rolling(20, min_periods=10).mean()
     out["FLOW.TURNOVER_RATIO"] = df["amt"] / df["tmv"].replace(0, np.nan) * 100
@@ -2213,16 +2224,43 @@ def _risk_from_index(bdf: pd.DataFrame, date_col: str, price_col: str, market: s
 
 
 # ── 合成 ────────────────────────────────────────────────────────────────────
+_MIN_MEMBER_COVERAGE = 0.7
+"""合成分的成员覆盖率下限（分母只算**该市场适用**的成员，见 build_composites 的 _eligible）。
+
+低于此比例 → 该日合成值置 NaN，不用少数成员冒充。
+性质：**质控参数**（防结构性不可比），非统计最优值；改小会把不完整合成放出来。
+"""
+
+
 def build_composites(pct: pd.DataFrame, raw: pd.DataFrame, market: str) -> pd.DataFrame:
     """温度计 / 风险指数 / FSI / 季节 + 顶底信号计数（全部向量化）。"""
     out = pd.DataFrame(index=pct.index)
+    _scope = {m["code"]: m.get("market_scope", "CN+HK") for m in INDICATORS}
+
+    def _eligible(members) -> list:
+        """该市场**适用**的成员（分母）。
+
+        CN-only 成员（如 FLOW.MARGIN_RATIO、FORECAST.*、SENT.*）对 HK 永远不可用，
+        不该被当成「缺失」——否则 HK 的覆盖率会被永久低估（如温度计 7/12）。
+        """
+        return [c for c, _ in members
+                if _scope.get(c, "CN+HK") in ("CN+HK", "GLOBAL") or _scope.get(c) == market]
 
     def _score(members):
         cols = []
         for code, sign in members:
             if code in pct.columns:
                 cols.append(pct[code] if sign > 0 else 100 - pct[code])
-        return pd.concat(cols, axis=1).mean(axis=1, skipna=True) if cols else pd.Series(np.nan, index=pct.index)
+        if not cols:
+            return pd.Series(np.nan, index=pct.index)
+        block = pd.concat(cols, axis=1)
+        score = block.mean(axis=1, skipna=True)
+        # 成员覆盖率门禁：不足则置 NaN，**不得用少数成员冒充合成值**。
+        #   实测动机：HK 行情已回填到 2000，但成员起点参差（宽度 2000 / 估值 2002 /
+        #   恒指波动 2013 / 资金流与情绪 2019）→ 2000 年的 thermometer 若只由 4 个成员
+        #   算出，与 2019 年的值结构性不可比，且会污染历史分位。
+        need = max(1, int(np.ceil(len(_eligible(members)) * _MIN_MEMBER_COVERAGE)))
+        return score.where(block.notna().sum(axis=1) >= need)
 
     out["thermometer"] = _score(COMPOSITES["thermometer"]["members"])
     out["risk_score"] = _score(COMPOSITES["risk_score"]["members"])
@@ -2470,7 +2508,7 @@ def run(codes=None, ctx=None, market: str = None, start: datetime.date = None,
     """
     end = end or datetime.date.today()
     markets = [market] if market else ["CN", "HK"]
-    data_start = {"CN": datetime.date(1990, 1, 1), "HK": datetime.date(2019, 1, 1)}
+    data_start = {"CN": datetime.date(1990, 1, 1), "HK": datetime.date(2000, 1, 1)}
 
     stats = {}
     with get_conn() as conn:

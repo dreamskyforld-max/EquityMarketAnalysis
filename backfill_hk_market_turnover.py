@@ -19,6 +19,12 @@
     （不加 --resume 即全量重采覆盖；日常采集写入的当日行情在锚点处 raw==QFQ，无需额外处理）。
   - 落库用 skip_null_updates=True：本脚本产出为 NULL 的估值列（市值/PE/PB/PS/PCF/
     换手率/量比/52周）不会把库中已有有效值回写成 NULL。
+  - 无因子表（新浪 qfq.js 返回 404，如 ETF 02800、长期无成交的 04621）= 从未除权除息
+    → 因子恒为 1，raw 即 QFQ，按原始价落库（不跳过、不重试）。
+  - close<=0 的全 0 占位行（停牌/退市/无成交代码，如 04621 的 6 行）一律剔除，
+    整只全无效则视为「无数据」，避免污染价格序列与 prev_close 递推。
+  - 复权后价格 >= 1e6 的「因子与原始价不自洽」行（如 00286 的 1998-2001）同样剔除：
+    这类行会超出价格列 NUMERIC(12,4) 的 1e8 上限，导致整批 5000 行 INSERT 溢出。
 
 字段说明：新浪仅返回基础量价（date/open/high/low/close/volume/amount），
   估值字段（市值/PE/PB/换手率等）新浪不提供，统一置空（NULL），
@@ -26,7 +32,7 @@
 
 用法：
     python3 backfill_hk_market_turnover.py --years 3                 # 全港股回溯近 3 年
-    python3 backfill_hk_market_turnover.py --start 2019-01-01        # 全港股，指定起始日期
+    python3 backfill_hk_market_turnover.py --start 2000-01-01        # 全港股，指定起始日期
     python3 backfill_hk_market_turnover.py --code HK.01857           # 仅采集单只股票（可省略 HK. 前缀）
     python3 backfill_hk_market_turnover.py --code 01857 --start 2023-01-01  # 单只 + 起始日期
     python3 backfill_hk_market_turnover.py --code HK.01857 --dry-run # 只看不落库
@@ -163,9 +169,20 @@ def _done_codes(start: date):
 # 新浪港股前复权因子接口（与 akshare stock_hk_daily(adjust="qfq") 同源）
 _HK_QFQ_URL = "https://finance.sina.com.cn/stock/hkstock/{}/qfq.js"
 
+# 复权后单价上限（港元）。任何真实港股都到不了这个量级，远超它的只可能是
+# 「新浪因子表与原始价不自洽」（实测 00286 达 2.08 亿）；同时它远低于
+# hk_daily_quote 价格列 NUMERIC(12,4) 的 1e8 上限，双重保险防整批 INSERT 溢出。
+_QFQ_PRICE_MAX = 1e6
+
 
 def _fetch_qfq_factors(sym, max_retry: int = 3):
-    """抓新浪港股前复权因子表 → {date: factor}（升序 dict）；失败返回 None。
+    """抓新浪港股前复权因子表 → {date: factor}（升序 dict）。
+
+    返回三种结果，语义严格区分：
+      · dict 非空 → 有除权除息记录，按因子表换算；
+      · {} 空 dict → 新浪明确「无该股因子表」(HTTP 404)，即从未发生除权除息
+        （新股 / ETF / 窝轮等），因子恒为 1，raw 即 QFQ（安全）；
+      · None → 网络/解析失败（拿不到真相），由调用方跳过该股，绝不 raw 冒充 QFQ。
 
     因子语义：接口按日期【降序】返回记录，最新一条通常 f=1（前复权锚定最新）。
     某交易日 d 的实际因子 = 「日期 <= d 的最新一条记录」的 f（从该记录日起向后生效）。
@@ -181,6 +198,12 @@ def _fetch_qfq_factors(sym, max_retry: int = 3):
     for attempt in range(max_retry):
         try:
             r = requests.get(_HK_QFQ_URL.format(sym), timeout=30)
+            if r.status_code == 404:
+                # 新浪对「无除权除息记录」的代码不生成 qfq.js（实测 04621/02905：
+                # qfq.js 404 而行情 klc_kl.js 200）→ 因子恒为 1，不等于采集失败。
+                # 不重试：404 是稳定响应，重试只会白白拖慢全市场回溯。
+                log.info(f"  {sym} 无前复权因子表（404，从未除权除息），按 raw=QFQ 处理")
+                return {}
             r.raise_for_status()
             txt = r.text
             i, j = txt.find("{"), txt.rfind("}")
@@ -209,7 +232,8 @@ def _fetch_daily(sym):
     与 a_daily_quote 口径统一（a 池走 stock_zh_a_daily(adjust="qfq")）。
     已验证：volume/amount 不受复权影响；OHLC 同行同因子缩放，不存在部分调整。
 
-    因子拿不到 → 抛异常，由 fetch_history 计为失败并跳过（绝不 raw 冒充 QFQ）。
+    因子拿不到（None）→ 抛异常，由 fetch_history 计为失败并跳过（绝不 raw 冒充 QFQ）；
+    因子表为空（{}）→ 该股从未除权除息，raw 即 QFQ，直接返回原始价（无需缩放）。
     """
     import akshare as ak
     raw = ak.stock_hk_daily(symbol=sym, adjust="")
@@ -225,14 +249,49 @@ def _fetch_daily(sym):
     fac = _fetch_qfq_factors(sym)
     if fac is None:
         raise RuntimeError(f"{sym} 前复权因子不可用，跳过该股（避免 raw 冒充 QFQ）")
+    if fac:
+        fdf = pd.DataFrame({"d": pd.to_datetime(list(fac.keys())), "f": list(fac.values())})
+        keys = pd.DataFrame({"d": pd.to_datetime(df["trade_date"])}).sort_values("d")
+        merged = pd.merge_asof(keys, fdf, on="d", direction="backward")
+        # 早于最早因子记录的日期 → 用最早因子（backfill）；仍为空 → 视为无复权(f=1)
+        f = merged["f"].bfill().fillna(1.0).to_numpy()
+        for col in ("open", "high", "low", "close"):
+            df[col] = (df[col].astype(float) * f).round(4)
+    # fac 为空 dict = 无除权除息，raw 即 QFQ，不做缩放
+    return _drop_bad_prices(df, sym)
 
-    fdf = pd.DataFrame({"d": pd.to_datetime(list(fac.keys())), "f": list(fac.values())})
-    keys = pd.DataFrame({"d": pd.to_datetime(df["trade_date"])}).sort_values("d")
-    merged = pd.merge_asof(keys, fdf, on="d", direction="backward")
-    # 早于最早因子记录的日期 → 用最早因子（backfill）；仍为空 → 视为无复权(f=1)
-    f = merged["f"].bfill().fillna(1.0).to_numpy()
-    for col in ("open", "high", "low", "close"):
-        df[col] = (df[col].astype(float) * f).round(4)
+
+def _drop_bad_prices(df: pd.DataFrame, sym) -> pd.DataFrame:
+    """剔除价格不可用的行（返回新 DataFrame，整只全无效则返回空表）。
+
+    两类行必须剔除，否则要么污染价格序列，要么直接把整批 INSERT 打崩：
+
+    ① close<=0（含 NaN）：新浪对长期停牌/无成交/已退市代码返回全 0 占位记录
+       （实测 04621：6 行 open/high/low/close/volume/amount 全 0，且无 qfq 因子表）。
+       这类「交易日」不存在真实成交，落库还会破坏 prev_close 递推（prev_close=0
+       → 次日涨跌幅算不出）。
+
+    ② 复权后价格 >= _QFQ_PRICE_MAX：新浪前复权因子与原始价可能**不自洽**。
+       实测 00286：1999 年原始价 4013 × 因子 51802 = 2.08 亿，2000 年 236 × 2590
+       = 61 万 —— 该股 1998-2001 的因子表与价格表对不上（因子从 51802 跳到 2590、
+       再跳到 27，价格同期从 4013 掉到 1.0）。这些行既非真实成交价，又会超出
+       NUMERIC(12,4) 的 1e8 上限 → 整批 5000 行 INSERT 报 numeric field overflow。
+       这类异常只出现在远古历史（00286 集中在 1998-2001，近 20 年正常），
+       剔除对近 N 年回溯与成交额聚合无影响。
+    """
+    if df.empty:
+        return df
+    ohlc = (
+        df[["open", "high", "low", "close"]]
+        .apply(pd.to_numeric, errors="coerce")
+        .to_numpy(dtype="float64")
+    )
+    bad = ~(ohlc[:, 3] > 0)  # close 非正 / NaN
+    bad |= (ohlc >= _QFQ_PRICE_MAX).any(axis=1)  # NaN >= x 为 False，不受影响
+    n_bad = int(bad.sum())
+    if n_bad:
+        log.info(f"  {sym} 剔除 {n_bad} 行无效价（close<=0 或复权后 >= {_QFQ_PRICE_MAX:g}）")
+        df = df[~bad].reset_index(drop=True)
     return df
 
 
@@ -595,7 +654,7 @@ class _QuoteWriter:
     BATCH = 5000
 
     def __init__(self):
-        from db import get_conn, bulk_upsert
+        from db import get_conn, bulk_upsert, sanitize_numeric_rows
         from get_hk_market_turnover import _ensure_table
         _ensure_table("hk_daily_quote")
         with get_conn() as conn:
@@ -603,14 +662,19 @@ class _QuoteWriter:
                 ensure_prev_close_columns(cur, "hk_daily_quote")
         self._get_conn = get_conn
         self._bulk_upsert = bulk_upsert
+        self._sanitize = sanitize_numeric_rows
         self._buf = []
         self.total = 0
 
     def __call__(self, rows):
         self._buf.extend(rows)
         while len(self._buf) >= self.BATCH:
-            self._flush(self._buf[:self.BATCH])
+            chunk = self._buf[:self.BATCH]
+            # 先出队再写：无论写入成败，这批都不能留在缓冲里。
+            # 否则失败批（如超列宽溢出）会被后续每只股票反复重试 →
+            # 一只坏数据级联毒死整轮余下所有股票（实测 00286 溢出）。
             del self._buf[:self.BATCH]
+            self._flush(chunk)
 
     def close(self):
         if self._buf:
@@ -624,10 +688,22 @@ class _QuoteWriter:
         # 冲突时仅覆盖有值字段，避免把日常采集/估值脚本已填的有效值回写成 NULL
         # （与 backfill_a_market_turnover.py 同款防护）。
         with self._get_conn() as conn:
-            self._bulk_upsert(conn, "hk_daily_quote", chunk,
+            # 越界值兜底：按库中真实列宽把超范围字段置 NULL。
+            # 正常路径已在 _drop_bad_prices 剔除，这里防的是「库中列宽比预期窄」
+            # 或其它字段越界 —— 否则一条溢出记录会让整批 5000 行全部回滚。
+            chunk, dropped = self._sanitize(conn, "hk_daily_quote", chunk)
+            if dropped:
+                log.warning(f"  {len(dropped)} 个越界字段已置空，示例: {dropped[:3]}")
+            # close 被置空的行无法作为日线（价格序列会断档/污染），整行丢弃
+            rows = [r for r in chunk if r.get("close") is not None]
+            if len(rows) != len(chunk):
+                log.warning(f"  丢弃 {len(chunk) - len(rows)} 行（close 越界或缺失）")
+            if not rows:
+                return
+            self._bulk_upsert(conn, "hk_daily_quote", rows,
                               conflict_cols=["stock_code", "trade_date"],
                               skip_null_updates=True)
-        self.total += len(chunk)
+        self.total += len(rows)
         log.info(f"  个股日线已落库 {self.total} 条")
 
 

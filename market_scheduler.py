@@ -189,6 +189,19 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     ("融资融券全量", "get_margin_balance.py",
      {"hour": "9,18", "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
 
+    # 多空力量回合日表（force_round_daily）：从 tick_data 四档 + trend_snapshot 价格派生
+    # 分钟级攻防回合与 λ_pct/LQ/留存率，供 stock-realtime 分时图「攻守状态 / 博弈结果」
+    # 两个 grid 消费。范围 = realtime_collect_target.collect_tick=TRUE（打开实时交易流水的票）；
+    # 四档阈值读 fund_flow_settings（线上生效口径，与分时图同源）。
+    # 频率：**盘中每分钟一轮**（不是盘后一次）——分时图是分钟级视图，盘中要能看到
+    # 「这一波谁占优、效率多少」，等收盘后才有数据就失去了实时决策价值。
+    # 实测：81 只票 8 线程并行单轮 10.9s（瓶颈是 tick_data 的 CASE WHEN+GROUP BY 聚合），
+    # 远小于 60s 间隔；天级串行以保证适用性（近 20 日主回合累计）逐日累计正确。
+    # 盘中未收口的最后回合会被标 ongoing，前端显示「进行中」不画结果。
+    # second=5 避开整点，与其他整点任务错开；hour 9-16 覆盖港股 9:30-16:10 与 A 股 9:30-15:00。
+    ("多空力量回合", "build_force_rounds.py",
+     {"minute": "*", "second": 5, "hour": "9-16", "day_of_week": "mon-fri"}, None, True, None, 900),
+
     # 港股全日沽空（全市场全量）：一次抓取港交所全日沽空快照页，解析全部港股
     # 并全量入库 daily_short_selling（全局任务，不依赖股票列表，run 忽略 codes）。
     # 港交所约 16:50 发布，17:30、18:30 兜底补采。
