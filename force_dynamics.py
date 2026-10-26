@@ -25,18 +25,25 @@
       "tiers": {"super": (in, out), "big": (...), "mid": (...), "small": (...)}}, ...]
 buy/sell/tiers 均为**元**（成交额）；t 为 "HH:MM" 字符串，需按交易日连续。
 
-输出（回合列表，每回合一个 dict）
+输出（回合列表，每回合一个 dict）—— **全部为胜方视角**
 --------------------------------
-t0/t1/minutes/side     时段、时长、方向（+1 多 / -1 空）
-attack_vol/counter_vol 攻方同向投入合计 / 回合内反向流量
-net_vol                攻方向净得手
-defend_max             守方量能相对其基线的最大放大倍数（阻击意图）
-impact/keep_ratio      冲击（攻方视角最大位移）/ 留存率 = 冲击 ÷ 最终位移
-eff / eff_pct          λ（元/亿）/ λ_pct（每亿元推动的百分点，跨票口径）
-lq                     对手盘厚度 = 守方四档总投入 ÷ 攻方特大+大投入
-win                    胜 / 弱 / 负（按留存率分档）
+t0/t1/minutes          时段、时长
+win_side               胜方：ΔP>0 → +1（多），ΔP<0 → -1（空），ΔP=0 → 0
+                       「胜方」= 最终影响股价走向的一方（唯一视角，无攻守二元对立）
+p0/p1/dp               起点价 / 终点价 / 位移（带符号）
+inv_win/inv_lose       胜方投入 / 负方投入（均取该方向**全部档位主动成交额**）
+eff / eff_pct          边际效率 λ（元/亿）/ λ_pct（每亿元推动的百分点，跨票口径）
+peak_win/keep          胜方方向上的最大位移 / 冲击留存 = |ΔP| ÷ peak_win（0~1，恒正）
+amplitude              回合最大振幅（不分方向，辅助观察激烈程度）
+lq                     对手盘厚度 = 负方投入 ÷ 胜方投入
+lq_main                同上，分母改用「特大+大」口径（仅诊断）
+defend_max             负方量能相对其基线的最大放大倍数（负方是否反击）
+r_bal                  均衡确认时的对称度
 end                    均衡 / 静默 / 易位 / 超时 / 收盘
-is_main                是否主回合（投入 >= 当日门槛）
+is_main                是否主回合（胜方投入 >= 当日门槛）
+
+> 「胜负」标签已移除（2026-10-26）：胜方由 ΔP 符号定义，再输出「胜/弱/负」是冗余的；
+> 回合内是否打得干净由 `keep`（冲击留存）这一连续量表达，不再分档。
 
 调用方
 ------
@@ -60,6 +67,9 @@ DEFEND_WIN = 10       # 阻击倍数的滚动窗口（分钟）
 BALANCE_HOLD = 2      # 均衡需连续确认的分钟数
 QUIET_MIN = 5         # 连续 N 分钟不活跃即判定「静默收口」
 MAX_ROUND_MIN = 90    # 单回合最长分钟数（兜底）
+NEUTRAL_PCT = 0.001     # 「无胜方」中性区间：|ΔP| ÷ 起点价 < 0.1% 时判定为横盘，不指定胜方
+                        # 依据：微小位移强行归给某一方会让「胜方」语义在震荡市失真
+                        # （10-21 11:59-13:06 位移仅 -0.2 元/-0.05%，实为横盘微跌）
 MAIN_VOL_FLOOR = 1.0e8  # 主回合投入下限（元）
 MAIN_VOL_PCT = 0.015    # 主回合门槛 = max(下限, 当日双边额 × 该比例)
                         # 绝对金额门槛对低价股/低流动性票不公平（设计文档 §5.1：
@@ -82,47 +92,84 @@ def main_vol_threshold(rows: list[dict]) -> float:
     return max(MAIN_VOL_FLOOR, sum(r["g"] for r in rows) * MAIN_VOL_PCT)
 
 
-def _close(rows: list[dict], cur: dict, reason: str) -> dict:
-    """收口一个回合：位移、效率、分档指标、胜负。"""
+def _close(rows: list[dict], cur: dict, reason: str,
+           buys: list[float], sells: list[float]) -> dict:
+    """收口一个回合 —— **统一按「胜方视角」出指标**（2026-10-26 口径重构）。
+
+    胜方 = 最终影响股价走向的一方：ΔP>0 → 多方，ΔP<0 → 空方。
+    视角从始至终只有一个（胜方），不再有「发起方/守方」两套并存的语义。
+    回合切分仍需要「触发方向」（attack_side），但它只是切分工具、不对外输出。
+
+    指标（分母口径 = 该方向全部主动成交额，选择依据见设计文档 §2.3：
+    单回合 CV 0.54 / 跨日 CV 0.42，优于「特大+大」的 0.77/0.79 与「净额」的 0.58/0.52）：
+      eff_pct   边际效率 = |ΔP| ÷ 胜方投入 × 100 ÷ 价格  （每亿元推动的百分点）
+      keep      冲击留存 = |ΔP| ÷ 胜方方向上的最大位移     （0~1，恒正）
+      lq        对手盘厚度 = 负方投入 ÷ 胜方投入
+    """
     s, e = cur["start"], cur["end"]
-    p0, p1 = cur["p0"], rows[e]["price"]      # 基准 = 进攻发起前一分钟
+    p0, p1 = cur["p0"], rows[e]["price"]      # 基准 = 回合启动前一分钟
     dp = p1 - p0
-    signed = dp * cur["side"]                 # 攻方视角：>0 表示攻方推动成功
-    vol = cur["attack"]
-    eff = abs(signed) / (vol / 1e8) if vol > 0 else float("nan")
-    impact = cur["peak"]                      # 攻方视角的最大位移（冲击）
-    keep_ratio = (signed / impact) if impact > 0 else float("nan")
-    # λ_pct：每亿元投入推动的百分点（跨票可比口径）。原始 λ（元/亿）跨票差 64 倍且与
-    # 分钟波动成正比，除以价格后缩到约 1.5 倍（设计文档 §5.1）。
-    eff_pct = (abs(signed) / (vol / 1e8)) / p0 * 100 if (p0 and p0 > 0 and vol > 0) else float("nan")
-    # 分档口径：攻方投入 = 攻方向「特大+大」绝对额（重骑兵+骑兵，主导力量）；
-    # LQ 对手盘厚度 = 守方四档总投入 ÷ 攻方特大+大。LQ 是 Kyle(1985) 的流动性供给：
-    # 对手盘越厚，攻方每亿元推动的价格越多、完成得越干净。
+    ws = 1 if dp > 0 else (-1 if dp < 0 else 0)   # 胜方：谁最终影响了股价走向
+    # 中性区间：股价几乎没动时不指定胜方（否则横盘微跌也会被归给空方）
+    if p0 and p0 > 0 and abs(dp) / p0 < NEUTRAL_PCT:
+        ws = 0
     seg = rows[s:e + 1]
+    amplitude = max(x["price"] for x in seg) - min(x["price"] for x in seg)   # 不分方向的振幅
+
+    if ws == 0:
+        # 横盘：不产出效率类指标（inv_win 为 NaN → is_main 恒 False → 不进柱状图）
+        nan = float("nan")
+        return dict(
+            t0=rows[s]["t"], t1=rows[e]["t"], minutes=e - s + 1,
+            win_side=0, p0=p0, p1=p1, dp=dp,
+            inv_win=nan, inv_lose=nan, eff=nan, eff_pct=nan,
+            peak_win=nan, keep=nan, amplitude=amplitude,
+            lq=nan, lq_main=nan, defend_max=nan, defend_t=None,
+            r_bal=cur["r_bal"], end=reason,
+        )
+
+    buy_all = sum(x["buy"] for x in seg)
+    sell_all = sum(x["sell"] for x in seg)
+    inv_win = buy_all if ws > 0 else sell_all     # 胜方投入（全部档位主动成交额）
+    inv_lose = sell_all if ws > 0 else buy_all    # 负方投入
     bm = sum(x["tiers"]["super"][0] + x["tiers"]["big"][0] for x in seg)
     sm = sum(x["tiers"]["super"][1] + x["tiers"]["big"][1] for x in seg)
-    br = sum(x["tiers"]["mid"][0] + x["tiers"]["small"][0] for x in seg)
-    sr = sum(x["tiers"]["mid"][1] + x["tiers"]["small"][1] for x in seg)
-    atk_main, def_main, def_ret = (sm, bm, br) if cur["side"] < 0 else (bm, sm, sr)
-    lq = ((def_main + def_ret) / atk_main) if atk_main > 0 else float("nan")
-    # 结果按「留存率」分档：冲击再大，守不住就不算赢（对应「试探 vs 决战」）
-    if impact <= 0:
-        win = "负"
-    elif keep_ratio >= 0.5:
-        win = "胜"
-    elif keep_ratio >= 0.15:
-        win = "弱"
+    inv_win_main = bm if ws > 0 else sm           # 主力口径（仅作诊断）
+    inv_lose_main = sm if ws > 0 else bm
+
+    eff = abs(dp) / (inv_win / 1e8) if inv_win > 0 else float("nan")
+    eff_pct = eff / p0 * 100 if (p0 and p0 > 0) else float("nan")
+
+    # 冲击留存：胜方方向上的最大位移中，有多少最终留下（恒 0~1）
+    if ws > 0:
+        peak_win = max(x["price"] - p0 for x in seg)
     else:
-        win = "负"
+        peak_win = max(p0 - x["price"] for x in seg)
+    keep = (abs(dp) / peak_win) if peak_win > 0 else float("nan")
+
+    lq = (inv_lose / inv_win) if inv_win > 0 else float("nan")
+    lq_main = (inv_lose_main / inv_win_main) if inv_win_main > 0 else float("nan")
+
+    # 负方量能放大（原「阻击倍数」，胜方视角下改看负方是否反击）
+    defend, defend_t = 0.0, None
+    if ws != 0:
+        for k in range(s + 1, e + 1):
+            opp = sells[k] if ws > 0 else buys[k]
+            base = _roll_median(sells if ws > 0 else buys, k, DEFEND_WIN)
+            mult = opp / base if base > 0 else 0.0
+            if mult > defend:
+                defend, defend_t = mult, rows[k]["t"]
+
     return dict(
-        t0=rows[s]["t"], t1=rows[e]["t"], minutes=e - s + 1, side=cur["side"],
-        attack_vol=vol, counter_vol=cur["counter"], net_vol=cur["net"] * cur["side"],
-        defend_max=cur["defend"], defend_t=cur["defend_t"], r_bal=cur["r_bal"],
-        p0=p0, p1=p1, dp=dp, signed=signed, impact=impact, keep_ratio=keep_ratio, eff=eff,
-        eff_pct=eff_pct,
-        lq=lq, def_main_ratio=(def_main / atk_main) if atk_main > 0 else float("nan"),
-        def_ret_ratio=(def_ret / atk_main) if atk_main > 0 else float("nan"),
-        win=win, end=reason,
+        t0=rows[s]["t"], t1=rows[e]["t"], minutes=e - s + 1,
+        win_side=ws,
+        p0=p0, p1=p1, dp=dp,
+        inv_win=inv_win, inv_lose=inv_lose,
+        eff=eff, eff_pct=eff_pct,
+        peak_win=peak_win, keep=keep, amplitude=amplitude,
+        lq=lq, lq_main=lq_main,
+        defend_max=defend, defend_t=defend_t,
+        r_bal=cur["r_bal"], end=reason,
     )
 
 
@@ -147,24 +194,11 @@ def detect_rounds(rows: list[dict]) -> list[dict]:
         return r["g"] > 0 and _sym(r) >= R_BALANCE and abs(r["net"]) / r["g"] <= IMB_BALANCE
 
     def new_round(i: int, side: int) -> dict:
-        # p0 取「进攻发起前一分钟」的价：冲击幅度必须从发起前的基准算，
-        # 否则首击那一分钟的价格已包含冲击，会把冲击记成 0（10-23 09:31 即踩此坑）。
-        return dict(start=i, side=side, attack=0.0, counter=0.0, net=0.0,
-                    defend=0.0, defend_t=None, r_bal=None,
-                    p0=rows[max(0, i - 1)]["price"], peak=0.0, last_active=i)
-
-    def acc(cur: dict, r: dict) -> None:
-        """把一分钟计入回合计量：同向记 attack、反向记 counter、代数和记 net；
-        并追踪「攻方视角的最大位移」（冲击幅度，区别于回合结束时的留存）。"""
-        v = r["net"] * cur["side"]
-        if v > 0:
-            cur["attack"] += v
-        else:
-            cur["counter"] += -v
-        cur["net"] += r["net"]
-        peak = (r["price"] - cur["p0"]) * cur["side"]
-        if peak > cur["peak"]:
-            cur["peak"] = peak
+        # p0 取「回合启动前一分钟」的价：位移必须从启动前的基准算，
+        # 否则首击那一分钟的价格已包含冲击，会把位移记成 0（10-23 09:31 即踩此坑）。
+        # side 仅作切分用的「触发方向」，不对外输出（对外统一为胜方视角）。
+        return dict(start=i, side=side, r_bal=None,
+                    p0=rows[max(0, i - 1)]["price"], last_active=i)
 
     rounds: list[dict] = []
     cur: dict | None = None
@@ -174,56 +208,47 @@ def detect_rounds(rows: list[dict]) -> list[dict]:
         # 攻守易位：当前分钟的反向进攻开启新回合（不计入旧回合）
         if cur is not None and side and side != cur["side"]:
             cur["end"] = max(cur["start"], i - 1)
-            rounds.append(_close(rows, cur, "易位"))
+            rounds.append(_close(rows, cur, "易位", buys, sells))
             cur = None
 
         if cur is None:
             if not side:
                 continue
             cur = new_round(i, side)
-            acc(cur, r)          # 启动分钟必须计入，否则会漏掉最重的一击
             continue
 
-        acc(cur, r)
         if r["g"] >= g_act:
             cur["last_active"] = i
-
-        # 守方量能（相对其自身基线；启动分钟不计，避免把首击算成阻击）
-        if i > cur["start"]:
-            opp = sells[i] if cur["side"] > 0 else buys[i]
-            base = _roll_median(sells if cur["side"] > 0 else buys, i, DEFEND_WIN)
-            mult = opp / base if base > 0 else 0.0
-            if mult > cur["defend"]:
-                cur["defend"], cur["defend_t"] = mult, r["t"]
 
         # 均衡确认
         if i - cur["start"] >= BALANCE_HOLD and all(
                 balanced(j) for j in range(i - BALANCE_HOLD + 1, i + 1)):
             cur["end"] = i
             cur["r_bal"] = _sym(r)
-            rounds.append(_close(rows, cur, "均衡"))
+            rounds.append(_close(rows, cur, "均衡", buys, sells))
             cur = None
             continue
 
         # 静默结束：连续 QUIET_MIN 分钟不再活跃 → 回合自然熄灭（避免长回合吞掉整段行情）
         if i - cur["last_active"] >= QUIET_MIN:
             cur["end"] = cur["last_active"]
-            rounds.append(_close(rows, cur, "静默"))
+            rounds.append(_close(rows, cur, "静默", buys, sells))
             cur = None
             continue
 
         if i - cur["start"] >= MAX_ROUND_MIN:
             cur["end"] = i
-            rounds.append(_close(rows, cur, "超时"))
+            rounds.append(_close(rows, cur, "超时", buys, sells))
             cur = None
 
     if cur is not None:
         cur["end"] = len(rows) - 1
-        rounds.append(_close(rows, cur, "收盘"))
-    # 主回合门槛直接标记到回合上，避免各调用方用不同口径
+        rounds.append(_close(rows, cur, "收盘", buys, sells))
+    # 主回合门槛直接标记到回合上，避免各调用方用不同口径。
+    # 口径：胜方投入（该方向全部主动成交额）≥ max(1亿, 当日双边额×1.5%)
     th = main_vol_threshold(rows)
     for r in rounds:
-        r["is_main"] = r["attack_vol"] >= th
+        r["is_main"] = r["inv_win"] >= th
     return rounds
 
 
