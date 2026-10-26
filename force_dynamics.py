@@ -47,7 +47,8 @@ is_main                是否主回合（胜方投入 >= 当日门槛）
 
 调用方
 ------
-`build_force_rounds.py`（每日 16:40 跑批落库 force_round_daily）。
+`build_force_rounds.py`（盘中每分钟跑批落库 force_round_daily，单轮只算当天；
+历史日期漏跑用 `python3 build_force_rounds.py --days N` 回填）。
 """
 from __future__ import annotations
 

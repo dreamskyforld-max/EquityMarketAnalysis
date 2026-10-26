@@ -195,8 +195,12 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     # 四档阈值读 fund_flow_settings（线上生效口径，与分时图同源）。
     # 频率：**盘中每分钟一轮**（不是盘后一次）——分时图是分钟级视图，盘中要能看到
     # 「这一波谁占优、效率多少」，等收盘后才有数据就失去了实时决策价值。
-    # 实测：81 只票 8 线程并行单轮 10.9s（瓶颈是 tick_data 的 CASE WHEN+GROUP BY 聚合），
-    # 远小于 60s 间隔；天级串行以保证适用性（近 20 日主回合累计）逐日累计正确。
+    # 单轮范围只算「当天」（days_back=1，见下方 GLOBAL_TASK_KWARGS）：此前按最近 5 个
+    # 交易日全量重算，单轮实测 100~135s 超过 60s cron 间隔，被 max_instances=1 合并成
+    # 约 2 分钟一轮；只算当天单轮约 20~25s（瓶颈是 tick_data 的 CASE WHEN+GROUP BY 聚合）。
+    # 适用性判定（近 20 日主回合累计）由 recent_main_count 读库中 trade_date<当天 的历史行，
+    # 与本次跑批范围无关，故只算当天不影响正确性。历史日期漏跑（服务停/失败）用
+    # `python3 build_force_rounds.py --days N` 回填。
     # 盘中未收口的最后回合会被标 ongoing，前端显示「进行中」不画结果。
     # second=5 避开整点，与其他整点任务错开；hour 9-16 覆盖港股 9:30-16:10 与 A 股 9:30-15:00。
     ("多空力量回合", "build_force_rounds.py",
@@ -346,6 +350,14 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     # 以免「调度器挂掉→监控也失效」的同源单点故障。
 ]
 
+# 需要向模块 run() 传额外关键字参数的全局任务（任务名 → run() kwargs）。
+# 注册循环把这些 kwargs 透传给 execute_task → run_script → run_module。
+GLOBAL_TASK_KWARGS: dict[str, dict] = {
+    # 每分钟一轮只重算「当天」（5 天全量重算单轮 100~135s > 60s cron 间隔，实际被
+    # max_instances=1 合并成约 2 分钟一轮；见该任务条目的注释）。
+    "多空力量回合": {"days_back": 1},
+}
+
 # ── 盘中批量采集（按市场拆分）────────────────────────────────
 # 「每个市场每分钟一个全局任务」，codes=该市场 collect_trend=TRUE 的全量股票，
 # 一次批量快照分发（get_quote 写 daily_quote + record_trend 写 trend_snapshot）。
@@ -361,7 +373,8 @@ for _mkt, _mkt_codes in sorted(_intraday_by_market.items()):
 
 # ── 执行器 ──────────────────────────────────────────────────
 
-def run_script(script_name: str, codes=None, timeout: int = 180) -> bool:
+def run_script(script_name: str, codes=None, timeout: int = 180,
+               kwargs: dict | None = None) -> bool:
     """运行采集模块（常驻进程内调用，无 subprocess 冷启动）。
 
     通过 collector_runtime.run_module 惰性导入模块并调用其 run(codes, ctx)，
@@ -372,6 +385,8 @@ def run_script(script_name: str, codes=None, timeout: int = 180) -> bool:
     Args:
         codes: 股票代码列表；可为 None（全局任务，由模块自行决定范围）、
                str（单票，自动包成 [str]）或 list（多票全局任务）。
+        kwargs: 额外传给模块 run() 的关键字参数（如 build_force_rounds 的
+                days_back）；None 表示用模块自身默认值。
     """
     if codes is None:
         pass  # 保持 None，交给模块 run() 决定默认范围
@@ -383,7 +398,7 @@ def run_script(script_name: str, codes=None, timeout: int = 180) -> bool:
     def _target():
         try:
             from collector_runtime import run_module
-            run_module(script_name, codes)
+            run_module(script_name, codes, **(kwargs or {}))
             result["ok"] = True
         except BaseException as e:
             result["err"] = e
@@ -408,7 +423,8 @@ def run_script(script_name: str, codes=None, timeout: int = 180) -> bool:
 
 
 def execute_task(name: str, modules: list, codes=None,
-                 force: bool = False, market: str | None = None, timeout: int = 180):
+                 force: bool = False, market: str | None = None, timeout: int = 180,
+                 kwargs: dict | None = None):
     """执行一组采集模块（顺序执行）
 
     Args:
@@ -419,6 +435,7 @@ def execute_task(name: str, modules: list, codes=None,
         force: 是否跳过交易时段检查
         market: 市场标识（"HK"/"A"），用于交易时段判断；None 时不检查
         timeout: 单个脚本超时秒数，默认 180
+        kwargs: 额外传给各模块 run() 的关键字参数（见 GLOBAL_TASK_KWARGS）
     """
     if not force and market and not is_trading_hours(market):
         return
@@ -437,7 +454,7 @@ def execute_task(name: str, modules: list, codes=None,
 
     fail = 0
     for script in modules:
-        ok = run_script(script, codes, timeout)
+        ok = run_script(script, codes, timeout, kwargs)
         if not ok:
             fail += 1
 
@@ -568,10 +585,12 @@ def build_scheduler():
     for g_name, g_script, g_cron, g_codes, g_force, g_market, g_timeout in GLOBAL_TASKS:
         # 脚本字段：单个脚本用字符串，多个脚本用列表（如盘中批量采集）
         g_modules = g_script if isinstance(g_script, list) else [g_script]
+        # 需要显式传 run() 参数的任务（如 build_force_rounds 的 days_back=1）
+        g_kwargs = GLOBAL_TASK_KWARGS.get(g_name)
         sched.add_job(
             execute_task,
             trigger=CronTrigger(**g_cron),
-            args=[g_name, g_modules, g_codes, g_force, g_market, g_timeout],
+            args=[g_name, g_modules, g_codes, g_force, g_market, g_timeout, g_kwargs],
             id=g_name,
             replace_existing=True,
             misfire_grace_time=300,
