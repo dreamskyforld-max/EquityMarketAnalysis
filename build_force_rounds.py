@@ -78,7 +78,7 @@ def _fmt_item(idx: int, total: int, code: str, day: dt.date, st: dict[str, Any])
     else:
         lam = st.get("lam")
         lam_txt = "-" if lam is None else f"{lam:.3f}"
-        body = (f"{st['minutes']} 分钟 {st['rounds']} 回合 主 {st['mains']}"
+        body = (f"{st['minutes']} 分钟 {st['rounds']} 回合"
                 f" λ_pct {lam_txt} {'适用' if st['applicable'] else '不适用'}")
     return f"{head}｜{body}｜{st['elapsed']:.1f}s"
 
@@ -206,15 +206,16 @@ def upsert(cur, code: str, day: dt.date, rounds: list[dict], applicable: bool, l
               lambda_median, applicable))
 
 
-def recent_main_count(cur, code: str, day: dt.date, window: int = 20) -> int:
-    """近 window 个已落库交易日的主回合合计（适用性检查用）。"""
+def recent_round_count(cur, code: str, day: dt.date, window: int = 20) -> int:
+    """近 window 个已落库交易日的回合数合计（适用性 = 样本充足性检查）。
+
+    2026-10-26 起 `is_main` 已移除（窗口改由股价趋势段决定，一天 6~10 段，
+    「主回合」这一细分不再有意义），判据从「主回合数」改为「回合数」。
+    """
     cur.execute(
         """
-        SELECT COALESCE(SUM(n_main), 0) FROM (
-            SELECT jsonb_array_length(
-                (SELECT jsonb_agg(e) FROM jsonb_array_elements(rounds) e WHERE (e->>'is_main')::boolean)
-            ) AS n_main
-            FROM force_round_daily
+        SELECT COALESCE(SUM(jsonb_array_length(rounds)), 0) FROM (
+            SELECT rounds FROM force_round_daily
             WHERE stock_code=%s AND trade_date < %s
             ORDER BY trade_date DESC LIMIT %s
         ) t
@@ -236,7 +237,7 @@ def resolve_scope(codes: list[str] | None = None, days: list[dt.date] | None = N
                   days_back: int = 5) -> tuple[list[str], list[dt.date]]:
     """解析跑批范围：codes 缺省 = collect_tick 全池；days 缺省 = 最近 days_back 个交易日。
 
-    days 一律返回**日期正序**——回合适用性依赖历史主回合逐日累计，乱序会算错。
+    days 一律返回**日期正序**——适用性依赖历史回合逐日累计，乱序会算错。
     """
     with db.get_conn() as conn, conn.cursor() as cur:
         if not codes:
@@ -251,7 +252,7 @@ def resolve_scope(codes: list[str] | None = None, days: list[dt.date] | None = N
                 WHERE stock_code = ANY(%s) ORDER BY 1 DESC LIMIT %s
                 """, (list(codes), days_back))
             days = sorted(r[0] for r in cur.fetchall())
-    # 始终正序（含调用方显式传入的 days）：适用性靠逐日累计主回合数，乱序会算错
+    # 始终正序（含调用方显式传入的 days）：适用性靠逐日累计回合数，乱序会算错
     return list(codes), sorted(days)
 
 
@@ -274,21 +275,24 @@ def process_one(code: str, day: dt.date, th: dict[str, Any],
             if len(rows) < 60:
                 return dict(status="skip", reason="thin", minutes=len(rows),
                             elapsed=time.time() - t0)
-            rounds = fd.detect_rounds(rows)
-            # 盘中（当日且未过收市竞价）：最后一个「收盘」回合其实还在打，标 ongoing，
-            # 前端据此显示「进行中」且不画结果，避免把未收口的攻防误示为已结束。
-            if _is_live(day) and rounds and rounds[-1]["end"] == "收盘":
+            # 回合窗口 = 股价趋势段（上涨/下跌/横盘），见 force_dynamics.rounds_by_trend。
+            # 2026-10-26 从 detect_rounds（资金相位切分）切换：原口径一天几十个碎块。
+            rounds = fd.rounds_by_trend(rows)
+            # 盘中（当日且未过收市竞价）：最后一个趋势段其实还在走，标 ongoing，
+            # 前端据此显示「进行中」且不画结果，避免把未收口的走势误示为已结束。
+            # 注：趋势段窗口下 end 是「趋势」而不再是「收盘」，故不再用 end 判断。
+            if _is_live(day) and rounds:
                 rounds[-1]["ongoing"] = True
-            mains = [r for r in rounds if r["is_main"]]
-            lams = [r["eff_pct"] for r in mains if r["eff_pct"] == r["eff_pct"]]
+            # λ_pct 中位数 = 全部回合的 eff_pct 中位（横盘段为 NaN，已被过滤）
+            lams = [r["eff_pct"] for r in rounds if r["eff_pct"] == r["eff_pct"]]
             lam_med = float(np.median(lams)) if lams else None
-            # 适用性：近 20 个已落库交易日的主回合合计 ≥20 才输出结论。
+            # 适用性：近 20 个已落库交易日的回合数合计 ≥20（样本充足才输出结论）。
             # 依赖按日期正序跑（resolve_scope 已排序），历史回填时逐日累计才准确。
-            prev = recent_main_count(cur, code, day)
-            applicable = prev + len(mains) >= 20
+            prev = recent_round_count(cur, code, day)
+            applicable = prev + len(rounds) >= 20
             upsert(cur, code, day, rounds, applicable, lam_med)
             conn.commit()
-            return dict(status="ok", minutes=len(rows), rounds=len(rounds), mains=len(mains),
+            return dict(status="ok", minutes=len(rows), rounds=len(rounds),
                         lam=lam_med, applicable=applicable, elapsed=time.time() - t0)
     except Exception as e:  # noqa: BLE001
         log.debug("%s %s 失败堆栈", code, day, exc_info=True)
@@ -324,7 +328,7 @@ def run(codes: list[str] | None = None, days: list[dt.date] | None = None,
 
     t0 = time.time()
     idx = done = failed = 0
-    n_rounds = n_mains = 0
+    n_rounds = 0
     skips = {k: 0 for k in _SKIP_REASONS}
     hb = _Heartbeat()
     hb.start()
@@ -351,7 +355,7 @@ def run(codes: list[str] | None = None, days: list[dt.date] | None = None,
             if not tasks:
                 continue
             day_t0 = time.time()
-            d_done = d_skip = d_fail = d_rounds = d_mains = 0
+            d_done = d_skip = d_fail = d_rounds = 0
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 for (code, d), st in zip(tasks, ex.map(_task, tasks)):
                     idx += 1
@@ -360,9 +364,7 @@ def run(codes: list[str] | None = None, days: list[dt.date] | None = None,
                         done += 1
                         d_done += 1
                         d_rounds += st["rounds"]
-                        d_mains += st["mains"]
                         n_rounds += st["rounds"]
-                        n_mains += st["mains"]
                     elif st["status"] == "fail":
                         failed += 1
                         d_fail += 1
@@ -374,16 +376,16 @@ def run(codes: list[str] | None = None, days: list[dt.date] | None = None,
                     if not quiet:
                         log.info("%s%s", _fmt_item(idx, total, code, d, st),
                                  _fmt_eta(t0, idx, total))
-            log.info("%s 汇总：写入 %d / 跳过 %d / 失败 %d｜回合 %d 主回合 %d｜%.1fs（%d 线程）",
-                     day, d_done, d_skip, d_fail, d_rounds, d_mains,
+            log.info("%s 汇总：写入 %d / 跳过 %d / 失败 %d｜回合 %d｜%.1fs（%d 线程）",
+                     day, d_done, d_skip, d_fail, d_rounds,
                      time.time() - day_t0, workers)
     finally:
         hb.stop()
 
     dur = time.time() - t0
-    log.info("完成：写入 %d / 跳过 %d / 失败 %d（共 %d 项）｜回合 %d 主回合 %d｜"
+    log.info("完成：写入 %d / 跳过 %d / 失败 %d（共 %d 项）｜回合 %d｜"
              "耗时 %s｜平均 %.1fs/项",
-             done, sum(skips.values()), failed, total, n_rounds, n_mains,
+             done, sum(skips.values()), failed, total, n_rounds,
              _fmt_dur(dur), dur / max(1, idx))
     detail = "、".join(f"{_SKIP_REASONS[k]} {v}" for k, v in skips.items() if v)
     if detail:

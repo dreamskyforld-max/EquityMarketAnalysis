@@ -40,7 +40,6 @@ lq_main                同上，分母改用「特大+大」口径（仅诊断�
 defend_max             负方量能相对其基线的最大放大倍数（负方是否反击）
 r_bal                  均衡确认时的对称度
 end                    均衡 / 静默 / 易位 / 超时 / 收盘
-is_main                是否主回合（胜方投入 >= 当日门槛）
 
 > 「胜负」标签已移除（2026-10-26）：胜方由 ΔP 符号定义，再输出「胜/弱/负」是冗余的；
 > 回合内是否打得干净由 `keep`（冲击留存）这一连续量表达，不再分档。
@@ -49,10 +48,18 @@ is_main                是否主回合（胜方投入 >= 当日门槛）
 ------
 `build_force_rounds.py`（盘中每分钟跑批落库 force_round_daily，单轮只算当天；
 历史日期漏跑用 `python3 build_force_rounds.py --days N` 回填）。
+
+窗口来源（2026-10-26 变更）
+--------------------------
+生产路径 = `rounds_by_trend`：窗口由**股价趋势段**决定（`trend_segmenter.layer1_segments`
+切上涨/下跌/横盘大段），指标仍由 `_close` 计算。
+`detect_rounds`（资金相位状态机）**已退役**，仅保留供与历史结论对照。
 """
 from __future__ import annotations
 
 import numpy as np
+
+import trend_segmenter
 
 TIERS = ["super", "big", "mid", "small"]
 
@@ -71,10 +78,6 @@ MAX_ROUND_MIN = 90    # 单回合最长分钟数（兜底）
 NEUTRAL_PCT = 0.001     # 「无胜方」中性区间：|ΔP| ÷ 起点价 < 0.1% 时判定为横盘，不指定胜方
                         # 依据：微小位移强行归给某一方会让「胜方」语义在震荡市失真
                         # （10-21 11:59-13:06 位移仅 -0.2 元/-0.05%，实为横盘微跌）
-MAIN_VOL_FLOOR = 1.0e8  # 主回合投入下限（元）
-MAIN_VOL_PCT = 0.015    # 主回合门槛 = max(下限, 当日双边额 × 该比例)
-                        # 绝对金额门槛对低价股/低流动性票不公平（设计文档 §5.1：
-                        # HK.03690 仅 8 个回合、SH.600941/SH.520900 为 0），故用相对口径
 
 
 def _roll_median(vals: list[float], i: int, w: int) -> float:
@@ -86,11 +89,6 @@ def _sym(r: dict) -> float:
     """对称度 R = min(买,卖)/max(买,卖)。R→1 双方量能对等，R→0 完全单边。"""
     lo, hi = min(r["buy"], r["sell"]), max(r["buy"], r["sell"])
     return (lo / hi) if hi > 0 else 0.0
-
-
-def main_vol_threshold(rows: list[dict]) -> float:
-    """当日「主回合」投入门槛（元）。"""
-    return max(MAIN_VOL_FLOOR, sum(r["g"] for r in rows) * MAIN_VOL_PCT)
 
 
 def _close(rows: list[dict], cur: dict, reason: str,
@@ -118,7 +116,7 @@ def _close(rows: list[dict], cur: dict, reason: str,
     amplitude = max(x["price"] for x in seg) - min(x["price"] for x in seg)   # 不分方向的振幅
 
     if ws == 0:
-        # 横盘：不产出效率类指标（inv_win 为 NaN → is_main 恒 False → 不进柱状图）
+        # 横盘：不产出效率类指标（inv_win / eff_pct / keep / lq 全为 NaN）
         nan = float("nan")
         return dict(
             t0=rows[s]["t"], t1=rows[e]["t"], minutes=e - s + 1,
@@ -245,11 +243,66 @@ def detect_rounds(rows: list[dict]) -> list[dict]:
     if cur is not None:
         cur["end"] = len(rows) - 1
         rounds.append(_close(rows, cur, "收盘", buys, sells))
-    # 主回合门槛直接标记到回合上，避免各调用方用不同口径。
-    # 口径：胜方投入（该方向全部主动成交额）≥ max(1亿, 当日双边额×1.5%)
-    th = main_vol_threshold(rows)
-    for r in rounds:
-        r["is_main"] = r["inv_win"] >= th
+    return rounds
+
+
+def _flat_round(rows: list[dict], s: int, e: int, reason: str) -> dict:
+    """横盘段的无胜方回合（字段结构与 `_close` 的 ws==0 分支完全一致）。"""
+    nan = float("nan")
+    seg = rows[s:e + 1]
+    p0, p1 = rows[s]["price"], rows[e]["price"]
+    return dict(
+        t0=rows[s]["t"], t1=rows[e]["t"], minutes=e - s + 1,
+        win_side=0, p0=p0, p1=p1, dp=p1 - p0,
+        inv_win=nan, inv_lose=nan, eff=nan, eff_pct=nan,
+        peak_win=nan, keep=nan,
+        amplitude=max(x["price"] for x in seg) - min(x["price"] for x in seg),
+        lq=nan, lq_main=nan, defend_max=nan, defend_t=None,
+        r_bal=None, end=reason,
+    )
+
+
+def rounds_by_trend(rows: list[dict], **seg_kwargs) -> list[dict]:
+    """按**股价趋势段**切回合（2026-10-26 新增，替代 `detect_rounds` 的资金相位切分）。
+
+    为什么换：原相位切分只要「资金静默 5 分钟」就收口，一段连续下跌会被切成十几个碎块
+    （HK.00700 一天几十个回合），与「一段下跌 = 一次空方攻击」的直觉不符。改为用
+    `trend_segmenter.layer1_segments` 切出的「上涨 / 下跌 / 横盘」大段作为回合窗口。
+
+    语义映射（窗口换了，指标口径不变）：
+      上涨段 → 多方自然为胜方（ΔP>0）；下跌段 → 空方；横盘段 → 不指定胜方（win_side=0，
+      效率类指标为 NaN，前端本来就不画三角、柱高为 0，只留底纹带）。
+    窗口之外的一切仍走 `_close`，λ / LQ / 冲击留存的计算完全复用，不另立口径。
+
+    额外字段（前端可选用，不影响现有渲染）：
+      trend     段方向（上涨/下跌/横盘）
+      chg_pct   段内累计涨跌幅（%）
+      rhythm    L2 节奏主标签（段内最长子段，如 急跌/缓跌/反弹/停顿）
+      rhythm_n  L2 子段数
+    """
+    if not rows:
+        return []
+    prices = np.array([r["price"] for r in rows], dtype=float)
+    segs = trend_segmenter.layer1_segments(prices, **seg_kwargs)
+    buys = [r["buy"] for r in rows]
+    sells = [r["sell"] for r in rows]
+
+    rounds: list[dict] = []
+    for seg in segs:
+        if seg.direction == "横盘":
+            r = _flat_round(rows, seg.s, seg.e, "趋势")
+        else:
+            cur = dict(start=seg.s, end=seg.e,
+                       side=1 if seg.direction == "上涨" else -1,
+                       r_bal=None, p0=rows[seg.s]["price"], last_active=seg.e)
+            r = _close(rows, cur, "趋势", buys, sells)
+        rhythm, n_sub, _ = trend_segmenter.layer2_rhythm(prices, seg.s, seg.e, seg.direction)
+        r["trend"] = seg.direction
+        r["chg_pct"] = round(float(seg.chg_pct), 4)
+        r["rhythm"] = rhythm
+        r["rhythm_n"] = n_sub
+        rounds.append(r)
+
     return rounds
 
 

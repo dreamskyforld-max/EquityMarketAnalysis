@@ -198,7 +198,7 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     # 单轮范围只算「当天」（days_back=1，见下方 GLOBAL_TASK_KWARGS）：此前按最近 5 个
     # 交易日全量重算，单轮实测 100~135s 超过 60s cron 间隔，被 max_instances=1 合并成
     # 约 2 分钟一轮；只算当天单轮约 20~25s（瓶颈是 tick_data 的 CASE WHEN+GROUP BY 聚合）。
-    # 适用性判定（近 20 日主回合累计）由 recent_main_count 读库中 trade_date<当天 的历史行，
+    # 适用性判定（近 20 日回合数累计）由 recent_round_count 读库中 trade_date<当天 的历史行，
     # 与本次跑批范围无关，故只算当天不影响正确性。历史日期漏跑（服务停/失败）用
     # `python3 build_force_rounds.py --days N` 回填。
     # 盘中未收口的最后回合会被标 ongoing，前端显示「进行中」不画结果。
