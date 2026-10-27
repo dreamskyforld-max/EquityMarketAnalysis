@@ -17,6 +17,8 @@
 - 本模块只负责**切窗口**（哪几分钟归一段 + 段的方向/涨幅）；
 - 段内的 λ / LQ / 冲击留存 / 胜负 等指标仍由 `force_dynamics._close` 计算
   （口径唯一真源不变，两边不重复定义）。
+- L1.5 大加速切分（`split_big_accel`）：在 L1 段内把「缓→急」的大加速单独切出
+  （每段最多一刀，只放行「又陡又长」的大加速），**参与窗口划分**。
 - L2 节奏（急跌/缓跌/反弹…）**只作为标签**输出，不参与窗口划分。
 
 设计约束
@@ -55,6 +57,13 @@ L2_PENALTIES = (0.5, 1, 2, 3, 5, 8, 12, 20, 30, 50)  # penalty 网格：取首�
 RHYTHM_EPS = 0.003         # |斜率| ≤ 该值 → 停顿
 RHYTHM_FAST = 0.03         # ≥ 该值 → 急涨/急跌
 RHYTHM_WAVE = 0.02         # 横盘段内 ≥ 该值 → 波动
+
+# —— L1.5 大加速切分参数（在 L1 段内把「缓→急」大加速单独切出，见 split_big_accel）——
+BIG_ACCEL_K = 3.0                    # 加速倍率门槛：右段/左段斜率比 ≥ 该值才切
+BIG_ACCEL_FAST_SLOPE_RANK = 0.85     # 急侧斜率下限 = 当日「15 分钟持续斜率」分布的该分位（%/min）
+BIG_ACCEL_FAST_SLOPE_FLOOR = 0.01    # 急侧斜率绝对下限（%/min），防「3×爬行」的退化切分
+BIG_ACCEL_FAST_MIN_MIN = 15          # 急侧（右段）最短分钟数
+BIG_ACCEL_SLOW_MIN_MIN = 12          # 缓侧（左段）最短分钟数
 
 
 class Segment(NamedTuple):
@@ -232,6 +241,87 @@ def _direction(p0: float, p1: float, threshold_pct: float) -> str:
 
 def _chg(p0: float, p1: float) -> float:
     return (p1 / p0 - 1) * 100 if p0 else 0.0
+
+
+# ══════════════════════════════════════════════════════════════
+# L1.5：大加速切分（方向不变，把「缓→急」的大加速单独切出）
+# ══════════════════════════════════════════════════════════════
+
+def _dir_slope_pct(prices, a: int, b: int, direction: str) -> float:
+    """[a,b] 闭区间的每分涨跌幅（%/min，带方向：趋势方向恒正）。"""
+    d = 1 if direction == "上涨" else -1
+    if b <= a or not prices[a]:
+        return 0.0
+    return d * (prices[b] / prices[a] - 1) * 100 / (b - a)
+
+
+def _day_slope_quantile(prices, rank: float, window: int = BIG_ACCEL_FAST_MIN_MIN) -> float:
+    """当日「window 分钟持续斜率」绝对值的 rank 分位（%/min）。
+
+    与急侧斜率同尺度（都是「持续 window 分钟」的斜率），故可作为急侧下限的相对参考：
+    低波动票（ETF/公用事业）的绝对斜率普遍偏小，固定 0.03%/min 会把它们整批卡死；
+    用当日自身斜率分布的分位，让每只票按自己的波动节奏判定「急」。
+    """
+    p = np.asarray(prices, dtype=float)
+    n = len(p)
+    if n <= window:
+        return 0.0
+    slopes = np.abs(p[window:] / p[:-window] - 1) * 100 / window
+    return float(np.percentile(slopes, rank * 100))
+
+
+def split_big_accel(prices, segments: list[Segment],
+                    k: float = BIG_ACCEL_K,
+                    fast_slope_rank: float = BIG_ACCEL_FAST_SLOPE_RANK,
+                    fast_slope_floor: float = BIG_ACCEL_FAST_SLOPE_FLOOR,
+                    fast_min_min: int = BIG_ACCEL_FAST_MIN_MIN,
+                    slow_min_min: int = BIG_ACCEL_SLOW_MIN_MIN) -> list[Segment]:
+    """在 L1 段内把「缓→急」的大加速单独切出（每段最多一刀）。
+
+    动机（2026-10-27）：L1 只认「方向反转」，不认「跌速加速」——10-21 的
+    10:52~15:22 一整段下跌，后半段（14:41~15:22）斜率是前半的 4.4 倍、且达到
+    「急跌」档，却被并成一个回合。本函数在方向不变的前提下，把这种明显更陡的
+    一段切出来作为独立回合；同时只放行「大加速」，避免把碎加速全切出来。
+
+    触发条件（全部满足才切；每段最多一刀，不递归）：
+      1) 存在切点 i 使「右段斜率 / 左段斜率」最大，且比值 ≥ k；
+      2) 右段（急侧）斜率 ≥ 急侧下限 = max(当日 15 分钟斜率分布的 fast_slope_rank 分位,
+         fast_slope_floor)——相对口径，低波动票也能按自身节奏触发（2026-10-27 改）；
+      3) 右段时长 ≥ fast_min_min（够长，不是毛刺）；
+      4) 左段（缓侧）时长 ≥ slow_min_min（前面真有一截「缓」）。
+    横盘段原样保留；上涨/下跌段方向不变，仅按切点一分为二。
+    切点 i 归右段（首分钟为急侧起点），连续性不变（sum(minutes) 不变）。
+    """
+    p = np.asarray(prices, dtype=float)
+    fast_slope_min = max(_day_slope_quantile(p, fast_slope_rank), fast_slope_floor)
+    out: list[Segment] = []
+    for seg in segments:
+        if seg.direction not in ("上涨", "下跌") or seg.minutes < slow_min_min + fast_min_min:
+            out.append(seg)
+            continue
+        # i = 急侧起点：左段 [seg.s, i-1]，右段 [i, seg.e]
+        best_i, best_ratio = None, 1.0
+        for i in range(seg.s + slow_min_min, seg.e - fast_min_min + 2):
+            left = _dir_slope_pct(p, seg.s, i - 1, seg.direction)
+            right = _dir_slope_pct(p, i, seg.e, seg.direction)
+            if left > 0 and right > 0:
+                ratio = right / left
+                if ratio > best_ratio:
+                    best_ratio, best_i = ratio, i
+        if best_i is None or best_ratio < k:
+            out.append(seg)
+            continue
+        right_slope = _dir_slope_pct(p, best_i, seg.e, seg.direction)
+        right_min = seg.e - best_i + 1
+        left_min = best_i - seg.s
+        if right_slope < fast_slope_min or right_min < fast_min_min or left_min < slow_min_min:
+            out.append(seg)
+            continue
+        out.append(Segment(seg.s, best_i - 1, seg.direction,
+                           _chg(p[seg.s], p[best_i - 1]), left_min))
+        out.append(Segment(best_i, seg.e, seg.direction,
+                           _chg(p[best_i], p[seg.e]), right_min))
+    return out
 
 
 # ══════════════════════════════════════════════════════════════

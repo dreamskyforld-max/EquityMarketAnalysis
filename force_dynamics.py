@@ -52,7 +52,8 @@ end                    均衡 / 静默 / 易位 / 超时 / 收盘
 窗口来源（2026-10-26 变更）
 --------------------------
 生产路径 = `rounds_by_trend`：窗口由**股价趋势段**决定（`trend_segmenter.layer1_segments`
-切上涨/下跌/横盘大段），指标仍由 `_close` 计算。
+切上涨/下跌/横盘大段），再叠加 `trend_segmenter.split_big_accel` 把「缓→急」的大加速
+单独切出（每段最多一刀）；指标仍由 `_close` 计算。
 `detect_rounds`（资金相位状态机）**已退役**，仅保留供与历史结论对照。
 """
 from __future__ import annotations
@@ -269,6 +270,11 @@ def rounds_by_trend(rows: list[dict], **seg_kwargs) -> list[dict]:
     （HK.00700 一天几十个回合），与「一段下跌 = 一次空方攻击」的直觉不符。改为用
     `trend_segmenter.layer1_segments` 切出的「上涨 / 下跌 / 横盘」大段作为回合窗口。
 
+    在此基础上叠加 L1.5 大加速切分（`trend_segmenter.split_big_accel`）：趋势段只认
+    「方向反转」，不认「跌速加速」，于是把「缓→急」的大加速单独切出（每段最多一刀，
+    只放行又陡又长的大加速）。10-21 的 10:52~15:22 即被切为 10:52~14:40（缓跌）与
+    14:41~15:22（急跌）两个回合。
+
     语义映射（窗口换了，指标口径不变）：
       上涨段 → 多方自然为胜方（ΔP>0）；下跌段 → 空方；横盘段 → 不指定胜方（win_side=0，
       效率类指标为 NaN，前端本来就不画三角、柱高为 0，只留底纹带）。
@@ -284,6 +290,9 @@ def rounds_by_trend(rows: list[dict], **seg_kwargs) -> list[dict]:
         return []
     prices = np.array([r["price"] for r in rows], dtype=float)
     segs = trend_segmenter.layer1_segments(prices, **seg_kwargs)
+    # L1.5：把「缓→急」的大加速单独切出（每段最多一刀，只放行又陡又长的大加速）。
+    # 10-21 的 10:52~15:22 后半段急跌即靠这一步从整段下跌中切出（见 trend_segmenter.split_big_accel）。
+    segs = trend_segmenter.split_big_accel(prices, segs)
     buys = [r["buy"] for r in rows]
     sells = [r["sell"] for r in rows]
 

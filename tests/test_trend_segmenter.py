@@ -131,3 +131,76 @@ def test_rhythm_label_accelerate_decelerate():
     assert ts._rhythm_label("上涨", 0.06, 0.01) == "加速涨"
     assert ts._rhythm_label("下跌", -0.004, -0.05) == "减速跌"
     assert ts._rhythm_label("上涨", 0.004, 0.05) == "减速涨"
+
+
+# —— L1.5 大加速切分（split_big_accel）——
+
+def test_split_big_accel_slow_then_fast_gets_split():
+    # 缓跌 120 分钟（-0.005%/min）→ 急跌 20 分钟（-0.05%/min，10 倍），无方向反转，应切成 2 段
+    slow = [100.0 - i * 0.005 for i in range(120)]
+    fast_start = slow[-1]
+    fast = [fast_start - i * 0.05 for i in range(1, 21)]
+    prices = slow + fast
+    segs = ts.layer1_segments(prices)
+    assert len(segs) == 1 and segs[0].direction == "下跌"
+    splitted = ts.split_big_accel(prices, segs)
+    assert len(splitted) == 2
+    assert splitted[0].e == 119              # 缓侧止于索引 119
+    assert splitted[1].s == 120              # 急侧从索引 120 起
+    assert splitted[1].direction == "下跌"
+    assert splitted[1].minutes == 20
+
+
+def test_split_big_accel_relative_threshold_triggers_low_vol():
+    # 低波动票：急侧 -0.02%/min（绝对 < 旧阈值 0.03），相对自身缓侧 -0.004%/min 是 5 倍，
+    # 且超过「当日 P85 斜率 + 下限」→ 旧绝对口径会漏切，相对口径应能切出。
+    slow = [20.0 - i * 0.0008 for i in range(120)]          # -0.004%/min
+    fast_start = slow[-1]
+    fast = [fast_start - i * 0.004 for i in range(1, 21)]   # -0.02%/min
+    prices = slow + fast
+    segs = ts.layer1_segments(prices)
+    assert len(segs) == 1 and segs[0].direction == "下跌"
+    splitted = ts.split_big_accel(prices, segs)
+    assert len(splitted) == 2
+    assert splitted[1].s == 120
+
+
+def test_split_big_accel_floor_blocks_crawl():
+    # 急侧 < 绝对下限 0.01 的「3×爬行」不应切（即使比值 ≥3，绝对太慢不算「大加速」）
+    slow = [100.0 - i * 0.002 for i in range(120)]          # -0.002%/min
+    fast_start = slow[-1]
+    fast = [fast_start - i * 0.009 for i in range(1, 21)]   # -0.009%/min（< 0.01 下限）
+    prices = slow + fast
+    segs = ts.layer1_segments(prices)
+    assert len(segs) == 1 and segs[0].direction == "下跌"
+    assert len(ts.split_big_accel(prices, segs)) == 1       # 不切
+
+
+def test_split_big_accel_constant_slope_not_split():
+    # 恒定斜率下跌：无加速，不应切
+    prices = [100.0 - i * 0.01 for i in range(120)]
+    segs = ts.layer1_segments(prices)
+    assert len(segs) == 1
+    assert len(ts.split_big_accel(prices, segs)) == 1
+
+
+def test_split_big_accel_preserves_continuity():
+    rng = np.random.default_rng(23)
+    prices = 100 + np.cumsum(rng.normal(0, 0.3, 330))
+    segs = ts.layer1_segments(prices)
+    splitted = ts.split_big_accel(prices, segs)
+    assert splitted[0].s == 0
+    assert splitted[-1].e == len(prices) - 1
+    assert sum(s.minutes for s in splitted) == len(prices)
+    for prev, cur in zip(splitted, splitted[1:]):
+        assert cur.s == prev.e + 1           # 无缝、不重叠
+
+
+def test_split_big_accel_flat_segments_untouched():
+    # 横盘段不参与切分，原样保留
+    flat = [10.0 + (0.001 if i % 2 else -0.001) for i in range(60)]
+    segs = ts.layer1_segments(flat)
+    assert segs[0].direction == "横盘"
+    splitted = ts.split_big_accel(flat, segs)
+    assert len(splitted) == 1
+    assert splitted[0].direction == "横盘"
