@@ -23,6 +23,9 @@ import logging
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
+from db import clean_ohlc
+from collector_runtime import prefer_ipv4
+
 # ── 自动加载 .env ──
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 if os.path.exists(env_path):
@@ -115,7 +118,7 @@ def write_records(records):
 
 
 def build_records(kl_data, bench_code, bench_name):
-    """从 K 线 DataFrame 构建记录列表（含成交量/额）"""
+    """从 K 线 DataFrame 构建记录列表（含 OHLC + 成交量/额）"""
     closes = kl_data['close'].tolist()
     times = kl_data['time_key'].tolist()
     # 富途 K 线可能包含 volume / turnover 列
@@ -123,6 +126,11 @@ def build_records(kl_data, bench_code, bench_name):
     has_to = 'turnover' in kl_data.columns
     vols = kl_data['volume'].tolist() if has_vol else None
     tos = kl_data['turnover'].tolist() if has_to else None
+
+    def _col(name):
+        return kl_data[name].tolist() if name in kl_data.columns else [None] * len(closes)
+
+    opens, highs, lows = _col('open'), _col('high'), _col('low')
     records = []
     for i in range(len(closes)):
         trade_date = str(times[i])[:10]
@@ -130,11 +138,13 @@ def build_records(kl_data, bench_code, bench_name):
         prev_close = float(closes[i - 1]) if i > 0 else None
         change_pct = round((last_price / prev_close - 1) * 100, 4) if prev_close and prev_close != 0 else None
         close_20d_ago = float(closes[i - 20]) if i >= 20 else None
+        o, h, lo = clean_ohlc(opens[i], highs[i], lows[i])
         rec = {
             "bench_code": bench_code, "bench_name": bench_name,
             "trade_date": trade_date, "update_time": trade_date,
             "last_price": last_price, "prev_close": prev_close,
             "change_pct": change_pct, "close_20d_ago": close_20d_ago,
+            "open_price": o, "high_price": h, "low_price": lo,
         }
         if vols and vols[i] is not None:
             rec["volume"] = int(vols[i])
@@ -200,11 +210,13 @@ def collect_hk_sina(bench_code, bench_name):
     has_amt = "amount" in df.columns
     recs = []
     for i in range(len(df)):
-        td = df.iloc[i]["date"]
+        row = df.iloc[i]
+        td = row["date"]
         if not isinstance(td, datetime.date):
             td = datetime.date.fromisoformat(str(td)[:10])
-        v = float(df.iloc[i]["close"])
+        v = float(row["close"])
         prev = float(df.iloc[i - 1]["close"]) if i > 0 else None
+        o, h, lo = clean_ohlc(row.get("open"), row.get("high"), row.get("low"))
         rec = {
             "bench_code": bench_code, "bench_name": bench_name,
             "trade_date": td,
@@ -212,6 +224,7 @@ def collect_hk_sina(bench_code, bench_name):
             "last_price": v, "prev_close": prev,
             "change_pct": round((v / prev - 1) * 100, 4) if prev else None,
             "close_20d_ago": float(df.iloc[i - 20]["close"]) if i >= 20 else None,
+            "open_price": o, "high_price": h, "low_price": lo,
         }
         if has_vol:
             vol = df.iloc[i].get("volume")
@@ -271,6 +284,7 @@ def collect_fred(bench_code, bench_name):
 
 def collect_eastmoney(bench_code, bench_name):
     """东财全球指数：拉取全部历史（lmt=_EM_MAX）"""
+    prefer_ipv4()      # 本机 IPv6 出口对该站不可用（见 collector_runtime.prefer_ipv4）
     import requests as req
     secid = EM_SECID.get(bench_code)
     if not secid:
@@ -323,6 +337,11 @@ def collect_eastmoney(bench_code, bench_name):
             c20 = float(rows[i-20][2]) if i >= 20 else None
             vol = int(float(rows[i][5])) if len(rows[i]) > 5 and rows[i][5] and rows[i][5] != '-' else None
             to = float(rows[i][6]) if len(rows[i]) > 6 and rows[i][6] and rows[i][6] != '-' else None
+            # 东财 klines: f52=开 f53=收 f54=高 f55=低
+            r = rows[i]
+            o, h, lo = clean_ohlc(r[1] if len(r) > 4 else None,
+                                  r[3] if len(r) > 4 else None,
+                                  r[4] if len(r) > 4 else None)
             rec = {
                 "bench_code": bench_code, "bench_name": bench_name,
                 "trade_date": td,
@@ -330,6 +349,7 @@ def collect_eastmoney(bench_code, bench_name):
                     datetime.date.fromisoformat(td), datetime.time.min),
                 "last_price": v, "prev_close": prev,
                 "change_pct": chg, "close_20d_ago": c20,
+                "open_price": o, "high_price": h, "low_price": lo,
             }
             if vol is not None:
                 rec["volume"] = vol
@@ -378,12 +398,15 @@ def collect_sina(bench_code, bench_name):
         prev = float(df.iloc[i - 1]["close"]) if i > 0 else None
         chg = round((v / prev - 1) * 100, 4) if (prev and prev != 0) else None
         c20 = float(df.iloc[i - 20]["close"]) if i >= 20 else None
+        o, h, lo = clean_ohlc(df.iloc[i].get("open"), df.iloc[i].get("high"),
+                              df.iloc[i].get("low"))
         rec = {
             "bench_code": bench_code, "bench_name": bench_name,
             "trade_date": td,
             "update_time": datetime.datetime.combine(td, datetime.time.min),
             "last_price": v, "prev_close": prev,
             "change_pct": chg, "close_20d_ago": c20,
+            "open_price": o, "high_price": h, "low_price": lo,
         }
         if has_vol:
             vol = df.iloc[i].get("volume", 0)
@@ -425,12 +448,15 @@ def collect_sina_a(bench_code, bench_name):
         prev = float(df.iloc[i - 1]["close"]) if i > 0 else None
         chg = round((v / prev - 1) * 100, 4) if (prev and prev != 0) else None
         c20 = float(df.iloc[i - 20]["close"]) if i >= 20 else None
+        o, h, lo = clean_ohlc(df.iloc[i].get("open"), df.iloc[i].get("high"),
+                              df.iloc[i].get("low"))
         rec = {
             "bench_code": bench_code, "bench_name": bench_name,
             "trade_date": td,
             "update_time": datetime.datetime.combine(td, datetime.time.min),
             "last_price": v, "prev_close": prev,
             "change_pct": chg, "close_20d_ago": c20,
+            "open_price": o, "high_price": h, "low_price": lo,
         }
         if has_vol:
             vol = df.iloc[i].get("volume", 0)

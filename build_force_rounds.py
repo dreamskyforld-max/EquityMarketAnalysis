@@ -1,15 +1,24 @@
-"""构建多空力量回合日表（force_round_daily）· 每日盘后跑批
+"""构建多空力量回合日表（force_round_daily）· 盘中每分钟一轮 + 盘后收口
 
 范围：采集管理中打开「实时交易流水」（realtime_collect_target.collect_tick=TRUE）的股票。
-时机：港股收市竞价 16:00-16:10 结束后 16:40 跑（market_scheduler.py 注册），
-      留 30 分钟缓冲——回合的「静默收口」需连续 5 分钟不活跃才判定，盘中跑会切错边界。
+时机：market_scheduler.py 注册两条（均为交易日）——
+      ① 「多空力量回合」盘中每分钟第 5 秒跑一轮（hour 9-16），只算当天：分时图是分钟级
+         视图，盘中必须能看到「这一波谁占优、效率多少」。当日 16:15 前最后一段趋势仍在走，
+         该轮会把最后回合标 ongoing，前端显示「进行中」且不画结果。
+      ② 「多空力量回合-盘后收口」17:05 兜底重算一次（force=True）：把盘中各轮次的
+         ongoing 标记清掉、以收盘数据定稿。分钟轮正常时 16:16 起就已覆盖成收口版，
+         这条只在「16:16~16:59 所有分钟轮都失败」时才真正起作用（如进程崩溃 / DB 超时）。
+      数据完整性：港股收市竞价 16:00-16:10 结束后 trend_snapshot 冻结，16:15 之后
+      _is_live() 返回 False，不再标 ongoing。窗口口径自 2026-10-26 改为「股价趋势段」
+      （rounds_by_trend），已不依赖「连续 5 分钟静默才收口」，故无需 30 分钟缓冲。
 
 依赖：只依赖本工程的 db / force_dynamics，**不 import stock-realtime**。
       四档阈值读 fund_flow_settings.thresholds_json（线上生效口径，与分时图同源）。
       表结构见 sql/schema.sql；口径定义见 stock-realtime/docs/force_dynamics_design.md。
 
 用法：
-    python3 build_force_rounds.py                # 增量（只补缺失/变更日）
+    python3 build_force_rounds.py                # 增量（只补缺失日；⚠ 当天行已存在会被跳过）
+    python3 build_force_rounds.py --days 1 --all # 手动补当天定稿（重算并清 ongoing）
     python3 build_force_rounds.py --days 94      # 回填最近 N 个交易日
     python3 build_force_rounds.py --code HK.00700 --days 20   # 单票调试
     python3 build_force_rounds.py --quiet        # 长跑只留每票汇总（少刷屏）

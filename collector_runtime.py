@@ -35,6 +35,25 @@ _MOD_CACHE = {}
 _IMPORT_LOCK = threading.Lock()    # 串行化模块首次 import
 
 
+def prefer_ipv4():
+    """把 urllib3 的 DNS 解析偏好限制为 IPv4（进程级、幂等）。
+
+    背景（2026-10-27 本机实测，勿删）：push2.eastmoney.com 有 AAAA 记录，但本机
+    IPv6 出口对该站返回「Empty reply from server」；urllib3/requests 默认优先 AAAA
+    且**连接失败后不回退** A 记录 → 表现为 ConnectionError / RemoteDisconnected。
+    同一 URL 用 `curl -4` 立刻 200（0.09s）。故东财采集前先调本函数。
+
+    只影响 urllib3 的连接族选择，不改系统设置；akshare 等同样走 urllib3 的请求
+    在进程内一并变成 IPv4（IPv4 全网可达，无副作用）。
+    """
+    import socket
+    try:
+        import urllib3.util.connection as _cn
+        _cn.allowed_gai_family = lambda: socket.AF_INET
+    except Exception as e:      # urllib3 缺失/版本差异不应阻断采集
+        log.warning("prefer_ipv4 设置失败（忽略）: %s", e)
+
+
 class _LockedCtx:
     """包装 OpenQuoteContext：每次方法调用自动加锁；断线时重建并重试一次。
 

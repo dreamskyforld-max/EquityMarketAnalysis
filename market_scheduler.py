@@ -206,6 +206,17 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     ("多空力量回合", "build_force_rounds.py",
      {"minute": "*", "second": 5, "hour": "9-16", "day_of_week": "mon-fri"}, None, True, None, 900),
 
+    # 多空力量回合-盘后收口（兜底）：把盘中各轮次写入的 ongoing 标记清掉、以收盘数据定稿。
+    # 分钟轮正常时 16:16 起就已覆盖成收口版（_is_live 在 16:15 后返回 False），本条的
+    # 真正价值在于「16:16~16:59 所有分钟轮都失败」时自愈（进程崩溃 / DB 超时），
+    # 否则当天会残留 ongoing=true，前端那一段永远显示「进行中」而不画结果。
+    # 时机 17:05：避开 16:59 分钟轮与 16:30/16:50 的港股补采，也没撞 18:45 的市场状态计算；
+    # 与分钟轮用不同 job id，故 max_instances=1 挡不住并发（两者同时跑会让 tick_data 聚合负载翻倍），
+    # 因此不要把兜底线放到 x:00~x:59 分钟轮覆盖的窗口内。
+    # kwargs 走 GLOBAL_TASK_KWARGS（days_back=1），run() 默认 only_missing=False → 幂等重算覆盖。
+    ("多空力量回合-盘后收口", "build_force_rounds.py",
+     {"hour": 17, "minute": 5, "day_of_week": "mon-fri"}, None, True, None, 900),
+
     # 港股全日沽空（全市场全量）：一次抓取港交所全日沽空快照页，解析全部港股
     # 并全量入库 daily_short_selling（全局任务，不依赖股票列表，run 忽略 codes）。
     # 港交所约 16:50 发布，17:30、18:30 兜底补采。
@@ -356,6 +367,8 @@ GLOBAL_TASK_KWARGS: dict[str, dict] = {
     # 每分钟一轮只重算「当天」（5 天全量重算单轮 100~135s > 60s cron 间隔，实际被
     # max_instances=1 合并成约 2 分钟一轮；见该任务条目的注释）。
     "多空力量回合": {"days_back": 1},
+    # 盘后收口同理只算当天（run() 默认 only_missing=False → 覆盖当天行、清掉 ongoing）。
+    "多空力量回合-盘后收口": {"days_back": 1},
 }
 
 # ── 盘中批量采集（按市场拆分）────────────────────────────────

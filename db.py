@@ -398,6 +398,40 @@ def sanitize_numeric_rows(conn, table: str, rows: list) -> tuple:
     return rows, dropped
 
 
+def clean_ohlc(open_price, high_price, low_price, eps: float = 0.01) -> tuple:
+    """OHLC 有效性护栏（2026-10-27）：返回 (open, high, low)，非法则整体 (None, None, None)。
+
+    为什么需要（实测 11 行脏数据，2026-10-27 清洗）：
+      · 新浪 HSI 早期（2013-12）开盘缺失被填 0 → open=0；
+      · 新浪/东财对日韩节假日「假交易日」或字段错位 → high < low（JP.N225 2024-08-12、
+        KR.KS11 2024-09-16~18 等）；
+      · 个别行的 low > close（HK.800000 2014-09-01）。
+    这些值若原样入库，会把振幅/影线/ATR 类衍生指标算成负数或 0；且**重跑全量回填会
+    原样写回**，所以护栏必须在写入侧，而不是靠一次性 UPDATE 清洗。
+
+    判定：任一为 None / 非数值 / NaN / ≤0，或 high < low、open 越界（容差 eps 吸收
+    「close 4 位小数 vs high/low 2 位小数」的舍入差，实测最大 0.001）→ 整组作废。
+
+    注意：这是**源数据自洽性**校验，不校验 OHL 与 close 的关系 —— close 来自另一列
+    （last_price），跨列比较会把纯舍入差误判为脏数据。
+    """
+    vals = []
+    for v in (open_price, high_price, low_price):
+        if v is None or isinstance(v, bool):
+            return None, None, None
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return None, None, None
+        if not math.isfinite(x):      # NaN / ±inf
+            return None, None, None
+        vals.append(x)
+    o, h, lo = vals
+    if min(o, h, lo) <= 0 or h < lo - eps or o > h + eps or o < lo - eps:
+        return None, None, None
+    return round(o, 4), round(h, 4), round(lo, 4)
+
+
 def widen_numeric_columns(conn, table: str, widths: dict) -> list:
     """需要时把 NUMERIC 列放宽到 widths={列: (p, s)}，返回实际改动的列名。
 

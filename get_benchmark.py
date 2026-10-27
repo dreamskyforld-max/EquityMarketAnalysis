@@ -22,8 +22,9 @@ import logging
 from datetime import date
 logging.basicConfig(level=logging.WARNING)
 from futu import RET_OK, KLType, AuType
-from db import get_conn, upsert
+from db import get_conn, upsert, clean_ohlc
 from collector_runtime import get_shared_ctx
+
 
 def fmt_price(val, max_dec=4):
     if val is None:
@@ -73,6 +74,7 @@ def _run_sina_a(bench_code, bench_name):
     change_pct = (close / prev_close - 1) * 100 if prev_close else 0.0
     close_20d_ago = float(data[-21]["close"]) if len(data) >= 21 else None
     volume = int(float(last["volume"])) if last.get("volume") else None
+    o, h, lo = clean_ohlc(last.get("open"), last.get("high"), last.get("low"))
 
     print(f"{bench_name} ({bench_code}) [新浪源]")
     print(f"最新价: {fmt_price(close)}")
@@ -91,6 +93,7 @@ def _run_sina_a(bench_code, bench_name):
                 "change_pct": round(change_pct, 4),
                 "close_20d_ago": close_20d_ago,
                 "volume": volume,
+                "open_price": o, "high_price": h, "low_price": lo,
             }
             upsert(conn, "daily_benchmark", data, conflict_cols=["bench_code", "trade_date"])
     except Exception as e:
@@ -120,6 +123,10 @@ def run(codes=None, ctx=None):
     if bench_code in ("SH.000001", "SZ.399001"):
         _run_sina_a(bench_code, bench_name)
         return
+
+    # 独立运行（CLI，__main__）不传 ctx → 取进程级共享上下文（docstring 承诺「可空」）
+    if ctx is None:
+        ctx = get_shared_ctx()
 
     # 1. 获取快照
     ret_snap, snap_data = ctx.get_market_snapshot([bench_code])
@@ -166,6 +173,7 @@ def run(codes=None, ctx=None):
     # 写入 daily_benchmark 表
     try:
         trade_date = date.fromisoformat(str(update_time)[:10]) if update_time and update_time != 'N/A' else date.today()
+        o, h, lo = clean_ohlc(row.get("open_price"), row.get("high_price"), row.get("low_price"))
         data = {
             "bench_code": bench_code,
             "bench_name": bench_name,
@@ -175,6 +183,7 @@ def run(codes=None, ctx=None):
             "prev_close": float(prev_close) if prev_close else None,
             "change_pct": round(float(change_pct), 4),
             "close_20d_ago": float(close_20d_ago) if close_20d_ago else None,
+            "open_price": o, "high_price": h, "low_price": lo,
         }
         with get_conn() as conn:
             upsert(conn, "daily_benchmark", data, conflict_cols=["bench_code", "trade_date"])

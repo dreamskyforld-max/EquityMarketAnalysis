@@ -20,6 +20,9 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import List, Dict, Optional
 
+from db import clean_ohlc
+from collector_runtime import prefer_ipv4
+
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -116,8 +119,14 @@ def _yahoo_proxy() -> Optional[str]:
 
 # ── 工具 ──
 def _r(v, ndigits=4):
-    """round 并处理 None"""
-    return round(float(v), ndigits) if v is not None else None
+    """round 并处理 None / NaN / 非数值"""
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if x != x else round(x, ndigits)
 
 
 def _save(records: list):
@@ -174,6 +183,8 @@ def _collect_futu(items: list) -> list:
                     max_count=25, extended_time=False)
                 close_20d = _r(float(kl.iloc[-21]['close'])) if ret_k == RET_OK and len(kl) >= 21 else None
 
+                o, h, lo = clean_ohlc(row.get('open_price'), row.get('high_price'),
+                                      row.get('low_price'))
                 records.append({
                     "bench_code": it["code"], "bench_name": it["name"],
                     "trade_date": td,
@@ -181,6 +192,7 @@ def _collect_futu(items: list) -> list:
                     "last_price": close, "prev_close": _r(prev),
                     "change_pct": _r(change), "close_20d_ago": close_20d,
                     "volume": vol, "turnover": _r(to) if to else None,
+                    "open_price": o, "high_price": h, "low_price": lo,
                 })
                 print(f"  [富途] ✅ {it['name']}({it['code']})  {close:.2f}  ({change:+.2f}%)  "
                       f"量:{vol or '-'}")
@@ -334,6 +346,7 @@ def _collect_akshare(items: list) -> list:
 # ── 东财全球指数 ──
 def _collect_eastmoney(items: list) -> list:
     """直调东方财富全球指数 API（无需 AKShare 封装）"""
+    prefer_ipv4()      # 本机 IPv6 出口对该站不可用（见 collector_runtime.prefer_ipv4）
     import requests as req
     import time as _time
     # 注意: push2his.eastmoney.com 在当前网络不可达，改用 push2.eastmoney.com（同款 kline 接口）
@@ -379,6 +392,10 @@ def _collect_eastmoney(items: list) -> list:
                 c20 = float(rows[-21][2]) if len(rows) >= 21 else None
                 vol = int(float(last[5])) if len(last) > 5 and last[5] and last[5] != '-' else None
                 to = _r(float(last[6])) if len(last) > 6 and last[6] and last[6] != '-' else None
+                # 东财 klines: f52=开 f53=收 f54=高 f55=低
+                o, h, lo = clean_ohlc(last[1] if len(last) > 4 else None,
+                                      last[3] if len(last) > 4 else None,
+                                      last[4] if len(last) > 4 else None)
                 records.append({
                     "bench_code": it["code"], "bench_name": it["name"],
                     "trade_date": date.fromisoformat(td),
@@ -386,6 +403,7 @@ def _collect_eastmoney(items: list) -> list:
                     "last_price": last_val, "prev_close": _r(prev_val),
                     "change_pct": _r(change), "close_20d_ago": _r(c20) if c20 else None,
                     "volume": vol, "turnover": to,
+                    "open_price": o, "high_price": h, "low_price": lo,
                 })
                 print(f"  [东财] ✅ {it['name']}({secid})  {last_val:,.2f}  ({change:+.2f}%)  {td}  "
                       f"量:{vol or '-'}")
@@ -434,6 +452,7 @@ def _collect_sina(items: list) -> list:
             last_val = float(last["close"])
             prev_val = float(prev["close"])
             change = (last_val / prev_val - 1) * 100 if prev_val != 0 else 0.0
+            o, h, lo = clean_ohlc(last.get("open"), last.get("high"), last.get("low"))
 
             records.append({
                 "bench_code": it["code"], "bench_name": it["name"],
@@ -443,6 +462,7 @@ def _collect_sina(items: list) -> list:
                 "change_pct": _r(change),
                 "close_20d_ago": _r(float(df.iloc[-21]["close"])) if len(df) >= 21 else None,
                 "volume": int(last["volume"]) if "volume" in last.index and last["volume"] else None,
+                "open_price": o, "high_price": h, "low_price": lo,
             })
             print(f"  [新浪] ✅ {it['name']}({sina_name})  {last_val:,.2f}  ({change:+.2f}%)  {td}  "
                   f"量:{last.get('volume', '-')}")
@@ -487,6 +507,7 @@ def _collect_sina_a(items: list) -> list:
             last_val = float(last["close"])
             prev_val = float(prev["close"])
             change = (last_val / prev_val - 1) * 100 if prev_val != 0 else 0.0
+            o, h, lo = clean_ohlc(last.get("open"), last.get("high"), last.get("low"))
 
             records.append({
                 "bench_code": it["code"], "bench_name": it["name"],
@@ -496,6 +517,7 @@ def _collect_sina_a(items: list) -> list:
                 "change_pct": _r(change),
                 "close_20d_ago": _r(float(df.iloc[-21]["close"])) if len(df) >= 21 else None,
                 "volume": int(last["volume"]) if "volume" in last.index and last["volume"] else None,
+                "open_price": o, "high_price": h, "low_price": lo,
             })
             print(f"  [新浪A股] ✅ {it['name']}({sina_code})  {last_val:,.2f}  ({change:+.2f}%)  {td}  "
                   f"量:{last.get('volume', '-')}")
@@ -560,12 +582,16 @@ def _collect_yahoo(items: list) -> list:
                 change = (last_val / prev_val - 1) * 100 if prev_val != 0 else 0.0
                 valid = [c for c in closes if c is not None]
                 c20 = valid[-21] if len(valid) >= 21 else None
+                o, h, lo = clean_ohlc((quote.get("open") or [None])[-1],
+                                      (quote.get("high") or [None])[-1],
+                                      (quote.get("low") or [None])[-1])
                 records.append({
                     "bench_code": it["code"], "bench_name": it["name"],
                     "trade_date": td,
                     "update_time": datetime.combine(td, datetime.min.time()),
                     "last_price": _r(last_val), "prev_close": _r(prev_val),
                     "change_pct": _r(change), "close_20d_ago": _r(c20) if c20 else None,
+                    "open_price": o, "high_price": h, "low_price": lo,
                 })
                 print(f"  [Yahoo] ✅ {it['name']}({ycode})  {last_val:.2f}  ({change:+.2f}%)  {td}")
                 break

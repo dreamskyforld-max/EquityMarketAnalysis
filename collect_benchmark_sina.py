@@ -18,6 +18,8 @@ import warnings
 from datetime import date, datetime
 from typing import Dict, List
 
+from db import clean_ohlc
+
 warnings.filterwarnings("ignore")
 
 # 新浪源 symbol 映射（键为 AKShare index_global_hist_sina 的中文全名）
@@ -65,6 +67,7 @@ def collect_one(it: dict, days: int = 0) -> List[dict]:
         change = (close / prev - 1) * 100 if (prev not in (None, 0)) else 0.0
         # 20 个交易日前的收盘（用于中期趋势）
         c20 = _r(df.iloc[i - 21]["close"]) if i >= 21 else None
+        o, h, lo = clean_ohlc(row.get("open"), row.get("high"), row.get("low"))
         records.append({
             "bench_code": it["code"],
             "bench_name": it["name"],
@@ -74,6 +77,7 @@ def collect_one(it: dict, days: int = 0) -> List[dict]:
             "prev_close": prev,
             "change_pct": _r(change),
             "close_20d_ago": c20,
+            "open_price": o, "high_price": h, "low_price": lo,
         })
     return records
 

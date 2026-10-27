@@ -220,6 +220,9 @@ CREATE TABLE IF NOT EXISTS daily_benchmark (
     bench_name          VARCHAR(50),                        -- 恒生指数/上证指数/深证成指
     trade_date          DATE            NOT NULL,
     update_time         TIMESTAMPTZ,
+    open_price          NUMERIC(12,4),                      -- 开盘点位（指数类源可得；FRED/汇率/债券/申万类源无 OHLC 语义，恒为 NULL）
+    high_price          NUMERIC(12,4),                      -- 最高点位（同上）
+    low_price           NUMERIC(12,4),                      -- 最低点位（同上）
     last_price          NUMERIC(12,4),
     prev_close          NUMERIC(12,4),
     change_pct          NUMERIC(8,4),
@@ -235,6 +238,9 @@ COMMENT ON COLUMN daily_benchmark.bench_code          IS '基准指数代码：H
 COMMENT ON COLUMN daily_benchmark.bench_name          IS '基准指数中文名称：恒生指数 / 上证指数 / 深证成指';
 COMMENT ON COLUMN daily_benchmark.trade_date          IS '交易日期 (YYYY-MM-DD)';
 COMMENT ON COLUMN daily_benchmark.update_time         IS '富途行情快照更新时间';
+COMMENT ON COLUMN daily_benchmark.open_price          IS '开盘点位（2026-10-27 新增；仅指数类源填充，FRED/汇率/美债/申万等单值序列为 NULL）';
+COMMENT ON COLUMN daily_benchmark.high_price          IS '最高点位（2026-10-27 新增；仅指数类源填充，其余为 NULL）';
+COMMENT ON COLUMN daily_benchmark.low_price           IS '最低点位（2026-10-27 新增；仅指数类源填充，其余为 NULL）';
 COMMENT ON COLUMN daily_benchmark.last_price          IS '基准指数最新价（当日收盘点位）';
 COMMENT ON COLUMN daily_benchmark.prev_close          IS '基准指数前一交易日收盘点位';
 COMMENT ON COLUMN daily_benchmark.change_pct          IS '基准指数涨跌幅(%)';
@@ -2199,7 +2205,8 @@ COMMENT ON COLUMN regime.dimension_value.is_final    IS 'FALSE=当日初步值�
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 20. 多空力量回合日表（force dynamics）
---     生产：build_force_rounds.py（market_scheduler 每交易日 16:40 跑；范围 = realtime_collect_target.collect_tick）
+--     生产：build_force_rounds.py（market_scheduler 交易日盘中每分钟一轮 + 17:05 盘后收口兜底；
+--           范围 = realtime_collect_target.collect_tick）
 --     消费：stock-realtime 分时图「攻守状态 / 博弈结果」两个 grid
 --     口径：stock-realtime/docs/force_dynamics_design.md（§1 回合相位 / §2 指标 / §5.1 跨票校准）
 --     计算：EquityMarketAnalysis/force_dynamics.py（纯函数状态机）
@@ -2207,10 +2214,11 @@ COMMENT ON COLUMN regime.dimension_value.is_final    IS 'FALSE=当日初步值�
 CREATE TABLE IF NOT EXISTS force_round_daily (
     stock_code    text NOT NULL,
     trade_date    date NOT NULL,
-    rounds        jsonb NOT NULL,     -- 当日回合全指标：t0/t1/minutes/side/attack_vol/counter_vol/
-                                       -- net_vol/defend_max/impact/keep_ratio/eff/eff_pct/lq/win/end/is_main
-    lambda_median numeric,            -- 当日主回合 λ_pct 中位数；ref_lambda = 近 20 行取中位数（在线毫秒级）
-    applicable    boolean NOT NULL DEFAULT false,  -- 近 20 个已落库交易日主回合合计 ≥20 才为 true；
+    rounds        jsonb NOT NULL,     -- 当日回合全指标：t0/t1/minutes/win_side/p0/p1/dp/inv_win/inv_lose/
+                                       -- eff/eff_pct/peak_win/keep/amplitude/lq/lq_main/defend_max/defend_t/
+                                       -- r_bal/end + 趋势段附加 trend/chg_pct/rhythm/rhythm_n（+ ongoing）
+    lambda_median numeric,            -- 当日回合 λ_pct 中位数（横盘段 eff_pct 为 NaN 已过滤）；ref 基线由前端取近 20 行中位数
+    applicable    boolean NOT NULL DEFAULT false,  -- 近 20 个已落库交易日回合数合计 ≥20 才为 true；
                                        -- false 时前端只提示「该标的无显著博弈结构」，不画散点
     updated_at    timestamp with time zone DEFAULT now(),
     PRIMARY KEY (stock_code, trade_date)
@@ -2218,6 +2226,6 @@ CREATE TABLE IF NOT EXISTS force_round_daily (
 CREATE INDEX IF NOT EXISTS idx_force_round_daily_lookup
     ON force_round_daily (stock_code, trade_date DESC);
 
-COMMENT ON TABLE  force_round_daily      IS '多空力量回合日表（一票一日一行，回合明细在 rounds jsonb）。由 build_force_rounds.py 盘后跑批生成；四档阈值取 fund_flow_settings.thresholds_json（线上生效口径，与分时图同源）。';
-COMMENT ON COLUMN force_round_daily.rounds IS '回合列表。λ_pct=每亿元投入推动的百分点（跨票口径，阈值须按票用自身历史中位数校准）；lq=守方四档总投入÷攻方特大+大；keep_ratio=冲击÷最终位移；win 按留存率分档（≥50%胜/15-50%弱/<15%负）。';
-COMMENT ON COLUMN force_round_daily.applicable IS '适用性：近 20 个已落库交易日主回合合计 ≥20。大盘股/ETF 资金流分散、无回合结构（SH.600941/SH.520900 恒为 false），不得输出博弈结论。';
+COMMENT ON TABLE  force_round_daily      IS '多空力量回合日表（一票一日一行，回合明细在 rounds jsonb）。由 build_force_rounds.py 盘中每分钟一轮 + 17:05 盘后收口兜底生成；四档阈值取 fund_flow_settings.thresholds_json（线上生效口径，与分时图同源）。';
+COMMENT ON COLUMN force_round_daily.rounds IS '回合列表。窗口=股价趋势段（rounds_by_trend，非资金相位切分）。λ_pct=每亿元投入推动的百分点（跨票口径，阈值须按票用自身历史中位数校准）；lq=负方投入÷胜方投入；keep=冲击÷胜方方向最大位移（0~1）；win_side=胜方（ΔP>0 多/+1、<0 空/-1、横盘 0）；ongoing=true 表示盘中未收口，前端显示「进行中」不画结果。';
+COMMENT ON COLUMN force_round_daily.applicable IS '适用性：近 20 个已落库交易日回合数合计 ≥20。大盘股/ETF 资金流分散、无回合结构（SH.600941/SH.520900 恒为 false），不得输出博弈结论。';

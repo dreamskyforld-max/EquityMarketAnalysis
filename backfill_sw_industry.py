@@ -27,7 +27,7 @@ import datetime
 import sys
 import time
 
-from db import get_conn, bulk_upsert
+from db import get_conn, bulk_upsert, clean_ohlc
 
 SOURCE = "akshare:index_hist_sw"
 TABLE = "daily_benchmark"
@@ -78,6 +78,9 @@ def _rows_for(code: str, name: str) -> list:
             "close_20d_ago": round(float(closes[i - 20]), 4)
             if i >= 20 and not pd.isna(closes[i - 20]) else None,
         }
+        # 源表含「开盘/最高/最低」列（index_hist_sw 官方口径）；缺失或自相矛盾则写 NULL
+        rec["open_price"], rec["high_price"], rec["low_price"] = clean_ohlc(
+            r.get("开盘"), r.get("最高"), r.get("最低"))
         vol, to = r.get("成交量"), r.get("成交额")
         if vol is not None and not pd.isna(vol):
             rec["volume"] = int(float(vol))
