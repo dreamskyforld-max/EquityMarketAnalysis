@@ -23,6 +23,9 @@ APScheduler==3.11.2          # market_scheduler 后台定时任务
 # ── 配置/工具 ──
 python-dotenv==1.2.2         # .env 加载 FRED_API_KEY 等
 
+# ── 研究/离线分析（非服务端运行时，仅 research/force_segmentation 绘图用） ──
+matplotlib==3.11.2             # 分时切分研究：窗口切分图 / 人工标注包出图
+
 # ── 数据处理 (akshare/pandas-datareader 间接依赖，显式锁定) ──
 pymupdf==1.28.2               # get_stock_sector_weight 解析恒生 factsheet PDF
 pandas==3.0.2
