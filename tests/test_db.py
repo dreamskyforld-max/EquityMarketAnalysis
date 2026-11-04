@@ -1,12 +1,15 @@
 """
 db.py 测试
 覆盖：get_conn 连接、upsert 写入/冲突更新、bulk_upsert 批量写入
-（需要本地数据库可用）
+（需要本地数据库可用）；read_sql 统一读库入口（不连库）
 """
+import re
 import sys, os, unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import db
 from db import get_conn, upsert, bulk_upsert
 
 TEST_TABLE = "_test_upsert"
@@ -157,6 +160,66 @@ class TestBulkUpsert(unittest.TestCase):
                         f"WHERE stock_code='HK.00002' AND trade_date='2026-06-10'")
             row = cur.fetchone()
             self.assertEqual(float(row[0]), 99.0)
+
+
+class TestReadSqlUnified(unittest.TestCase):
+    """只读查询统一走 db.read_sql（纯逻辑，不连库）。
+
+    背景（2026-11-04）：pandas 对「非 SQLAlchemy、非 sqlite3 的 DBAPI2 连接」发
+    UserWarning，且带 stacklevel 指向每个调用点 → 不会按"同一处只报一次"去重，
+    回填时按调用点各刷一条，淹没真实输出。全项目收口到 db.read_sql 统一屏蔽。
+    """
+
+    MSG = ("pandas only supports SQLAlchemy connectable (engine/connection) or "
+           "database string URI or sqlite3 DBAPI2 connection.")
+
+    def test_suppresses_pandas_connectable_warning(self):
+        import warnings as W
+        import pandas as pd
+
+        def fake(*a, **k):
+            W.warn(self.MSG, UserWarning, stacklevel=2)
+            return "ok"
+
+        with mock.patch.object(pd, "read_sql_query", side_effect=fake):
+            with W.catch_warnings(record=True) as rec:
+                W.simplefilter("always")
+                self.assertEqual(db.read_sql(object(), "SELECT 1"), "ok")
+        self.assertFalse([w for w in rec if "SQLAlchemy connectable" in str(w.message)])
+
+    def test_other_warnings_still_propagate(self):
+        """只屏蔽那一条消息，不能把 pandas / 用户的其它警告一并吞掉。"""
+        import warnings as W
+        import pandas as pd
+
+        def fake(*a, **k):
+            W.warn("some other warning", UserWarning, stacklevel=2)
+            return "ok"
+
+        with mock.patch.object(pd, "read_sql_query", side_effect=fake):
+            with W.catch_warnings(record=True) as rec:
+                W.simplefilter("always")
+                db.read_sql(object(), "SELECT 1")
+        self.assertTrue([w for w in rec if "some other" in str(w.message)])
+
+    def test_no_direct_pandas_read_sql_outside_db(self):
+        """禁止绕过 db.read_sql 直接用 pd.read_sql*（否则警告按调用点刷屏）。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        offenders = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in
+                           {".git", ".venv", "__pycache__", "node_modules", ".memory"}]
+            for fn in filenames:
+                if not fn.endswith(".py"):
+                    continue
+                p = os.path.join(dirpath, fn)
+                rel = os.path.relpath(p, root)
+                if rel == "db.py":
+                    continue
+                with open(p, encoding="utf-8", errors="ignore") as f:
+                    if re.search(r"pd\.read_sql(_query)?\(", f.read()):
+                        offenders.append(rel)
+        self.assertEqual(offenders, [], f"这些文件绕过了 db.read_sql：{offenders}")
 
 
 if __name__ == '__main__':

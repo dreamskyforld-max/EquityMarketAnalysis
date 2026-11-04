@@ -170,6 +170,67 @@ def read_scope_codes(markets=None):
         return codes, 0
 
 
+# ── 采集清单健康度护栏（2026-10-26 事故后加） ────────────────────────
+#
+# 事故链：sync_quote_universe 的 HK/SH 拉 get_stock_basicinfo 全部超时（OpenD 异常），
+# 按「跳过、保留旧清单」设计本应无损；但同轮末尾的软删**无条件全表执行**，
+# 而两市场 last_seen 早已停在 9 月（超 30 天窗口）→ 6167 只被置 is_collectable=FALSE。
+# v_quote_scope 只剩 realtime_collect_target 的 77 只港股，采集端照样「全批成功」，
+# hk_daily_quote 连续 4 个交易日（10-26~10-29）只有监控池日线、调度记「成功」，无人发现。
+#
+# 采集端必须自己校验清单是否塌陷：可采数相对同市场表内总数骤降 → 抛错让调度记失败。
+# 基线用 quote_universe 该市场「总行数」而非可采数——软删只置 FALSE、不物理删除，
+# 所以总行数不受塌陷影响（事故当天 77/3850 会被立刻识别）。
+SCOPE_MIN_RATIO = 0.5                                  # 可采 / 表内总数 低于此值 → 判塌陷
+_SCOPE_MIN_ABS = {"HK": 500, "SH": 500, "SZ": 500}      # 绝对下限（表为空/首次部署时兜底）
+
+
+def assess_scope(codes, totals, min_ratio=SCOPE_MIN_RATIO, min_abs=None):
+    """纯函数：评估各市场采集清单是否塌陷 → [(market, 可采数, 表内总数, 原因)]，空 = 健康。
+
+    totals: {market: quote_universe 该市场总行数}；min_abs: {market: 绝对下限}。
+    两个判据独立生效（相对骤降 / 绝对过少），任一命中即视为塌陷。
+    """
+    min_abs = _SCOPE_MIN_ABS if min_abs is None else min_abs
+    counts = {}
+    for c in codes or []:
+        mkt = str(c).split(".", 1)[0]
+        counts[mkt] = counts.get(mkt, 0) + 1
+    bad = []
+    for mkt in sorted(totals):
+        n = counts.get(mkt, 0)
+        total = totals[mkt] or 0
+        floor = int(min_abs.get(mkt, 0) or 0)
+        reasons = []
+        if total > 0 and n < total * min_ratio:
+            reasons.append(f"可采 {n} / 表内 {total} = {n / total:.1%} < {min_ratio:.0%}")
+        if floor and n < floor:
+            reasons.append(f"可采 {n} < 绝对下限 {floor}")
+        if reasons:
+            bad.append((mkt, n, total, "；".join(reasons)))
+    return bad
+
+
+def check_scope_health(codes, markets, min_ratio=SCOPE_MIN_RATIO, min_abs=None):
+    """按市场读 quote_universe 总行数并评估清单健康度；读库失败 → 返回空（不阻塞采集）。"""
+    markets = list(markets)
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT market, COUNT(*) FROM quote_universe "
+                    "WHERE market = ANY(%s) GROUP BY market", (markets,))
+                totals = dict(cur.fetchall())
+    except Exception as e:
+        log.warning(f"清单健康度检查读库失败（{type(e).__name__}: {e}）→ 本次跳过检查")
+        return []
+    bad = assess_scope(codes, totals, min_ratio, min_abs)
+    for mkt, n, total, reason in bad:
+        log.error(f"[{mkt}] 采集清单塌陷：{reason}（quote_universe 行未删，多为软删误杀；"
+                  f"执行 python3 sync_quote_universe.py --market {mkt} 修复后再采集）")
+    return bad
+
+
 # ── 带自愈的批量快照 ────────────────────────────────────────────────
 
 class RepairBudget:

@@ -28,7 +28,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from db import get_conn, bulk_upsert
+from db import get_conn, bulk_upsert, read_sql
 from psycopg2.extras import Json
 
 WINDOW = 60  # 分位数回溯窗口（交易日）
@@ -83,10 +83,10 @@ _MIN_W = 0.05
 def load_benchmark_history() -> pd.DataFrame:
     """读取 daily_benchmark 全历史 (bench_code, trade_date 排序)。"""
     with get_conn() as c:
-        df = pd.read_sql(
+        df = read_sql(
+            c,
             "SELECT bench_code, bench_name, trade_date, change_pct, last_price, close_20d_ago "
             "FROM daily_benchmark ORDER BY bench_code, trade_date",
-            c,
         )
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     return df
@@ -99,10 +99,11 @@ def load_correlation(stock_code: str, calc_date: date) -> Dict[str, float]:
     若某指标无相关性记录, 回退到 _DEFAULT_DIR 的方向, 权重用兜底值。
     """
     with get_conn() as c:
-        df = pd.read_sql(
+        df = read_sql(
+            c,
             "SELECT bench_code, pearson FROM benchmark_correlation "
             "WHERE stock_code=%s AND calc_date=%s",
-            c, params=(stock_code, calc_date),
+            params=(stock_code, calc_date),
         )
     return {r["bench_code"]: (None if pd.isna(r["pearson"]) else float(r["pearson"]))
             for _, r in df.iterrows()}

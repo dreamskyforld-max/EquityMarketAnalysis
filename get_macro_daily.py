@@ -24,7 +24,7 @@ import argparse
 import datetime
 import sys
 
-from db import get_conn
+from db import get_conn, read_sql
 from regime_schema import (upsert_macro_series, seed_series_meta,
                            load_series_defs, apply_series_defs)
 
@@ -279,13 +279,14 @@ def _derived_rows(conn, defs: dict) -> list:
     for code, name, a, b, unit, remark in DERIVED:
         p = (defs.get(code) or {}).get("params") or {}
         a, b = p.get("left", a), p.get("right", b)
-        df = pd.read_sql_query(
+        df = read_sql(
+            conn,
             """SELECT x.period_date, (x.value - y.value) AS v,
                       GREATEST(x.release_time, y.release_time) AS rel
                FROM regime.macro_series x JOIN regime.macro_series y
                  ON x.period_date = y.period_date AND x.revision=0 AND y.revision=0
                WHERE x.series_code=%s AND y.series_code=%s ORDER BY 1""",
-            conn, params=[a, b])
+            params=[a, b])
         n = 0
         for _, r in df.iterrows():
             if r["v"] is None or pd.isna(r["v"]):
@@ -385,13 +386,15 @@ def _cross_derived_rows(conn, defs: dict) -> list:
         head, code = spec.split(":", 1)
         kind, _, flag = head.partition("@")
         if kind == "macro":
-            df = pd.read_sql_query(
+            df = read_sql(
+                conn,
                 """SELECT period_date, value, release_time FROM regime.macro_series
-                   WHERE series_code=%s AND revision=0 ORDER BY period_date""", conn, params=[code])
+                   WHERE series_code=%s AND revision=0 ORDER BY period_date""", params=[code])
         else:
-            df = pd.read_sql_query(
+            df = read_sql(
+                conn,
                 """SELECT trade_date AS period_date, last_price AS value FROM daily_benchmark
-                   WHERE bench_code=%s ORDER BY trade_date""", conn, params=[code])
+                   WHERE bench_code=%s ORDER BY trade_date""", params=[code])
         out = {}
         for _, r in df.iterrows():
             if r["value"] is None or pd.isna(r["value"]):

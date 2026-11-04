@@ -8,7 +8,7 @@
 """
 import pandas as pd
 
-from db import get_conn
+from db import get_conn, read_sql as _db_read_sql
 
 # 表名常量
 T_MARKET_TURNOVER = "daily_market_turnover"
@@ -21,9 +21,9 @@ T_STOCK_INFO = "stock_info"
 
 
 def read_sql(sql: str, params=None) -> pd.DataFrame:
-    """执行只读 SQL，返回 DataFrame。"""
+    """执行只读 SQL，返回 DataFrame（连接形态警告的屏蔽见 db.read_sql）。"""
     with get_conn() as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+        return _db_read_sql(conn, sql, params=params)
 
 
 def load_market_turnover() -> pd.DataFrame:

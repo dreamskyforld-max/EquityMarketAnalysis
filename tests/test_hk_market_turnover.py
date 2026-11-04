@@ -102,6 +102,25 @@ def test_double_prefix_fails_all_batches():
 def test_run_raises_when_every_batch_failed(monkeypatch):
     """全批次失败必须抛错（调度器据此标记失败），不能静默返回。"""
     monkeypatch.setattr(m, "_hk_code_list", lambda: ["HK.00700", "HK.00001"])
+    monkeypatch.setattr(m, "_assert_scope_sane", lambda codes: None)
     monkeypatch.setattr(m, "get_shared_ctx", lambda: FakeCtx(ok=False))
     with pytest.raises(RuntimeError, match="全部批次失败"):
         m.run()
+
+
+def test_run_raises_when_scope_collapsed(monkeypatch):
+    """清单塌陷必须抛错（2026-10-26 事故）：当天 v_quote_scope 只剩监控池 77 只港股，
+    旧实现照样「全批成功」并落 77 行，调度记成功，断供 4 个交易日无人发现。
+    """
+    import snap_guard
+
+    monkeypatch.setattr(m, "_hk_code_list", lambda: [f"HK.{i:05d}" for i in range(1, 78)])
+    monkeypatch.setattr(
+        snap_guard, "check_scope_health",
+        lambda codes, markets, **kw: [("HK", len(codes), 3850, "可采 77 / 表内 3850 = 2.0% < 50%")])
+    called = []
+    monkeypatch.setattr(m, "fetch_market_snapshot_batch", lambda *a, **k: called.append(1))
+
+    with pytest.raises(RuntimeError, match="清单塌陷"):
+        m.run()
+    assert called == []          # 清单塌陷时不得发起快照，更不能写半份日线

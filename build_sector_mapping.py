@@ -42,7 +42,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from db import get_conn, bulk_upsert
+from db import get_conn, bulk_upsert, read_sql
 
 TABLE = "regime.sector_mapping"
 CONFLICT = ["ths_name"]
@@ -114,9 +114,10 @@ RULES = {
 
 def _sw_returns(conn, days: int) -> pd.DataFrame:
     """申万一级行业日收益（宽表：index=日期, columns=sw_code）。"""
-    df = pd.read_sql_query(
+    df = read_sql(
+        conn,
         """SELECT bench_code, trade_date, last_price FROM daily_benchmark
-           WHERE bench_code LIKE 'CN.SW%%' ORDER BY trade_date""", conn)
+           WHERE bench_code LIKE 'CN.SW%%' ORDER BY trade_date""")
     if df.empty:
         return pd.DataFrame()
     piv = df.pivot_table(index="trade_date", columns="bench_code", values="last_price")
@@ -286,11 +287,12 @@ def run(codes=None, ctx=None, days: int = 250, only: str = None, dry_run: bool =
 
 def report():
     with get_conn() as conn:
-        df = pd.read_sql_query(
+        df = read_sql(
+            conn,
             """SELECT m.ths_name, m.sw_code, m.sw_name, m.corr, m.corr_runner_up, m.remark,
                       m.confirmed,
                       (SELECT count(*) FROM regime.sector_fund_flow f WHERE f.sector_name=m.ths_name) AS flow_rows
-               FROM regime.sector_mapping m ORDER BY m.sw_code, m.ths_name""", conn)
+               FROM regime.sector_mapping m ORDER BY m.sw_code, m.ths_name""")
     if df.empty:
         print("  映射表为空，先跑 build_sector_mapping.py")
         return

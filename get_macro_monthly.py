@@ -30,7 +30,7 @@ import re
 import sys
 import time
 
-from db import get_conn
+from db import get_conn, read_sql
 from regime_schema import upsert_macro_series, seed_series_meta, load_series_defs
 
 TABLE = "regime.macro_series"
@@ -969,12 +969,13 @@ def _build_derived(conn) -> list:
     rows = []
     for d in DERIVED:
         a, b = d["expr"]
-        df = pd.read_sql_query(
+        df = read_sql(
+            conn,
             """SELECT a.period_date, a.value - b.value AS v
                FROM regime.macro_series a JOIN regime.macro_series b
                  ON a.period_date = b.period_date AND a.revision=0 AND b.revision=0
                WHERE a.series_code=%s AND b.series_code=%s ORDER BY 1""",
-            conn, params=[a, b])
+            params=[a, b])
         for _, r in df.iterrows():
             if r["v"] is None or pd.isna(r["v"]):
                 continue

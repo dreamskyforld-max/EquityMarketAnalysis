@@ -49,6 +49,34 @@ def get_conn():
         conn.close()
 
 
+# ---------- 只读查询 → DataFrame ----------
+def read_sql(conn, sql_text: str, params=None):
+    """执行只读查询并返回 DataFrame（全项目统一读库入口）。
+
+    为什么统一：pandas 对「非 SQLAlchemy、非 sqlite3 的 DBAPI2 连接」会发一条
+    UserWarning（'pandas only supports SQLAlchemy connectable ... Other DBAPI2
+    objects are not tested'）。本项目统一用 psycopg2 裸连接做参数化查询、不引入
+    SQLAlchemy —— 它只影响 pandas 的类型推断，不解决本项目任何问题，还多一层依赖。
+    该警告带 stacklevel 指向**每个调用点**，不会按"同一处只报一次"去重，回填时
+    会按调用点各刷一条，把真正的输出淹没。故在此按消息前缀精确屏蔽（不动其它警告）。
+
+    ⚠ pandas 在函数内惰性导入：db 被所有采集脚本 import，模块级 import pandas 会
+      给每分钟冷启动的进程都加几百 ms（见 collector_runtime 的 IOPS 整改背景）。
+
+    用法:
+        with get_conn() as conn:
+            df = read_sql(conn, "SELECT ... WHERE stock_code=%s", [code])
+    """
+    import warnings
+    import pandas as pd
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="pandas only supports SQLAlchemy connectable",
+            category=UserWarning)
+        return pd.read_sql_query(sql_text, conn, params=params)
+
+
 # ---------- 标识符工具（支持 schema.table 形态）----------
 def _table_ident(table: str):
     """表标识符：兼容 'schema.table'（如 regime.macro_series）。

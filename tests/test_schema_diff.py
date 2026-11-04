@@ -230,5 +230,120 @@ class TestDdlGeneration(unittest.TestCase):
             self.indexes, d))
 
 
+class TestSyncSchemasInScope(unittest.TestCase):
+    """2026-11-04 事故回归：regime.* 曾被整体排除在 diff 之外 → 落后永远检不出。
+
+    事故形态：regime.indicator_dict 缺 domain/role/params_hash/breaks，
+    脚本却报「结构基本一致」，而 market_state_daily 一写入即 UndefinedColumn 中断。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.schema_text = _read_schema()
+        cls.tables, cls.indexes, cls.views, _ = sd.parse_schema(cls.schema_text)
+
+    def test_regime_tables_are_parsed(self):
+        self.assertIn("regime.indicator_dict", self.tables)
+        self.assertIn("domain", self.tables["regime.indicator_dict"]["cols"])
+
+    def test_alter_added_columns_are_parsed(self):
+        """ALTER TABLE ... ADD COLUMN 登记的增量列必须在期望侧。
+
+        否则库里真实存在的列会被判成「多余列，将丢失数据」（高风险假阳性）。
+        """
+        cols = self.tables["regime.indicator_dict"]["cols"]
+        for c in ("params_hash", "breaks"):
+            with self.subTest(c=c):
+                self.assertIn(c, cols)
+        self.assertIn("model_version", self.tables["regime.indicator_value"]["cols"])
+        # NOT NULL 修饰必须跟着 ALTER 一起解析（signal_dict.market_scope 即此写法）
+        self.assertTrue(self.tables["regime.signal_dict"]["notnull"]["market_scope"])
+
+    def test_constraint_index_key_qualified_but_name_bare(self):
+        """约束索引：key 带 schema（防跨 schema 覆盖），物理名不带（与 PG 实际一致）。"""
+        info = self.indexes["regime.indicator_dict_pkey"]
+        self.assertEqual(info["tbl"], "regime.indicator_dict")
+        self.assertEqual(info["sig"][0], "indicator_dict")   # 裸表名，才能与库内对齐
+
+    def test_profile_schema_still_excluded(self):
+        """profile 是分区表（PARTITION OF），纳入 diff 会大量假差异 —— 必须排除。"""
+        self.assertFalse([t for t in self.tables if t.startswith("profile.")])
+
+    def test_regime_views_are_parsed(self):
+        self.assertIn("regime.v_macro_latest", self.views)
+
+    def test_extract_index_ddl_accepts_qualified_key(self):
+        idx = next((k for k, v in self.indexes.items()
+                    if k.startswith("regime.") and not v.get("constraint")), None)
+        self.assertIsNotNone(idx, "schema.sql 里应有 regime schema 的独立 CREATE INDEX")
+        ddl = sd.extract_index_ddl(self.schema_text, idx)
+        self.assertTrue(ddl and ddl.upper().startswith("CREATE"))
+
+
+class TestRegimeMissingColumnFixSql(unittest.TestCase):
+    """「目标库缺 regime 增量列」→ 必须产出可执行的修复 SQL（schema 限定）。
+
+    这是 2026-11-04 事故的直接回归：旧版既不比对 regime，生成的 ADD COLUMN
+    也不带 schema（表名写成 "regime.indicator_dict" 会直接语法错误）。
+    """
+
+    TARGET = "regime.indicator_dict"
+    MISSING = ("domain", "breaks", "params_hash")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.schema_text = _read_schema()
+        t, i, _, _ = sd.parse_schema(cls.schema_text)
+        cls.exp_t = {cls.TARGET: t[cls.TARGET]}
+        cls.exp_i = {k: v for k, v in i.items() if v["tbl"] == cls.TARGET}
+
+    def _server_state(self):
+        exp = self.exp_t[self.TARGET]
+        cols = {c: v for c, v in exp["cols"].items() if c not in self.MISSING}
+        act_t = {self.TARGET: {
+            "cols": cols, "order": list(cols),
+            "notnull": {c: exp["notnull"].get(c, False) for c in cols},
+        }}
+        act_i = {k: v for k, v in self.exp_i.items() if k in
+                 ("regime.indicator_dict_pkey",) or not v.get("constraint")}
+        # 实际库里的索引定义来自 pg_indexes（同一内容指纹），这里直接复用期望侧
+        return act_t, act_i
+
+    def test_missing_columns_detected(self):
+        act_t, act_i = self._server_state()
+        d = sd.diff_schema(self.exp_t, self.exp_i, act_t, act_i)
+        self.assertEqual(sorted(c for _, c, _ in d["add_cols"]), sorted(self.MISSING))
+        self.assertEqual(d["drop_cols"], [])
+
+    def test_fix_sql_is_executable_and_qualified(self):
+        act_t, act_i = self._server_state()
+        d = sd.diff_schema(self.exp_t, self.exp_i, act_t, act_i)
+        sql = "\n".join(sd.build_low_risk_sql(
+            self.schema_text, self.exp_t, self.exp_i, d))
+        self.assertIn('ALTER TABLE "regime"."indicator_dict" '
+                      'ADD COLUMN "domain" VARCHAR(16);', sql)
+        # information_schema 查询必须带 table_schema，否则同名表会误判"列已存在"
+        self.assertIn("table_schema='regime'", sql)
+        self.assertNotIn("-- [!]", sql)
+
+    def test_add_constraint_is_qualified(self):
+        ddl = sd.gen_ddl_add_constraint("regime.indicator_dict",
+                                        "regime.indicator_dict_pkey",
+                                        "PRIMARY KEY", ["indicator_code"])
+        self.assertIn('ALTER TABLE "regime"."indicator_dict"', ddl)
+        self.assertIn('ADD CONSTRAINT "indicator_dict_pkey"', ddl)
+        self.assertNotIn('"regime.indicator_dict_pkey"', ddl)
+
+    def test_create_table_ddl_qualifies_schema(self):
+        info = self.exp_t[self.TARGET]
+        cons = [(name, c["constraint"]["kind"], c["constraint"]["cols"])
+                for name, c in self.exp_i.items() if c.get("constraint")]
+        ddl = sd.gen_ddl_create_table(self.TARGET, info, cons)
+        self.assertIn('CREATE SCHEMA IF NOT EXISTS "regime";', ddl)
+        self.assertIn('CREATE TABLE IF NOT EXISTS "regime"."indicator_dict"', ddl)
+        self.assertIn('CONSTRAINT "indicator_dict_pkey" PRIMARY KEY ("indicator_code")',
+                      ddl)
+
+
 if __name__ == "__main__":
     unittest.main()

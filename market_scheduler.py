@@ -488,6 +488,88 @@ def execute_task(name: str, modules: list, codes=None,
             pass
 
 
+# ── 启动补跑（2026-10-26 事故）────────────────────────────────
+# APScheduler 的 CronTrigger 只在进程存活期间触发：进程若在计划时点"之后"启动
+# （10-27 / 10-28 / 10-29 分别 09:09 / 10:46 / 10:37 启动），当天 08:30 的清单刷新
+# 整天不执行 → 清单塌陷状态无人修复，断供从 1 天拖成 4 个交易日。
+# 下面在启动时对白名单任务补跑一次（仅「当天尚无 ok 记录」时），复用 execute_task
+# 的超时 / 日志 / collection_task_log 埋点，因此补跑与正常触发监控口径一致。
+_CATCH_UP_NAMES = ("全市场清单刷新",)
+
+
+def _catch_up_specs():
+    """白名单任务的执行参数 → [(名字, 脚本, hour, minute, timeout)]。
+
+    时点从 GLOBAL_TASKS 读（单一真相源，避免两处 cron 漂移）；高频/区间任务
+    （hour="*" 或 "9-16"）不参与补跑——它们下一次触发就在几分钟内，无需补。
+    """
+    specs = []
+    for name in _CATCH_UP_NAMES:
+        for g_name, g_script, g_cron, _codes, _force, _mkt, g_timeout in GLOBAL_TASKS:
+            if g_name != name:
+                continue
+            hour, minute = g_cron.get("hour"), g_cron.get("minute")
+            if not isinstance(hour, int) or not isinstance(minute, int):
+                break
+            specs.append((name, g_script if isinstance(g_script, str) else g_script[0],
+                          hour, minute, g_timeout))
+            break
+    return specs
+
+
+def _has_ok_today(task_name: str) -> bool:
+    """当天是否已有该任务的 ok 记录。读库失败一律按「有」处理（不补跑，避免启动期雪崩）。"""
+    try:
+        from db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 按香港时区比日期（::date 依赖会话时区，服务器 PG 若为 UTC 会在凌晨错日）
+                cur.execute(
+                    "SELECT 1 FROM collection_task_log "
+                    "WHERE task_name = %s AND status = 'ok' "
+                    "AND (started_at AT TIME ZONE 'Asia/Hong_Kong')::date "
+                    "  = (NOW() AT TIME ZONE 'Asia/Hong_Kong')::date LIMIT 1", (task_name,))
+                return cur.fetchone() is not None
+    except Exception as e:
+        log.warning(f"[启动补跑] 查询 {task_name} 执行记录失败"
+                    f"（{type(e).__name__}: {e}）→ 本次不补跑")
+        return True
+
+
+def missed_catch_up_tasks(now=None, has_ok_today=None):
+    """启动时需补跑的任务 → [(名字, 脚本, 超时)]；空 = 无需补跑。
+
+    判定：工作日 + 已过计划时点 + 当天无 ok 记录。has_ok_today 可注入（供测试）。
+    """
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return []
+    check = has_ok_today or _has_ok_today
+    out = []
+    for name, script, hour, minute, timeout in _catch_up_specs():
+        if (now.hour, now.minute) < (hour, minute):
+            continue
+        if check(name):
+            continue
+        out.append((name, script, timeout))
+    return out
+
+
+def schedule_catch_up(sched, now=None):
+    """把补跑任务挂到调度器（延迟 10s，走 default 线程池，由 scheduler 统一执行）。"""
+    from datetime import timedelta
+    for name, script, timeout in missed_catch_up_tasks(now):
+        log.warning(f"[启动补跑] 今天 {name} 尚未成功（进程在计划时点之后启动）→ 补跑一次")
+        sched.add_job(
+            execute_task,
+            "date",
+            run_date=datetime.now() + timedelta(seconds=10),
+            args=[name, [script], None, True, None, timeout],
+            id=f"{name}-启动补跑",
+            replace_existing=True,
+        )
+
+
 # ── 调度器 ───────────────────────────────────────────────────
 
 def is_trading_hours(market: str = "HK") -> bool:
@@ -649,6 +731,12 @@ def main():
 
     sched = build_scheduler()
     sched.start()
+
+    # 启动补跑：弥补「进程在计划时点之后启动 → 当天任务整日不触发」（2026-10-26 事故）
+    try:
+        schedule_catch_up(sched)
+    except Exception as e:
+        log.warning(f"[启动补跑] 挂载失败: {type(e).__name__}: {e}")
 
     # 保持进程运行
     try:

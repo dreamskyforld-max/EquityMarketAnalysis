@@ -18,6 +18,12 @@
 #        - 库比 schema.sql 更严格（多余 NOT NULL）                              → 仅提示
 #   4. 把所有修复 SQL 收集起来，输出到屏幕并写入带时间戳的文件，供用户手动执行。
 #
+# 同步范围（2026-11-04 变更）：由「硬编码只比 public」改为 SYNC_SCHEMAS 白名单
+# （默认 public,regime）。旧版把 regime.* 整体排除在 diff 之外，导致 regime 结构
+# 落后**永远检不出** —— 实例：regime.indicator_dict 缺 domain/role/params_hash/breaks，
+# 脚本报"结构基本一致"，而 market_state_daily 一写入就 UndefinedColumn 中断。
+# profile schema 仍排除（分区表由 profiling/schema.py 管理，见 SYNC_SCHEMAS 注释）。
+#
 # 修复 SQL 的完整性（2026-10-05 补，起因: trading_calendar 缺主键 + 三列缺
 # NOT NULL 被检出，但"修复 SQL"却是空的）:
 #   · 约束型索引（建表块内联 PRIMARY KEY / UNIQUE）在 schema.sql 中没有独立
@@ -46,6 +52,39 @@ import sys
 
 APP_DIR = os.environ.get("APP_DIR", "/home/mkt/EquityMarketAnalysis")
 SCHEMA_PATH = os.path.join(APP_DIR, "sql", "schema.sql")
+
+# 本工具比对的 schema 白名单（多项目共用库，只碰 schema.sql 里本项目声明的 schema）。
+#   public = 主库表；regime = 市场状态分析层（schema.sql 第 12~18 段）。
+# 刻意**不含 profile**：profile.tag_value 是按年分区表，分区子表由
+#   profiling/schema.py::ensure_partition() 动态创建、schema.sql 用
+#   「CREATE TABLE ... PARTITION OF」登记（无列清单），纳入 diff 会把分区子表
+#   判成"多余表"、把父表判成"缺列"，产生大量假差异。
+# 2026-11-04 补：此前 read_actual/parse_schema 硬编码只比对 public，导致
+#   regime.* 落后（indicator_dict 缺 domain/role/params_hash/breaks）完全不可见——
+#   部署前体检报了"6 项差异"却漏掉真正会打断计算的缺列。
+SYNC_SCHEMAS = tuple(s.strip() for s in
+                     os.environ.get("SCHEMA_DIFF_SCHEMAS", "public,regime").split(",")
+                     if re.match(r"^[A-Za-z_][\w]*$", s.strip() or ""))
+
+
+def schema_of(t):
+    """'regime.indicator_dict' → 'regime'；裸名 → 'public'。"""
+    return t.partition(".")[0] if "." in t else "public"
+
+
+def bare_name(t):
+    """'regime.idx_indicator_v' → 'idx_indicator_v'（schema.sql / indexdef 用裸名）。"""
+    return t.rpartition(".")[2]
+
+
+def qname(t):
+    """表/视图/索引 key → 带引号的可执行名：regime.foo → "regime"."foo"。"""
+    return f'"{schema_of(t)}"."{bare_name(t)}"' if "." in t else f'"{t}"'
+
+
+def _schema_array():
+    """SYNC_SCHEMAS → psql 的 ARRAY['public','regime'] 字面量（名字已做标识符校验）。"""
+    return "ARRAY[" + ",".join(f"'{s}'" for s in SYNC_SCHEMAS) + "]"
 
 
 # ── 读取 config.conf 取连接参数 ──────────────────────────────────────────────
@@ -245,6 +284,26 @@ def norm_view_def(s):
     return s
 
 
+def register_alter_column(tables, tname, col, rest):
+    """登记 `ALTER TABLE ... ADD COLUMN [IF NOT EXISTS] col TYPE ...` 的增量列。
+
+    schema.sql 用这一段给既有库补列（如 regime.indicator_dict.params_hash）。
+    旧版解析只认建表块 → 这些列在期望侧缺失 → 库里真实存在的列被误判成
+    「多余列（会丢数据）」。类型只取到 DEFAULT / NOT NULL 等修饰之前。
+    """
+    rest = rest.strip().rstrip(";").strip()
+    notnull = bool(re.search(r"\bNOT\s+NULL\b", rest, re.I))
+    typ = re.split(r"\s+(?:DEFAULT|NOT\s+NULL|NULL|PRIMARY\s+KEY|UNIQUE|CHECK|REFERENCES)\b",
+                   rest, maxsplit=1, flags=re.I)[0].strip()
+    info = tables.setdefault(tname, {"cols": {}, "order": [], "raw_cols": {}})
+    info.setdefault("raw_cols", {})[col] = re.sub(r"\s+", " ", typ)
+    info.setdefault("cols", {})[col] = norm_type(typ)
+    info.setdefault("order", [])
+    if col not in info["order"]:
+        info["order"].append(col)
+    info.setdefault("notnull", {})[col] = notnull
+
+
 # ── 解析本地 schema.sql → 期望结构 ───────────────────────────────────────────
 def parse_schema(text):
     """解析 schema.sql → 期望结构。
@@ -306,7 +365,7 @@ def parse_schema(text):
             # 旧正则 [A-Za-z_][\w]* 不认点号：CREATE TABLE profile.tag_registry 会被
             # 截成 "profile"，导致 4 张 profile 表的列被合并成一张假表，每次都误报
             # 「public.profile 缺失」。改为支持限定名：非 public 用 schema.table 作 key，
-            # 末尾统一剔除（本工具只同步 public schema）。
+            # 末尾按 SYNC_SCHEMAS 白名单过滤。
             tname = tbl if sch == "public" else f"{sch}.{tbl}"
             # cols = 归一化类型（仅比对用）；raw_cols = 原始类型（生成 DDL 用）
             tables.setdefault(tname, {"cols": {}, "order": [], "raw_cols": {}})
@@ -320,6 +379,21 @@ def parse_schema(text):
             else:
                 i += 1
                 continue
+        # 增量列：ALTER TABLE x ADD COLUMN IF NOT EXISTS col TYPE ...
+        # 2026-11-04 补：schema.sql 的「既有库自愈」段用 ALTER 登记增量列
+        # （如 regime.indicator_dict.params_hash / breaks），旧版只解析 CREATE TABLE
+        # 块 → 这些列在期望侧不存在 → 库里的真实列被误判为「多余列，将丢失数据」。
+        m = re.match(
+            r"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:([A-Za-z_][\w]*)\.)?"
+            r"([A-Za-z_][\w]*)\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+            r"([A-Za-z_][\w]*)\s+(.+?)\s*;?\s*$", line, re.I)
+        if m:
+            asch = (m.group(1) or "public").lower()
+            atbl = m.group(2).lower()
+            atname = atbl if asch == "public" else f"{asch}.{atbl}"
+            register_alter_column(tables, atname, m.group(3).lower(), m.group(4))
+            i += 1
+            continue
         # 索引（CREATE INDEX 可能跨行：名字在一行，ON 在下一行，或带 INCLUDE 子句）
         m = re.match(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w]*)", line, re.I)
         if m:
@@ -329,11 +403,17 @@ def parse_schema(text):
             while " ON " not in re.sub(r"\([^)]*\)", "", buf) and j + 1 < len(lines):
                 j += 1
                 buf = buf + " " + lines[j]
-            m2 = re.search(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w]*)\s+ON\s+(?:[A-Za-z_][\w]*\.)?([A-Za-z_][\w]*)", buf, re.I)
+            m2 = re.search(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w]*)\s+ON\s+(?:([A-Za-z_][\w]*)\.)?([A-Za-z_][\w]*)", buf, re.I)
             if m2:
+                # 索引归其表所在的 schema（schema.sql 里索引名不带 schema 前缀，
+                # 与 PG 规则一致：索引建在表的 schema 内）。key 对非 public 加前缀，
+                # 避免跨 schema 同名索引在字典里互相覆盖。
+                isch = (m2.group(2) or "public").lower()
                 name = m2.group(1).lower()
-                tbl = m2.group(2).lower()
-                indexes[name] = {"tbl": tbl, "sig": parse_index_signature(buf)}
+                tbl = m2.group(3).lower()
+                tbl_key = tbl if isch == "public" else f"{isch}.{tbl}"
+                idx_key = name if isch == "public" else f"{isch}.{name}"
+                indexes[idx_key] = {"tbl": tbl_key, "sig": parse_index_signature(buf)}
             i = j + 1
             continue
         # 在建表块内解析列
@@ -344,10 +424,10 @@ def parse_schema(text):
                 i += 1
                 continue
         i += 1
-    # 剔除非 public schema 的期望对象：本工具只同步 public（多项目共用库，绝不触碰
-    # 其它 schema）。profile.* 的建表与按年分区由 profiling/schema.py 幂等执行，
-    # schema.sql 中的该段落仅作结构真相源登记，不参与本工具的 diff/修复。
-    for t in [t for t in tables if "." in t]:
+    # 按 schema 白名单剔除期望对象：多项目共用库，绝不触碰其它 schema
+    # （SYNC_SCHEMAS 见文件头；profile.* 的分区建表由 profiling/schema.py 幂等执行，
+    #  schema.sql 中该段仅作结构真相源登记，不参与本工具的 diff/修复）。
+    for t in [t for t in tables if schema_of(t) not in SYNC_SCHEMAS]:
         tables.pop(t, None)
     # 主键列在 PG 里隐含 NOT NULL：把表级 PRIMARY KEY 的列补进期望 notnull，
     # 否则与库里 attnotnull=True 比对会误报"库更严格"（列级 PRIMARY KEY 已在
@@ -360,8 +440,8 @@ def parse_schema(text):
                 tables[info["tbl"]].setdefault("notnull", {})[c] = True
     for k in [k for k, v in indexes.items() if v.get("tbl") not in tables]:
         indexes.pop(k, None)
-    # 非 public 视图同理剔除（如 regime.v_macro_latest，由 regime_schema.py 幂等创建）
-    for v in [v for v in views if "." in v]:
+    # 视图同样按白名单过滤（regime.v_macro_latest 等由 regime_schema.py 幂等创建）
+    for v in [v for v in views if schema_of(v) not in SYNC_SCHEMAS]:
         views.pop(v, None)
         views_raw.pop(v, None)
     return tables, indexes, views, views_raw
@@ -413,30 +493,33 @@ def collect_inline_indexes(line, indexes, tname, current_col=None):
     # 独立 CREATE INDEX 语句 → 修复 SQL 必须用 ALTER TABLE ADD CONSTRAINT 还原；
     # 旧版生成侧只认 CREATE INDEX，导致"报了差异却没有修复 SQL"（trading_calendar
     # 缺主键即此形态），须靠这里的元信息兜底。
+    # 2026-11-04：约束索引的**物理名用裸表名**（PG 建约束索引不带 schema 前缀：
+    #   regime.indicator_dict 的主键实际叫 indicator_dict_pkey），而字典 key 对非
+    #   public 加 schema 前缀，避免跨 schema 同名索引互相覆盖。
+    tbl = bare_name(tname)
+    sch = schema_of(tname)
+
+    def _add(name, kind, cols_str, unique):
+        key = name if sch == "public" else f"{sch}.{name}"
+        indexes[key] = {
+            "tbl": tname,
+            "sig": parse_index_signature(
+                f"CREATE {'UNIQUE ' if unique else ''}INDEX {name} ON {tbl} ({cols_str})"),
+            "constraint": {"kind": kind, "cols": _split_cols(cols_str)},
+        }
+
     # 显式命名约束: CONSTRAINT xxx PRIMARY KEY / UNIQUE (...)
     m = re.match(r"CONSTRAINT\s+([A-Za-z_][\w]*)\s+(PRIMARY\s+KEY|UNIQUE)", line, re.I)
     if m:
         name = m.group(1).lower()
         unique = bool(re.search(r"UNIQUE", m.group(2), re.I))
         cols = _extract_constraint_cols(line, current_col)
-        indexes[name] = {
-            "tbl": tname,
-            "sig": parse_index_signature(
-                f"CREATE {'UNIQUE ' if unique else ''}INDEX {name} ON {tname} ({cols})"),
-            "constraint": {"kind": "UNIQUE" if unique else "PRIMARY KEY",
-                           "cols": _split_cols(cols)},
-        }
+        _add(name, "UNIQUE" if unique else "PRIMARY KEY", cols, unique)
         return
     # 内联 PRIMARY KEY（表级带括号，或列级无括号）
     if re.search(r"\bPRIMARY\s+KEY\b", line, re.I):
-        name = f"{tname}_pkey"
         cols = _extract_constraint_cols(line, current_col, primary=True)
-        indexes[name] = {
-            "tbl": tname,
-            "sig": parse_index_signature(
-                f"CREATE UNIQUE INDEX {name} ON {tname} ({cols})"),
-            "constraint": {"kind": "PRIMARY KEY", "cols": _split_cols(cols)},
-        }
+        _add(f"{tbl}_pkey", "PRIMARY KEY", cols, True)
         return
     # 匿名 UNIQUE (a, b, ...)  -> {table}_{col1}_{col2}_..._key
     # 注意: PG 对匿名 UNIQUE 约束生成的物理索引名是【全列】而非仅首列，
@@ -449,13 +532,7 @@ def collect_inline_indexes(line, indexes, tname, current_col=None):
         col_list = _split_cols(cols)
         if not col_list:
             return
-        name = f"{tname}_{'_'.join(col_list)}_key"
-        indexes[name] = {
-            "tbl": tname,
-            "sig": parse_index_signature(
-                f"CREATE UNIQUE INDEX {name} ON {tname} ({cols})"),
-            "constraint": {"kind": "UNIQUE", "cols": col_list},
-        }
+        _add(f"{tbl}_{'_'.join(col_list)}_key", "UNIQUE", cols, True)
         return
 
 
@@ -545,47 +622,53 @@ def parse_column_line(line, tname, tables):
 # ── 读取实际结构 ──────────────────────────────────────────────────────────────
 def read_actual(db):
     tables = {}
-    # 列（含类型）
+    # 列（含类型）。2026-11-04：由硬编码 'public' 改为 SYNC_SCHEMAS 白名单
+    # （否则 regime.* 的落后完全不可见）；relkind 兼容分区父表 'p'。
     sql = (
-        "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull "
+        "SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), "
+        "a.attnotnull "
         "FROM pg_class c "
         "JOIN pg_attribute a ON a.attrelid = c.oid "
         "JOIN pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = 'public' AND c.relkind = 'r' "
+        f"WHERE n.nspname = ANY ({_schema_array()}) AND c.relkind IN ('r','p') "
         "AND a.attnum > 0 AND NOT a.attisdropped "
-        "ORDER BY c.relname, a.attnum;"
+        "ORDER BY n.nspname, c.relname, a.attnum;"
     )
     out = psql_query(db, sql)
     for row in out.splitlines():
         if not row.strip():
             continue
         parts = row.split("|")
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
-        t, c, typ = parts[0], parts[1], parts[2]
+        sch, t, c, typ = parts[0].strip().lower(), parts[1], parts[2], parts[3]
+        t = t if sch == "public" else f"{sch}.{t}"
         tables.setdefault(t, {"cols": {}, "order": [], "notnull": {}})
         tables[t]["cols"][c] = norm_type(typ)
         tables[t]["order"].append(c)
         # attnotnull：实际库的 NOT NULL 状态（-tA 模式下布尔输出 t/f）。
         # 2026-10-05 补：之前只比类型，漏报 nullable 差异。
-        if len(parts) >= 4:
-            tables[t].setdefault("notnull", {})[c] = parts[3].strip().lower() in ("t", "true")
+        if len(parts) >= 5:
+            tables[t].setdefault("notnull", {})[c] = parts[4].strip().lower() in ("t", "true")
 
     # 索引（含 indexdef，用于按"内容指纹"比对，避免同名不同名误报）
-    # 返回结构: indexes[name] = {tbl, sig}
+    # 返回结构: indexes[key] = {tbl, sig}；key/tbl 对非 public schema 加前缀。
     indexes = {}
-    sql = ("SELECT indexname, tablename, indexdef "
-           "FROM pg_indexes WHERE schemaname = 'public';")
+    sql = ("SELECT schemaname, indexname, tablename, indexdef "
+           f"FROM pg_indexes WHERE schemaname = ANY ({_schema_array()});")
     out = psql_query(db, sql)
     for row in out.splitlines():
         if not row.strip():
             continue
         parts = row.split("|")
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
-        iname, tbl, indexdef = parts[0], parts[1], parts[2]
+        sch, iname, tbl, indexdef = (parts[0].strip().lower(), parts[1],
+                                     parts[2], parts[3])
+        tbl_key = tbl if sch == "public" else f"{sch}.{tbl}"
+        idx_key = iname if sch == "public" else f"{sch}.{iname}"
         sig = parse_index_signature(indexdef)
-        indexes[iname] = {"tbl": tbl, "sig": sig}
+        indexes[idx_key] = {"tbl": tbl_key, "sig": sig}
 
     # 视图：同时取库里实际定义（pg_get_viewdef），用于"语义比对"而非"只看名字"。
     # 旧逻辑只看名字是否存在，导致"存在即算差异"，每次都提示重刷 CREATE OR REPLACE；
@@ -595,18 +678,19 @@ def read_actual(db):
     # 取库里视图的真实定义（pg_get_viewdef，多行压成空格避免被 splitlines 截断）。
     # 存 norm_view_def 归一化后的文本供一级比对；一级判为不一致时，再由
     # resolve_view_def_via_pg 把 schema.sql 的定义交 PG 反解析复核（二级确认）。
-    sql = ("SELECT c.relname, replace(pg_get_viewdef(c.oid, true), chr(10), ' ') "
+    sql = ("SELECT n.nspname, c.relname, replace(pg_get_viewdef(c.oid, true), chr(10), ' ') "
            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-           "WHERE n.nspname = 'public' AND c.relkind = 'v';")
+           f"WHERE n.nspname = ANY ({_schema_array()}) AND c.relkind = 'v';")
     out = psql_query(db, sql)
     for row in out.splitlines():
         if not row.strip():
             continue
         parts = row.split("|")
-        if len(parts) < 2:
+        if len(parts) < 3:
             continue
-        vname, vdef = parts[0], parts[1]
-        views[vname.strip().lower()] = norm_view_def(vdef)
+        sch, vname, vdef = parts[0].strip().lower(), parts[1].strip().lower(), parts[2]
+        key = vname if sch == "public" else f"{sch}.{vname}"
+        views[key] = norm_view_def(vdef)
 
     return tables, indexes, views
 
@@ -678,8 +762,13 @@ def gen_ddl_create_table(t, table_info, constraints=()):
         if not cols:
             continue
         col_list = ", ".join(f'"{x}"' for x in cols)
-        parts.append(f'CONSTRAINT "{name}" {kind} ({col_list})')
-    return f'CREATE TABLE IF NOT EXISTS "{t}" ({", ".join(parts)});'
+        # 约束名是物理名（不带 schema）：key 可能是 regime.xxx_pkey，须剥前缀。
+        parts.append(f'CONSTRAINT "{bare_name(name)}" {kind} ({col_list})')
+    # 非 public 表：先确保 schema 存在（新库部署时 CREATE TABLE 会因此失败）
+    head = ""
+    if "." in t:
+        head = f'CREATE SCHEMA IF NOT EXISTS "{schema_of(t)}";\n'
+    return head + f'CREATE TABLE IF NOT EXISTS {qname(t)} ({", ".join(parts)});'
 
 
 def gen_ddl_add_constraint(t, name, kind, cols):
@@ -695,7 +784,8 @@ def gen_ddl_add_constraint(t, name, kind, cols):
     col_list = ", ".join(f'"{c}"' for c in cols)
     return (f'-- 注: 若表中已有违反约束的数据（重复行 / 主键列为 NULL）会执行失败，'
             f'失败不损坏数据\n'
-            f'ALTER TABLE "{t}" ADD CONSTRAINT "{name}" {kind} ({col_list});')
+            f'ALTER TABLE {qname(t)} ADD CONSTRAINT "{bare_name(name)}" '
+            f'{kind} ({col_list});')
 
 
 def gen_ddl_set_not_null(t, col):
@@ -705,30 +795,33 @@ def gen_ddl_set_not_null(t, col):
         SELECT count(*) FROM "<t>" WHERE "<col>" IS NULL;
     """
     return (f'-- 注: 若 "{col}" 已有 NULL 行会执行失败（可先自查 '
-            f'SELECT count(*) FROM "{t}" WHERE "{col}" IS NULL）\n'
-            f'ALTER TABLE "{t}" ALTER COLUMN "{col}" SET NOT NULL;')
+            f'SELECT count(*) FROM {qname(t)} WHERE "{col}" IS NULL）\n'
+            f'ALTER TABLE {qname(t)} ALTER COLUMN "{col}" SET NOT NULL;')
 
 
 def gen_ddl_add_column(t, col, typ):
+    # information_schema 查询必须带 table_schema，否则同名表（如 regime/public 都有
+    # 的表）会互相误判为"列已存在"而跳过 ADD COLUMN（2026-11-04 补）。
     return (f'DO $$ BEGIN IF NOT EXISTS ('
             f'SELECT 1 FROM information_schema.columns '
-            f"WHERE table_name='{t}' AND column_name='{col}'"
-            f') THEN ALTER TABLE "{t}" ADD COLUMN "{col}" {typ}; END IF; END $$;')
+            f"WHERE table_schema='{schema_of(t)}' AND table_name='{bare_name(t)}' "
+            f"AND column_name='{col}'"
+            f') THEN ALTER TABLE {qname(t)} ADD COLUMN "{col}" {typ}; END IF; END $$;')
 
 
 def gen_ddl_drop_column(t, col):
     # 高风险: 会丢失该列数据。生成的 SQL 默认注释掉，需用户手动取消注释才执行。
-    return f'ALTER TABLE "{t}" DROP COLUMN IF EXISTS "{col}";'
+    return f'ALTER TABLE {qname(t)} DROP COLUMN IF EXISTS "{col}";'
 
 
 def gen_ddl_drop_index(idx):
     # 高风险: 删索引。生成的 SQL 默认注释掉，需用户手动取消注释才执行。
-    return f'DROP INDEX IF EXISTS "{idx}";'
+    return f'DROP INDEX IF EXISTS {qname(idx)};'
 
 
 def gen_ddl_alter_type(t, col, new):
     # 高风险: 改列类型可能丢精度 / 破坏自增。默认注释掉，需用户手动取消注释才执行。
-    return f'ALTER TABLE "{t}" ALTER COLUMN "{col}" TYPE {new};'
+    return f'ALTER TABLE {qname(t)} ALTER COLUMN "{col}" TYPE {new};'
 
 
 # ── 差异计算与修复 SQL 组装（纯函数，供 main 与单元测试共用）────────────────────
@@ -882,6 +975,8 @@ def main():
     print("=" * 64)
     if not os.path.exists(SCHEMA_PATH):
         sys.exit(f"[x] 找不到 {SCHEMA_PATH}")
+    print(f"[i] 比对 schema 范围: {', '.join(SYNC_SCHEMAS)}"
+          f"（环境变量 SCHEMA_DIFF_SCHEMAS 可覆盖）")
 
     db = load_db_conf()
     with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
@@ -1070,19 +1165,29 @@ def main():
 
 
 def extract_index_ddl(text, idx):
-    # 找到 CREATE ... INDEX idx ON ... 的完整语句（到 ; 或行尾）
+    # 找到 CREATE ... INDEX idx ON ... 的完整语句（到 ; 或行尾）。
+    # idx 的 key 可能是 regime.idx_xxx（非 public schema），而 schema.sql 里的
+    # 索引名从不带 schema 前缀（与 PG 规则一致：索引建在表的 schema 内）→ 搜裸名。
     pat = re.compile(
         r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-        + re.escape(idx) + r"\s+ON\s+.*?;",
+        + re.escape(bare_name(idx)) + r"\s+ON\s+.*?;",
         re.I | re.S)
     m = pat.search(text)
     return m.group(0).strip() if m else None
 
 
 def extract_view_ddl(text, v):
-    pat = re.compile(
-        r"CREATE\s+OR\s+REPLACE\s+VIEW\s+" + re.escape(v) + r"\s+.*?;",
-        re.I | re.S)
+    # 非 public 视图在 schema.sql 里写作 CREATE OR REPLACE VIEW regime.v_xxx：
+    # 已知 schema 时要求前缀精确匹配（避免跨 schema 同名视图取错定义）；
+    # public 允许带可选前缀（历史写法两种都有）。
+    if "." in v:
+        pat = re.compile(
+            r"CREATE\s+OR\s+REPLACE\s+VIEW\s+" + re.escape(schema_of(v)) + r"\."
+            + re.escape(bare_name(v)) + r"\s+.*?;", re.I | re.S)
+    else:
+        pat = re.compile(
+            r"CREATE\s+OR\s+REPLACE\s+VIEW\s+(?:[A-Za-z_][\w]*\.)?"
+            + re.escape(v) + r"\s+.*?;", re.I | re.S)
     m = pat.search(text)
     return m.group(0).strip() if m else None
 

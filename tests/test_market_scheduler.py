@@ -187,6 +187,40 @@ class TestBuildScheduler(unittest.TestCase):
         sched.shutdown(wait=False)
 
 
+class TestStartupCatchUp(unittest.TestCase):
+    """启动补跑（2026-10-26 事故）：进程在 08:30 后才启动 → 当天清单刷新整天不执行。
+
+    事故期间 10-27/28/29 分别 09:09 / 10:46 / 10:37 启动，08:30 的清单刷新一次都没跑，
+    清单塌陷状态无人修复，断供从 1 天拖成 4 个交易日。
+    """
+
+    def _missed(self, now, has_ok):
+        from market_scheduler import missed_catch_up_tasks
+        return missed_catch_up_tasks(now, has_ok_today=lambda name: has_ok)
+
+    def test_weekend_never_catch_up(self):
+        self.assertEqual(self._missed(datetime(2026, 10, 31, 10, 0), False), [])   # 周六
+
+    def test_before_scheduled_time_no_catch_up(self):
+        self.assertEqual(self._missed(datetime(2026, 11, 2, 8, 0), False), [])     # 周一 08:00
+
+    def test_after_scheduled_time_without_ok_catches_up(self):
+        out = self._missed(datetime(2026, 11, 2, 9, 9), False)                     # 周一 09:09
+        self.assertEqual([x[0] for x in out], ["全市场清单刷新"])
+        self.assertEqual(out[0][1], "sync_quote_universe.py")
+
+    def test_after_scheduled_time_with_ok_no_catch_up(self):
+        self.assertEqual(self._missed(datetime(2026, 11, 2, 10, 46), True), [])
+
+    def test_catch_up_specs_from_global_tasks(self):
+        """补跑时点从 GLOBAL_TASKS 读（单一真相源），避免两处 cron 漂移。"""
+        from market_scheduler import GLOBAL_TASKS, _catch_up_specs
+        expected = {n: (c.get("hour"), c.get("minute"))
+                    for n, _s, c, *_ in GLOBAL_TASKS if n in ("全市场清单刷新",)}
+        specs = {s[0]: (s[2], s[3]) for s in _catch_up_specs()}
+        self.assertEqual(specs, expected)
+
+
 class TestImportIntegrity(unittest.TestCase):
     """import 完整性"""
 

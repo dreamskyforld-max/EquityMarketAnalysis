@@ -205,3 +205,40 @@ def test_snapshot_batch_all_codes_removed(monkeypatch):
     assert removed == ["HK.02900"]
     assert len(ctx.batches) == 1              # 剔除后批空 → 立即返回，不再调用
     assert marked == ["HK.02900"]             # 逐个暴露过程中即落账
+
+
+# ── 采集清单健康度护栏（2026-10-26 事故） ─────────────────────────────
+
+def test_assess_scope_healthy():
+    """稳态：可采 3800 / 表内 3850（含 37 只黑名单）→ 不报警。"""
+    codes = [f"HK.{i:05d}" for i in range(1, 3801)]
+    assert g.assess_scope(codes, {"HK": 3850}) == []
+
+
+def test_assess_scope_collapsed_by_ratio():
+    """事故现场：可采 77 / 表内 3850（软删把全市场置 FALSE，行还在）→ 必须判塌陷。"""
+    codes = [f"HK.{i:05d}" for i in range(1, 78)]
+    bad = g.assess_scope(codes, {"HK": 3850})
+    assert len(bad) == 1
+    mkt, n, total, reason = bad[0]
+    assert (mkt, n, total) == ("HK", 77, 3850)
+    assert "2.0%" in reason
+
+
+def test_assess_scope_per_market():
+    """按市场分别判定（事故真实形态）：SH 只剩 4 只、SZ 正常 → 只报 SH。"""
+    codes = ([f"SH.{i:06d}" for i in range(1, 5)]
+             + [f"SZ.{i:06d}" for i in range(1, 2940)])
+    bad = g.assess_scope(codes, {"SH": 2381, "SZ": 2973})
+    assert [b[0] for b in bad] == ["SH"]
+
+
+def test_assess_scope_abs_floor_when_total_unknown():
+    """表内总数为 0（清单未初始化）时用绝对下限兜底，避免「表空 → 比例无意义 → 放行」。"""
+    assert g.assess_scope(["HK.00700"], {"HK": 0}) != []
+    assert g.assess_scope([f"HK.{i:05d}" for i in range(1, 600)], {"HK": 0}) == []
+
+
+def test_assess_scope_ignores_market_without_baseline():
+    """totals 里没有该市场（如只采 SH 时传了全量 codes）→ 不评估、不误报。"""
+    assert g.assess_scope(["HK.00700"], {}) == []

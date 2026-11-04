@@ -17,31 +17,30 @@
 from __future__ import annotations
 
 import argparse
-import warnings
 from datetime import date, timedelta
 
 import pandas as pd
 
 from liquidity import _data
-from db import get_conn
-
-warnings.filterwarnings("ignore")
+from db import get_conn, read_sql
 
 
 # ---- 本地读取（_data 未提供的两张表，仅本脚本使用） ----
 def _load_short_selling() -> pd.DataFrame:
     with get_conn() as conn:
-        return pd.read_sql_query(
+        return read_sql(
+            conn,
             "SELECT stock_code, trade_date, short_selling_amt FROM daily_short_selling "
-            "ORDER BY trade_date", conn,
+            "ORDER BY trade_date",
         )
 
 
 def _load_buyback() -> pd.DataFrame:
     with get_conn() as conn:
-        return pd.read_sql_query(
+        return read_sql(
+            conn,
             "SELECT stock_code, buyback_date, amount FROM daily_buyback_event "
-            "ORDER BY buyback_date", conn,
+            "ORDER BY buyback_date",
         )
 
 

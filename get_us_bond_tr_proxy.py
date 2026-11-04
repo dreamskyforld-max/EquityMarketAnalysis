@@ -47,7 +47,7 @@ import argparse
 import datetime
 import sys
 
-from db import get_conn
+from db import get_conn, read_sql
 from regime_schema import (upsert_macro_series, seed_series_meta,
                            load_series_defs, apply_series_defs)
 
@@ -93,9 +93,10 @@ def _rows() -> list:
     import pandas as pd
 
     with get_conn() as conn:
-        df = pd.read_sql_query(
+        df = read_sql(
+            conn,
             """SELECT trade_date, last_price FROM daily_benchmark
-               WHERE bench_code = 'US.DGS10' ORDER BY trade_date""", conn)
+               WHERE bench_code = 'US.DGS10' ORDER BY trade_date""")
     if df.empty:
         return []
     s = pd.Series(pd.to_numeric(df["last_price"], errors="coerce").to_numpy(),

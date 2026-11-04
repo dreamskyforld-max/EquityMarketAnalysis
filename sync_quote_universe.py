@@ -217,6 +217,29 @@ def _upsert_universe(conn, rows):
     return len(data)
 
 
+def soft_delete_scope(conn, ok_markets, days):
+    """按市场软删：只处理本轮「拉取 + 写入」都成功的市场，返回影响行数。
+
+    2026-10-26 事故：HK/SH 拉 get_stock_basicinfo 连续超时（按设计跳过、保留旧清单），
+    但软删原实现无条件全表执行，而两市场 last_seen 早已停在 9 月（超 30 天窗口）→
+    6167 只被置 is_collectable=FALSE。次日起 v_quote_scope 只剩 realtime_collect_target
+    的 77 只港股 + 4 只沪股，hk/a_daily_quote 静默断供 4 个交易日，调度还记「成功」。
+    故软删必须限定在本轮确实拉取成功并写入的市场：失败市场的 last_seen 是「上一次
+    成功刷新」的旧值，用它判退市等于把整个市场误杀。ok_markets 为空 → 一律不删。
+    """
+    ok_markets = list(ok_markets)
+    if not ok_markets:
+        log.warning("本轮无任何市场刷新成功 → 跳过软删（防清单被误杀）")
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE quote_universe SET is_collectable = FALSE, updated_at = NOW() "
+            "WHERE is_collectable AND market = ANY(%s) "
+            "AND (last_seen IS NULL OR last_seen < NOW() - make_interval(days => %s))",
+            (ok_markets, days))
+        return cur.rowcount
+
+
 def _sync_stock_info(conn, rows):
     """联动：新增代码 → INSERT 进 stock_info（仅补名称字典）；已存在 → 只更新「源权威字段」，且仅在有变更时写。
 
@@ -285,6 +308,7 @@ def run(codes=None, ctx=None):
     cur_active, known = _cur_state()
 
     total_up = 0
+    ok_markets: list[str] = []      # 本轮「拉取 + 写入」都成功的市场 → 只有它们允许软删
     for market in markets:
         fetched = None
         for sec_type in types:
@@ -319,17 +343,14 @@ def run(codes=None, ctx=None):
             ins_n, chg_n = _sync_stock_info(conn, fetched)
             log.info(f"[{market}] quote_universe 写入 {n_up} 只；stock_info 联动：新增 {ins_n} 只、"
                      f"存量字段更新 {chg_n} 只")
+        ok_markets.append(market)
 
-    # 软删（全局，不区分市场）
+    # 软删：只对本轮「拉取 + 写入」都成功的市场执行（2026-10-26 事故，见 soft_delete_scope）
     if not dry:
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE quote_universe SET is_collectable = FALSE, updated_at = NOW() "
-                    "WHERE is_collectable AND (last_seen IS NULL OR last_seen < NOW() - make_interval(days => %s))",
-                    (soft_days,))
-                n_off = cur.rowcount
-        log.info(f"软删：{n_off} 只超 {soft_days} 天未在源出现 → is_collectable=FALSE")
+            n_off = soft_delete_scope(conn, ok_markets, soft_days)
+        log.info(f"软删：{n_off} 只超 {soft_days} 天未在源出现 → is_collectable=FALSE"
+                 f"（范围：{ok_markets or '无（本轮全部市场刷新失败）'}）")
         # 快照黑名单**不再自动复位**（2026-09-28 定稿：发现即拉黑、永久有效）：
         # 坏码终身只报错一次，之后由 v_quote_scope.snap_ok 在清单层直接跳过，不再重复请求。
         # 需要恢复某代码时人工解除：python3 snap_guard.py list / unblock <stock_code>。

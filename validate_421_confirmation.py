@@ -28,7 +28,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from db import get_conn
+from db import get_conn, read_sql
 
 # ── 证据分组（与 §4.2.1 二、逐条对应）─────────────────────────────────────
 # (指标编码, sign, 说明)；sign 为 +1 表示「该指标上行 = 支持超配股票」
@@ -48,10 +48,11 @@ def _load_pct(conn) -> pd.DataFrame:
     """取全部所需指标在 CN 侧的 (date, code) → percentile 宽表。"""
     codes = sorted({c for g in GROUPS.values() for c, _, _ in g
                     if not c.startswith("__")})
-    df = pd.read_sql_query(
+    df = read_sql(
+        conn,
         """SELECT trade_date, indicator_code, percentile
            FROM regime.indicator_value
-           WHERE market='CN' AND indicator_code = ANY(%s)""", conn, params=[codes])
+           WHERE market='CN' AND indicator_code = ANY(%s)""", params=[codes])
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     wide = df.pivot_table(index="trade_date", columns="indicator_code",
                           values="percentile", aggfunc="last")
@@ -63,10 +64,11 @@ def _term_spread_chg20(conn) -> pd.Series:
 
     ⚠ 用 expanding 分位（只用当日及以前的数据）→ 与指标层口径一致、无前视。
     """
-    df = pd.read_sql_query(
+    df = read_sql(
+        conn,
         """SELECT trade_date, raw_value FROM regime.indicator_value
            WHERE market='CN' AND indicator_code='RISK.TERM_SPREAD'
-           ORDER BY trade_date""", conn)
+           ORDER BY trade_date""")
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     s = df.set_index("trade_date")["raw_value"].astype(float).sort_index()
     chg = s.diff(20).dropna()
@@ -105,9 +107,10 @@ def build_confirmation(conn) -> pd.DataFrame:
     pct["__TERM_SPREAD_PCT__"] = _expanding_pct(ts_chg)
 
     # §4.1 档位：长周期 ERP 分位（月频，向后填充到日频）
-    erp = pd.read_sql_query(
+    erp = read_sql(
+        conn,
         """SELECT trade_date, percentile FROM regime.indicator_value
-           WHERE market='CN' AND indicator_code='VAL.ERP_LG' ORDER BY trade_date""", conn)
+           WHERE market='CN' AND indicator_code='VAL.ERP_LG' ORDER BY trade_date""")
     erp["trade_date"] = pd.to_datetime(erp["trade_date"])
     erp_pct = erp.set_index("trade_date")["percentile"].astype(float).sort_index()
 
@@ -140,9 +143,10 @@ def build_confirmation(conn) -> pd.DataFrame:
 
 def forward_returns(conn, horizons) -> pd.DataFrame:
     """上证指数未来 h 个交易日收益（%）。"""
-    df = pd.read_sql_query(
+    df = read_sql(
+        conn,
         """SELECT trade_date, last_price FROM daily_benchmark
-           WHERE bench_code='SH.000001' ORDER BY trade_date""", conn)
+           WHERE bench_code='SH.000001' ORDER BY trade_date""")
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     s = df.set_index("trade_date")["last_price"].astype(float).sort_index()
     out = pd.DataFrame(index=s.index)
@@ -227,9 +231,10 @@ def main() -> int:
     print("  · 同步性高 → 该组只能作状态描述，不能作独立领先确认（文档「九」要求标注）")
     print("─" * 78)
     with get_conn() as conn:
-        sh = pd.read_sql_query(
+        sh = read_sql(
+            conn,
             """SELECT trade_date, last_price FROM daily_benchmark
-               WHERE bench_code='SH.000001' ORDER BY trade_date""", conn)
+               WHERE bench_code='SH.000001' ORDER BY trade_date""")
     sh["trade_date"] = pd.to_datetime(sh["trade_date"])
     sh_s = sh.set_index("trade_date")["last_price"].astype(float).sort_index()
     ret20 = (sh_s / sh_s.shift(20) - 1) * 100

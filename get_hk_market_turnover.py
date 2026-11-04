@@ -341,10 +341,28 @@ def _print(rec):
     print(f"标的数量 : {rec['stock_count']} 只")
 
 
+def _assert_scope_sane(codes):
+    """清单塌陷护栏（2026-10-26 事故）：可采代码数骤降时抛错，绝不按残余清单静默采集。
+
+    事故当天 v_quote_scope 的港股只剩 realtime_collect_target 的 77 只（正常约 3,800），
+    脚本仍「全批成功」→ hk_daily_quote 连续 4 个交易日只有监控池日线，
+    daily_market_turnover 也只记了 77 只的合计额，调度全程记「成功」无人发现。
+    """
+    from snap_guard import check_scope_health
+    bad = check_scope_health(codes, ["HK"])
+    if bad:
+        _mkt, _n, _total, reason = bad[0]
+        raise RuntimeError(
+            f"港股采集清单塌陷：{reason}（多为 sync_quote_universe 软删误杀；"
+            f"执行 python3 sync_quote_universe.py --market {_mkt} 修复后再采集）"
+        )
+
+
 def run(codes=None, ctx=None):
     """采集入口（常驻调用兼容）。codes 可为代码列表，空则全港股。"""
     if not codes:
         codes = _hk_code_list()
+        _assert_scope_sane(codes)
     rec = fetch_market_snapshot_batch(codes, ctx)
     bad_removed = rec.get("snap_bad_removed")
     if isinstance(bad_removed, list) and bad_removed:
@@ -367,6 +385,7 @@ if __name__ == "__main__":
     import os
     dry = "--dry-run" in sys.argv
     codes = _hk_code_list()
+    _assert_scope_sane(codes)
     rec = fetch_market_snapshot_batch(codes)
     _print(rec)
     if rec.get("trade_date") and not dry:

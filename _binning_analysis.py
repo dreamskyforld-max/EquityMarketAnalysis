@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, ".")
-from db import get_conn  # noqa: E402
+from db import get_conn, read_sql  # noqa: E402
 
 N_TIERS = 5
 NAME = {
@@ -84,7 +84,7 @@ def main():
       AND COALESCE(r.num_unit, '') NOT IN ('percentile_0_100', 'count', 'rank')
     """
     with get_conn() as conn:
-        df = pd.read_sql(q, conn)
+        df = read_sql(conn, q)
 
     rows = []
     for code, g in df.groupby("tag_code", sort=True):

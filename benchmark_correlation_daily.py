@@ -26,7 +26,7 @@ from typing import List
 
 import pandas as pd
 
-from db import get_conn
+from db import get_conn, read_sql
 
 MIN_DAYS = 30  # 最少公共天数才纳入分析
 
@@ -66,7 +66,7 @@ def load_data(stock_code: str) -> pd.DataFrame:
     ORDER BY b.bench_code, s.trade_date
     """
     with get_conn() as c:
-        return pd.read_sql(sql, c, params=(stock_code,))
+        return read_sql(c, sql, params=(stock_code,))
 
 
 # ── 结果落库 ──
