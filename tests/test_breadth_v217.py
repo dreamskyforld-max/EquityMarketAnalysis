@@ -188,7 +188,7 @@ class TestDictSchemaSelfHeal(unittest.TestCase):
 
     V21_COLS = {
         "indicator_dict": ["domain", "role", "params_hash", "breaks"],
-        "indicator_value": ["is_final", "model_version"],
+        "indicator_value": ["model_version"],
     }
 
     def test_ddl_covers_v21_columns(self):

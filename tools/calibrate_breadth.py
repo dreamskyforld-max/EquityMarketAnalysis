@@ -69,6 +69,27 @@ WEIGHT_CAP = 0.25
 REP_COVERAGE_MIN = 1.0       # 代表级覆盖门禁：score 是全代表等权均值，缺任一代表即口径不完整
                              # 登记在 dimension_dict.params，生产者默认 0.0 以兼容旧种子
 
+# ── L2 参数层变更（v2.1.11，2026-11-05）─────────────────────────────────────
+# 这些键原先散落在模块常量 / 未接入，登记后才纳入 params_hash，改阈值才会触发重算。
+PARAM_UPDATES = {
+    "flag_gap": 15.0,             # 对齐 build_dimension_value.FLAG_GAP
+    "flag_extreme": 20.0,         # 对齐 build_dimension_value.FLAG_EXTREME
+    "quality_sample": 750,        # §2.4 规则 6：n_sample < 750 降置信
+    "min_periods": 250,           # 与 L1 BREADTH_PCT_MIN_PERIODS 对齐（仅登记，L2 不直接消费）
+    "contrib_sign_split": True,   # contrib 按 delta 符号分组，修 pos/neg 越界
+    "flags_shape": "dict",        # §2.3.3 形状冻结标记
+    "dispersion_scope": "non_flags_only",  # 阶段 3 方案 C：dispersion 排除诊断成员
+    "calib_version": "v2.1.12",   # 参数层变更 → params_hash 变化 → 全量重算 L2
+}
+
+FLAGS_REMARK = (
+    "⚠ v2.1.11 输出形状冻结：flags 为 dict —— structural:list[str] 恒存在（结构性背离文案）；"
+    "n_sample:int（当日有效成员的最小分位样本数，缺键时不写）；仅命中时写 "
+    "low_coverage / high_dispersion / missing_representative / short_sample / no_data:true。"
+    "blocks 每族 {score,coverage,representative}；contrib {pos:[{code,delta}],neg:[...]} "
+    "按 delta 符号分组（contrib_sign_split=true）。下游不得按 list 遍历 flags。"
+)
+
 CANDIDATES = {
     "涨跌家数": ["BREADTH.ADV_RATIO", "BREADTH.ADV_MINUS_DEC", "BREADTH.MCCLELLAN"],
     "均线": ["BREADTH.PCT_ABOVE_MA60", "BREADTH.PCT_ABOVE_MA200"],
@@ -304,13 +325,61 @@ def build_dict_row(results: dict, flags_only: set) -> dict:
     }
 
 
+def _json(value):
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def update_params_only(conn) -> dict:
+    """只更新 `dimension_dict.params` / `params_hash` / `remark`，**不重标定**。
+
+    与 `--write` 的区别：后者会重跑族划分 / 代表 / 内部一致性 / 切点，L1 分位订正后
+    可能连带改动成员清单与冻结切点（超出「参数层变更」的范围）。本模式保持
+    `members` / `state_bands` / `state_labels` 原样，只换参数与形状契约。
+
+    params_hash 必须与 `build_dict_row` 用同一 payload 算法，否则消费端会误判旧口径。
+    """
+    df = _read(
+        "SELECT members, state_bands, state_labels, params, params_hash, remark "
+        "FROM regime.dimension_dict WHERE dimension_code=%s", conn, params=[DIM])
+    if df.empty:
+        raise RuntimeError(f"regime.dimension_dict 无 {DIM}，请先跑 --write")
+    r = df.iloc[0]
+    members, bands, labels = (_json(r[k]) for k in ("members", "state_bands", "state_labels"))
+    params = dict(_json(r["params"]) or {})
+    params.update(PARAM_UPDATES)
+    payload = {"members": members, "state_bands": bands, "params": params, "labels": labels}
+    ph = hashlib.md5(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+    remark = (str(r["remark"] or "") + FLAGS_REMARK)[:8000]
+    # ⚠ 必须走 UPDATE，不能用 bulk_upsert：后者按 rows 的键拼 INSERT 语句，
+    #   其余 NOT NULL 列（dimension_name / question / polarity / members ...）会变成
+    #   NULL 并在 INSERT 阶段就触发 NotNullViolation（ON CONFLICT 救不回来）。
+    from psycopg2.extras import Json
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE regime.dimension_dict SET params=%s, params_hash=%s, remark=%s, "
+            "updated_at=%s WHERE dimension_code=%s",
+            (Json(params), ph, remark, datetime.datetime.now(msd.TZ_CN), DIM))
+        if cur.rowcount != 1:
+            raise RuntimeError(f"{DIM} 参数更新影响 {cur.rowcount} 行，预期 1 行")
+    return {"old_hash": r["params_hash"], "params_hash": ph, "params": params}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", action="store_true", help="只读打印标定报告")
-    ap.add_argument("--write", action="store_true", help="写 regime.dimension_dict")
+    ap.add_argument("--write", action="store_true", help="写 regime.dimension_dict（含重标定）")
+    ap.add_argument("--params-only", action="store_true",
+                    help="只登记参数层变更并重算 params_hash，不重标定族/切点")
     args = ap.parse_args()
-    if not (args.probe or args.write):
-        ap.error("需指定 --probe 或 --write")
+    if not (args.probe or args.write or args.params_only):
+        ap.error("需指定 --probe / --write / --params-only")
+    if args.params_only:
+        with get_conn() as conn:
+            out = update_params_only(conn)
+        print(f"✅ {DIM} 参数层更新：{out['old_hash']} → {out['params_hash']}")
+        print(f"   params={out['params']}")
+        print("   ⚠ members / state_bands / state_labels 未变；须全量重算 L2")
+        return
 
     with get_conn() as conn:
         data = {mk: _load(conn, mk) for mk in ("CN", "HK")}

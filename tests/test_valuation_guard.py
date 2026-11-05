@@ -145,8 +145,12 @@ class TestWriteMarketGuard(unittest.TestCase):
         # 必须在 ERP_Z 与分位计算之前
         self.assertLess(src.index("combined[c] = _valuation_asof_guard(combined[c])"),
                         src.index("_expanding_zscore("))
+        # v2.1.11：分位计算已抽到 _compute_percentiles（单一真相源），
+        # 护栏仍必须发生在调用它之前；分位函数本身继续用 _expanding_percentile。
         self.assertLess(src.index("combined[c] = _valuation_asof_guard(combined[c])"),
-                        src.index("_expanding_percentile("))
+                        src.index("_compute_percentiles(combined)"))
+        self.assertIn("_expanding_percentile(",
+                      inspect.getsource(msd._compute_percentiles))
 
 
 class TestExtraAndDict(unittest.TestCase):

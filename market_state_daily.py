@@ -79,11 +79,27 @@ QUOTE_VALUATION_CODES = frozenset({
    PIT 成分池未重建期间须在 extra 标 survivorship_bias / quality='low'。
    VAL.ERP_Z 由 _write_market 基于 VAL.ERP 派生，自动跟随，不在集合内。"""
 
-# ── §5.1 v2.1.7 宽度口径（改动须同步 doc/market_profile.md 与 BREADTH_CALIB_VERSION）──
-BREADTH_CALIB_VERSION = "v2.1.7"
-"""宽度口径版本。任何改变既有 raw / 分位数值的改动都必须递增本值：
-   它进入 indicator_dict.params_hash 与 indicator_value.model_version，
-   变化即代表历史需全量重算（§5.7 PIT 铁律）。"""
+# ── §5.1 v2.1.11 宽度口径（改动须同步 doc/market_state_data_architecture.md 与版本号）──
+BREADTH_CALIB_VERSION = "v2.1.11"
+"""宽度族（rolling）口径版本。v2.1.11 = 补 min_periods=250 + extra.n_sample +
+   LIMIT_NET 制度起点前残留清理。它进入 indicator_dict.params_hash 与
+   indicator_value.model_version，变化即代表宽度族历史需全量重算（§2.4 规则 4/5）。"""
+
+EXPANDING_CALIB_VERSION = "v2.1.7"
+"""其余指标（expanding）口径版本，**刻意保持在 v2.1.7**。
+
+⚠ 旧实现把 BREADTH_CALIB_VERSION 无差别塞进所有指标的 _params_hash payload，
+   宽度族递增版本会连带把另外 112 个指标的 params_hash 全改掉 → 库内
+   model_version 未重算即变成「旧口径数据」，等于制造全库版本不一致。
+   故按 rolling / expanding 拆开：本次只重算宽度族，其余指标逐值不变、版本不变。
+   待各维度自己的口径版本升级时再递增本常量并单独全量重算。"""
+
+BREADTH_PCT_MIN_PERIODS = 250
+"""§2.4 规则 1：宽度族有效观测不足 250 不计算分位（L2 另以 3×250=750 降置信）。
+
+⚠ 当前**只对 BREADTH_ROLLING_CODES 生效**：其余指标沿用旧的无 min_periods 口径。
+   代码与库内数据必须一致——本次没有重算其余指标，故不能对它们启用，否则出现
+   「代码已是新口径、库内仍是旧值」。通用化留待各维度口径版本升级时统一处理。"""
 
 BREADTH_PCT_WINDOW = 2520
 """宽度成员分位窗口（约 10 年交易日，按**有效观测行数**计，不是自然日）。
@@ -678,12 +694,18 @@ def _q(conn, sql, params=None) -> pd.DataFrame:
     return read_sql(conn, sql, params=params)
 
 
-def _expanding_percentile(s: pd.Series, window: int | None = None) -> pd.Series:
+def _expanding_percentile(s: pd.Series, window: int | None = None,
+                          min_periods: int = 0) -> pd.Series:
     """逐点 as-of 历史分位（只用 t 及之前的数据，无前视）。
 
     window=None → expanding（全历史，保持旧行为，压力维度与其余指标用）；
     window=N    → 滚动最近 N 个**有效观测**（含当前点）。按有效观测行数而非自然日计，
                   避免停牌 / 节假日造成窗口长度漂移（§5.7 L2-a 宽度滚动 10 年）。
+    min_periods → 参与排位的有效观测（含当前点）不足该数时 percentile 为 NaN。
+                  默认 0 = 旧行为，保证其余指标与既有回归测试逐值不变；宽度族由
+                  `_compute_percentiles` 传 `BREADTH_PCT_MIN_PERIODS`（§2.4 规则 1）。
+                  ⚠ 样本不足时仍把该观测放进窗口 / 有序 buf，只是不产出读数——
+                  否则后续计数会错位，等于把「样本数」也算错。
 
     并列值用中位秩（§7.1）：avg_rank = n_less + n_equal/2，再按 (rank+0.5)/(n+1) 折算；
     与原实现完全一致，只是参考样本由全历史改为最近 N 个。滚动时旧观测按值从有序 buf
@@ -705,7 +727,9 @@ def _expanding_percentile(s: pd.Series, window: int | None = None) -> pd.Series:
         lo = bisect.bisect_left(buf, v)
         hi = bisect.bisect_right(buf, v)
         avg_rank = (lo + hi) / 2.0
-        out[i] = 100.0 * (avg_rank + 0.5) / (len(buf) + 1)
+        n_including_current = len(buf) + 1
+        if n_including_current >= min_periods:
+            out[i] = 100.0 * (avg_rank + 0.5) / n_including_current
         bisect.insort(buf, v)
         if window is not None:
             order.append(v)
@@ -722,7 +746,7 @@ def _params_hash(meta: dict, rolling: bool) -> str:
         str(meta.get("code") or ""), str(meta.get("unit") or ""),
         str(meta.get("direction") or ""), str(meta.get("formula") or ""),
         f"roll{BREADTH_PCT_WINDOW}" if rolling else "expanding",
-        BREADTH_CALIB_VERSION,
+        BREADTH_CALIB_VERSION if rolling else EXPANDING_CALIB_VERSION,
     ])
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -761,7 +785,7 @@ def _json_scalar(v):
     return int(v) if isinstance(v, (int, np.integer)) else float(v)
 
 
-def _breadth_extra(code: str, d, detail) -> dict | None:
+def _breadth_extra(code: str, d, detail, n_sample=None) -> dict | None:
     """构造 indicator_value.extra（§5.1 v2.1.7）。
 
     ① point-in-time 成分池未重建前，**所有个股横截面聚合指标**（宽度 + 估值）标注
@@ -776,6 +800,10 @@ def _breadth_extra(code: str, d, detail) -> dict | None:
     if (code in BREADTH_ROLLING_CODES or code in QUOTE_VALUATION_CODES) and not PIT_UNIVERSE_READY:
         ex["survivorship_bias"] = True
         ex["quality"] = "low"
+    # §2.3.2 / §2.4 规则 6：截至当日参与分位计算的有效观测数（宽度族专用）。
+    # 由 _write_market 传入；L2 的短样本降置信读这个键，不再需要另算一遍历史。
+    if n_sample is not None:
+        ex["n_sample"] = int(n_sample)
     if code == "BREADTH.ADV_MINUS_DEC" and detail is not None and d in detail.index:
         row = detail.loc[d]
         ex.update({k: _json_scalar(row[k]) for k in ("adv", "dec", "n", "unchanged")})
@@ -2440,7 +2468,6 @@ ALTER TABLE regime.indicator_dict  ADD COLUMN IF NOT EXISTS domain       VARCHAR
 ALTER TABLE regime.indicator_dict  ADD COLUMN IF NOT EXISTS role         VARCHAR(16) DEFAULT 'context';
 ALTER TABLE regime.indicator_dict  ADD COLUMN IF NOT EXISTS params_hash  VARCHAR(16);
 ALTER TABLE regime.indicator_dict  ADD COLUMN IF NOT EXISTS breaks       JSONB;
-ALTER TABLE regime.indicator_value ADD COLUMN IF NOT EXISTS is_final     BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE regime.indicator_value ADD COLUMN IF NOT EXISTS model_version VARCHAR(16);
 """
 
@@ -2509,6 +2536,32 @@ def _load_stored_raw(conn, market: str) -> pd.DataFrame:
                           values="raw_value", aggfunc="last")
 
 
+def _compute_percentiles(combined: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """按 code 选分位窗口算 as-of 分位，并返回每列的有效观测数（extra.n_sample）。
+
+    ⚠ **单一真相源**：`_write_market`（日频增量 / 全量回填）与
+      `tools/recalc_breadth_percentile.py`（按宽度指标族历史重算）都必须调本函数，
+      否则两处分位口径会漂移（§2.4 规则 4/5）。
+
+    宽度族 rolling(2520) + min_periods(250)；其余 expanding、无 min_periods
+    （见 EXPANDING_CALIB_VERSION / BREADTH_PCT_MIN_PERIODS 的注释）。
+    n_sample 对 rolling 按窗口截断（窗口内参与排位的观测数），expanding 为累计有效数。
+    """
+    pct_cols, n_samples = {}, {}
+    for c in combined.columns:
+        s = combined[c]
+        rolling = c in BREADTH_ROLLING_CODES
+        window = BREADTH_PCT_WINDOW if rolling else None
+        pct_cols[c] = (_expanding_percentile(
+                            s, window=window,
+                            min_periods=BREADTH_PCT_MIN_PERIODS if rolling else 0)
+                       if c not in NO_PERCENTILE
+                       else pd.Series(np.nan, index=combined.index))
+        counts = s.notna().cumsum()
+        n_samples[c] = counts.clip(upper=window) if window else counts
+    return pd.DataFrame(pct_cols, index=combined.index), n_samples
+
+
 def _write_market(conn, market: str, series_map: dict, start: datetime.date,
                   write: bool) -> dict:
     """分位化（宽度滚动 10 年 / 其余 expanding）+ 写 `indicator_value`，返回统计。
@@ -2559,15 +2612,9 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
         combined["VAL.ERP_Z"] = _expanding_zscore(
             combined["VAL.ERP"].astype(float), ERP_Z_MIN_PERIODS)
 
-    # 分类/编码类指标不做分位（如美林象限 1-4 是**类别标签**，分位没有意义）。
-    # §5.7 L2-a：宽度成员用滚动 10 年（BREADTH_PCT_WINDOW），其余 expanding；
-    # 压力维度必须 expanding（滚动会把历史危机移出样本，与 FSI 目的相反）。
-    pct = pd.DataFrame({c: (_expanding_percentile(
-                                combined[c],
-                                window=BREADTH_PCT_WINDOW if c in BREADTH_ROLLING_CODES else None)
-                            if c not in NO_PERCENTILE
-                            else pd.Series(np.nan, index=combined.index))
-                        for c in combined.columns}, index=combined.index)
+    # 分类/编码类指标不做分位（见 _compute_percentiles / NO_PERCENTILE）。
+    # §5.7 L2-a：宽度成员用滚动 10 年 + min_periods=250，其余 expanding。
+    pct, n_samples = _compute_percentiles(combined)
     write_idx = [d for d in combined.index if isinstance(d, datetime.date) and d >= start]
     if not write:
         last = write_idx[-1] if write_idx else None
@@ -2600,7 +2647,10 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
                 "indicator_code": code, "market": market, "trade_date": d,
                 "raw_value": None if v is None or pd.isna(v) else round(float(v), 6),
                 "percentile": None if p is None or pd.isna(p) else round(float(p), 2),
-                "extra": _breadth_extra(code, d, detail),
+                "extra": _breadth_extra(
+                    code, d, detail,
+                    n_sample=(n_samples.get(code).get(d)
+                              if code in BREADTH_ROLLING_CODES else None)),
                 "model_version": params_by_code.get(code),
                 "updated_at": now,
             })

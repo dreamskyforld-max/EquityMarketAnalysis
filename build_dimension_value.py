@@ -26,15 +26,25 @@
 派生量按 §5.1「不落表，由消费方按固定 model_version 重算」：A/D Line、McClellan
 Summation Index、A/D 与指数双高点背离。它们不写库，由 `--derived` 输出。
 
+`--audit` 是 `doc/market_state_data_architecture.md` §5.1 的**只读契约自检**：核验 11 个
+宽度原子是否采集 / 分位化、字典与 L2 计算契约是否自洽、最新一日出档门禁为何通过或未通过。
+它不写库、不改口径，用于回答「§5.1 的维度指标现在能不能算对」。
+
+⚠ 口径变更纪律（§2.2）：任何改变 `dimension_value` 输出形状的修正都必须由
+`dimension_dict.params` 显式登记并触发 `params_hash` 变化 + L2 全量重算，禁止在
+`params_hash` 未变时改变输出。`contrib_sign_split` 即按此纪律做成默认关闭的字典开关。
+
 用法：
     .venv/bin/python3 build_dimension_value.py --write            # 增量（最近 45 天）
     .venv/bin/python3 build_dimension_value.py --write --backfill # 全历史
     .venv/bin/python3 build_dimension_value.py --derived --market CN   # 打印派生量
+    .venv/bin/python3 build_dimension_value.py --audit            # §5.1 契约自检（只读）
 """
 from __future__ import annotations
 
 import argparse
 import datetime
+import importlib
 import json
 import sys
 
@@ -225,6 +235,24 @@ def _load_percentiles(conn, market, codes, start, end):
                           values="percentile", aggfunc="last").sort_index()
 
 
+def _load_n_samples(conn, market, codes, start, end):
+    """读 L1 `extra.n_sample`（阶段 1 落地），供 §2.4 规则 6 短样本降置信。
+
+    只取本市场参与的成员，带实体过滤 + 时间下界（资源规范 R7）。
+    旧行没有该键 → 返回 NaN，**不**触发降置信（缺键 ≠ 短样本）。
+    """
+    df = _read_sql(
+        "SELECT trade_date, indicator_code, (extra ->> %s)::numeric AS n_sample "
+        "FROM regime.indicator_value "
+        "WHERE market=%s AND indicator_code=ANY(%s) AND trade_date BETWEEN %s AND %s "
+        "  AND (extra ->> %s) IS NOT NULL ORDER BY trade_date",
+        conn, params=["n_sample", market, codes, start, end, "n_sample"])
+    if df.empty:
+        return pd.DataFrame()
+    return df.pivot_table(index="trade_date", columns="indicator_code",
+                          values="n_sample", aggfunc="last").sort_index()
+
+
 def _breadth_flags(aligned: pd.DataFrame, trade_date, flag_gap: float,
                    flag_extreme: float) -> list[str]:
     """`DIM.BREADTH` 专属的结构性背离 flags（§5.7 L2-c，v2.1.9）。
@@ -286,6 +314,16 @@ def build_breadth_dimension(
     # 新维度需要不同判据时只改自己的 dimension_dict.params，无需动本函数。
     flag_gap = float(params.get("flag_gap", FLAG_GAP))
     flag_extreme = float(params.get("flag_extreme", FLAG_EXTREME))
+    # §5.1 `contrib` 契约修复（2026-11-05 评估发现，**默认关闭**）：
+    #   旧写法 pos=nlargest(3) / neg=nsmallest(3) 未按 delta 符号分组，成员少或
+    #   delta 同号时会把非正偏离写进 pos、非负偏离写进 neg，甚至同一成员两边都出现
+    #   （库内实测 92,064 个条目中 709 条越界）。估值生产者已按符号分组，宽度遗漏。
+    # ⚠ 启用会改变 contrib 的 JSONB 内容 → 必须先在 dimension_dict.params 登记本键
+    #   （params_hash 随之变化）并全量重算 L2，否则同一 model_version 混存两套形状。
+    contrib_sign_split = bool(params.get("contrib_sign_split", False))
+    # §2.4 规则 6：`n_sample < quality_sample` 降置信。默认 0 = 关闭（新维度不写该键
+    # 就正常出档，v1.6 扩展隔离约定）；DIM.BREADTH 字典登记 750 后生效。
+    quality_sample = float(params.get("quality_sample", 0))
 
     all_codes = [m["code"] for m in members]
     scopes = _load_market_scopes(conn, all_codes)
@@ -335,10 +373,34 @@ def build_breadth_dimension(
     rep_valid = rep_frame.notna().sum(axis=1)
     rep_coverage = rep_valid / max(n_eff, 1)
 
+    # v2.1.12 / 阶段 3 方案 C：dispersion 只按**参与合成的成员**算，排除 flags_only 诊断成员。
+    # 理由：score 由族代表等权算出，flags_only 成员已被标定判为与核心宽度分不同构念、
+    # 且不进 score；拿它们判断「平均分是否具代表性」是逻辑错配（HK 实测把未出档率
+    # 从 6.27% 抬到 12.61%）。coverage 分母仍按全部 eligible（§5.1 不变）。
+    # ⚠ 归一化因子同步改用 core_valid，与 tools/probe_breadth_gate.py 的 C 口径逐值一致。
+    flags_only_codes = {m["code"] for m in members if m.get("flags_only")}
+    core_codes = [c for c in eligible if c not in flags_only_codes] or eligible
     valid = aligned[eligible].notna().sum(axis=1)
     coverage = valid / max(len(eligible), 1)
-    dispersion = aligned[eligible].std(axis=1, ddof=1)
-    dispersion_norm = dispersion * np.sqrt(valid / 10.0)
+    # `dispersion_scope` 由字典驱动：缺省 "all" 保持旧口径（新维度不会静默继承），
+    # 登记 "non_flags_only" 才启用方案 C —— 与 rep_coverage_min / contrib_sign_split
+    # 同款，保证 params_hash 变化时口径才变。
+    use_core = str(params.get("dispersion_scope", "all")) == "non_flags_only"
+    scope_codes = core_codes if use_core else eligible
+    scope_valid = (aligned[scope_codes].notna().sum(axis=1) if use_core else valid)
+    dispersion = (aligned[scope_codes].std(axis=1, ddof=1) if len(scope_codes) > 1
+                  else pd.Series(np.nan, index=aligned.index))
+    dispersion_norm = dispersion * np.sqrt(scope_valid / 10.0)
+
+    # 短样本（§2.4 规则 6）：只取**进 score 的族代表**里最小的 n_sample。
+    # ⚠ 不能用全体 eligible：EQ_VS_CAP_20D 等 flags_only 诊断成员起点晚（CN 2018 起），
+    #   它首次出现时 n_sample=1 会把整个维度拖成「短样本」，即使代表们已有 28 年历史。
+    #   score 的可靠性由代表决定，故分母只按 reps 计；缺键的旧行 NaN → 不判短样本。
+    ns_frame = _load_n_samples(conn, market, eligible, start, end)
+    n_sample_min = (ns_frame.reindex(index=aligned.index, columns=reps).min(axis=1)
+                    if not ns_frame.empty else pd.Series(np.nan, index=aligned.index))
+    short_sample = (pd.Series(False, index=aligned.index) if quality_sample <= 0
+                    else (n_sample_min < quality_sample).fillna(False))
 
     band_index = np.digitize(score.fillna(-1).to_numpy(), bands)      # 等值归较高档（§8.1.1）
     state = pd.Series([labels[int(band_level)] for band_level in band_index], index=score.index)
@@ -349,6 +411,7 @@ def build_breadth_dimension(
     high = gate_passed & (coverage >= 0.8) & (dispersion_norm <= 20.0)
     confidence[high] = "高"
     confidence[gate_passed & ~high] = "中"
+    confidence[short_sample] = "低"       # §2.4 规则 6：只降置信，不改 score / state
 
     def _contrib(trade_date):
         deviation = (aligned.loc[trade_date, eligible] - score.loc[trade_date]).dropna()
@@ -356,11 +419,38 @@ def build_breadth_dimension(
             return [{"code": indicator_code,
                     "delta": round(float(deviation_value), 2)}
                     for indicator_code, deviation_value in deviations.items()]
+        if contrib_sign_split:
+            # 0.005 = 保留两位小数后仍非零的最小幅度，避免写出 delta=0.0 的「贡献」
+            return {"pos": _lst(deviation[deviation > 0.005].nlargest(3)),
+                    "neg": _lst(deviation[deviation < -0.005].nsmallest(3))}
         return {"pos": _lst(deviation.nlargest(3)), "neg": _lst(deviation.nsmallest(3))}
 
     def _flags(trade_date):
-        # 宽度专属实现已隔离到模块级函数；此处只做参数绑定。
-        return _breadth_flags(aligned, trade_date, flag_gap, flag_extreme)
+        """§2.3.3 dict 形状（2026-11-05 定稿，写入 dimension_dict.remark 并由测试钉住）：
+
+        `structural` 恒存在（list[str]，结构性背离文案）；其余为**仅命中时写入**的
+        可用性标记；`n_sample` 为当日有效成员的最小分位样本数（缺键时不写）。
+        ⚠ 旧形状是字符串数组，下游解析不得再按 list 遍历本列。
+        """
+        flags = {"structural": _breadth_flags(aligned, trade_date, flag_gap, flag_extreme)}
+        ns = n_sample_min.get(trade_date)
+        if ns is not None and not pd.isna(ns):
+            flags["n_sample"] = int(ns)
+        if pd.isna(score.loc[trade_date]):
+            flags["no_data"] = True
+        if coverage.loc[trade_date] < coverage_min:
+            flags["low_coverage"] = True
+        dn = dispersion_norm.loc[trade_date]
+        if not pd.isna(dn):
+            # 落一份门禁实测值，供消费端与 --audit 精确复算出档判定，不必按 coverage 反推
+            flags["dispersion_norm"] = round(float(dn), 2)
+            if dn > dispersion_max:
+                flags["high_dispersion"] = True
+        if rep_coverage.loc[trade_date] < rep_coverage_min:
+            flags["missing_representative"] = True
+        if bool(short_sample.loc[trade_date]):
+            flags["short_sample"] = True
+        return flags
 
     def _block_scores(trade_date):
         block_score_map = {}
@@ -403,7 +493,6 @@ def build_breadth_dimension(
             "contrib": _contrib(trade_date),
             "flags": _flags(trade_date),
             "confidence": confidence.loc[trade_date],
-            "is_final": True,                 # 纯派生量，收盘即终值
             "model_version": params_hash,
             "updated_at": now,
         })
@@ -558,7 +647,7 @@ def build_valuation_dimension(
             "coverage": round(float(coverage.loc[trade_date]), 4),
             "dispersion": None if pd.isna(dispersion.loc[trade_date]) else round(float(dispersion.loc[trade_date]), 2),
             "blocks": _blocks(trade_date), "contrib": _contrib(trade_date), "flags": _flags(trade_date),
-            "confidence": confidence.loc[trade_date], "is_final": True,
+            "confidence": confidence.loc[trade_date],
             "model_version": params_hash, "updated_at": now,
         })
     if write and rows:
@@ -567,6 +656,21 @@ def build_valuation_dimension(
                     skip_null_updates=False, only_if_changed=True)
     return {"rows": len(rows), "dates": len(score.index),
             "state_rows": 0 if (market == "CN" and cn_state_disabled) else int(gate_passed.sum())}
+
+
+def _purge_stale_dimension_rows(conn, dimension_code, market, params_hash) -> int:
+    """全量重算时删除「本轮不再产出」的旧口径行（UPSERT 不会删行）。
+
+    典型场景：min_periods 落地后前 249 日不再有维度行，但库里旧行仍在，
+    且 model_version 是上一版 → 消费端会读到同一维度两套口径（§2.4 规则 4/5）。
+    ⚠ 只在 `backfill + write` 时调用；与后续写入同事务，生产者异常会整体 rollback。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM regime.dimension_value WHERE dimension_code=%s AND market=%s "
+            "AND model_version IS DISTINCT FROM %s",
+            (dimension_code, market, params_hash))
+        return cur.rowcount
 
 
 def _active_dimensions(conn):
@@ -614,6 +718,11 @@ def build_all_dimensions(conn, start=None, end=None, backfill=False, write=True,
             except RuntimeError as e:
                 print(f"  ⚠ L2 {dimension_code} 跳过：{e}")
                 continue
+            if backfill and write:
+                n_purged = _purge_stale_dimension_rows(
+                    conn, dimension_code, market_code, dimension_params_hash)
+                if n_purged:
+                    print(f"  ⚠ L2 {market_code} {dimension_code} 清理旧口径残留 {n_purged} 行")
             if dimension_code == DIM_BREADTH:
                 dimension_stats = build_breadth_dimension(
                     conn, dimension_config, dimension_params_hash, market_code,
@@ -639,6 +748,292 @@ def build_all_dimensions(conn, start=None, end=None, backfill=False, write=True,
     return stats
 
 
+# ── §5.1 契约自检（只读，不写库、不改口径）────────────────────────────────────
+def audit_breadth_contract(conn, markets=("CN", "HK"), end=None) -> dict:
+    """按 `doc/market_state_data_architecture.md` §5.1 核验「DIM.BREADTH 能否算对」。
+
+    只读三件事，不改变任何数据 / 口径：
+      ① L1：11 个宽度原子是否登记、采集、分位化，版本与新鲜度是否对齐；
+      ② L2：字典成员 / sign / state_bands / params / 代表 / 门禁是否自洽；
+      ③ 落库：dimension_value 版本是否一致、最新一日四道出档门禁为何通过或未通过。
+
+    L1 侧唯一真相源（成员集合 / 制度起点 / 分位窗口）用 `importlib` **惰性动态导入**
+    `market_state_daily`（与 `collector_runtime.run_module` 同款），避免与该文件 run() 里
+    的反向 import 形成静态导入环；运行时两处都是函数内导入，不成环。
+    所有查询带实体过滤或时间下界（AGENTS.md 计算任务资源约定）。
+    """
+    msd = importlib.import_module("market_state_daily")
+
+    end = end or datetime.date.today()
+    findings: list[dict] = []
+
+    def add(market, code, level, message, **evidence):
+        findings.append({"market": market, "code": code, "level": level,
+                         "ok": level == "PASS", "message": message,
+                         "evidence": evidence})
+
+    try:
+        dim, params_hash = load_dimension_dict(conn, DIM_BREADTH)
+    except RuntimeError as exc:
+        add("ALL", "L2.DICT", "FAIL", f"dimension_dict 不可用：{exc}")
+        return {"findings": findings, "summary": {"PASS": 0, "WARN": 0, "FAIL": 1}}
+
+    members = dim["members"]
+    codes = [m["code"] for m in members]
+    params = dim["params"]
+    expected = set(msd.BREADTH_ROLLING_CODES)
+    add("ALL", "L2.MEMBERS", "PASS" if set(codes) == expected else "FAIL",
+        f"members {len(codes)} 个 / L1 宽度集合 {len(expected)} 个",
+        missing=sorted(expected - set(codes)), extra=sorted(set(codes) - expected))
+
+    idf = _read_sql(
+        "SELECT indicator_code, market_scope, direction, params_hash, is_active "
+        "FROM regime.indicator_dict WHERE indicator_code = ANY(%s)",
+        conn, params=[codes])
+    idict = {r["indicator_code"]: r for _, r in idf.iterrows()}
+
+    def in_scope(indicator_code, market):
+        r = idict.get(indicator_code)
+        return r is not None and r["market_scope"] in (market, "CN+HK", "GLOBAL")
+
+    absent = [c for c in codes if c not in idict or not bool(idict[c]["is_active"])]
+    add("ALL", "L1.DICT", "PASS" if not absent else "FAIL",
+        f"indicator_dict 登记 {len(idict)}/{len(codes)} 个宽度成员", inactive=absent)
+
+    bad_sign = [
+        {"code": m["code"], "sign": m.get("sign"), "direction": idict[m["code"]]["direction"]}
+        for m in members if m["code"] in idict
+        and int(m.get("sign", 1)) != (-1 if idict[m["code"]]["direction"] == "high_risk" else 1)
+    ]
+    add("ALL", "L2.SIGN", "PASS" if not bad_sign else "FAIL",
+        "members[].sign 与 indicator_dict.direction 一致（§5.1 输入段）", mismatch=bad_sign)
+
+    bands_by_market = dim["state_bands"]
+    for market in markets:
+        b = bands_by_market.get(market) if isinstance(bands_by_market, dict) else None
+        ok = bool(b) and len(b) == 4 and all(float(b[i]) < float(b[i + 1]) for i in range(3))
+        add(market, "L2.BANDS", "PASS" if ok else "FAIL",
+            f"state_bands[{market}] 按市场冻结、4 个升序切点", bands=b)
+    add("ALL", "L2.LABELS", "PASS" if len(dim["state_labels"]) == 5 else "FAIL",
+        "state_labels 五档", labels=dim["state_labels"])
+
+    required = ("coverage_min", "dispersion_max", "weight_cap", "rep_coverage_min", "pct_window")
+    missing_params = [k for k in required if k not in params]
+    add("ALL", "L2.PARAMS", "PASS" if not missing_params else "FAIL",
+        "门禁与聚合参数齐备", missing=missing_params)
+    add("ALL", "L1.PCT_WINDOW",
+        "PASS" if int(params.get("pct_window", -1)) == msd.BREADTH_PCT_WINDOW else "FAIL",
+        f"分位窗口与 L1 一致（{msd.BREADTH_PCT_WINDOW} 有效观测）",
+        dict_value=params.get("pct_window"))
+    unregistered = [k for k in ("flag_gap", "flag_extreme") if k not in params]
+    add("ALL", "L2.PARAMS_HASH", "PASS" if not unregistered else "WARN",
+        "flags 判据阈值已登记字典并纳入 params_hash" if not unregistered
+        else "flags 判据阈值未登记字典，改阈值不触发重算（§2.2）",
+        using_module_constants=unregistered)
+    short_sample = "quality_sample" in params and "min_periods" in params
+    add("ALL", "L2.SHORT_SAMPLE", "PASS" if short_sample else "WARN",
+        "宽度已接入 n_sample < 750 短样本降置信（§2.4 规则 6）" if short_sample
+        else "宽度尚未接入 n_sample < 750 短样本降置信（§2.4 规则 6）",
+        dictionary_keys=[k for k in ("quality_sample", "min_periods") if k in params])
+    add("ALL", "L1.PIT", "PASS" if msd.PIT_UNIVERSE_READY else "WARN",
+        "PIT 成分池未重建：宽度分位带 survivorship_bias / quality=low，禁止跨年代水位比较",
+        pit_universe_ready=msd.PIT_UNIVERSE_READY)
+    scope = str(params.get("dispersion_scope", "all"))
+    c_on = scope == "non_flags_only"
+    add("ALL", "L2.DISPERSION_NORM", "PASS" if c_on else "WARN",
+        "dispersion 已按方案 C 排除 flags_only 诊断成员" if c_on
+        else "dispersion 仍按全体成员计算（阶段 3 方案 C 未启用）",
+        dispersion_scope=scope,
+        formula="dispersion(core) * sqrt(core_valid/10)" if c_on
+                else "dispersion(all) * sqrt(valid/10)")
+
+    for market in markets:
+        eligible = [c for c in codes if in_scope(c, market)]
+        reps = [m["code"] for m in members
+                if m.get("representative") and not m.get("flags_only")
+                and in_scope(m["code"], market)]
+        flags_only = [m["code"] for m in members if m.get("flags_only")]
+        add(market, "L2.REPS", "PASS" if len(reps) == (5 if market == "CN" else 4) else "FAIL",
+            f"有效族代表 {len(reps)} 个（HK 自动少 LIMIT_NET 族）", reps=reps,
+            expected_members=len(eligible), flags_only=flags_only)
+
+        w = min(1.0 / len(reps), float(params.get("weight_cap", 0.25))) if reps else 0.0
+        cap_active = bool(reps) and w < 1.0 / len(reps) - 1e-12
+        add(market, "L2.WEIGHT_CAP", "PASS" if cap_active else "WARN",
+            "weight_cap 对当前代表数不改变权重（§5.1 称「有名无实的护栏」）"
+            if not cap_active else "weight_cap 生效", per_rep_weight=round(w, 4))
+
+        # L1 原子：采集 / 分位化 / 版本
+        cov = _read_sql(
+            "SELECT indicator_code, count(*) AS n, min(trade_date) AS d0, max(trade_date) AS d1, "
+            " count(raw_value) AS n_raw, count(percentile) AS n_pct, "
+            " min(model_version) AS v0, max(model_version) AS v1, "
+            " count(*) FILTER (WHERE model_version IS NULL) AS n_nullver, "
+            " count(*) FILTER (WHERE percentile IS NOT NULL "
+            "   AND (extra ->> %s)::numeric < %s) AS n_short_leak, "
+            " count(*) FILTER (WHERE percentile IS NULL "
+            "   AND (extra ->> %s)::numeric >= %s) AS n_long_gap "
+            "FROM regime.indicator_value WHERE market=%s AND indicator_code=ANY(%s) "
+            " AND trade_date >= %s GROUP BY 1",
+            # ⚠ 占位符按 SQL 文本出现顺序替换：SELECT 里的 4 个在 WHERE 的 3 个之前。
+            conn, params=["n_sample", msd.BREADTH_PCT_MIN_PERIODS,
+                          "n_sample", msd.BREADTH_PCT_MIN_PERIODS,
+                          market, codes, DATA_START[market]])
+        by_code = {r["indicator_code"]: r for _, r in cov.iterrows()}
+        detail, problems = [], []
+        for c in eligible:
+            r = by_code.get(c)
+            if r is None:
+                problems.append(f"{c}: 无 indicator_value 行")
+                continue
+            ver_ok = (r["v0"] == r["v1"] == idict[c]["params_hash"] and int(r["n_nullver"]) == 0)
+            # min_periods 落地后，短样本期 percentile 为 NULL 是**预期**，不是缺口。
+            # 真正的不一致：短样本期仍给了分位，或样本够了却没给分位。
+            pct_ok = (int(r["n_short_leak"]) == 0 and int(r["n_long_gap"]) == 0)
+            detail.append(f"{c}={int(r['n'])}行/{str(r['d0'])[:10]}~{str(r['d1'])[:10]}"
+                          f"/分位{int(r['n_pct'])}/NULL{int(r['n']) - int(r['n_pct'])}")
+            if not (ver_ok and pct_ok):
+                problems.append(
+                    f"{c}: min_periods一致={pct_ok}(短样本泄漏{int(r['n_short_leak'])}"
+                    f"/长样本缺口{int(r['n_long_gap'])}) 版本一致={ver_ok}")
+        add(market, "L1.ATOM", "PASS" if not problems else "FAIL",
+            f"{len(eligible) - len(problems)}/{len(eligible)} 个宽度原子已采集并按 min_periods 分位化",
+            problems=problems, detail=detail)
+
+        latest_iv = max((r["d1"] for r in by_code.values() if r["d1"] is not None), default=None)
+        quote_table = "a_daily_quote" if market == "CN" else "hk_daily_quote"
+        latest_quote = _read_sql(
+            f"SELECT max(trade_date) AS d FROM {quote_table} WHERE trade_date >= %s",
+            conn, params=[end - datetime.timedelta(days=30)]).iloc[0]["d"]
+        iv_s = str(latest_iv)[:10] if latest_iv is not None else None
+        qt_s = str(latest_quote)[:10] if latest_quote is not None else None
+        add(market, "L1.FRESHNESS", "PASS" if iv_s == qt_s else "WARN",
+            f"L1 最新 {iv_s} / 行情最新 {qt_s}", l1=iv_s, quote=qt_s)
+
+        # L2 落库：版本 + 最新一日门禁复算
+        dv = _read_sql(
+            "SELECT count(*) AS n, min(trade_date) AS d0, max(trade_date) AS d1, "
+            " count(state) AS n_state, "
+            " count(*) FILTER (WHERE model_version IS DISTINCT FROM %s) AS n_ver_bad "
+            "FROM regime.dimension_value WHERE dimension_code=%s AND market=%s",
+            conn, params=[params_hash, DIM_BREADTH, market]).iloc[0]
+        add(market, "L2.VERSION", "PASS" if int(dv["n_ver_bad"]) == 0 else "FAIL",
+            f"dimension_value {int(dv['n'])} 行 / 出档 {int(dv['n_state'])} 日，"
+            f"model_version 全部=={params_hash}", mismatched=int(dv["n_ver_bad"]))
+
+        last = _read_sql(
+            "SELECT trade_date, score, state, coverage, dispersion, confidence, flags, blocks, contrib "
+            "FROM regime.dimension_value WHERE dimension_code=%s AND market=%s AND trade_date<=%s "
+            "ORDER BY trade_date DESC LIMIT 1",
+            conn, params=[DIM_BREADTH, market, end])
+        if last.empty:
+            add(market, "L2.LATEST_GATE", "FAIL", "dimension_value 无行")
+            continue
+        lr = last.iloc[0]
+        flags = _parse_jsonb(lr["flags"]) or {}
+        # 方案 C 后归一化因子改用 core_valid，无法从 coverage 反推；生产者已把实测值
+        # 写进 flags.dispersion_norm，自检直接读它，保证门禁复算逐值精确。
+        disp_norm = flags.get("dispersion_norm")
+        if disp_norm is not None:
+            disp_norm = float(disp_norm)
+        block_map = _parse_jsonb(lr["blocks"]) or {}
+        reps_ok = sum(1 for v in block_map.values()
+                      if isinstance(v, dict) and v.get("score") is not None)
+        rep_cov = reps_ok / len(reps) if reps else 0.0
+        gates = {
+            "score_not_null": lr["score"] is not None and not pd.isna(lr["score"]),
+            "coverage": float(lr["coverage"]) >= float(params["coverage_min"]),
+            "dispersion_norm": disp_norm is not None and disp_norm <= float(params["dispersion_max"]),
+            "rep_coverage": rep_cov >= float(params.get("rep_coverage_min", 0.0)),
+        }
+        consistent = (lr["state"] is not None) == all(gates.values())
+        add(market, "L2.LATEST_GATE", "PASS" if consistent else "FAIL",
+            f"{str(lr['trade_date'])[:10]} score={lr['score']} state={lr['state']} "
+            f"confidence={lr['confidence']}", gates=gates,
+            dispersion_norm=None if disp_norm is None else round(disp_norm, 2),
+            rep_coverage=round(rep_cov, 4),
+            failed=[k for k, v in gates.items() if not v])
+        shape_ok = isinstance(flags, dict) and "structural" in flags
+        add(market, "L2.FLAGS_SHAPE", "PASS" if shape_ok else "FAIL",
+            "flags 为 §2.3.3 的 dict 形状且含 structural 键（下游不得按 list 遍历）",
+            flags_type=type(flags).__name__)
+        if lr["state"] is None:
+            avail = {"low_coverage", "high_dispersion", "short_sample",
+                     "no_data", "missing_representative"}
+            has_avail = isinstance(flags, dict) and bool(set(flags) & avail)
+            add(market, "L2.FLAGS_AVAILABILITY", "PASS" if has_avail else "WARN",
+                "未出档行须在 flags 写出被哪道门禁卡住", flags=flags)
+
+        # contrib 符号越界统计（§2.3.3：正负各 top3）
+        cdf = _read_sql(
+            "SELECT trade_date, contrib FROM regime.dimension_value "
+            "WHERE dimension_code=%s AND market=%s AND trade_date >= %s",
+            conn, params=[DIM_BREADTH, market, DATA_START[market]])
+        total = bad = 0
+        for _, r in cdf.iterrows():
+            ct = _parse_jsonb(r["contrib"])
+            if not isinstance(ct, dict):
+                continue
+            for side, wrong in (("pos", lambda d: d <= 0), ("neg", lambda d: d >= 0)):
+                for item in ct.get(side, []) or []:
+                    total += 1
+                    if wrong(float(item.get("delta", 0))):
+                        bad += 1
+        add(market, "L2.CONTRIB_SIGN", "PASS" if bad == 0 else "WARN",
+            f"contrib 条目 {total} 个，符号越界 {bad} 个"
+            + ("；字典登记 contrib_sign_split=true 并重算 L2 后修复" if bad else ""),
+            contrib_sign_split=bool(params.get("contrib_sign_split", False)))
+
+    n_old = _read_sql(
+        "SELECT count(*) AS n FROM regime.indicator_value "
+        "WHERE indicator_code=%s AND market=%s AND trade_date < %s "
+        " AND (raw_value IS NOT NULL OR percentile IS NOT NULL)",
+        conn, params=["BREADTH.LIMIT_NET", "CN", msd.LIMIT_EFFECTIVE_FROM]).iloc[0]["n"]
+    add("CN", "L1.LIMIT_GUARD", "PASS" if int(n_old) == 0 else "FAIL",
+        f"LIMIT_NET 制度起点 {msd.LIMIT_EFFECTIVE_FROM} 前残留非空 {int(n_old)} 行"
+        + ("；护栏前值会污染 1996-12-16 起 2520 观测滚动分位" if int(n_old) else ""),
+        residual_rows=int(n_old))
+
+    lower = min(DATA_START.values())
+    fin = _read_sql(
+        "SELECT count(*) FILTER (WHERE extra ->> %s IS NOT NULL) AS n_sample "
+        "FROM regime.indicator_value WHERE indicator_code=ANY(%s) AND trade_date >= %s",
+        conn, params=["n_sample", codes, lower]).iloc[0]
+    add("ALL", "L1.N_SAMPLE", "PASS" if int(fin["n_sample"]) > 0 else "WARN",
+        f"indicator_value.extra.n_sample 有值 {int(fin['n_sample'])} 行"
+        + ("；宽度为 0 → 短样本降置信缺数据源，无法在 L2 接入"
+           if int(fin["n_sample"]) == 0 else ""),
+        rows_with_n_sample=int(fin["n_sample"]))
+
+    summary = {k: sum(1 for f in findings if f["level"] == k)
+               for k in ("PASS", "WARN", "FAIL")}
+    return {"findings": findings, "summary": summary,
+            "params_hash": params_hash, "dimension_dict": dim}
+
+
+def format_breadth_audit(report: dict) -> str:
+    """把自检结果排成可读报告（不改数值，仅展示）。"""
+    s = report["summary"]
+    lines = [f"§5.1 DIM.BREADTH 契约自检：PASS {s['PASS']} / WARN {s['WARN']} / FAIL {s['FAIL']}"
+             f"（只读，未写库）"]
+    current = None
+    for f in report["findings"]:
+        if f["market"] != current:
+            current = f["market"]
+            lines.append(f"\n【{current}】")
+        lines.append(f"  [{f['level']:<4}] {f['code']:<24} {f['message']}")
+        for key, value in f["evidence"].items():
+            if key == "detail" and isinstance(value, list):
+                lines.append("         detail:")
+                lines.extend(f"           - {x}" for x in value)
+                continue
+            text = str(value)
+            if len(text) > 220:
+                text = text[:217] + "..."
+            lines.append(f"         {key}: {text}")
+    return "\n".join(lines)
+
+
 def run(codes=None, ctx=None, market=None, start=None, end=None,
         backfill=False, write=True) -> dict:
     """兼容 `market_scheduler` 的 run_module 调用约定。"""
@@ -654,6 +1049,8 @@ def main():
     ap.add_argument("--write", action="store_true", help="写 regime.dimension_value")
     ap.add_argument("--backfill", action="store_true", help="全历史")
     ap.add_argument("--derived", action="store_true", help="打印派生量（不落表）")
+    ap.add_argument("--audit", action="store_true",
+                    help="§5.1 宽度契约自检（只读，不写库）")
     ap.add_argument("--market", choices=["CN", "HK"])
     ap.add_argument("--dim", action="append", dest="dimension_codes",
                     help="只算指定维度（可重复，如 --dim DIM.VALUATION）；默认全部启用维度")
@@ -663,6 +1060,10 @@ def main():
     markets = [args.market] if args.market else ["CN", "HK"]
     end = args.end or datetime.date.today()
     with get_conn() as conn:
+        if args.audit:
+            print(format_breadth_audit(
+                audit_breadth_contract(conn, markets=markets, end=end)))
+            return
         if args.derived:
             for market_code in markets:
                 window_start = args.start or DATA_START[market_code]

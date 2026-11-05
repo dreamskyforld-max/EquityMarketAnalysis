@@ -1678,7 +1678,6 @@ CREATE TABLE IF NOT EXISTS regime.indicator_value (
     raw_value       NUMERIC(20,6),
     percentile      NUMERIC(6,2),                      -- 0-100 历史分位（原始值分位，未做方向调整）
     extra           JSONB,                             -- 明细（如顶部信号命中清单）
-    is_final        BOOLEAN         NOT NULL DEFAULT FALSE,  -- FALSE=当日初步值（源未齐），T+1 全链路重算后置 TRUE
     model_version   VARCHAR(16),                       -- 本行口径（= indicator_dict.params_hash）
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
 
@@ -1989,7 +1988,6 @@ CREATE TABLE IF NOT EXISTS regime.dimension_value (
     contrib         JSONB,                              -- {pos:[{code,delta}],neg:[{code,delta}]} 正负各 top3
     flags           JSONB,                              -- 结构性背离/极端（如 NEW_HIGH_LOW_20 vs _60）
     confidence      VARCHAR(8),                         -- 高/中/低
-    is_final        BOOLEAN         NOT NULL DEFAULT FALSE, -- FALSE=当日初步值（上游原子未齐）；T+1 全链路重算
     model_version   VARCHAR(16),                        -- 口径版本（= dimension_dict.params_hash）
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
 
@@ -2035,7 +2033,6 @@ CREATE TABLE IF NOT EXISTS regime.business_value (
     status         VARCHAR(12),                         -- 已确认 / 待确认
     confidence     VARCHAR(8),                          -- 高/中/低（宽度确认等外部调节项写这里）
     detail         JSONB,                               -- {candidate,evidence,binding_constraint,trigger,spike,missing}；MARKET_TEMPERATURE={components,quality,coverage,dispersion,low_agreement,quantiles,composition_version}（components/quantiles 无条件必输出）
-    is_final       BOOLEAN         NOT NULL DEFAULT FALSE, -- FALSE=当日初步值（源未齐），T+1 重算后置 TRUE
     model_version  VARCHAR(16),
     updated_at     TIMESTAMPTZ     DEFAULT NOW(),
 
@@ -2050,7 +2047,6 @@ COMMENT ON COLUMN regime.business_dict.output_schema IS '输出字段说明。�
 COMMENT ON COLUMN regime.business_value.since_date IS '当前状态的首次进入日（状态机产出）；配合 dwell_days 判断状态是否已稳定';
 COMMENT ON COLUMN regime.dimension_value.blocks IS '块级分数 {"块名":{"score":..,"coverage":..}}。SYSTEMIC_STRESS.trigger 的唯一数据来源——成员级 contrib 拿不到「信用块取最紧」的语义，没有本列只能用成员 top3 反推';
 COMMENT ON COLUMN regime.business_value.detail   IS '增量信息集中在此：MARKET_REGIME={candidate,evidence,breadth_confirmation}；MARKET_TEMPERATURE={components,quality,coverage,dispersion,low_agreement,quantiles,composition_version}（components 与 quantiles 无条件必输出；quality=low 照常发布但须标注；不落 history_stats，前瞻验证走离线报告）；SYSTEMIC_STRESS={trigger,spike,blocks}（压力 70 分时「信用在扩」还是「波动在冲」处置不同）；RISK_BUDGET={binding_constraint,raw_cap,inputs,constrained_by,missing}（比数字更有用的是「被什么卡住的」）';
-COMMENT ON COLUMN regime.business_value.is_final IS 'FALSE=当日初步值（18:45 计算时中债/事件类源尚未落库，T 日口径不完整），T+1 重算后置 TRUE。消费端展示终值、调试看初步值；不得把 is_final=FALSE 的值当定论';
 
 CREATE INDEX IF NOT EXISTS idx_biz_value_date ON regime.business_value (market, trade_date DESC);
 
@@ -2165,15 +2161,11 @@ ALTER TABLE regime.indicator_dict  ADD COLUMN IF NOT EXISTS params_hash VARCHAR(
 ALTER TABLE regime.indicator_dict  ADD COLUMN IF NOT EXISTS breaks      JSONB;
 ALTER TABLE regime.signal_dict     ADD COLUMN IF NOT EXISTS market_scope VARCHAR(16) NOT NULL DEFAULT 'CN+HK';
 ALTER TABLE regime.signal_dict     ADD COLUMN IF NOT EXISTS params_hash  VARCHAR(16);
-ALTER TABLE regime.indicator_value ADD COLUMN IF NOT EXISTS is_final      BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE regime.indicator_value ADD COLUMN IF NOT EXISTS model_version VARCHAR(16);
-ALTER TABLE regime.dimension_value ADD COLUMN IF NOT EXISTS is_final      BOOLEAN NOT NULL DEFAULT FALSE;
 
 COMMENT ON COLUMN regime.indicator_dict.params_hash  IS '原子指标口径指纹（分位窗口 / min_periods / 极性 / 公式版本）。变化必须触发该指标历史重算；与 dimension_dict.params_hash / business_dict.params_hash 同为「口径变更」的唯一信号';
 COMMENT ON COLUMN regime.indicator_dict.breaks       IS '制度/源断点 [{date, reason}]（注册制、涨跌幅规则变更、北向 2024-08 停披露、港股卖空 2026-06 起等）。断点前后的分位**不可比**，前端须按断点分段显示；不登记的断点会被使用者误读成市场信号';
-COMMENT ON COLUMN regime.indicator_value.is_final    IS 'FALSE=当日初步值（T 日 18:45 计算时中债/事件类源尚未落库）。⚠ T+1 源补齐后必须沿 L1→L2→L3 **全链路**重算并覆盖——只重算 business_value 会让维度分与业务值来自不同口径';
 COMMENT ON COLUMN regime.indicator_value.model_version IS '本行所用原子口径（= indicator_dict.params_hash）';
-COMMENT ON COLUMN regime.dimension_value.is_final    IS 'FALSE=当日初步值（上游原子为初步值）。同 indicator_value.is_final：T+1 必须全链路重算';
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 20. 多空力量回合日表（force dynamics）

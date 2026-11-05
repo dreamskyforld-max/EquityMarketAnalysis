@@ -118,9 +118,10 @@ L3 业务指标   business_value      方向 / 温度 / 压力 / 预算，一市
 **指标值存储表**：indicator_value -- 原子指标值、dimension_value -- 维度指标值、business_value -- 业务指标值。  
 **字段说明**：字段说明回答的是「读到这一列时，它是什么、拿它可以做什么、什么时候不可用」，不只是类型和值域。
 
-> **拿到任何一行，先做两件事**：
-> ① `is_final = FALSE` → 当日初步值（上游源未齐），**不能当定论**；
-> ② `model_version` 与对应字典的 `params_hash` 不等 → 旧口径数据（版本映射见 §2.2）。
+> **拿到任何一行，先做一件事**：
+> `model_version` 与对应字典的 `params_hash` 不等 → 旧口径数据（版本映射见 §2.2）。
+> ⚠ v2.1.12 起三张值表已删除 `is_final` 列：全项目零消费方、T+1 置终值流程从未实现。
+> 「口径新旧」由 `model_version` 判定，「值是否刷新过」由 `updated_at`（`only_if_changed=True`）判定。
 >
 > 三张值表都是长表，用主键 `(编码, market, trade_date)` 点查。⚠ `market` 是**市场键**（该行由哪个市场的计算产出），不是标的所在地；哪些市场有值，由字典的 `market_scope` 声明。一行完整样例：L1 见 §4、L2 见 §5.2、L3 见本节末尾。
 
@@ -134,7 +135,7 @@ L3 业务指标   business_value      方向 / 温度 / 压力 / 预算，一市
 | 知道分数是谁拉高 / 拉低的 | `contrib` | 成员级 top3，**反推不出块级语义**（那是 `blocks` 的职责） |
 | 知道是哪一块在紧张 | `blocks` | 只有 L2 有；`SYSTEMIC_STRESS.trigger` 的唯一来源 |
 | 知道判定依据 / 被什么卡住 | `detail` | 只有 L3 有，键按 `biz_code` 不同（见 2.3.4） |
-| 判断数据新旧 / 是否终值 | `model_version`、`is_final` | 见本节开头 |
+| 判断数据新旧 / 口径版本 | `model_version` | 见本节开头；`is_final` 列已删除 |
 
 #### 2.3.2 `regime.indicator_value`（L1 原子读数）
 
@@ -146,7 +147,6 @@ L3 业务指标   business_value      方向 / 温度 / 压力 / 预算，一市
 | `raw_value` | `NUMERIC(20,6)` | 指标原始值，单位见 `indicator_dict.unit` | 展示绝对值、画原始值曲线；量纲各异，**不要跨指标比较原始值** |
 | `percentile` | `NUMERIC(6,2)` | 0–100 的 as-of 历史分位 | 跨指标可比的公共刻度，L2 合成与信号族都读它。NULL = 未达 `min_periods`，或该指标在 `NO_PERCENTILE` 集合内（§2.4.1） |
 | `extra` | `JSONB` | 质量与明细 | 判断样本是否可信、是否需要标注偏差；形状见下 |
-| `is_final` | `BOOLEAN` | FALSE = 当日初步值，T+1 全链路重算后置 TRUE | 消费端展示终值、调试看初步值 |
 | `model_version` | `VARCHAR(16)` | `= indicator_dict.params_hash` | 判口径新旧 |
 
 `extra` 的实际形状与键含义：
@@ -172,12 +172,11 @@ L3 业务指标   business_value      方向 / 温度 / 压力 / 预算，一市
 | `score` | `NUMERIC(6,2)` | 0–100，已按该维度 `polarity` 统一方向 | 画维度分曲线、作为 L3 连续型业务指标的输入 |
 | `state` | `VARCHAR(12)` | 五档定性，标签见 `dimension_dict.state_labels` | 展示一句结论。**NULL = 未出档**（`coverage` / `dispersion` 门禁未过，或短样本约束期），不是「中性」（§2.4.6） |
 | `coverage` | `NUMERIC(5,4)` | 0–1，有效成员 / 应有成员 | 判断是否"只有半个维度"；分母按 `market_scope` 计 |
-| `dispersion` | `NUMERIC(6,2)` | 成员分位的标准差 | 判断是否内部严重背离；门禁用 `dispersion_norm = dispersion × sqrt(n/10)` |
+| `dispersion` | `NUMERIC(6,2)` | **参与合成成员**（排除 `flags_only`）分位的标准差 | 判断是否内部严重背离；门禁用 `dispersion_norm = dispersion × sqrt(core_valid/10)`（方案 C） |
 | `blocks` | `JSONB` | **块级分数**：每个分块各自的分数与覆盖度 | 回答「是哪一块在动」；`SYSTEMIC_STRESS.trigger` 的唯一来源，形状见下 |
 | `contrib` | `JSONB` | **成员贡献**：正负各 top3 | 下钻看「谁把分数拉高 / 拉低」，形状见下 |
 | `flags` | `JSONB` | 结构性背离标记 + 可用性标记 | 判断这一行能否当结论、哪些信息不能被平均抹掉，形状见下 |
 | `confidence` | `VARCHAR(8)` | 高 / 中 / 低 | 低置信时不得按确定结论使用 |
-| `is_final` | `BOOLEAN` | FALSE = 当日初步值 | 见本节开头 |
 | `model_version` | `VARCHAR(16)` | `= dimension_dict.params_hash` | 判口径新旧 |
 | `updated_at` | `TIMESTAMPTZ` | 写入时间 | 排查重算 / 补数 |
 
@@ -208,7 +207,8 @@ L3 业务指标   business_value      方向 / 温度 / 压力 / 预算，一市
 | 可用性（本文件扩展） | `short_sample`、`n_sample`、`anchor_window`、`no_data`、`low_coverage`、`high_dispersion` | 判断这一行能否当结论、为什么 `state` 为 NULL；键名由生产端按 §5.2 的门禁与短样本约束约定 |
 
 > ⚠ **本表没有 `quality` / `extra` 列**（它们属于 L1）。可用性一律用 `confidence` + `flags` 承载；写 `quality='low'` 会落库失败。
-> ⚠ **两处口径尚未固定，实现前须处理**：① `flags` 承载可用性是**对 DDL 原注释的扩展用法**，要正式化应更新 `sql/schema.sql` 的列注释，或走 schema 变更新增列；② `blocks` 是 JSONB、无 schema 约束，DDL 示例为 `{"块名":{"score","coverage"}}`，而 §5.2 的估值样例用了 `{"anchor":..,"check":..}`。形状须由生产端固定、写进 `dimension_dict.remark` 并用测试钉住，否则下游 `trigger` 的解析会漂。
+> ✅ **v2.1.11（2026-11-05）两处口径已固定**（写入 `dimension_dict.remark`，由 `tests/test_breadth_v2111.py` 钉住）：① `DIM.BREADTH.flags` 为 **dict** —— `structural: list[str]` 恒存在（结构性背离文案），`n_sample: int`（族代表中最小的有效观测数），仅命中时写 `low_coverage` / `high_dispersion` / `missing_representative` / `short_sample` / `no_data: true`；旧的字符串数组形状已废止，**下游不得按 list 遍历**。② `blocks` 按维度区分：宽度每族 `{score, coverage, representative}`，估值 `{anchor:{code,percentile}, check:{n,divergent}}`；`DIM.VALUATION.flags` 为 dict（`n_sample` / `anchor_window` / 可选标记）。
+> ⚠ `sql/schema.sql` / `regime_schema.py` 的 `flags` 列注释仍是 DDL 原意（仅结构性背离），可用性标记属本文件定义的扩展用法，DDL 注释待同步（不改变表结构）。
 
 #### 2.3.4 `regime.business_value`（L3 业务读数）
 
@@ -224,7 +224,7 @@ L3 业务指标   business_value      方向 / 温度 / 压力 / 预算，一市
 | `status` | `VARCHAR(12)` | 已确认 / 待确认 | 初始化段为「待确认」，`RISK_BUDGET` 据此保守取值 |
 | `confidence` | `VARCHAR(8)` | 高 / 中 / 低 | 宽度确认等外部调节项写这里 |
 | `detail` | `JSONB` | 增量信息，键按 `biz_code` 见下表 | 「被什么卡住的」「为什么判定」比数字更有用，见下表 |
-| `is_final` / `model_version` | `BOOLEAN` / `VARCHAR(16)` | 终值标记 / 口径版本 | 见本节开头 |
+| `model_version` | `VARCHAR(16)` | 口径版本 | 见本节开头 |
 
 **`level` 与 `score` 按 `biz_code` 的实际含义**（使用者最容易读错的地方）：
 
@@ -264,7 +264,6 @@ L3 一行样例（市场温度）：
                            "DIM.FLOW": 48.6, "DIM.BREADTH": 45.6},
              "quantiles": [37.5, 46.2, 53.8, 62.5],
              "quality": "low", "composition_version": "v1"},
-  "is_final": true,
   "model_version": "e5f6a7b8"
 }
 ```
@@ -297,7 +296,7 @@ L3 一行样例（市场温度）：
 | 3 | 出档门禁 | `coverage` 或 `dispersion_norm` 未达门禁 → 只出 `score` + `low_confidence`，**不输出 `state`**；三个参数见下方「规则涉及的参数」 | 覆盖不足说明「半个维度」，成员严重背离说明平均分不具代表性；宁可说不确定，不给确定的错结论 |
 | 4 | PIT / 终值 | 分位只用截至该 `trade_date` 可得的样本，落库即终值，禁止刷写历史行；全量重算只有**两类合法触发**：① `params_hash` 变更（口径变了）；② **参考样本集变更**（历史数据回补 / 数据起点护栏解除）。两者都须递增 `model_version`；②的判定与例外见 §2.2 末注 | 否则今天回看历史维度分与当时发布的值不是同一个数，快照不可复现；`model_version` 让新旧口径可区分 |
 | 5 | 幂等与重算粒度 | L1 可按单日单指标重算，**但仅限参考样本集未变的情形**；`expanding` 类指标一旦历史回补，须按指标族全量重算并递增 `model_version`，不得只补新日期（口径门禁把回补段挡在输入之外时例外）；L2 可单日重算但某日须六维全部重算；L3 状态机类必须全量重算 | 成员跨维度共享，只算一维会让 `coverage` / `dispersion` 与邻维不一致；`dwell` / `streak` 是累计量，从窗口中间以空状态起步会被重置；**`expanding` 分位的参考样本含全部历史，新增历史观测会改变每一天的排位，只写新日期会让同一序列混存新旧两套分位** |
-| 6 | 可用性 | `state IS NULL` 只能读作「未出档」；`is_final = FALSE` 不得当定论；`n_sample < 750`（= `3 × min_periods`）降置信 | 短样本分位不是「值小」而是不可信；NULL 若被当成「中性」，会把低置信读数伪装成确定结论 |
+| 6 | 可用性 | `state IS NULL` 只能读作「未出档」；`model_version` 与字典 `params_hash` 不等即旧口径；`n_sample < 750`（= `3 × min_periods`）降置信 | 短样本分位不是「值小」而是不可信；NULL 若被当成「中性」，会把低置信读数伪装成确定结论 |
 | 7 | 不可比 | 六个维度分不可横向比较或求均值；唯一合法例外是连续型业务指标先把各维 `score` 转成自身 as-of 分位 `u_i` 再等权平均；禁止跨维度雷达图 | 分位基数、聚合结构、语义都不同，宽度 60 与估值 60 没有可比性；未归一就平均会因「单锚分位」与「多次平均分位」的方差差异产生隐式权重 |
 
 **规则涉及的参数**（附属于上面的规则，不是独立索引；变更的重算范围见 §2.2）
@@ -372,7 +371,6 @@ L3 一行样例（市场温度）：
   "raw_value": 32.640000,
   "percentile": 63.40,
   "extra": {"n_sample": 2143, "survivorship_bias": true, "quality": "low"},
-  "is_final": true,
   "model_version": "b7c9d0e1"
 }
 ```
@@ -440,7 +438,8 @@ L3 一行样例（市场温度）：
 
 本维度专用参数（`state_bands` / `state_labels` / `flags_only` / `representative` / 标定判据组）的**定义见「计算模型」的「本环节参数」表**；通用参数（`min_periods` / `pct_window` / `winsor` / `coverage_min` / `dispersion_max` / `weight_cap`）定义在 §2.4，其中 `winsor` 当前为未生效预留键。下方是 `dimension_dict` 一行的**字典种子**——参数写入数据库的物化形态，**不是定义**；其中通用参数的取值与 §2.4 一致，不是第二处定义。种子真源为 `tools/calibrate_breadth.py --write` 的产物（族构成、代表与切点均由离线标定写入）。
 
-**字典种子**（对应表 `regime.dimension_dict`）：
+**维度指标注册**  
+对应表为 regime.dimension_dict  
 
 ```json
 {
@@ -469,19 +468,23 @@ L3 一行样例（市场温度）：
              "min_intra_corr": 0.5, "min_pc1": 0.6, "min_decade_corr": 0.3,
              "min_construct_corr": 0.4,
              "flags_only": ["BREADTH.AMT_CONC_TOP10", "BREADTH.EQ_VS_CAP_20D"],
-             "calib_version": "v2.1.9"},
-  "params_hash": "<口径指纹>",
+             "rep_coverage_min": 1.0, "flag_gap": 15.0, "flag_extreme": 20.0,
+             "quality_sample": 750, "min_periods": 250,
+             "contrib_sign_split": true, "flags_shape": "dict",
+             "dispersion_scope": "non_flags_only",
+             "calib_version": "v2.1.12"},
+  "params_hash": "4852d3274f07f359",
   "is_active": true
 }
 ```
 
-> 只有 `representative = true` 且非 `flags_only` 的成员进 `score`，其余 `weight = 0`；`flags_only` 成员仍计入 `coverage` / `dispersion` / `contrib` / `flags`，不得静默消失。代表由 CN 标定、**两市场共用**（字典一行无法按市场存不同代表），HK 自动少一个 `LIMIT_NET` 族。⚠ `params.winsor` 是未生效预留键（§2.4 规则 1）；本种子口径与库内一致（`calib_version = v2.1.10`、`params_hash = 957c1d11c4321577`），`rep_coverage_min = 1.0` 已登记并生效（启用后须全量重算 L2，见 v1.7）。
+> 只有 `representative = true` 且非 `flags_only` 的成员进 `score`，其余 `weight = 0`；`flags_only` 成员仍计入 `coverage` / `contrib` / `flags`，但**不计入 `dispersion`**（方案 C，v2.1.12）。代表由 CN 标定、**两市场共用**（字典一行无法按市场存不同代表），HK 自动少一个 `LIMIT_NET` 族。⚠ `params.winsor` 是未生效预留键（§2.4 规则 1）；本种子口径与库内一致（`calib_version = v2.1.12`、`params_hash = 4852d3274f07f359`）。`rep_coverage_min = 1.0` 已登记并生效；v2.1.11 另登记 `flag_gap` / `flag_extreme`（纳入 `params_hash`）、`quality_sample` / `min_periods`（短样本降置信）、`contrib_sign_split`（`contrib` 按 delta 符号分组）、`flags_shape = "dict"` / `dispersion_scope = "non_flags_only"`（方案 C），详见附录 C。
 
 **输入侧数据可用性门禁（L1 层）**：
 
 - **横截面分母**：CN `n` = 当日 `change_pct IS NOT NULL` 且剔除 B 股；HK `n` = `close/prev_close` 非空、过 `HK_MIN_AMOUNT = 100000` 港元仙股门槛且 `prev_close ≠ 0`；均线 / 新高新低类另以「有 w 日以上历史」的 `ok_w` 为分母（各成员覆盖率不同）。停牌 / 新股 / 无成交靠 SQL 与 `ok_w` 隐式过滤，**无显式标志位**。⚠ 字段 100% 覆盖 ≠ 有效样本满覆盖：HK 过仙股门槛后分母本身是时变的，这是与 A/D 归一化同源的非平稳来源。
 - **两市场涨跌判定不同源**：CN 用 `change_pct`；HK 的 `ADV_RATIO` / `UP_DOWN_STRENGTH` 用 `(close/prev_close − 1)`，而 `AVG_CORR_VW` / 等权收益用 `change_pct`。同一日两市场的「上涨」定义不完全一致。
-- **制度起点**：`LIMIT_EFFECTIVE_FROM = 1996-12-16`，此前无涨跌停制度、用涨跌幅阈值判定会把早期大幅波动误记为涨跌停，故 `LIMIT_NET` 置 NaN；三个制度断点（1996-12-16 / 2020-08-24 / 2023-02-17）写入 `indicator_dict.breaks`，断点前后分位不可比。⚠ ST（±5%）无带生效日期的历史标志位，属**数据源缺口**而非代码缺口。⚠ **库内现状（2026-11-05 实测）**：`indicator_value` 的 CN `LIMIT_NET` 仍有 1990-12-20~1996-12-13 共 **1,505 行非空** `raw_value` / `percentile`（护栏加入前写入、`skip_null_updates` 未清除），会污染 1996-12-16 起 2520 观测滚动分位 →「置 NaN」描述的是**生产端代码行为，不是库内现状**；须清库 + 单指标重算 + 递增 `model_version`，步骤见附录 D。
+- **制度起点**：`LIMIT_EFFECTIVE_FROM = 1996-12-16`，此前无涨跌停制度、用涨跌幅阈值判定会把早期大幅波动误记为涨跌停，故 `LIMIT_NET` 置 NaN；三个制度断点（1996-12-16 / 2020-08-24 / 2023-02-17）写入 `indicator_dict.breaks`，断点前后分位不可比。⚠ ST（±5%）无带生效日期的历史标志位，属**数据源缺口**而非代码缺口。✅ **2026-11-05 已清理**：1,505 行护栏前残留已 DELETE，宽度族按 `tools/recalc_breadth_percentile.py` 全量重算分位并递增 `model_version`（`BREADTH_CALIB_VERSION = v2.1.11`）；「置 NaN」现已是库内现状。
 - **幸存者偏差**：`PIT_UNIVERSE_READY = False` —— 历史按当前成分股回填，已退市个股基本不在池内（按「是否仍更新」实测 CN 停更 20/5,711、HK 12/2,843；停更占比极低只说明该判据**无法量化**早年偏差，不构成「偏差严重」的证据；偏差存在由外部退市常识佐证，该判据识别不出早年已消失的标的）。偏差是**时变的、随年份衰减、方向随行情状态变化**：下跌日宽度比例被高估、早期年份最大。故所有宽度类分位写 `extra.survivorship_bias = true` / `extra.quality = 'low'`，**禁止用于跨年代水位比较，也禁止单独作为档位标定依据**；切点标定样本须报告按年代分层的档位占比。解除 = 口径变更：接入含退市股的全历史源、按 `trade_date` 重建 PIT 成分池后，递增 `model_version` 并按 §2.4 规则 4/5 全量重算。
 - 上述门禁都定义在**输入侧**、由数据口径决定而非标定决定，故不进 `dimension_dict.params` / `params_hash`；但 `HK_MIN_AMOUNT` / `LIMIT_EFFECTIVE_FROM` 一旦变更会改动 `raw_value` 与参考样本集，须按 §2.2 递增版本并全量重算 L1 + L2。
 
@@ -494,7 +497,7 @@ L3 一行样例（市场温度）：
 | 市值加权 `EQ_VS_CAP_20D` | CN 2018-01-15 / HK 2001-06 | `total_market_val` 2000 年仅 6% 覆盖；CN 属短样本，按 `n_sample` 降置信 |
 | 恒指点位 `HK.800000` | **2013-08-20** 起，未回填 | A/D 与指数背离在 2013-08 前不可算，不得用回填的行情起点冒充可算区间 |
 | 成交额集中度 | 近一年 A 股 52~68（均值 59）、港股 86~93（均值 90） | 港股小盘股流动性差、集中度天然远高 → 两侧只能各自纵向看分位，不得横比 |
-| `LIMIT_NET` | CN **制度起点** 1996-12-16；HK 无此制度 | 原「1990-12 起」在制度上不成立；⚠ 库内 1996 前 1,505 行护栏前残留非空值待清理，见「输入侧门禁」与附录 D |
+| `LIMIT_NET` | CN **制度起点** 1996-12-16；HK 无此制度 | 原「1990-12 起」在制度上不成立；✅ 1996 前 1,505 行护栏前残留已于 2026-11-05 清理并重算分位 |
 
 → **HK 回填只解除宽度类的字段覆盖限制**，估值 / 市值加权 / 恒指族仍各受其源约束；合成分按成员覆盖门禁逐层放开，不能从「宽度 2000 年起」外推为「所有指标 2000 年起」。
 
@@ -517,9 +520,9 @@ L3 一行样例（市场温度）：
 0. 读当日 11 个成员的 `percentile`，按 `members[].sign` 对齐到「高分 = 广」。
 1. 按 `members[].block` 分族，跳过 `flags_only` 与 `market_scope` 不覆盖本市场的成员（HK 自动少 `LIMIT_NET` 族），每族取 `representative = true` 的 1 个代表。
 2. **只有代表进分数**：按 `w` 加权，缺失代表按有效权重重归一化（`min_count = 1`），结果裁剪到 0–100；其余成员 `weight = 0`。
-3. 校验 / 诊断成员只做三件事：计入 `coverage` / `dispersion`、写 `contrib`（正负各 top3）、写 `flags`（结构性背离标记）；**不改 `score`**。
-4. `coverage = valid / expected`（分母按 `market_scope` 覆盖本市场的成员计数），`dispersion_norm = dispersion × sqrt(valid / 10)`；另单独算 `rep_coverage = 有效代表数 / 应有代表数`（`coverage` 分母含非代表成员，不能替代）；`confidence` 按「门禁通过且 `coverage ≥ 0.8`、`dispersion_norm ≤ 20` → 高 / 门禁通过但非高 → 中 / 未通过 → 低」三档。
-5. `state` 按 `state_bands[market]` 切五档，**仅在** `score` 非 NULL、`coverage ≥ coverage_min`、`dispersion_norm ≤ dispersion_max`、`rep_coverage ≥ rep_coverage_min` 时输出，否则 `state = NULL`，只留 `score` + 低置信（§2.4.3）；短样本降置信见规则 6，当前实现尚未把它接入本步（见下方 ⚠）。
+3. 校验 / 诊断成员只做三件事：计入 `coverage`、写 `contrib`（正负各 top3）、写 `flags`（结构性背离标记）；**不改 `score`**。⚠ **方案 C（v2.1.12）**：`dispersion` 排除 `flags_only` 诊断成员，只按参与合成的成员算 —— 它们本就不进 `score`，用它们判断「平均分是否具代表性」是逻辑错配（阶段 3 对照实验：HK 未出档率由 12.61% 降到 6.27%，档位稳定性几乎不变）。
+4. `coverage = valid / expected`（分母按 `market_scope` 覆盖本市场的成员计数），`dispersion_norm = dispersion(core) × sqrt(core_valid / 10)`；另单独算 `rep_coverage = 有效代表数 / 应有代表数`（`coverage` 分母含非代表成员，不能替代）；`confidence` 按「门禁通过且 `coverage ≥ 0.8`、`dispersion_norm ≤ 20` → 高 / 门禁通过但非高 → 中 / 未通过 → 低」三档，再按规则 6 的短样本判定压到低。
+5. `state` 按 `state_bands[market]` 切五档，**仅在** `score` 非 NULL、`coverage ≥ coverage_min`、`dispersion_norm ≤ dispersion_max`、`rep_coverage ≥ rep_coverage_min` 时输出，否则 `state = NULL`，只留 `score` + 低置信（§2.4.3）；短样本降置信已接入（只降置信，不改 `score` / `state`）。
 
 本层没有额外分支逻辑，以上五步即完整计算。
 
@@ -531,13 +534,13 @@ L3 一行样例（市场温度）：
 | `state_labels` | 极窄 / 偏窄 / 中性 / 偏广 / 极广 | 第 5 步，随 `state` 一起落库 | **决定 `state` 列写入哪个文字标签**；只影响标签文字，不改切点、不改 `score` | 数据字典枚举值，不是 UI 文案；与 `state_bands` 同步冻结 |
 | `representative` / `block` | 5 个有效族各 1 个代表（CN；HK 4 个），见字典种子 | 第 1–2 步 | **决定哪些成员进 `score`、以及族间等权的粒度**；只改 `score` 与 `blocks`，不改单个 `percentile` | 一阶差分相关中位 ≥ `min_intra_corr`、PC1 ≥ `min_pc1`、年代分层相关 ≥ `min_decade_corr` 三条判据；代表按历史长度 × PC1 载荷打分。写入字典并纳入 `params_hash`，变更触发 L2 全量重算 |
 | `flags_only` | `{BREADTH.AMT_CONC_TOP10, BREADTH.EQ_VS_CAP_20D}` | 第 1、3 步 | **把成员移出 `score`，但保留在 `coverage` / `dispersion` / `contrib` / `flags`**；改变 `score`，不改变成员是否入库 | **同期内部一致性**（不是构念效度：无外部效标 / 前瞻检验）：与核心宽度分同期相关（两市场取最小）< `min_construct_corr = 0.4`；仅检验 4 个结构族成员、不检验 3 个通过族代表。变更触发 `params_hash` 与 L2 重算 |
-| `rep_coverage_min` | 1.0（**待启用**） | 第 5 步，出档判定 | **要求全部族代表都有值才出档**；只改 `state`，不改 `score` / `coverage` | 回归 2026-11-05 实测：13,926 个出档日中 336 天缺 1 个代表仍出档、其中 98 天 `confidence=高`。字典登记该键后生产者才启用（旧种子默认 0.0 保持旧行为）；登记会改变 `params_hash`，须全量重算 L2 |
+| `rep_coverage_min` | 1.0（**已启用**） | 第 5 步，出档判定 | **要求全部族代表都有值才出档**；只改 `state`，不改 `score` / `coverage` | 回归 2026-11-05 实测：13,926 个出档日中 336 天缺 1 个代表仍出档、其中 98 天 `confidence=高`。字典已登记该键并全量重算 L2；生产者缺省 0.0 仅为兼容旧种子 |
 | 标定判据组与样本区间 | `min_intra_corr = 0.5` / `min_pc1 = 0.6` / `min_decade_corr = 0.3` / `min_construct_corr = 0.4`；`calib_start = 1996-01-01`、`calib_end = 2025-12-31` | **离线标定**（`tools/calibrate_breadth.py --write`），不在日频计算中生效 | 决定族构成、代表、切点；**不直接改日频输出**，经字典种子与 `params_hash` 传导 | ⚠ **窗口对全部标定环节生效**：族划分 / 代表 / 同期内部一致性剔除 / 切点一律只读 `[calib_start, calib_end]`；2026 起仅用于 `--probe` 样本外占比报告，不参与任何标定决策（2026-11-05 修前视）。判据与窗口由回归测试钉住；变更须重标并重算 L2 |
-| `FLAG_GAP` / `FLAG_EXTREME` | 15 / 20 | 第 3 步的 `flags` 判据 | 快慢窗分位差 >15、极端分位 <20 时写结构性背离文案；**不改 `score` / `state`** | `build_dimension_value.py` 实现常量。⚠ 未登记 `params_hash`，与 §2.2「阈值一律登记字典」不一致，属待补口径缺口 |
+| `FLAG_GAP` / `FLAG_EXTREME` | 15 / 20 | 第 3 步的 `flags` 判据 | 快慢窗分位差 >15、极端分位 <20 时写结构性背离文案；**不改 `score` / `state`** | ✅ v2.1.11 已登记 `dimension_dict.params.flag_gap` / `flag_extreme`，纳入 `params_hash`；模块常量降级为缺省回退 |
 
 > 通用参数 `min_periods` / `pct_window` / `winsor` / `coverage_min` / `dispersion_max` / `weight_cap` 定义在 §2.4 规则 1、3，本环节只引用名字、不重复数值（`winsor` 为未生效预留键）；`weight_cap` 对 CN 5 族（`1/5 = 0.2`）与 HK 4 族（`1/4 = 0.25`）**都不改变权重**，当前仅是有名无实的护栏。
 > `HK_MIN_AMOUNT` / `LIMIT_EFFECTIVE_FROM` / `PIT_UNIVERSE_READY` 是 **L1 输入侧门禁**（定义在「输入」段），不是 L2 合成参数，不进 `dimension_dict.params` / `params_hash`。
-> ⚠ `confidence` 当前按 `coverage` / `dispersion_norm` 三级判定落库，`state` 出档也只过这两道门禁，与 §2.4 规则 6 的 `n_sample < 750` 短样本降置信尚未合并；该差异须在字典 `remark` 与回归测试中钉住，消费端不得只按其中一条判可用性。
+> ✅ v2.1.11 已把 §2.4 规则 6 的 `n_sample < 750` 接入 `confidence`（只降置信、不改 `score` / `state`，并写 `flags.short_sample`）：`n_sample` 取**族代表**里最小的 L1 `extra.n_sample`（不用全体成员，避免晚起点的 `flags_only` 诊断成员把整维拖成短样本）。`quality_sample = 750` 已登记字典，缺省 0 时关闭以隔离新维度。
 
 **落地形态**（原理确定后的实现）：
 
@@ -551,7 +554,7 @@ for market, trade_date in calendar:
                 if market_scope[c] in (market, 'CN+HK', 'GLOBAL')]
     valid    = count(aligned WHERE c IN eligible)
     coverage = valid / len(eligible)
-    dispersion_norm = std(aligned[eligible].values()) * sqrt(valid / 10)
+    dispersion_norm = std(aligned[core].values()) * sqrt(core_valid / 10)  # 方案 C：core = eligible 排除 flags_only
 
     # 族 → 每族固定 1 个代表 → 族间等权
     reps = [m.code for m in members
@@ -576,11 +579,11 @@ for market, trade_date in calendar:
                   score=score, state=state, coverage=coverage,
                   dispersion=..., blocks=每族{score, coverage, representative},
                   contrib=正负各 top3, flags=结构性背离标记,
-                  confidence=confidence, is_final=TRUE,
+                  confidence=confidence,
                   model_version=dimension_dict.params_hash)
 ```
 
-出档门禁见 §2.4.3；PIT、幂等、重算粒度、版本化见 §2.4.4–5（**参考样本集变更的第二类全量重算触发见 §2.2 / 规则 4**：宽度是 rolling 窗口，历史回补仍会改变窗口内排位，不得只补新日期）。落库须用 `skip_null_updates=False`——`state = NULL` 必须能覆盖旧档，否则门禁不通过时会残留上一次的结论。`is_final = TRUE`（纯派生量，收盘即终值）；⚠ 但 L1 `indicator_value` 目前全库 `is_final = FALSE`（T+1 置 TRUE 的流程未实现），终值链尚未闭合，见附录 D；`dimension_value` **没有 `quality` / `extra` 列**，可用性一律用 `confidence` + `flags` 承载，样本质量标在 L1 的 `indicator_value.extra`。
+出档门禁见 §2.4.3；PIT、幂等、重算粒度、版本化见 §2.4.4–5（**参考样本集变更的第二类全量重算触发见 §2.2 / 规则 4**：宽度是 rolling 窗口，历史回补仍会改变窗口内排位，不得只补新日期）。落库须用 `skip_null_updates=False`——`state = NULL` 必须能覆盖旧档，否则门禁不通过时会残留上一次的结论。`is_final` 列已于 v2.1.12 从三张值表删除（零消费方、T+1 流程从未实现）；口径新旧由 `model_version` 判定。`dimension_value` **没有 `quality` / `extra` 列**，可用性一律用 `confidence` + `flags` 承载，样本质量标在 L1 的 `indicator_value.extra`。
 
 **宽度口径约束（输入侧偏差的传导）**：`PIT_UNIVERSE_READY = False` 期间，宽度分位带 `survivorship_bias = true` / `quality = 'low'`，绝对读数只作展示 / 诊断不参与出档，相对变化只可作 20/60 日**短窗**内的定性参考（若偏差随年份单调衰减，多年期趋势本身也被污染）。两市场构成 / 分母不同的指标（集中度、行业广度、涨跌力度比）一律各自纵向看分位、不得横向比数值。解除需两步：① 接含退市股的全历史源、重建 PIT 成分池并把 `PIT_UNIVERSE_READY` 置 `True`；② 重做族 / 切点标定、按 §2.4 规则 4 递增 `model_version` 并全量重算。在此之前，**解除字段覆盖限制 ≠ 解除口径约束**。
 
@@ -596,7 +599,7 @@ for market, trade_date in calendar:
   "score": 19.26,
   "state": "极窄",
   "coverage": 1.0000,
-  "dispersion": 13.04,
+  "dispersion": 14.54,
   "blocks": {"涨跌家数": {"score": 39.74, "coverage": 1.0, "representative": "BREADTH.ADV_RATIO"},
              "均线": {"score": 8.63, "coverage": 1.0, "representative": "BREADTH.PCT_ABOVE_MA60"},
              "新高新低": {"score": 18.39, "coverage": 1.0, "representative": "BREADTH.NEW_HIGH_LOW_20"},
@@ -608,18 +611,18 @@ for market, trade_date in calendar:
               "neg": [{"code": "BREADTH.UP_DOWN_STRENGTH", "delta": -16.03},
                       {"code": "BREADTH.PCT_ABOVE_MA200", "delta": -14.80},
                       {"code": "BREADTH.PCT_ABOVE_MA60", "delta": -10.63}]},
-  "flags": ["权重股掩盖多数股票下跌", "成交额集中度偏高"],
+  "flags": {"n_sample": 2520, "structural": ["权重股掩盖多数股票下跌", "成交额集中度偏高"],
+            "dispersion_norm": 13.79},
   "confidence": "高",
-  "is_final": true,
-  "model_version": "817527149b58a808"
+  "model_version": "4852d3274f07f359"
 }
 ```
 
-`score = 19.26 < CN 切点 P20 = 31.20` → 第 1 档「极窄」；`coverage = 1.0`（11/11）、`dispersion_norm = 13.04 × sqrt(11/10) ≈ 13.68 ≤ 30` → 出档且 `confidence = 高`。⚠ 该行 `model_version = 817527149b58a808` 是 v2.1.9 口径快照；启用 `rep_coverage_min` 后字典 `params_hash` 会变化，须全量重算 L2。
+`score = 19.26 < CN 切点 P20 = 31.20` → 第 1 档「极窄」；`coverage = 1.0`（11/11）、`dispersion_norm = 14.54 × sqrt(9/10) ≈ 13.79 ≤ 30`（分母 9 = 11 成员 − 2 个 `flags_only`） → 出档且 `confidence = 高`。该行是 v2.1.11 口径；`flags` 为 dict（§2.3.3），`n_sample` 取族代表的最小有效观测数。
 
 未出档差异：`state = null`、`confidence = "低"`，`score` 与 `blocks` 照出；`state = null` 只能读作「**未出档**」，不是「中性」（§2.4.6）。
 
-> ⚠ `flags` 当前是**字符串数组**、`blocks` 每族额外带 `representative`，与 §2.3.3 的通用键名示例（`flags.short_sample` / `{"块名":{"score","coverage"}}`）形状不同。§2.3.3 已记「形状须由生产端固定、写进 `dimension_dict.remark` 并用测试钉住」；本节以 `build_dimension_value.py` 的当前形状为准，**统一前下游解析不得假定通用示例**。
+> ✅ v2.1.11 起 `flags` 形状已在 §2.3.3 固定为 dict、写进 `dimension_dict.remark` 并由 `tests/test_breadth_v2111.py` 钉住；`blocks` 每族额外带 `representative`。下游解析以本节与 §2.3.3 为准，**不得再按字符串数组遍历**。
 
 **派生量（不落表，由消费方按固定 `model_version` 重算）**：
 
@@ -657,7 +660,7 @@ for market, trade_date in calendar:
 
 本维度专用参数（`quality_sample`、`check_divergence`、`state_bands`、`state_labels`）的**定义见「计算模型」的「本环节参数」表**；通用参数（`min_periods`、`coverage_min`、`dispersion_max`、`weight_cap`、`winsor`）定义在 §2.4 对应规则，其中 `winsor` 当前为未生效预留键。下方是 `dimension_dict` 的一行**字典种子**——这些参数写入数据库的物化形态，**不是定义**；其中通用参数的取值与 §2.4 一致，不是第二处定义。
 
-**维度指标定义**  
+**维度指标注册**  
 对应表为 regime.dimension_dict   
 ```json
 {
@@ -803,7 +806,6 @@ for market, trade_date in calendar:
               "neg": [{"code": "VAL.ERP", "delta": -5.1}]},
   "flags": {"n_sample": 5120, "anchor_window": "expanding"},
   "confidence": "高",
-  "is_final": true,
   "model_version": "a1b2c3d4"
 }
 ```
@@ -848,7 +850,7 @@ CN 口径约束期的差异：`state = null`、`confidence = "低"`、`flags.sho
 | 3 | 锚（全市场 PE 中位数）`VAL.PE_TTM_MEDIAN.percentile = 63.4` | 计算 `DIM.VALUATION` | `score = 63.40`；改任一校验项分位后 `score` 不变 |
 | 4 | 锚分位为 NULL | 同上 | `score IS NULL`、`state IS NULL`、`confidence = '低'`、`flags.no_data = true`，不回落 `VAL.ERP` |
 | 5 | `coverage = 0.50` | 同上 | `score` 有值、`state IS NULL`、`flags.low_coverage = true` |
-| 6 | `state IS NULL` | 消费方读取 | 不得解释为「中性」；`is_final = FALSE` 不得当作定论 |
+| 6 | `state IS NULL` | 消费方读取 | 不得解释为「中性」；`confidence = 低` 时不得按确定结论使用 |
 | 7 | 同一 `(market, trade_date)` 连续跑两次 | 重算 L2 | 除 `updated_at` 外逐字段相等（幂等） |
 | 8 | 消费方读 `business_value.level` | 未按 `biz_code` 过滤 | 应被 `output_schema.level_semantics` 校验拦截（多态列禁止跨 biz 比较） |
 
@@ -895,6 +897,10 @@ CN 口径约束期的差异：`state = null`、`confidence = "低"`、`flags.sho
 | v1.2 | 2026-11-05 | **宽度维度数据契约迁入**：按 §3 统一模板把 `market_profile.md` §5.1 迁移为本文档 §5.1「宽度 Breadth · `DIM.BREADTH`」，与 §5.2 估值样板并列（编号与 `market_profile.md` §5 对齐；原 §5.1 六维总览改为章首无编号索引）；四块（定义 / 输入 / 计算模型 / 输出）对齐 `regime.dimension_dict` 真实种子与 `regime.dimension_value` 真实读数，含 11 个成员、5 个有效族代表（HK 4）、按市场冻结切点、输入侧门禁（仙股门槛 / 涨跌停制度起点 / 幸存者偏差）、两项不落表派生量与下游接口；实现状态与变更编年仍分别归附录 D 与 `market_profile.md`。§0 / 附录 A / 附录 C / 附录 D 交叉引用同步 |
 | v1.5 | 2026-11-05 | **§5.1 准确性与科学性整改**（按 P0→P1→P2）：P0 ① 标定样本收口——族划分 / 代表 / 内部一致性剔除只读 `[calib_start, calib_end]`，2026 起仅作样本外报告（`tools/calibrate_breadth.py` + 回归测试）；② `LIMIT_NET` 护栏前残留 1,505 行如实披露并登记清理步骤。P1 ③ 代表级覆盖门禁 `rep_coverage_min`（生产者默认 0.0 兼容旧种子、字典登记后启用 + 回归测试）；④ `winsor` 降级为未生效预留键（§2.2 / §2.4 / §4 / §5.1 / §5.2 与 schema 注释同步）；⑤ 术语「构念效度」→「同期内部一致性」。P2 ⑥ 跨年代可比 / 停更占比 / 等频占比 / 代表打分 / `weight_cap` / `is_final` 等措辞与编辑瑕疵。**未执行破坏性数据变更**（清库与全量重算须单独确认）；只读复跑 `--probe` 确认收口后族 / 代表 / 切点 / `flags_only` 与库内一致 |
 
+| v1.9 | 2026-11-05 | **阶段 1 + 阶段 2 合并落地**（一次 L2 全量重算）：① L1 宽度族口径升级 `BREADTH_CALIB_VERSION = v2.1.11` —— 补 `min_periods=250`、`extra.n_sample`、清理 `LIMIT_NET` 1996-12-16 前 1,505 行护栏残留；`_params_hash` 按 rolling / expanding 拆分版本，避免宽度升级波及其余 112 个指标；分位计算收敛到 `_compute_percentiles` 单一真相源，新增 `tools/recalc_breadth_percentile.py`。② L2 参数层 `calib_version = v2.1.11`、`params_hash = 176bef79e3c215bc` —— `flags` 切为 §2.3.3 的 dict（形状写入 `dimension_dict.remark` + 回归测试钉住）、登记 `flag_gap` / `flag_extreme` / `quality_sample` / `min_periods` / `contrib_sign_split`、启用短样本降置信；`tools/calibrate_breadth.py --params-only` 不重标族与切点。③ 全量重算后 CN 8508 行 / HK 6377 行，`model_version` 全部一致；`build_dimension_value.py --audit` = PASS 26 / WARN 7 / FAIL 0。④ **阶段 3 只做离线对照**（`tools/probe_breadth_gate.py`），`dispersion_norm` 口径未改 |
+
+| v1.10 | 2026-11-05 | **删除 `is_final` + 阶段 3 方案 C 落地**：① 三张值表 DROP COLUMN `is_final`（零消费方、T+1 流程从未实现），`sql/schema.sql` / `regime_schema.py` / `market_state_daily.py` 的列定义、自愈 DDL、COMMENT、两个 L2 写入点、测试与本文档同步；口径新旧改由 `model_version` 判定。② `dispersion_scope = non_flags_only`：`dispersion` 排除 `flags_only` 诊断成员，归一化因子改用 `core_valid`；`flags` 增 `dispersion_norm` 供门禁复算；`params_hash` `176bef79e3c215bc → 4852d3274f07f359`，全量重算 L2 后 CN 出档 6709 / HK 5977 日，与对照实验 C 逐值一致。③ `--audit` = PASS 29 / WARN 3 / FAIL 0，全量 pytest 517 passed |
+
 ## 附录 D 状态看板
 
 | 项 | 状态 |
@@ -904,9 +910,9 @@ CN 口径约束期的差异：`state = null`、`confidence = "低"`、`flags.sho
 | 其余四个 L2 维度（情绪 / 资金 / 压力 / 趋势） | 仅 DDL 与设计稿，零生产者 |
 | 四个 `BIZ.*` 业务指标、`signal_value`、`v_signal_summary` | 仅 DDL，零生产者 |
 | 按 §3 模板迁移其余对象 | 已完成 `DIM.BREADTH`（§5.1，由 `market_profile.md` §5.1 迁移）与 `DIM.VALUATION`（§5.2）；其余四个维度待办，推广后 `market_profile.md` §5 的数据层规格由本文档取代 |
-| `LIMIT_NET` 1996 前护栏残留（1,505 行非空值） | **待清理**：先置 NULL（`UPDATE regime.indicator_value SET raw_value=NULL, percentile=NULL WHERE indicator_code='BREADTH.LIMIT_NET' AND market='CN' AND trade_date < '1996-12-16'`），再用 `_expanding_percentile(window=2520)` 单指标重算 1996-12-16 起分位并递增 `model_version`；属破坏性数据变更，须单独确认窗口 |
-| 代表级覆盖门禁 `rep_coverage_min` | 生产者与回归测试已就绪；**当前库内字典未登记该键（默认 0.0 不启用）**，须跑 `tools/calibrate_breadth.py --write`（`calib_version` v2.1.10、`params_hash` 变化）并按 §2.4 规则 4/5 全量重算 L2 |
-| L1 `indicator_value.is_final` 全库 FALSE | 与 L2 全 TRUE 的终值链未闭合；T+1 置 TRUE 流程待设计（跨层） |
+| `LIMIT_NET` 1996 前护栏残留 | ✅ 2026-11-05 已 DELETE 1,505 行，并按 v2.1.11 全量重算宽度族分位（附录 C v1.9） |
+| 代表级覆盖门禁 `rep_coverage_min` | ✅ 已登记 `1.0` 并生效，L2 已全量重算 |
+| `is_final` 列 | ✅ v2.1.12 从三张值表删除（零消费方、T+1 流程从未实现）；口径新旧由 `model_version` 判定 |
 | 旧合成层 `regime.market_regime_daily` | ✅ 2026-11-05 已删除（零消费方）；`sql/schema.sql` / `regime_schema.py` / 生产者 / 监控 / 测试全清，删前快照 `/tmp/market_regime_daily_backup_20261105.csv.gz` |
 | PIT 成分池（含退市股）、`LIMIT_NET` 的 ST 判定 | 未实现，属数据源缺口 |
 | HK 估值起点核定 | 已完成（PE/ERP 2001-09-06 等，见 §5.2 输入表） |
@@ -918,3 +924,8 @@ CN 口径约束期的差异：`state = null`、`confidence = "低"`、`flags.sho
 | 解除护栏的前置：真实 PE 列 / 独立参考序列、PB 回填、退市股成分池、窗口实测与 `state_bands` 重标 | 待办（§5.2「CN 口径约束」）；解除后须递增 `model_version` 并全量重算 |
 | L1 估值序列是否已按回填段重算 | **否**（`indicator_value` 仍 2018-01-02 起，各 2143 行）——刻意保持，勿直接跑 `--backfill` 前先确认护栏 |
 | 2018+ 偶发字段级覆盖塌陷（实测 2026-10-26~29 `pe>0` 有效占比 0.37~0.38） | **采集侧既有缺口，本次未处理**；须单独清库 + 口径版本，勿与回填护栏混做（否则 `skip_null_updates` 会留下新旧混存） |
+| L1 宽度族 `min_periods=250` / `extra.n_sample` | ✅ 已落地（`market_state_daily.py` + `tools/recalc_breadth_percentile.py`），前 250 有效观测分位置 NULL；非宽度指标仍用旧口径（`EXPANDING_CALIB_VERSION` 保持 v2.1.7） |
+| `DIM.BREADTH` 字典与生产数据 | `params_hash=4852d3274f07f359`；CN 8509 行（出档 6709）/ HK 6378 行（出档 5977），`model_version` 全部一致；`--audit` = PASS 29 / WARN 3 / FAIL 0 |
+| `flags` / `blocks` JSONB 形状 | ✅ §2.3.3 已固定为 dict，`dimension_dict.remark` + `tests/test_breadth_v2111.py` 钉住；`sql/schema.sql` 列注释待同步 |
+| 阶段 3 dispersion 门禁对照实验 | ✅ 只读报告（`tools/probe_breadth_gate.py`）已评审，**按方案 C 落地**：`dispersion_scope = non_flags_only`，生产端出档日与实验预测逐值一致 |
+| 非宽度族 554 行 `model_version IS NULL` | 未处理（MACRO.CREDIT_IMPULSE HK 523 / MACRO.LPR 30 / RISK.SYNC_DOWN_20D 1），属既有残留，另案 |

@@ -164,7 +164,7 @@ class TestSingleAnchor(unittest.TestCase):
         self.assertFalse(h.kw["skip_null_updates"])
         self.assertEqual(h.rows[0]["dimension_code"], rd.DIM_VALUATION)
         self.assertEqual(h.rows[0]["model_version"], "hash123")
-        self.assertTrue(h.rows[0]["is_final"])
+        self.assertNotIn("is_final", h.rows[0])
 
 
 class TestMultiDimensionBuild(unittest.TestCase):

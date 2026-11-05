@@ -164,7 +164,7 @@ class TestBreadthFlagsIsolated(unittest.TestCase):
 
     def test_breadth_flags_is_a_named_isolated_function(self):
         src = inspect.getsource(bd.build_breadth_dimension)
-        self.assertIn("return _breadth_flags(aligned, trade_date, flag_gap, flag_extreme)", src)
+        self.assertIn("_breadth_flags(aligned, trade_date, flag_gap, flag_extreme)", src)
         doc = inspect.getdoc(bd._breadth_flags) or ""
         self.assertIn("宽度专属", doc)
 

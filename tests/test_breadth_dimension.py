@@ -169,7 +169,12 @@ class _FakeConn:
 
 def _fake_read(scopes: pd.DataFrame, pct_long: pd.DataFrame):
     def f(sql, conn, params=None):
-        return scopes.copy() if "indicator_dict" in sql else pct_long.copy()
+        if "indicator_dict" in sql:
+            return scopes.copy()
+        if "n_sample" in sql:
+            # L1 extra.n_sample 查询：旧种子无该键 → 空表，不触发短样本降置信
+            return pd.DataFrame(columns=["trade_date", "indicator_code", "n_sample"])
+        return pct_long.copy()
     return f
 
 
@@ -204,12 +209,12 @@ class TestBuildMarket(unittest.TestCase):
         self.assertEqual(st["state_rows"], 5)
         r = rows[0]
         for k in ("score", "state", "coverage", "dispersion", "contrib", "flags",
-                  "blocks", "confidence", "is_final", "model_version"):
+                  "blocks", "confidence", "model_version"):
             self.assertIn(k, r)
+        self.assertNotIn("is_final", r)       # v2.1.12 起该列已删除
         self.assertAlmostEqual(float(r["score"]), 50.0, places=2)
         self.assertEqual(r["state"], "中性")
         self.assertEqual(r["confidence"], "高")
-        self.assertTrue(r["is_final"])
         self.assertEqual(r["model_version"], "hash16")
         self.assertEqual(set(r["contrib"]), {"pos", "neg"})
         self.assertIn("涨跌家数", r["blocks"])
@@ -251,7 +256,10 @@ class TestBuildMarket(unittest.TestCase):
         """短窗新高低 < 长窗 − 15 → flags 命中，且不被平均分抹掉。"""
         pct = self._pct({D(2020, 1, d): [50, 50, 10, 80, 50] for d in range(1, 6)})
         _, rows = self._run(pct)
-        self.assertTrue(any("短窗动能衰竭" in f for f in rows[0]["flags"]))
+        # v2.1.11：flags 切成 §2.3.3 的 dict，结构性文案在 structural 键下
+        self.assertIsInstance(rows[0]["flags"], dict)
+        self.assertTrue(any("短窗动能衰竭" in f
+                            for f in rows[0]["flags"]["structural"]))
 
     def test_rep_coverage_gate_blocks_state(self):
         """代表缺失但非代表齐全：coverage=0.8 已过旧门禁，代表级门禁必须挡住。
