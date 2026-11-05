@@ -3,8 +3,10 @@
 锁住：
   ① A/D Line / Summation Index 的 cumsum 语义与 SI_0=0 固定；
   ② 双高点 A/D 背离能触发顶/底背离、幅度为 z 单位、持续天数递增；
-  ③ 族标定与构念效度判据常量（防回退）；
-  ④ `build_market` 五件套 + blocks/contrib/flags/confidence + 出档门禁。
+  ③ 族标定与同期内部一致性判据常量（防回退）；
+  ④ `build_breadth_dimension` 五件套 + blocks/contrib/flags/confidence + 出档门禁
+     （含代表级覆盖门禁 rep_coverage_min）；
+  ⑤ 标定样本收口：族划分 / 代表 / 内部一致性只读 [CALIB_START, CALIB_END]。
 
 背景见 doc/market_profile.md §5.1 / §5.7 L2-c / §8.1.1。
 """
@@ -19,7 +21,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import regime_dimensions as rd
+import build_dimension_value as rd
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import calibrate_breadth as cb
 
@@ -156,7 +158,8 @@ DIM_FIX = {
     ],
     "state_bands": {"CN": [20, 40, 60, 80], "HK": [20, 40, 60, 80]},
     "state_labels": ["极窄", "偏窄", "中性", "偏广", "极广"],
-    "params": {"coverage_min": 0.6, "dispersion_max": 30.0, "weight_cap": 0.25},
+    "params": {"coverage_min": 0.6, "dispersion_max": 30.0, "weight_cap": 0.25,
+               "rep_coverage_min": 1.0},
 }
 
 
@@ -176,9 +179,9 @@ class TestBuildMarket(unittest.TestCase):
             "indicator_code": [m["code"] for m in DIM_FIX["members"]],
             "market_scope": ["CN+HK"] * 5,
         })
-        with mock.patch.object(rd, "_read", side_effect=_fake_read(scopes, pct_long)), \
+        with mock.patch.object(rd, "_read_sql", side_effect=_fake_read(scopes, pct_long)), \
              mock.patch.object(rd, "bulk_upsert") as up:
-            st = rd.build_market(_FakeConn(), DIM_FIX, "hash16", "CN",
+            st = rd.build_breadth_dimension(_FakeConn(), DIM_FIX, "hash16", "CN",
                                  D(2020, 1, 1), D(2020, 1, 5), True)
             rows = up.call_args.args[2]
         return st, rows
@@ -237,9 +240,9 @@ class TestBuildMarket(unittest.TestCase):
         scopes = pd.DataFrame({
             "indicator_code": [m["code"] for m in dim["members"]],
             "market_scope": ["CN+HK"] * 5})
-        with mock.patch.object(rd, "_read", side_effect=_fake_read(scopes, pct)), \
+        with mock.patch.object(rd, "_read_sql", side_effect=_fake_read(scopes, pct)), \
              mock.patch.object(rd, "bulk_upsert") as up:
-            rd.build_market(_FakeConn(), dim, "h", "CN", D(2020, 1, 1), D(2020, 1, 5), True)
+            rd.build_breadth_dimension(_FakeConn(), dim, "h", "CN", D(2020, 1, 1), D(2020, 1, 5), True)
             rows = up.call_args.args[2]
         # 代表 ADV_RATIO=50、NHL20 翻向后=90 → score=70
         self.assertAlmostEqual(float(rows[0]["score"]), 70.0, places=2)
@@ -249,6 +252,76 @@ class TestBuildMarket(unittest.TestCase):
         pct = self._pct({D(2020, 1, d): [50, 50, 10, 80, 50] for d in range(1, 6)})
         _, rows = self._run(pct)
         self.assertTrue(any("短窗动能衰竭" in f for f in rows[0]["flags"]))
+
+    def test_rep_coverage_gate_blocks_state(self):
+        """代表缺失但非代表齐全：coverage=0.8 已过旧门禁，代表级门禁必须挡住。
+
+        回归 2026-11-05 实测：13926 个出档日中 336 天缺 1 个代表仍出档，
+        其中 98 天标 confidence=高。
+        """
+        pct = self._pct({D(2020, 1, d): [50, 50, None, 50, 50] for d in range(1, 6)})
+        st, rows = self._run(pct)
+        self.assertEqual(st["state_rows"], 0)
+        self.assertTrue(all(r["state"] is None for r in rows))
+        self.assertTrue(all(r["confidence"] == "低" for r in rows))
+        self.assertTrue(all(r["score"] is not None for r in rows))  # 只挡出档，不改 score
+        self.assertEqual(float(rows[0]["coverage"]), 0.8)
+
+    def test_legacy_seed_keeps_rep_gate_off(self):
+        """旧字典未登记 rep_coverage_min → 默认 0.0，保持旧行为。
+
+        必须如此：库内 v2.1.9 种子的 params_hash 未变，若生产者悄悄启用硬门禁，
+        会出现「同一 model_version 两套口径」。
+        """
+        dim = dict(DIM_FIX)
+        dim["params"] = {k: v for k, v in DIM_FIX["params"].items()
+                         if k != "rep_coverage_min"}
+        pct = self._pct({D(2020, 1, d): [50, 50, None, 50, 50] for d in range(1, 6)})
+        scopes = pd.DataFrame({
+            "indicator_code": [m["code"] for m in dim["members"]],
+            "market_scope": ["CN+HK"] * 5})
+        with mock.patch.object(rd, "_read_sql", side_effect=_fake_read(scopes, pct)), \
+             mock.patch.object(rd, "bulk_upsert"):
+            st = rd.build_breadth_dimension(_FakeConn(), dim, "hash16", "CN",
+                                 D(2020, 1, 1), D(2020, 1, 5), True)
+        self.assertEqual(st["state_rows"], 5)
+
+
+class TestCalibrationWindow(unittest.TestCase):
+    """P0-1：标定不得触碰样本外年份，否则「样本外占比」不是 held-out 验证。"""
+
+    @staticmethod
+    def _wide():
+        idx = pd.date_range("2024-01-01", "2026-12-31", freq="B")
+        rng = np.random.default_rng(11)
+        cols = list(dict.fromkeys(c for ms in cb.CANDIDATES.values() for c in ms))
+        return pd.DataFrame(rng.normal(50, 8, (len(idx), len(cols))),
+                            index=idx, columns=cols)
+
+    def test_slice_bounds(self):
+        cal = cb._calib_slice(self._wide())
+        self.assertGreaterEqual(cal.index.min(), pd.Timestamp(cb.CALIB_START))
+        self.assertLessEqual(cal.index.max(), pd.Timestamp(cb.CALIB_END))
+        self.assertGreater(len(cal), 250)
+
+    def test_family_stats_exclude_oos(self):
+        wide = self._wide()
+        self.assertGreater(wide.index.max(), pd.Timestamp(cb.CALIB_END))
+        meta = {c: ("high_good", "CN+HK") for c in wide.columns}
+        with mock.patch.object(cb, "_corr_stats", wraps=cb._corr_stats) as spy:
+            cb.calibrate(wide, meta, "CN", set())
+        self.assertTrue(spy.call_args_list)
+        for call in spy.call_args_list:
+            self.assertLessEqual(call.args[0].index.max(), pd.Timestamp(cb.CALIB_END))
+
+    def test_flags_only_excludes_oos(self):
+        wide = self._wide()
+        data = {"CN": (wide, {}), "HK": (wide, {})}
+        with mock.patch.object(cb, "_calib_slice", wraps=cb._calib_slice) as spy:
+            got = cb._flags_only(data)
+        self.assertEqual(spy.call_count, 2)
+        sliced = {"CN": (cb._calib_slice(wide), {}), "HK": (cb._calib_slice(wide), {})}
+        self.assertEqual(got, cb._flags_only(sliced))
 
 
 if __name__ == "__main__":

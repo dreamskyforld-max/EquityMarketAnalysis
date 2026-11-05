@@ -290,7 +290,7 @@ def _migrate_monitor_config():
 
 
 # 市场状态分析系统（regime schema）表登记：随 regime_schema.py 落地（2026-09-30）。
-# indicator_value / market_regime_daily 属「计算层」，P1 上线前以 active=FALSE 预登记，
+# indicator_value / dimension_value 属「计算层」，P1 上线前以 active=FALSE 预登记，
 # 避免空表被误判为「从未采集」而持续告警。
 _REGIME_TABLE_CONFIG = [
     # (db_name, table_name, time_column, period, expect_lag, refresh_weekday, remark, active)
@@ -301,8 +301,6 @@ _REGIME_TABLE_CONFIG = [
      "指标字典（market_state_daily 每次运行同步）", True),
     ("regime", "indicator_value", "updated_at", "day", 1, 0,
      "市场状态计算层 market_state_daily（工作日 18:45）", True),
-    ("regime", "market_regime_daily", "updated_at", "day", 1, 0,
-     "市场状态合成（同上，与 indicator_value 同批写入）", True),
     ("regime", "analyst_forecast_snapshot", "snapshot_date", "day", 1, 0,
      "get_analyst_forecast（逐日快照，18:40；缺一天即断档不可补）", True),
     # 事件表用 updated_at 判「采集器是否还活着」：业务日期天然稀疏（可能数日无新事件），
@@ -352,7 +350,7 @@ def _migrate_regime_monitor_config():
             cur.execute(
                 "UPDATE monitor_table_config SET active=true "
                 "WHERE db_name='regime' "
-                "AND table_name IN ('indicator_dict','indicator_value','market_regime_daily')"
+                "AND table_name IN ('indicator_dict','indicator_value','dimension_value','dimension_dict')"
             )
         conn.commit()
 
@@ -373,7 +371,7 @@ def _migrate_regime_monitor_config():
 #
 # 其余保持默认 'HK'，理由：
 #   · 混合/全球表（daily_quote / daily_benchmark / benchmark_minute / indicator_value /
-#     market_regime_daily / stock_sector / trading_calendar）含港股序列，用**更宽**的港股
+#     dimension_value / stock_sector / trading_calendar）含港股序列，用**更宽**的港股
 #     日历才不会漏报，也保持既有告警口径不变；
 #   · 港股通类表（daily_ggt_hold 等）真实交易日是「沪深港**共同开市**」的交集，
 #     单一市场日历无法精确表达（CN/HK 各有独家假日），暂按 HK 并在文档标注为已知残差。

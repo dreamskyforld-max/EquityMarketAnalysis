@@ -34,10 +34,13 @@ a_backfill_progress.json
 test.py
 test_ticker.py
 
-# ── AI 生成的 Markdown 文档（不传 GitHub）──
+# ── Markdown 文档（默认不传 GitHub，仅设计与正式文档放行）──
 *.md
-# README 是项目正式文档，需要入库（其余 AI 生成的 md 仍忽略）
+# README 是项目正式文档，需要入库
 !README.md
+# 设计/规范/研究类文档入库（doc/ 与 research/ 下）；部署不传服务器仍由 deploy.sh 的 rsync --exclude '*.md' 控制
+!doc/**/*.md
+!research/**/*.md
 
 # ── 测试缓存 ──
 .pytest_cache/
@@ -47,3 +50,5 @@ sql/schema.sql.generated
 
 # ── schema 差异修复 SQL（服务器待执行产物，不入库）──
 sql/schema_fix_*.sql
+research/force_segmentation/labels/*
+research/force_segmentation/results/*

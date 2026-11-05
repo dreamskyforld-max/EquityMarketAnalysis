@@ -1948,33 +1948,9 @@ COMMENT ON COLUMN regime.sector_fund_flow.net_inflow   IS '净额（亿元）＝
 
 CREATE INDEX IF NOT EXISTS idx_sector_flow_date ON regime.sector_fund_flow (trade_date DESC);
 
--- 11. 市场状态合成（温度计/季节/风险/FSI；一市场一日一行，计算层写入）
-CREATE TABLE IF NOT EXISTS regime.market_regime_daily (
-    trade_date          DATE        NOT NULL,
-    market              VARCHAR(8)  NOT NULL,          -- CN / HK
-    thermometer         NUMERIC(6,2),                  -- 市场温度计 0-100（天气）
-    season              VARCHAR(8),                    -- 春/夏/秋/冬
-    season_score        NUMERIC(6,2),
-    risk_score          NUMERIC(6,2),                  -- 风险指数 0-100
-    fsi                 NUMERIC(6,2),                  -- 金融压力指数 0-100
-    risk_appetite       NUMERIC(6,2),                  -- 跨资产风险偏好 0-100（§5.4：6 成分等权，2026-10-09 起有值）
-    top_signal_cnt      SMALLINT,                      -- 顶部信号命中数
-    bottom_signal_cnt   SMALLINT,
-    detail              JSONB,                         -- 分项/成员明细
-    updated_at          TIMESTAMPTZ DEFAULT NOW(),
-
-    PRIMARY KEY (trade_date, market)
-);
-
-COMMENT ON TABLE  regime.market_regime_daily                IS '市场状态合成表（温度计/季节/风险/FSI），由计算层 market_state_daily.py 写入';
-COMMENT ON COLUMN regime.market_regime_daily.season         IS '春=熊末牛初 / 夏=牛市中段 / 秋=牛市末段 / 冬=熊市中后段（v1 规则版，信用脉冲维度待接入）';
-COMMENT ON COLUMN regime.market_regime_daily.top_signal_cnt IS '顶部预警信号命中数（见 market_profile.md §8.2）';
-COMMENT ON COLUMN regime.market_regime_daily.risk_appetite IS '跨资产风险偏好指数 0-100（market_profile.md §5.4）：7 成分等权（VIX/美元/AAA 信用利差/AA-AAA 等级利差 取反 + 标普/铜/黄金 20 日动量）；>80 极度 Risk-On，<20 极度 Risk-Off。注：分位按各市场自身历史展开 → CN/HK 数值可能略有差异';
-
 -- ═══════════════════════════════════════════════════════════════════════
 -- v2.1 三层指标架构：原子指标 → 维度指标(L2) → 业务指标(L3) + 横切信号
 --   设计见 doc/market_profile.md §5.0-§5.12；代码侧 DDL 见 regime_schema.py（两者必须逐字一致）
---   旧合成表 market_regime_daily 保留待迁移，迁移完成后 drop
 -- ═══════════════════════════════════════════════════════════════════════
 
 -- 12. 维度指标字典（L2）：六维的成员/极性/聚合方式/阈值，口径真相源在代码，本表是可版本化投影
@@ -1984,8 +1960,6 @@ CREATE TABLE IF NOT EXISTS regime.dimension_dict (
     question         VARCHAR(120),                      -- 该维度回答的业务问题（一句话）
     polarity         VARCHAR(12)     NOT NULL,          -- high_good=越高越好 / high_risk=越高越危险
     members          JSONB           NOT NULL,          -- [{code, sign, weight, block}]；sign 统一极性，block 为分族/分块名
-    agg_method       VARCHAR(16)     NOT NULL DEFAULT 'block_equal',
-                                                        -- block_equal=分块等权 / mean_winsor=扁平等权(仅同质) / single_anchor=单锚+校验 / rule=规则判定
     block_agg        JSONB,                             -- 块内聚合方式 {"块名":"mean"|"max"}（压力维度的信用块取 max=最紧）
     state_bands      JSONB,                             -- 5 档阈值（默认 [20,40,60,80]）
     state_labels     JSONB,                             -- 5 档标签（按极性命名，如 极窄/偏窄/中性/偏广/极广）
@@ -1998,9 +1972,8 @@ CREATE TABLE IF NOT EXISTS regime.dimension_dict (
 
 COMMENT ON TABLE  regime.dimension_dict            IS '维度指标字典（L2）：六个维度（宽度/估值/情绪/资金/压力/趋势）的成员、极性、聚合方式与阈值参数';
 COMMENT ON COLUMN regime.dimension_dict.members    IS '成员清单 [{code,sign,weight,block}]；sign 用于统一极性（+1 顺向、-1 取 100−分位），block 为分族/分块名（宽度=4族、情绪=3块、资金=2块、压力=5块）。同一原子指标只能归属一个维度（情绪=意愿、资金=真金白银净流，见 market_profile.md §5.0）';
-COMMENT ON COLUMN regime.dimension_dict.agg_method IS '六维不共用同一算法、只共用框架（market_profile.md §5.7 L2-b）：block_equal=分块等权（情绪/资金/压力）；single_anchor=单锚+校验（估值：ERP 定档，其余只调置信）；mean_winsor=扁平等权（仅成员同质时可用，否则权重会退化成「写了几个指标」）；rule=规则判定（趋势：方向由 L3 判定，本维度的 score 只承载「趋势有多陡」，用单锚 σ 归一化，不做平均）';
 COMMENT ON COLUMN regime.dimension_dict.block_agg  IS '块内聚合方式 {"块名":"mean"|"max"}。默认 mean；压力维度的信用块**取第二紧**（trimmed max）而非 max——AA 系成员源只留近 3 日，max 会被短样本成员永久绑架；块内 coverage < 0.5 时退化为均值并标 low_confidence（market_profile.md §5.5）';
-COMMENT ON COLUMN regime.dimension_dict.params      IS '维度级参数：winsor=[2,98]（**仅用于稳健估计参考分布**，分位结果不截尾）、coverage_min=0.6、dispersion_max=30（对 dispersion_norm=dispersion×sqrt(n/10)）、weight_cap=0.25、K=3（**仅趋势维度**：σ 归一化后「几个标准差算满格」，纯展示参数，单调变换不改排序；趋势维度不出档故改 K 不需重标阈值）';
+COMMENT ON COLUMN regime.dimension_dict.params      IS '维度级参数：winsor=[2,98]（**预留键，当前不参与计算**；L1 分位走经验秩，见 market_state_daily._expanding_percentile）、coverage_min=0.6、dispersion_max=30（对 dispersion_norm=dispersion×sqrt(n/10)）、weight_cap=0.25、K=3（**仅趋势维度**：σ 归一化后「几个标准差算满格」，纯展示参数，单调变换不改排序；趋势维度不出档故改 K 不需重标阈值）';
 COMMENT ON COLUMN regime.dimension_dict.params_hash IS '口径指纹（成员/权重/winsor/阈值/门禁的哈希）。变化即口径变更，必须触发该维度历史重算；消费端读到的 model_version 与本值不等即为旧口径数据';
 
 -- 13. 维度指标日频读数（L2）：一市场一日一维一行
@@ -2185,7 +2158,6 @@ ALTER TABLE regime.indicator_dict ADD COLUMN IF NOT EXISTS role   VARCHAR(16) DE
 COMMENT ON COLUMN regime.indicator_dict.domain    IS 'v2.1 维度归属（L2）：宽度/估值/情绪/资金/压力/趋势。NULL = 宏观条件输入（不属任何维度、不参与维度聚合），由业务指标按需直接引用';
 COMMENT ON COLUMN regime.indicator_dict.role      IS '指标在架构中的角色：status=参与状态/预算判定 · context=仅作背景与解释 · explanation=解释维度成员（有信号级消费者、无决策级消费者，如情绪与资金维度）';
 COMMENT ON COLUMN regime.indicator_dict.dimension IS '【legacy】旧分组字段（11 个取值，「资金」混入 M1/LPR/DXY 等宏观利率、「趋势」为 0），仅作浏览分组；v2.1 起维度归属一律看 domain。计划在计算层迁移时改名 theme';
-COMMENT ON TABLE  regime.market_regime_daily      IS '【v2.1 已废弃，保留待迁移】旧合成层：温度计/季节/风险/FSI/跨资产风险偏好。继任者 dimension_value + business_value + signal_value；旧字段口径（如 season 实际只由 PCT_ABOVE_MA200 的 25 分位决定）不再维护';
 
 -- 19. v2.1.1 增量列（评审整改；既有库自愈，新建库已在上方 CREATE TABLE 中带上）
 --     B2 口径指纹    B3 初步值标记    B10 制度断点

@@ -1,7 +1,10 @@
 """跨资产风险偏好与外部环境指标测试（§3.4 + §5.4）。
 
 背景：`get_global_benchmarks.py` 每小时采的 17 个基准里，此前**只有 US.DGS10/DGS2 被计算层消费**；
-VIX / 美元 / EFFR / 全球股指都在库里但没用起来（`risk_appetite` 列更是**从未写过值**）。
+VIX / 美元 / EFFR / 全球股指都在库里但没用起来。
+⚠ 2026-11-05：旧合成表 `regime.market_regime_daily`（含 risk_appetite 等 4 个合成指数）已删除，
+   原「风险偏好入库 / 区间 / 与 VIX 方向」三项库内测试随之移除；L2 继任者见
+   `build_dimension_value.py` / `tools/calibrate_valuation.py`。本文件保留纯函数与 L1 指标存在性测试。
 本文件钉住三件容易出错的事：
 
   ① **动量必须在源市场日历上算**：20 日动量 = 源序列 `s/s.shift(20)−1`，
@@ -55,8 +58,8 @@ class TestAlignClose(unittest.TestCase):
         self.assertAlmostEqual(float(mom_src.iloc[25]), manual, places=6)
 
 
-class TestRiskAppetiteInDb(unittest.TestCase):
-    """库内实测（需数据库）：新指标存在、风险偏好落在 0-100 且方向正确。"""
+class TestExternalIndicatorsInDb(unittest.TestCase):
+    """库内实测（需数据库）：§3.4 外部环境 7 个 L1 原子指标存在且新鲜。"""
 
     @classmethod
     def setUpClass(cls):
@@ -87,41 +90,6 @@ class TestRiskAppetiteInDb(unittest.TestCase):
                 self.assertIn(c, got, f"{c} 未入库")
                 self.assertGreater(got[c][0], 200, f"{c} 行数过少：{got[c][0]}")
                 self.assertGreater(got[c][1], D(2026, 6, 1), f"{c} 不新鲜：{got[c][1]}")
-
-    def test_risk_appetite_written_both_markets(self):
-        self.cur.execute("""SELECT market, count(*) FROM regime.market_regime_daily
-                            WHERE risk_appetite IS NOT NULL GROUP BY 1""")
-        got = dict(self.cur.fetchall())
-        self.assertGreater(got.get("CN", 0), 3000, f"CN 风险偏好行数过少：{got}")
-        self.assertGreater(got.get("HK", 0), 1000, f"HK 风险偏好行数过少：{got}")
-
-    def test_risk_appetite_range(self):
-        self.cur.execute("""SELECT min(risk_appetite), max(risk_appetite),
-                                   avg(risk_appetite) FROM regime.market_regime_daily
-                            WHERE risk_appetite IS NOT NULL""")
-        lo, hi, avg = (float(x) for x in self.cur.fetchone())
-        self.assertGreaterEqual(lo, 0.0)
-        self.assertLessEqual(hi, 100.0)
-        self.assertTrue(30 < avg < 70, f"长期均值 {avg:.1f} 偏离中性过远，疑似成分方向写反")
-
-    def test_direction_with_vix(self):
-        """方向约定：风险偏好高 ⇒ VIX 低（负相关）；与股指动量正相关。"""
-        self.cur.execute("""
-            SELECT r.trade_date, r.risk_appetite, v.raw_value, s.raw_value
-            FROM regime.market_regime_daily r
-            JOIN regime.indicator_value v ON v.indicator_code='RISK.VIX'
-                 AND v.market='CN' AND v.trade_date=r.trade_date
-            JOIN regime.indicator_value s ON s.indicator_code='MACRO.SPX_MOM20'
-                 AND s.market='CN' AND s.trade_date=r.trade_date
-            WHERE r.market='CN' AND r.risk_appetite IS NOT NULL
-            ORDER BY r.trade_date""")
-        rows = self.cur.fetchall()
-        self.assertGreater(len(rows), 1500, "可比样本过少")
-        ra = pd.Series([float(x[1]) for x in rows])
-        vix = pd.Series([float(x[2]) for x in rows])
-        spx = pd.Series([float(x[3]) for x in rows])
-        self.assertLess(ra.corr(vix), -0.3, "风险偏好应与 VIX 负相关（sign 可能写反）")
-        self.assertGreater(ra.corr(spx), 0.5, "风险偏好应与标普动量正相关")
 
 
 if __name__ == "__main__":

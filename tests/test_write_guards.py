@@ -349,9 +349,13 @@ class _FakeWriteConn:
 
 
 class TestWriteMarketInvalidDays(unittest.TestCase):
-    """_write_market：带外键被 pop、塌陷日清库、合成行跳过、非横截面指标仍写。"""
+    """_write_market：带外键被 pop、塌陷日清库、非横截面指标仍写。
 
-    def test_invalid_days_purged_and_composite_skipped(self):
+    2026-11-05：旧合成表 market_regime_daily 已删除，原「合成行跳过塌陷日」与
+    build_composites 测试桩一并移除；本类只验证 L1 indicator_value 的写入/清库语义。
+    """
+
+    def test_invalid_days_purged(self):
         import pandas as pd
         idx = [D(2026, 10, 13), D(2026, 10, 14)]
         series = {
@@ -365,14 +369,7 @@ class TestWriteMarketInvalidDays(unittest.TestCase):
         def fake_bulk_upsert(c, table, rows, **kw):
             captured.setdefault(table, []).extend(rows)
 
-        comp = pd.DataFrame({
-            "thermometer": [28.0, 31.0], "risk_score": [54.0, 59.0], "fsi": [50.0, 50.0],
-            "risk_appetite": [40.0, 41.0], "season": ["冬", "冬"], "season_score": [30.0, 31.0],
-            "top_signal_cnt": [1, 1], "bottom_signal_cnt": [0, 0],
-            "_top_hits": ["a", "b"], "_bottom_hits": ["", ""],
-        }, index=idx)
         with mock.patch.object(msd, "_load_stored_raw", lambda c, m: pd.DataFrame()), \
-             mock.patch.object(msd, "build_composites", lambda p, r, m: comp), \
              mock.patch("db.bulk_upsert", fake_bulk_upsert), \
              mock.patch.object(msd, "bulk_upsert", fake_bulk_upsert):
             msd._write_market(conn, "HK", series, D(2026, 10, 13), True)
@@ -380,13 +377,12 @@ class TestWriteMarketInvalidDays(unittest.TestCase):
         # ① 带外键被 pop：不会变成一列指标（否则 iv_rows 里会出现它）
         codes_written = {r["indicator_code"] for r in captured["regime.indicator_value"]}
         self.assertNotIn(msd._INVALID_DATES_KEY, codes_written)
-        # ② 塌陷日：横截面指标被清库（两条 DELETE：指标 + 合成）
-        self.assertEqual(len(conn.deletes), 2)
+        # ② 塌陷日：横截面指标被清库（旧合成表删除后只剩这一条 DELETE）
+        self.assertEqual(len(conn.deletes), 1)
         for sql, params in conn.deletes:
             self.assertIn(D(2026, 10, 14), params[1])
-        # ③ 合成行跳过塌陷日，但保留正常日
-        mr_dates = [r["trade_date"] for r in captured["regime.market_regime_daily"]]
-        self.assertEqual(mr_dates, [D(2026, 10, 13)])
+        # ③ 不再写任何旧合成表
+        self.assertNotIn("regime.market_regime_daily", captured)
         # ④ 非横截面指标两天都写（外部资金流与当日样本数无关）
         nb = {(r["trade_date"]) for r in captured["regime.indicator_value"]
               if r["indicator_code"] == "FLOW.NORTHBOUND_NET"}
@@ -397,14 +393,7 @@ class TestWriteMarketInvalidDays(unittest.TestCase):
         import pandas as pd
         idx = [D(2026, 10, 13), D(2026, 10, 14)]
         conn = _FakeWriteConn()
-        # 合成结果必须带 mr_rows 用到的列（season/_top_hits 等），否则是测试桩不完整
-        cols = {"thermometer": [28.0, 31.0], "risk_score": [54.0, 59.0], "fsi": [50.0, 50.0],
-                "risk_appetite": [40.0, 41.0], "season": ["冬", "冬"], "season_score": [30.0, 31.0],
-                "top_signal_cnt": [1, 1], "bottom_signal_cnt": [0, 0],
-                "_top_hits": ["a", "b"], "_bottom_hits": ["", ""]}
         with mock.patch.object(msd, "_load_stored_raw", lambda c, m: pd.DataFrame()), \
-             mock.patch.object(msd, "build_composites",
-                               lambda p, r, m: pd.DataFrame(cols, index=idx)), \
              mock.patch("db.bulk_upsert", lambda *a, **k: None), \
              mock.patch.object(msd, "bulk_upsert", lambda *a, **k: None):
             msd._write_market(conn, "HK",

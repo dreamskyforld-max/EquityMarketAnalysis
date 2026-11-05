@@ -350,7 +350,7 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     ("市场事件采集", "get_market_events.py",
      {"hour": 19, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 900),
 
-    # 市场状态计算层（读原始表算指标 → regime.indicator_value / market_regime_daily）。
+    # 市场状态计算层（读原始表算指标 → regime.indicator_value；L2 由 build_dimension_value.py 产出）。
     # 依赖当日终值：A股 16:10、港股 16:30 盘后补采 + 港股沽空 18:30 三采 → 18:45 跑。
     # 增量窗口 45 天（自动重算并覆盖近段），首次/补历史用 --backfill（分块，可中断续跑）。
     ("市场状态计算", "market_state_daily.py",

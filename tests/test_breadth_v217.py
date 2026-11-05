@@ -232,11 +232,20 @@ class TestDictSchemaSelfHeal(unittest.TestCase):
 
 
 class TestBreadthExtra(unittest.TestCase):
-    def test_bias_flag_for_breadth_only(self):
-        ex = msd._breadth_extra("BREADTH.ADV_RATIO", D(2026, 1, 5), None)
-        self.assertTrue(ex["survivorship_bias"])
-        self.assertEqual(ex["quality"], "low")
-        self.assertIsNone(msd._breadth_extra("VAL.PE_TTM_MEDIAN", D(2026, 1, 5), None))
+    def test_bias_flag_for_cross_sectional_indicators(self):
+        """个股横截面聚合指标（宽度 + 估值）共用一个 PIT 成分池缺口 → 同款标注。
+
+        v2.1.12 起估值侧 `_breadth_extra` 不再返回 None（PE/PB/破净/ERP 都读
+        a_daily_quote / hk_daily_quote 当日横截面）；外部指数口径（ERP_LG 等）
+        不是个股横截面，仍不标。
+        """
+        for code in ("BREADTH.ADV_RATIO", "VAL.PE_TTM_MEDIAN",
+                     "VAL.PB_MEDIAN", "VAL.ERP"):
+            with self.subTest(code=code):
+                ex = msd._breadth_extra(code, D(2026, 1, 5), None)
+                self.assertTrue(ex["survivorship_bias"])
+                self.assertEqual(ex["quality"], "low")
+        self.assertIsNone(msd._breadth_extra("VAL.ERP_LG", D(2026, 1, 5), None))
 
     def test_no_flag_when_pit_universe_ready(self):
         with mock.patch.object(msd, "PIT_UNIVERSE_READY", True):

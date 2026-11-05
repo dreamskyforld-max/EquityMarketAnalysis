@@ -2,7 +2,12 @@
 """宽度维度 `DIM.BREADTH` 的族划分与档位切点标定（v2.1.9）。
 
 读 `regime.indicator_value.percentile`（`--backfill` 后的 v2.1.8 口径），按
-`doc/market_profile.md` §5.1 / §5.7 L2-b / §8.1.1 产出：
+`doc/market_profile.md` §5.1 / §5.7 L2-b / §8.1.1 产出。
+
+⚠ **标定样本收口**（2026-11-05，见 `doc/market_state_data_architecture.md` §5.1）：
+族划分 / 代表 / 内部一致性剔除 / 切点一律只读 `[CALIB_START, CALIB_END]`；
+2026 起的数据仅供 `--probe` 报告样本外占比，不参与任何标定决策，
+避免「用样本外调参、再报样本外表现」的前视：
 
   ① **族划分**：一阶差分相关矩阵（水平值相关会被共同趋势污染）+ PCA 第一主成分
      解释度 + 年代分层稳定性；三条判据全过才保留该族，否则拆成单成员族。
@@ -61,6 +66,8 @@ STRUCT_CODES = ["BREADTH.EQ_VS_CAP_20D", "BREADTH.AMT_CONC_TOP10",
 COVERAGE_MIN = 0.6
 DISPERSION_MAX = 30.0
 WEIGHT_CAP = 0.25
+REP_COVERAGE_MIN = 1.0       # 代表级覆盖门禁：score 是全代表等权均值，缺任一代表即口径不完整
+                             # 登记在 dimension_dict.params，生产者默认 0.0 以兼容旧种子
 
 CANDIDATES = {
     "涨跌家数": ["BREADTH.ADV_RATIO", "BREADTH.ADV_MINUS_DEC", "BREADTH.MCCLELLAN"],
@@ -120,19 +127,52 @@ def _decade_corr(diff: pd.DataFrame, members: list[str]) -> dict:
     return out
 
 
-def calibrate(wide, meta, market: str, flags_only: set) -> dict:
-    diff = wide.diff()
-    cal = wide[(wide.index >= CALIB_START) & (wide.index <= CALIB_END)]
+def _calib_slice(wide: pd.DataFrame) -> pd.DataFrame:
+    """标定样本 `[CALIB_START, CALIB_END]`。族划分 / 代表 / 内部一致性 / 切点一律只用它。
 
-    # §8.5 构念效度：三个通过族的代表构成「核心宽度分」，结构族成员与它的相关
-    # 用来判定是否只是「同一构念的另一种读数」（过低 → 移出 score，仅作 flags）。
+    index 统一走 `pd.to_datetime`：库里读出的 `trade_date` 可能是 `datetime.date`，
+    也可能是 pandas 的 datetime64，直接与 `datetime.date` 比较会抛 TypeError。
+    """
+    idx = pd.to_datetime(wide.index)
+    return wide[(idx >= pd.Timestamp(CALIB_START)) & (idx <= pd.Timestamp(CALIB_END))]
+
+
+def _construct_corr(data: dict) -> dict:
+    """各结构族成员与核心宽度分的同期相关（按市场）；只读标定样本。"""
+    corr_by_code = {}
+    for wide, _ in data.values():
+        cal = _calib_slice(wide)
+        core = cal[[c for c in CORE_REPS if c in cal.columns]].mean(axis=1, skipna=True)
+        for c in STRUCT_CODES:
+            if c in cal.columns:
+                corr_by_code.setdefault(c, []).append(float(cal[c].corr(core)))
+    return corr_by_code
+
+
+def _flags_only(data: dict, corr_by_code: dict | None = None) -> set:
+    """同期内部一致性过低的成员 → 只作 flags。
+
+    ⚠ 这是**内部一致性**检验（与 3 个代表构成的「核心宽度分」同期相关），
+    不是构念效标 / 前瞻检验。常量名 `MIN_CONSTRUCT_CORR` 沿用不改，
+    避免改变 `params_hash` 触发历史重算。
+    """
+    corr = corr_by_code if corr_by_code is not None else _construct_corr(data)
+    return {c for c, vs in corr.items() if min(vs) < MIN_CONSTRUCT_CORR}
+
+
+def calibrate(wide, meta, market: str, flags_only: set) -> dict:
+    cal = _calib_slice(wide)
+    diff = cal.diff()          # 族划分只用标定样本，不含样本外年份
+
+    # 同期内部一致性：三个通过族的代表构成「核心宽度分」，结构族成员与它的
+    # 同期相关用来判定是否只是「同一构念的另一种读数」（过低 → 移出 score）。
     core = cal[[c for c in CORE_REPS if c in cal.columns]].mean(axis=1, skipna=True)
     construct_corr = {c: round(float(cal[c].corr(core)), 3)
                       for c in STRUCT_CODES if c in cal.columns}
 
     blocks, effective = {}, []
     for name, members in CANDIDATES.items():
-        mem = [c for c in members if c in wide.columns]
+        mem = [c for c in members if c in cal.columns]
         if not mem:
             continue
         med, pc1, load = _corr_stats(diff, mem)
@@ -140,7 +180,7 @@ def calibrate(wide, meta, market: str, flags_only: set) -> dict:
         stable = all(v >= MIN_DECADE_CORR for v in dec.values()) if dec else True
         passed = len(mem) < 2 or (med >= MIN_INTRA_CORR and pc1 >= MIN_PC1 and stable)
         eligible = [c for c in mem if c not in flags_only]
-        nobs = wide[mem].notna().sum()
+        nobs = cal[mem].notna().sum()   # 代表打分的历史长度也只按标定样本
         rep = max(eligible or mem,
                   key=lambda c: 0.6 * nobs[c] / max(nobs.max(), 1) + 0.4 * load[c])
         blocks[name] = {
@@ -169,7 +209,7 @@ def calibrate(wide, meta, market: str, flags_only: set) -> dict:
     for dec, g in score.groupby(pd.to_datetime(score.index).year // 10 * 10):
         if len(g) >= 250:
             decade_share[f"{int(dec) * 10}s"] = _shares(g)
-    oos = score_full[score_full.index > CALIB_END]
+    oos = score_full[pd.to_datetime(score_full.index) > pd.Timestamp(CALIB_END)]
 
     return {
         "market": market,
@@ -216,18 +256,20 @@ def build_dict_row(results: dict, flags_only: set) -> dict:
             "weight": round(1.0 / len(cn["effective_blocks"]), 4) if is_rep else 0.0,
         })
     params = {
-        "winsor": [2, 98], "coverage_min": COVERAGE_MIN,
+        "winsor": [2, 98],  # 预留键：L1 分位用经验秩，当前不参与计算（见文档 §2.4 规则 1）
+        "coverage_min": COVERAGE_MIN,
         "dispersion_max": DISPERSION_MAX, "weight_cap": WEIGHT_CAP,
+        "rep_coverage_min": REP_COVERAGE_MIN,
         "pct_window": msd.BREADTH_PCT_WINDOW,
         "calib_start": str(CALIB_START), "calib_end": str(CALIB_END),
         "min_intra_corr": MIN_INTRA_CORR, "min_pc1": MIN_PC1,
         "min_decade_corr": MIN_DECADE_CORR,
         "min_construct_corr": MIN_CONSTRUCT_CORR,
         "flags_only": sorted(flags_only),
-        "calib_version": "v2.1.9",
+        "calib_version": "v2.1.10",  # 标定窗口收口 + 代表级门禁 → 口径变更，须全量重算 L2
     }
     payload = {"members": members, "state_bands": bands, "params": params,
-               "labels": LABELS, "agg_method": "block_equal"}
+               "labels": LABELS}
     ph = hashlib.md5(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
     block_agg = {b["block"]: "mean" for b in cn["effective_blocks"]}
     remark = (
@@ -238,7 +280,10 @@ def build_dict_row(results: dict, flags_only: set) -> dict:
         "但仍计入 coverage / dispersion / contrib / flags。"
         "族标定实证：三个同质族一阶差分相关 0.59~0.93 / PC1 0.79~0.96 通过；"
         "「结构族」相关约 0.10 / PC1 约 0.45 不通过 → 拆为单成员族；"
-        "其中与核心宽度分构念相关过低者（flags_only）移出 score、仅作 flags。"
+        "其中与核心宽度分**同期内部一致性**过低者（flags_only）移出 score、仅作 flags"
+        "（该判据不是构念效度：无外部效标 / 前瞻检验）。"
+        "⚠ 族划分 / 代表 / 内部一致性 / 切点一律只读 [calib_start, calib_end]，"
+        "样本外年份不参与标定。"
         "⚠ 代表由 CN 标定、**两市场共用**（dimension_dict 一行无法按市场存不同代表）："
         "HK 单独标定显示涨跌家数族最优代表为 ADV_MINUS_DEC（CN 为 ADV_RATIO），"
         "两者同族且一阶差分相关 >0.69；统一代表以保两市场读数可比。"
@@ -251,7 +296,7 @@ def build_dict_row(results: dict, flags_only: set) -> dict:
         "dimension_code": DIM, "dimension_name": "宽度",
         "question": "上涨的参与面有多广（描述型，高分=越广，非'越好'）",
         "polarity": "high_good", "members": members,
-        "agg_method": "block_equal", "block_agg": block_agg,
+        "block_agg": block_agg,
         "state_bands": bands, "state_labels": LABELS,
         "params": params, "params_hash": ph,
         "is_active": True, "remark": remark,
@@ -269,14 +314,9 @@ def main():
 
     with get_conn() as conn:
         data = {mk: _load(conn, mk) for mk in ("CN", "HK")}
-    # §8.5 构念效度：取**两市场相关的最小值**，避免单市场侥幸通过
-    corr_by_code = {}
-    for wide, _ in data.values():
-        core = wide[[c for c in CORE_REPS if c in wide.columns]].mean(axis=1, skipna=True)
-        for c in STRUCT_CODES:
-            if c in wide.columns:
-                corr_by_code.setdefault(c, []).append(float(wide[c].corr(core)))
-    flags_only = {c for c, vs in corr_by_code.items() if min(vs) < MIN_CONSTRUCT_CORR}
+    # 同期内部一致性（取两市场相关最小值，避免单市场侥幸通过）；只用标定样本
+    corr_by_code = _construct_corr(data)
+    flags_only = _flags_only(data, corr_by_code)
     results = {mk: calibrate(wide, meta, mk, flags_only)
                for mk, (wide, meta) in data.items()}
 
@@ -288,7 +328,7 @@ def main():
             print(f"✅ 写入 regime.dimension_dict {DIM}，params_hash={row['params_hash']}")
 
     if args.probe:
-        print(f"构念效度（两市场最小相关，阈值 {MIN_CONSTRUCT_CORR}）: "
+        print(f"同期内部一致性（两市场最小相关，阈值 {MIN_CONSTRUCT_CORR}）: "
               f"{ {c.split('.')[-1]: round(min(v), 3) for c, v in corr_by_code.items()} }")
         print(f"flags_only（不进 score，仅作 flags）: {sorted(flags_only)}")
         for mk, r in results.items():

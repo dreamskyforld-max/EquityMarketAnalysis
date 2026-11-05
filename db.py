@@ -243,7 +243,7 @@ def bulk_upsert(conn, table, data_list, conflict_cols, do_nothing=False,
     only_if_changed: 仅当**数据列**真的变了才执行 UPDATE
                 （`DO UPDATE SET ... WHERE tbl.c IS DISTINCT FROM EXCLUDED.c OR ...`）。
                 适用于「源是月/季频、但按 PIT 填充成日频网格」的**计算层**表
-                （regime.indicator_value / regime.market_regime_daily）：
+                （regime.indicator_value / regime.dimension_value）：
                   ① 值没变的行**完全不写** → 不再把同一行反复重写（省行版本膨胀 / WAL /
                      autovacuum 负担；实测 indicator_value 全表 31.5% 的行是重复值）；
                   ② updated_at 恢复「值最后变化时间」的语义（原先被刷新成「最后一次被跑到」，
