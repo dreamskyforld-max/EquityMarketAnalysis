@@ -1959,10 +1959,10 @@ CREATE TABLE IF NOT EXISTS regime.dimension_dict (
     question         VARCHAR(120),                      -- 该维度回答的业务问题（一句话）
     polarity         VARCHAR(12)     NOT NULL,          -- high_good=越高越好 / high_risk=越高越危险
     members          JSONB           NOT NULL,          -- [{code, sign, weight, block}]；sign 统一极性，block 为分族/分块名
-    block_agg        JSONB,                             -- 块内聚合方式 {"块名":"mean"|"max"}（压力维度的信用块取 max=最紧）
+    block_agg        JSONB,                             -- 块内聚合方式 {"块名":"mean"|"max"}（压力维度 M1 为 4 块块内等权，见 §5.5 v1.17）
     state_bands      JSONB,                             -- 5 档阈值（默认 [20,40,60,80]）
     state_labels     JSONB,                             -- 5 档标签（按极性命名，如 极窄/偏窄/中性/偏广/极广）
-    params           JSONB,                             -- {winsor:[2,98],coverage_min:0.6,dispersion_max:30,weight_cap:0.25, K:3(趋势)}
+    params           JSONB,                             -- {winsor:[2,98],coverage_min:0.6,dispersion_max:30,weight_cap:0.25, sigma_win:252/tsmom_variant=price(趋势)}
     params_hash      VARCHAR(16),                       -- 口径指纹：变化必须触发历史重算
     is_active        BOOLEAN         NOT NULL DEFAULT TRUE,
     remark           TEXT,
@@ -1970,9 +1970,9 @@ CREATE TABLE IF NOT EXISTS regime.dimension_dict (
 );
 
 COMMENT ON TABLE  regime.dimension_dict            IS '维度指标字典（L2）：六个维度（宽度/估值/情绪/资金/压力/趋势）的成员、极性、聚合方式与阈值参数';
-COMMENT ON COLUMN regime.dimension_dict.members    IS '成员清单 [{code,sign,weight,block}]；sign 用于统一极性（+1 顺向、-1 取 100−分位），block 为分族/分块名（宽度=4族、情绪=3块、资金=2块、压力=5块）。同一原子指标只能归属一个维度（情绪=意愿、资金=真金白银净流，见 market_profile.md §5.0）';
-COMMENT ON COLUMN regime.dimension_dict.block_agg  IS '块内聚合方式 {"块名":"mean"|"max"}。默认 mean；压力维度的信用块**取第二紧**（trimmed max）而非 max——AA 系成员源只留近 3 日，max 会被短样本成员永久绑架；块内 coverage < 0.5 时退化为均值并标 low_confidence（market_profile.md §5.5）';
-COMMENT ON COLUMN regime.dimension_dict.params      IS '维度级参数：winsor=[2,98]（**预留键，当前不参与计算**；L1 分位走经验秩，见 market_state_daily._expanding_percentile）、coverage_min=0.6、dispersion_max=30（对 dispersion_norm=dispersion×sqrt(n/10)）、weight_cap=0.25、K=3（**仅趋势维度**：σ 归一化后「几个标准差算满格」，纯展示参数，单调变换不改排序；趋势维度不出档故改 K 不需重标阈值）';
+COMMENT ON COLUMN regime.dimension_dict.members    IS '成员清单 [{code,sign,weight,block}]；sign 用于统一极性（+1 顺向、-1 取 100−分位），block 为分族/分块名（宽度=4族、情绪=3块、资金=按市场单锚2块+诊断、压力=4块+1诊断、趋势=强度锚+方向腿+校验3块单锚）。同一原子指标只能归属一个维度（情绪=意愿、资金=真金白银净流、趋势=指数方向与强度，见 market_profile.md §5.0）';
+COMMENT ON COLUMN regime.dimension_dict.block_agg  IS '块内聚合方式 {"块名":"mean"|"max"}。默认 mean；压力维度 M1（§5.5 v1.17）为固定核心集 9 成员 / 4 块块内等权 + 块间等权，原 21 成员 5 块与信用块取第二紧方案已废弃（AA 系仅 19~27 行，见 market_state_data_architecture.md §5.5）';
+COMMENT ON COLUMN regime.dimension_dict.params      IS '维度级参数：winsor=[2,98]（**预留键，当前不参与计算**；L1 分位走经验秩，见 market_state_daily._expanding_percentile）、coverage_min=0.6、dispersion_max=30（对 dispersion_norm=dispersion×sqrt(n/10)）、weight_cap=0.25、sigma_win=252 与 tsmom_variant=price（**仅趋势维度**：σ 归一化强度 t=|TSMOM_12M|/σ_252 作 L1 raw_value，DIM.TREND.score 取其 expanding 分位；原固定 K=3 线性刻度因单边趋势年系统性顶格已废弃，见 market_state_data_architecture.md §5.6 v1.19）';
 COMMENT ON COLUMN regime.dimension_dict.params_hash IS '口径指纹（成员/权重/winsor/阈值/门禁的哈希）。变化即口径变更，必须触发该维度历史重算；消费端读到的 model_version 与本值不等即为旧口径数据';
 
 -- 13. 维度指标日频读数（L2）：一市场一日一维一行
@@ -1981,7 +1981,7 @@ CREATE TABLE IF NOT EXISTS regime.dimension_value (
     market          VARCHAR(8)      NOT NULL,           -- CN / HK
     trade_date      DATE            NOT NULL,
     score           NUMERIC(6,2),                       -- 0-100，方向已统一到该维度极性
-    state           VARCHAR(12),                        -- 定性档；NULL = 覆盖度/分歧不达标，不出档
+    state           VARCHAR(12),                        -- 定性档；NULL = 覆盖度/分歧不达标，不出档（趋势维规格上恒 NULL）
     coverage        NUMERIC(5,4),                       -- 有效成员 / 应有成员（0-1）
     dispersion      NUMERIC(6,2),                       -- 成员分位标准差
     blocks          JSONB,                              -- 块级分数 {"波动":{"score":..,"coverage":..},...}；SYSTEMIC_STRESS.trigger 依赖本列
@@ -1995,8 +1995,8 @@ CREATE TABLE IF NOT EXISTS regime.dimension_value (
 );
 
 COMMENT ON TABLE  regime.dimension_value            IS '维度指标日频读数（L2）：一市场一日一维一行，由计算层写入';
-COMMENT ON COLUMN regime.dimension_value.state      IS '定性档（5 档，标签按极性命名：宽度 极窄/偏窄/中性/偏广/极广，压力 极稳/稳健/正常/紧张/危机）。NULL 表示不出档（coverage<0.6 或 dispersion>30）——此时只可读 score，不可读定性结论';
-COMMENT ON COLUMN regime.dimension_value.coverage   IS '有效成员 / 应有成员（0-1）。⚠ 分母按 market 判定（members[].code 联 indicator_dict.market_scope ∈ {当前市场, CN+HK, GLOBAL}）。港股情绪 4/7 ≈ 0.57、资金维度 CN/HK 各 2/5 = 0.4，均必然不出档；缺口是信息，不得按中性处理';
+COMMENT ON COLUMN regime.dimension_value.state      IS '定性档（5 档，标签按极性命名：宽度 极窄/偏窄/中性/偏广/极广，压力 极稳/稳健/正常/紧张/危机）。NULL 表示不出档（coverage<0.6 或 dispersion>30）——此时只可读 score，不可读定性结论；⚠ 趋势维度（§5.6 v1.19）规格上恒 NULL：三态方向由 BIZ.MARKET_REGIME 状态机产出，不是门禁未过，不得填「中性」';
+COMMENT ON COLUMN regime.dimension_value.coverage   IS '有效成员 / 应有成员（0-1）。⚠ 分母按 market 判定（members[].code 联 indicator_dict.market_scope ∈ {当前市场, CN+HK, GLOBAL}），只计本市场成员，故 HK 情绪成员齐备时 coverage 仍为 1.0。港股情绪 2/7 是维度完整度（flags.dimension_completeness），不是 coverage；HK 不出档由块级门禁 block_coverage_min、切点未标定与短样本决定（见 market_state_data_architecture.md §5.3）。缺口是信息，不得按中性处理';
 COMMENT ON COLUMN regime.dimension_value.dispersion IS '成员分位的标准差。内部严重背离（短期动能强、中期未修复）时明显抬升，此时平均分不可直接当结论，必须下钻 contrib/flags。⚠ 门禁用 dispersion_norm = dispersion × sqrt(n/10)（n=有效成员数）——成员数为 2 与 20 时同一绝对阈值的严格程度差一个量级';
 COMMENT ON COLUMN regime.dimension_value.flags      IS '结构性背离与极端标记（NEW_HIGH_LOW_20 与 _60 反向、MA60 与 MA200 分层、等权与市值加权差极端）；这些快慢/结构对照不能被平均分抹掉';
 
@@ -2046,7 +2046,7 @@ COMMENT ON COLUMN regime.business_value.score    IS '⚠ **同为多态列**：M
 COMMENT ON COLUMN regime.business_dict.output_schema IS '输出字段说明。⚠ **必须包含 level_semantics 与 score_semantics**（枚举值 + 方向），供消费方在读取 level/score 前校验——没有它，多态列的误用无法在 DB 层被发现（建议消费方按 biz_code 建独立视图，禁止跨 biz 联合查询）。MARKET_TEMPERATURE 的 score_semantics 必须标注「四维分位均值、分布向 50 集中、非等频分位读数、非绝对泡沫」，level_semantics 标注「升序=越热」';
 COMMENT ON COLUMN regime.business_value.since_date IS '当前状态的首次进入日（状态机产出）；配合 dwell_days 判断状态是否已稳定';
 COMMENT ON COLUMN regime.dimension_value.blocks IS '块级分数 {"块名":{"score":..,"coverage":..}}。SYSTEMIC_STRESS.trigger 的唯一数据来源——成员级 contrib 拿不到「信用块取最紧」的语义，没有本列只能用成员 top3 反推';
-COMMENT ON COLUMN regime.business_value.detail   IS '增量信息集中在此：MARKET_REGIME={candidate,evidence,breadth_confirmation}；MARKET_TEMPERATURE={components,quality,coverage,dispersion,low_agreement,quantiles,composition_version}（components 与 quantiles 无条件必输出；quality=low 照常发布但须标注；不落 history_stats，前瞻验证走离线报告）；SYSTEMIC_STRESS={trigger,spike,blocks}（压力 70 分时「信用在扩」还是「波动在冲」处置不同）；RISK_BUDGET={binding_constraint,raw_cap,inputs,constrained_by,missing}（比数字更有用的是「被什么卡住的」）';
+COMMENT ON COLUMN regime.business_value.detail   IS '增量信息集中在此：MARKET_REGIME={candidate,evidence,breadth_confirmation,trend_state,turn_risk}（§6.1 v2：trend_state=趋势/震荡转折二分、turn_risk=MA200 与动量符号背离）；MARKET_TEMPERATURE={components,quality,coverage,dispersion,low_agreement,quantiles,composition_version}（components 与 quantiles 无条件必输出；quality=low 照常发布但须标注；不落 history_stats，前瞻验证走离线报告）；SYSTEMIC_STRESS={trigger,spike,blocks}（压力 70 分时「信用在扩」还是「波动在冲」处置不同）；RISK_BUDGET={binding_constraint,raw_cap,inputs,constrained_by,missing}（比数字更有用的是「被什么卡住的」）';
 
 CREATE INDEX IF NOT EXISTS idx_biz_value_date ON regime.business_value (market, trade_date DESC);
 
@@ -2153,7 +2153,7 @@ ALTER TABLE regime.indicator_dict ADD COLUMN IF NOT EXISTS role   VARCHAR(16) DE
 
 COMMENT ON COLUMN regime.indicator_dict.domain    IS 'v2.1 维度归属（L2）：宽度/估值/情绪/资金/压力/趋势。NULL = 宏观条件输入（不属任何维度、不参与维度聚合），由业务指标按需直接引用';
 COMMENT ON COLUMN regime.indicator_dict.role      IS '指标在架构中的角色：status=参与状态/预算判定 · context=仅作背景与解释 · explanation=解释维度成员（有信号级消费者、无决策级消费者，如情绪与资金维度）';
-COMMENT ON COLUMN regime.indicator_dict.dimension IS '【legacy】旧分组字段（11 个取值，「资金」混入 M1/LPR/DXY 等宏观利率、「趋势」为 0），仅作浏览分组；v2.1 起维度归属一律看 domain。计划在计算层迁移时改名 theme';
+COMMENT ON COLUMN regime.indicator_dict.dimension IS '【legacy】旧分组字段（11 个取值，「资金」混入 M1/LPR/DXY 等宏观利率；「趋势」自 v1.19 起有 3 个 TREND.*），仅作浏览分组；v2.1 起维度归属一律看 domain。计划在计算层迁移时改名 theme';
 
 -- 19. v2.1.1 增量列（评审整改；既有库自愈，新建库已在上方 CREATE TABLE 中带上）
 --     B2 口径指纹    B3 初步值标记    B10 制度断点

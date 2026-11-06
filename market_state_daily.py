@@ -8,6 +8,7 @@
       → regime.indicator_dict   （指标字典：口径/方向/频率/来源，代码即字典）
         regime.indicator_value  （指标时序：raw_value + 历史分位）
         regime.dimension_value   （L2 维度值，由 build_dimension_value.py 按字典分派写入）
+        regime.business_value    （L3 业务值，由 build_business_value.py 在 L2 之后分派写入）
 
 关键约定：
   · **分位口径**：`indicator_value.percentile` = 原始值的历史分位（0-100，只用 t 及之前的
@@ -93,6 +94,66 @@ EXPANDING_CALIB_VERSION = "v2.1.7"
    model_version 未重算即变成「旧口径数据」，等于制造全库版本不一致。
    故按 rolling / expanding 拆开：本次只重算宽度族，其余指标逐值不变、版本不变。
    待各维度自己的口径版本升级时再递增本常量并单独全量重算。"""
+
+FLOW_CALIB_VERSION = "v2.1.14"
+"""资金族「净额」4 指标的口径版本（DIM.FLOW 落地，见 doc/market_state_data_architecture.md §5.4）。
+
+与 BREADTH_CALIB_VERSION / EXPANDING_CALIB_VERSION 并列，只挂在 FLOW_CALIB_CODES 上，
+改动不会波及其余 119 个指标的 params_hash（§2.2 按指标族隔离版本）。4 条指标统一为
+「20 交易日累计净额 ÷ 同期成交额 ×100」的 L1 输入侧口径，percentile 是唯一真相源。"""
+
+FLOW_CALIB_CODES = frozenset({
+    "FLOW.SOUTHBOUND_NET", "FLOW.NORTHBOUND_NET",
+    "FLOW.MARGIN_NET_20D", "FLOW.BUYBACK_NET_20D",
+})
+"""⚠ 必须精确枚举，不可用 startswith("FLOW.")：会误伤 TURNOVER_RATIO / MARGIN_RATIO /
+SHORT_SELLING_RATIO / HIBOR_3M（口径未变；TURNOVER_RATIO 还被 DIM.SENTIMENT 引用）。"""
+
+FLOW_ASOF_START = {
+    "FLOW.MARGIN_NET_20D": datetime.date(2019, 1, 2),
+    "FLOW.BUYBACK_NET_20D": datetime.date(2010, 1, 4),
+}
+"""L1 输入侧护栏（§5.4）：分位参考样本起点。
+
+· CN 两融净增：daily_margin_balance 虽已回补齐 2010 起，但 2015-2018 去杠杆段波动极大
+  （2015 sd 1.37 / 2017 min -6.07）且标的池由 87 只扩到 3993 只，会把 expanding 分布
+  的上尾抬高、把 2019+ 分位系统性压低 → 补齐段只作离线对照，2019-01-02 起才进分位。
+· HK 回购：2010 前单票集中度最高 92%、2002 年 amount 全 NULL → 2010-01-04 起才进分位。
+  2016 后回购常态化（20 日比率 0.1067→0.3394）由 L2 flags.regime_shift_2016 标注。
+⚠ 护栏作用于**产出层**（早于该日 raw_value 置 NULL），20 日窗口仍在护栏前数据上计算：
+  既保证起点当日窗口完整，又不把护栏前的值放进参考分布。"""
+
+# ── §5.6 v1.19 趋势族口径（改动须同步 doc/market_state_data_architecture.md 与版本号）──
+TREND_CALIB_VERSION = "v2.1.19"
+"""趋势族 3 个 `TREND.*` 原子的口径版本（DIM.TREND 落地，见 §5.6）。
+
+与 FLOW_CALIB_VERSION 同款：只挂在 TREND_CALIB_CODES 上，改动不会波及其余 123 个
+指标的 params_hash（§2.2 按指标族隔离版本）。口径 = 252 交易日价格动量 / MA200 偏离 /
+σ 归一化强度 t，三者都由 daily_benchmark 指数收盘价现算，L1 有 raw_value + percentile。"""
+
+TREND_CALIB_CODES = frozenset({
+    "TREND.TSMOM_12M", "TREND.MA200_DEV", "TREND.STRENGTH_T",
+})
+
+TREND_ASOF_START = {
+    "CN": datetime.date(1993, 1, 1),
+    "HK": datetime.date(2013, 8, 20),
+}
+"""L1 输入侧护栏（§5.6）：分位参考样本起点。
+
+· CN 1991-92 上证刚开市，σ_252 年均值仅 0.114 / 0.557，t 中位数 12.07 / 10.22，
+  固定刻度下 100% / 75% 的交易日顶格；把这段放进 expanding 参考分布会把 1993+ 的
+  分位系统性压低 → 1993-01-01 起才进分位（补齐段只作离线对照）。
+· HK 恒指 daily_benchmark 实际起点 2013-08-20，更早无源。
+⚠ 护栏作用于**产出层**（早于该日 raw_value 置 NULL），200/252 日窗口仍在护栏前
+  数据上计算：既保证起点当日窗口完整，又不把护栏前的值放进参考分布。"""
+
+TREND_SIGMA_WIN = 252
+TREND_MA_WIN = 200
+TREND_TSMOM_WIN = 252
+TREND_BENCH_CODE = {"CN": "SH.000001", "HK": "HK.800000"}
+"""σ / MA / 动量窗口均为**交易日**（按行数计），指数代码按市场各固定一个。
+   三者都进 TREND_CALIB_VERSION 的口径指纹，改动须递增版本并全量重算。"""
 
 BREADTH_PCT_MIN_PERIODS = 250
 """§2.4 规则 1：宽度族有效观测不足 250 不计算分位（L2 另以 3×250=750 降置信）。
@@ -227,14 +288,22 @@ INDICATORS: list[dict] = [
          remark="定义：两融余额占流通市值比例，杠杆资金水位　·　判读：持续攀升=杠杆加码（助涨也助跌）；高位叠加宽度恶化是典型风险信号　·　数据：依赖流通市值字段 → 2018 起；仅 CN",
          market_scope="CN", unit="pct", direction="high_risk", freq="day",
          formula="Σ两融余额 / Σ流通市值 * 100（杠杆水位；2018 起）"),
-    dict(code="FLOW.SOUTHBOUND_NET", name="南向净流入(亿港元)", scope="MARKET", dimension="资金",
-         remark="定义：港股通南向资金当日净流入（亿港元），内地资金定价港股的边际力量　·　判读：持续净流入=内地资金定价权增强、利好港股流动性；单日大额须辨别是否为成分股调整所致　·　数据：数据 2026-04 起，样本短，分位需长窗口累积才有意义",
-         market_scope="HK", unit="yi_hkd", direction="high_good", freq="day",
-         formula="Σ est_net_inflow（daily_ggt_hold）；数据 2026-04 起，分位需长窗口累积"),
-    dict(code="FLOW.NORTHBOUND_NET", name="北向净流入(亿元)", scope="MARKET", dimension="资金",
-         remark="定义：北向资金当日净流入（亿元），外资配置 A 股的边际力量　·　判读：持续净流入=外资风险偏好回升，与人民币汇率、中美利差同向确认　·　数据：⚠ 官方 2024-08-16 后停止披露，**序列在断点终止无新值**，勿用于当期判断",
-         market_scope="CN", unit="yi_cny", direction="high_good", freq="day",
-         formula="daily_northbound_flow.net_inflow；⚠ 官方 2024-08-16 后停披露，本指标序列在断点终止"),
+    dict(code="FLOW.SOUTHBOUND_NET", name="南向净流入强度(20日/成交额)", scope="MARKET", dimension="资金",
+         remark="定义：南向资金近 20 交易日累计净流入 ÷ 同期港股市场成交额 × 100　·　判读：高分=内地资金定价港股的边际力量偏强；净额是流量型成分，随市场规模漂移，直接对原始金额取分位会把「年份」读成资金强弱，故必须先标准化　·　数据：daily_ggt_hold.est_net_inflow 是持股变动反推的**估算值**（送股/转托管会失真，与 hold_value_change_1d 相关仅 0.19），2026-04 起仅约 130 个交易日、样本短　·　⚠ 单日净流噪声极大且成分股调整/半日市会失真，20 日累计是固定口径；改 formula 须按 §2.2 递增版本并全量重算 L1+L2　·　⚠ 在 DIM.FLOW 中降为 flags_only 诊断成员，不进 score",
+         market_scope="HK", unit="pct", direction="high_good", freq="day",
+         formula="SUM(daily_ggt_hold.est_net_inflow × 1e8, 20 交易日) / SUM(daily_market_turnover.total_turnover, 同期 20 交易日) × 100；窗口内有效观测不足 20 → NULL，不补 0、不填 50；半日市由 L2 标注、不改 L1 值"),
+    dict(code="FLOW.NORTHBOUND_NET", name="北向净流入强度(20日/成交额)", scope="MARKET", dimension="资金",
+         remark="定义：北向资金近 20 交易日累计净流入 ÷ 同期 A 股市场成交额 × 100　·　判读：高分=外资配置力量偏强　·　数据：⚠ 官方 2024-08-16 后停止披露，序列在断点终止、断点后一律 NULL，不得用于当期判断、不得补 0 或 50　·　⚠ 在 DIM.FLOW 中降为 flags_only 诊断成员，只作断点标注",
+         market_scope="CN", unit="pct", direction="high_good", freq="day",
+         formula="SUM(daily_northbound_flow.net_inflow × 1e8, 20 交易日) / SUM(a_daily_market_turnover.total_turnover, 同期 20 交易日) × 100；窗口内有效观测不足 20 → NULL"),
+    dict(code="FLOW.MARGIN_NET_20D", name="两融净增强度(20日/成交额)", scope="MARKET", dimension="资金",
+         remark="定义：Σ两融余额的 20 交易日净增 ÷ 同期 A 股成交额 × 100，即杠杆资金的**有符号净流**　·　判读：高分=杠杆资金净流入侧；与 FLOW.MARGIN_RATIO（存量水位）互补，后者分母依赖流通市值、2026-10 曾因字段覆盖塌陷失真，故不进 DIM.FLOW 核心　·　数据：daily_margin_balance 2010-03-31 起、2011 后近乎全覆盖；rzrq_balance 缺失行由 rz_balance+rq_balance 补出（实测 176133 行子字段均非空）　·　⚠ L1 输入侧护栏 FLOW_ASOF_START=2019-01-02：2015-2018 去杠杆段波动与标的池扩张会污染 expanding 参考分布，补齐段只作离线对照　·　CN 侧 DIM.FLOW 的唯一核心成员（单锚）",
+         market_scope="CN", unit="pct", direction="high_good", freq="day",
+         formula="(Σ COALESCE(rzrq_balance, rz_balance+rq_balance)[t] − 同口径[t−20 交易日]) / SUM(a_daily_market_turnover.total_turnover, 近 20 交易日) × 100；2019-01-02 前的 raw_value 置 NULL"),
+    dict(code="FLOW.BUYBACK_NET_20D", name="港股回购净额强度(20日/成交额)", scope="MARKET", dimension="资金",
+         remark="定义：近 20 交易日港股公司回购金额 ÷ 同期港股成交额 × 100，即公司部门净买入 / 股份供给收缩　·　判读：高分=公司净买入偏强；⚠ 它不是外部资金流入，是股份供给侧流量，语义边界须与跨境净流区分　·　数据：daily_buyback_event 1991-11-28 起 10.4 万条、全 HK. 前缀、amount 与 volume×avg_price 零偏差；2002 年 amount 全 NULL、2010 前单票集中度最高 92%，故 2010 起才进分位　·　⚠ buyback_date 含休市日，按「下一个开市日」归并后再累计；交易日序列以 daily_market_turnover.trade_date 为准（trading_calendar 的 HK 段滞后）　·　⚠ 2016 后回购常态化（20 日比率 0.1067→0.3394，3.2 倍制度抬升），expanding 分位会把 2016 后系统性排到高位，只作相对变化读数、不做跨年代水平比较（L2 flags.regime_shift_2016）　·　HK 侧 DIM.FLOW 的唯一核心成员（单锚）",
+         market_scope="HK", unit="pct", direction="high_good", freq="day",
+         formula="SUM(daily_buyback_event.amount 归并至下一开市日, 20 交易日) / SUM(daily_market_turnover.total_turnover, 同期 20 交易日) × 100；2010-01-04 前的 raw_value 置 NULL"),
     dict(code="FLOW.SHORT_SELLING_RATIO", name="港股卖空成交占比", scope="MARKET", dimension="资金",
          remark="定义：港股卖空金额占全市场成交额比例，做空/对冲力量强度　·　判读：异常升高=看空或对冲需求上升，常伴波动放大；持续低位=缺乏做空制衡　·　数据：数据 2026-06 起，样本短；仅 HK",
          market_scope="HK", unit="pct", direction="high_risk", freq="day",
@@ -664,6 +733,20 @@ INDICATORS: list[dict] = [
          market_scope="CN", unit="yi_yuan", direction="high_good", freq="day",
          remark="定义：近 5 个交易日行业资金净流入合计　·　判读：平滑单日噪声，>0 中期资金面偏暖　·　数据：需 ≥5 个交易日数据（min_periods=5），不足则空——避免把部分窗口当完整窗口；仅 CN",
          formula="Σ 近5个交易日 SECTOR.FLOW_NET"),
+
+    # —— 趋势 Trend（§5.6 v1.19 落地；唯一归属 DIM.TREND / BIZ.MARKET_REGIME） ——
+    dict(code="TREND.TSMOM_12M", name="指数12月价格动量", scope="MARKET", dimension="趋势",
+         remark="定义：指数收盘价相对 252 个交易日前的价格收益，时间序列动量（TSMOM）　·　判读：>0 指数上行、<0 下行，是 §5.8 方向状态机第二腿的 raw_value 来源；本原子取 expanding 分位只供维度层校验，方向判定一律读 raw_value　·　口径：价格收益、不减无风险利率（CN 中债 / HK 美债中枢不同，减 rf 会让同涨幅判出不同状态）；股息偏差已知，补法是全收益指数而非减 rf　·　数据：daily_benchmark SH.000001 / HK.800000 收盘价现算，护栏 CN 1993-01-01 / HK 2013-08-20；CN+HK",
+         market_scope="CN+HK", unit="ratio", direction="neutral", freq="day",
+         formula="P_t / P_{t−252} − 1（价格收益，不减无风险利率；252 个交易日）"),
+    dict(code="TREND.MA200_DEV", name="指数MA200偏离", scope="MARKET", dimension="趋势",
+         remark="定义：指数收盘价相对 200 个交易日简单均线的偏离　·　判读：>0 站上长期均线、<0 跌破，是 §5.8 方向状态机第一腿的 raw_value 来源；不进 DIM.TREND.score　·　口径：200 = 交易日（约 290 自然日），指数无复权　·　数据：同 TSMOM_12M 护栏与指数源；CN+HK",
+         market_scope="CN+HK", unit="ratio", direction="neutral", freq="day",
+         formula="close / MA200 − 1（MA200 = 200 个交易日简单均线）"),
+    dict(code="TREND.STRENGTH_T", name="指数趋势强度t统计量", scope="MARKET", dimension="趋势",
+         remark="定义：|TSMOM_12M| / σ_252，即 12 个月收益相当于几个年化标准差（T=1 的 t 统计量，≈ 年化 Sharpe）　·　判读：越大趋势越陡、**与多空方向解耦**（分子取绝对值）；raw_value 保留可读的「几个标准差」，DIM.TREND.score 取本原子的 expanding 分位，用相对刻度避免固定 K 在单边趋势年系统性顶格　·　口径：σ_252 与 TSMOM 同为 252 交易日窗口（配对正确前提），由同一条收盘价现算、不建独立波动原子（§5.5 已有 RISK.RV20/60）　·　数据：σ=0 或序列 <252 日置 NULL；护栏 CN 1993-01-01 / HK 2013-08-20；CN+HK",
+         market_scope="CN+HK", unit="sigma", direction="neutral", freq="day",
+         formula="|TSMOM_12M| / σ_252；σ_252 = std(日对数收益, 252 个交易日) × √252"),
 ]
 
 # 不做历史分位的指标：
@@ -746,7 +829,9 @@ def _params_hash(meta: dict, rolling: bool) -> str:
         str(meta.get("code") or ""), str(meta.get("unit") or ""),
         str(meta.get("direction") or ""), str(meta.get("formula") or ""),
         f"roll{BREADTH_PCT_WINDOW}" if rolling else "expanding",
-        BREADTH_CALIB_VERSION if rolling else EXPANDING_CALIB_VERSION,
+        (TREND_CALIB_VERSION if meta.get("code") in TREND_CALIB_CODES
+         else (FLOW_CALIB_VERSION if meta.get("code") in FLOW_CALIB_CODES
+               else (BREADTH_CALIB_VERSION if rolling else EXPANDING_CALIB_VERSION))),
     ])
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -1344,6 +1429,110 @@ def _valuation_asof_guard(s, start_date=VALUATION_ASOF_START):
     return s.mask(_valuation_before_mask(s.index, start_date))
 
 
+# ── §5.4 资金族 L1 原子：20 交易日累计净额 ÷ 同期成交额 ──────────────────────
+def _asof_guard(s: pd.Series, start_date: datetime.date) -> pd.Series:
+    """L1 输入侧护栏：早于 start_date 的 raw_value 置 NULL（不进分位参考样本）。
+
+    ⚠ 只在**产出层**裁剪；20 日窗口已在完整序列上算完，故 start_date 当日窗口不缺样本。
+    """
+    if s is None or len(s) == 0:
+        return s
+    return s.where([d >= start_date for d in s.index])
+
+
+def _map_to_next_trading_day(df: pd.DataFrame, date_col: str, value_col: str,
+                             idx) -> pd.Series:
+    """事件日归并到「>= 该日的最近交易日」并求和。
+
+    daily_buyback_event.buyback_date 含休市日（2010 起 145 个不在 HK 交易日历内，
+    且 trading_calendar 的 HK 段只到 2026-10-29）。idx 取成交额表交易日，是唯一
+    对齐基准。落在 idx 末尾之后的事件丢弃（尚未收口，不提前计入）。
+    """
+    if df.empty or len(idx) == 0:
+        return pd.Series(dtype=float)
+    idx_sorted = pd.DatetimeIndex(sorted(set(idx)))
+    src = pd.to_datetime(df[date_col])
+    pos = idx_sorted.searchsorted(src, side="left")
+    out: dict = {}
+    for p, v in zip(pos, df[value_col].to_numpy(dtype=float)):
+        if p < len(idx_sorted):
+            key = idx_sorted[p].date()
+            out[key] = out.get(key, 0.0) + float(v)
+    return pd.Series(out, dtype=float).sort_index()
+
+
+def _flow_net_strength(net: pd.Series, turnover: pd.Series, idx,
+                       window: int = 20, fill_zero: bool = False) -> pd.Series:
+    """20 交易日累计净额 / 同期累计成交额 × 100。
+
+    net 与 turnover 同量纲（元 / 港元）。fill_zero=False 时缺口按**缺失**处理
+    （窗口内有效观测不足 window 个即 NaN，§5.4「缺口不是中性」）；fill_zero=True
+    用于「当日无事件 = 真实的 0」的事件型流量（港股回购）。
+    """
+    n = net.reindex(idx)
+    if fill_zero:
+        n = n.fillna(0.0)
+    n20 = n.rolling(window, min_periods=window).sum()
+    t20 = turnover.reindex(idx).rolling(window, min_periods=window).sum()
+    return n20 / t20.replace(0, np.nan) * 100
+
+
+def _flow_atoms_cn(conn, start: datetime.date, end: datetime.date, idx) -> dict:
+    """CN 侧两条资金原子：两融净增 20D（核心）、北向净额 20D/成交额（诊断）。
+
+    ⚠ 独立查询 daily_margin_balance，不复用 calc_cn 的 margin Series：COALESCE 修复
+      只作用于新原子，不改 FLOW.MARGIN_RATIO 既有值、不触发它重算。
+    所有 SQL 带 [start, end] 下界并在库侧 GROUP BY（资源规范 R1/R7）。
+    """
+    bal = _series_from_df(_q(conn, """
+        SELECT trade_date,
+               sum(COALESCE(m.rzrq_balance,
+                            COALESCE(m.rz_balance, 0) + COALESCE(m.rq_balance, 0))) AS bal
+        FROM daily_margin_balance m
+        WHERE m.trade_date BETWEEN %s AND %s GROUP BY 1 ORDER BY 1
+    """, [start, end]), "trade_date", "bal")
+    tv = _series_from_df(_q(conn, """
+        SELECT trade_date, total_turnover FROM a_daily_market_turnover
+        WHERE trade_date BETWEEN %s AND %s AND total_turnover > 0 ORDER BY 1
+    """, [start, end]), "trade_date", "total_turnover")
+    nb = _series_from_df(_q(conn, """
+        SELECT trade_date, net_inflow * 1e8 AS net FROM daily_northbound_flow
+        WHERE trade_date BETWEEN %s AND %s ORDER BY 1
+    """, [start, end]), "trade_date", "net")
+    bal_i = bal.reindex(idx)
+    tv20 = tv.reindex(idx).rolling(20, min_periods=20).sum().replace(0, np.nan)
+    margin_net = (bal_i - bal_i.shift(20)) / tv20 * 100
+    return {
+        "FLOW.MARGIN_NET_20D": _asof_guard(
+            margin_net, FLOW_ASOF_START["FLOW.MARGIN_NET_20D"]),
+        "FLOW.NORTHBOUND_NET": _flow_net_strength(nb, tv, idx),
+    }
+
+
+def _flow_atoms_hk(conn, start: datetime.date, end: datetime.date, idx) -> dict:
+    """HK 侧两条资金原子：公司净回购 20D（核心）、南向净额 20D/成交额（诊断）。"""
+    tv = _series_from_df(_q(conn, """
+        SELECT trade_date, total_turnover FROM daily_market_turnover
+        WHERE trade_date BETWEEN %s AND %s AND total_turnover > 0 ORDER BY 1
+    """, [start, end]), "trade_date", "total_turnover")
+    snet = _series_from_df(_q(conn, """
+        SELECT trade_date, sum(est_net_inflow) * 1e8 AS net FROM daily_ggt_hold
+        WHERE trade_date BETWEEN %s AND %s GROUP BY 1 ORDER BY 1
+    """, [start, end]), "trade_date", "net")
+    bdf = _q(conn, """
+        SELECT buyback_date, sum(amount) AS amt FROM daily_buyback_event
+        WHERE buyback_date BETWEEN %s AND %s AND amount IS NOT NULL
+        GROUP BY 1 ORDER BY 1
+    """, [start, end])
+    bb_daily = _map_to_next_trading_day(bdf, "buyback_date", "amt", idx)
+    return {
+        "FLOW.BUYBACK_NET_20D": _asof_guard(
+            _flow_net_strength(bb_daily, tv, idx, fill_zero=True),
+            FLOW_ASOF_START["FLOW.BUYBACK_NET_20D"]),
+        "FLOW.SOUTHBOUND_NET": _flow_net_strength(snet, tv, idx),
+    }
+
+
 # ── 计算：CN ────────────────────────────────────────────────────────────────
 def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 400) -> dict:
     """A 股指标计算（宽度/估值/资金/风险），返回 {code: Series}。"""
@@ -1472,16 +1661,18 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     cmv = df["cmv"].astype(float)
     out["FLOW.MARGIN_RATIO"] = (margin.reindex(cmv.index) / cmv.replace(0, np.nan) * 100)
 
-    # ④ 北向净流入（断点 2024-08-16 之后自然为空）
-    ndf = _q(conn, """SELECT trade_date, net_inflow FROM daily_northbound_flow
-                      WHERE trade_date BETWEEN %s AND %s ORDER BY 1""", [w_start, end])
-    out["FLOW.NORTHBOUND_NET"] = _series_from_df(ndf, "trade_date", "net_inflow")
+    # ④ §5.4 资金族新口径原子：两融净增 20D（DIM.FLOW 核心）+ 北向 20D 累计/成交额（诊断）
+    #    ⚠ 北向单日净额在此被 replace 为新口径；2024-08-16 断点后源表无行 →
+    #      reindex 为 NaN → 窗口内有效观测不足 20 → NULL，不补 0、不填 50。
+    out.update(_flow_atoms_cn(conn, w_start, end, df.index))
 
     # ⑤ 指数波动率 / 回撤（上证指数）
     bdf = _q(conn, """SELECT trade_date, last_price FROM daily_benchmark
                       WHERE bench_code='SH.000001' AND trade_date BETWEEN %s AND %s ORDER BY 1""",
              [w_start, end])
     out.update(_risk_from_index(bdf, "trade_date", "last_price", "CN"))
+    # §5.6 趋势族：全历史算窗口、reindex 到本轮主索引（护栏见 TREND_ASOF_START）
+    out.update(_trend_atoms(conn, "CN", end, out["RISK.RV20"].index))
 
     # ⑥ ERP = 1/PE − 中国10Y国债（日频口径：个股聚合 PE 中位数，自 2018）
     #    债券腿取全历史（~5000 行，开销可忽略），以便同时服务 VAL.ERP 与 VAL.ERP_LG。
@@ -1654,10 +1845,10 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
         out["BREADTH.PCT_ABOVE_MA200"] = _mask_days(
             wdf["ab200"] / wdf["ok200"].replace(0, np.nan) * 100, bad_days)
 
-    # 南向净流入（亿港元）
-    sdf = _q(conn, """SELECT trade_date, sum(est_net_inflow) AS net FROM daily_ggt_hold
-                      WHERE trade_date BETWEEN %s AND %s GROUP BY 1 ORDER BY 1""", [w_start, end])
-    out["FLOW.SOUTHBOUND_NET"] = _series_from_df(sdf, "trade_date", "net")
+    # §5.4 资金族新口径原子：港股公司净回购 20D（DIM.FLOW 核心）
+    #    + 南向 20D 累计/成交额（诊断，est_ 估算且 2026-04 起样本短）。
+    #    ⚠ 回购事件的 buyback_date 含休市日，在函数内归并到「下一开市日」再累计。
+    out.update(_flow_atoms_hk(conn, w_start, end, df.index))
 
     # 卖空成交占比 = 沽空金额(亿港元) / 全市场成交额
     shdf = _q(conn, """SELECT trade_date, sum(short_selling_amt) AS short_amt
@@ -1675,6 +1866,8 @@ def calc_hk(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
                       WHERE bench_code='HK.800000' AND trade_date BETWEEN %s AND %s ORDER BY 1""",
              [w_start, end])
     out.update(_risk_from_index(bdf, "trade_date", "last_price", "HK"))
+    # §5.6 趋势族：全历史算窗口、reindex 到本轮主索引（护栏见 TREND_ASOF_START）
+    out.update(_trend_atoms(conn, "HK", end, out["RISK.RV20"].index))
 
     # ERP = 1/PE − 美债10Y
     #   ⚠ **前视修正**：美债（美股标的）T 日收盘在北京时间 T+1 上午才可得。原实现用
@@ -2450,6 +2643,43 @@ def _risk_from_index(bdf: pd.DataFrame, date_col: str, price_col: str, market: s
     }
 
 
+def _trend_atoms(conn, market: str, end: datetime.date, index=None) -> dict:
+    """§5.6 趋势族 3 个原子：从指数收盘价现算（全历史读、按窗口 reindex）。
+
+    与 `_risk_from_index` 刻意分开：① 200/252 交易日窗口比 400 自然日 warmup 更长，
+    必须拿全历史才能保证窗口完整（HK 假期多，400 自然日未必够 252 个交易日）；
+    ② 不改 `bdf` 的查询范围，避免顺带改变 RV20 / RV60 / MAXDD_250 的既有数值。
+    `index` 传入 calc_cn / calc_hk 的窗口索引时 reindex 到该索引 —— 这样 `new_raw`
+    的日期范围与其余指标一致，`_write_market` 的 `hist` 拼接与分位逻辑零影响。
+
+    资源规范：查询带 `bench_code` 实体过滤 + `trade_date<=end` 下界，单序列
+    CN 8757 / HK 3253 行，远低于 50 万行红线。
+    """
+    bench = TREND_BENCH_CODE[market]
+    asof = TREND_ASOF_START[market]
+    df = _q(conn, """SELECT trade_date, last_price FROM daily_benchmark
+                     WHERE bench_code=%s AND trade_date<=%s AND last_price>0
+                     ORDER BY trade_date""", [bench, end])
+    s = _series_from_df(df, "trade_date", "last_price")
+    if s.empty:
+        return {}
+    ret = np.log(s / s.shift(1))
+    sigma = ret.rolling(TREND_SIGMA_WIN, min_periods=TREND_SIGMA_WIN).std() * np.sqrt(252)
+    mom12 = s / s.shift(TREND_TSMOM_WIN) - 1
+    ma_dev = s / s.rolling(TREND_MA_WIN, min_periods=TREND_MA_WIN).mean() - 1
+    strength = mom12.abs() / sigma.where(sigma > 0)     # σ=0 → NaN，不填 0
+    out = {
+        "TREND.TSMOM_12M": mom12,
+        "TREND.MA200_DEV": ma_dev,
+        "TREND.STRENGTH_T": strength,
+    }
+    # 护栏只作用于产出层：窗口仍在护栏前数据上计算，护栏前的值不进 expanding 参考分布。
+    out = {code: v.where(v.index >= asof) for code, v in out.items()}
+    if index is not None:
+        out = {code: v.reindex(index) for code, v in out.items()}
+    return out
+
+
 # ── 落库 ────────────────────────────────────────────────────────────────────
 # 库结构自愈（2026-11-04 事故）：
 #   目标库的 regime.indicator_dict 停留在 v2.1 之前的结构，而本模块按最新 schema
@@ -2714,11 +2944,13 @@ def run(codes=None, ctx=None, market: str = None, start: datetime.date = None,
                   f"，用时 {tot['elapsed_s']}s")
         # L2 维度层：L1 全市场写完后统一重算（无状态，单日可重算；此处按本次窗口）。
         # 字典尚未标定时只告警、不中断 L1 —— 采集轮次不能被维度层拖垮。
+        l2_ok = False
         try:
             import build_dimension_value
             stats["dimensions"] = build_dimension_value.build_all_dimensions(
                 conn, start=start, end=end, backfill=backfill, write=write,
                 markets=markets)
+            l2_ok = True
             for mk, s in stats["dimensions"].items():
                 print(f"  ✅ L2 {mk}: dimension_value {s['rows']} 行 / 出档 {s['state_rows']} 日")
                 for _dc, _ds in s.get("dims", {}).items():
@@ -2726,6 +2958,24 @@ def run(codes=None, ctx=None, market: str = None, start: datetime.date = None,
         except Exception as e:
             print(f"  ⚠ L2 维度层跳过（{type(e).__name__}: {e}）；"
                   f"可单独跑 build_dimension_value.py --write（标定见 tools/calibrate_breadth.py --write）")
+        # L3 业务层：必须在 L2 写出 dimension_value **之后** 调用 ——
+        # BIZ.MARKET_REGIME 读 DIM.TREND.score / DIM.BREADTH.state；L2 失败时
+        # 不得拿上一轮维度读数继续算（l2_ok 守卫）。异常隔离与 L2 同款：
+        # 业务层失败不拖垮 L1/L2 采集轮次。
+        if l2_ok:
+            try:
+                import build_business_value
+                stats["business"] = build_business_value.build_all_business(
+                    conn, markets=markets, write=write)
+                for mk, per_biz in stats["business"].items():
+                    for bc, bs in per_biz.items():
+                        print(f"  ✅ L3 {mk} {bc}: business_value {bs['rows']} 行"
+                              f" / 切换 {bs.get('switches', 0)} 次")
+            except Exception as e:
+                print(f"  ⚠ L3 业务层跳过（{type(e).__name__}: {e}）；"
+                      f"可单独跑 build_business_value.py --write")
+        else:
+            print("  ⚠ L3 业务层跳过：L2 维度层未完成，避免用陈旧维度读数")
     return stats
 
 

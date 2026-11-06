@@ -179,6 +179,8 @@ def ensure_tables():
     _migrate_market_config()
     _migrate_profile_task_config()
     _migrate_coverage_config()
+    _migrate_northbound_retire()
+    _migrate_alert_dedupe()
 
 
 # 行数覆盖度监控配置（2026-10-16，事故驱动）：
@@ -222,7 +224,9 @@ _SEED_TABLE_CONFIG = [
     ("daily_margin_balance",    "trade_date",   "day",    1, 0, "get_margin_balance"),
     ("macro_environment_score", "trade_date",   "day",    0, 0, "macro_environment_score"),
     ("daily_trend",             "trade_date",   "day",    0, 0, "get_trend"),
-    ("daily_northbound_flow",   "trade_date",   "day",    0, 0, "get_northbound"),
+    # 北向：官方 2024-08-19 起停披露日频净买入（末次有效 2024-08-16）。此行为留痕，
+    # 建库后会立刻被 _migrate_northbound_retire 置 active=false，不产生停滞告警。
+    ("daily_northbound_flow",   "trade_date",   "day",    0, 0, "get_northbound(已封存/停更)"),
     ("benchmark_correlation",   "updated_at",   "lowfreq", 3, 0, "benchmark_correlation_daily"),
     ("stock_sector",            "updated_at",   "week",   0, 1, "get_stock_sector(每周二刷新)"),
     # —— 盘中高频型（必须用盘中时间戳列，才能抓「超 N 分钟未更新」）——
@@ -290,8 +294,10 @@ def _migrate_monitor_config():
 
 
 # 市场状态分析系统（regime schema）表登记：随 regime_schema.py 落地（2026-09-30）。
-# indicator_value / dimension_value 属「计算层」，P1 上线前以 active=FALSE 预登记，
-# 避免空表被误判为「从未采集」而持续告警。
+# 计算层（indicator_value / dimension_value）已于 2026-09-30 P1 上线，登记为 active=TRUE。
+# L3 business_value 已由 market_state_daily.run() 在 L2 之后日频接线（工作日 18:45）。
+# ⚠ 该表用 only_if_changed=True 落库：状态不变时 updated_at 不刷新，故 time_column
+#   必须用 trade_date 按业务日期判新鲜度（见 period='day' 的说明），否则会误报断供。
 _REGIME_TABLE_CONFIG = [
     # (db_name, table_name, time_column, period, expect_lag, refresh_weekday, remark, active)
     ("regime", "macro_series", "updated_at", "lowfreq", 3, 0,
@@ -301,6 +307,10 @@ _REGIME_TABLE_CONFIG = [
      "指标字典（market_state_daily 每次运行同步）", True),
     ("regime", "indicator_value", "updated_at", "day", 1, 0,
      "市场状态计算层 market_state_daily（工作日 18:45）", True),
+    ("regime", "business_dict", "updated_at", "lowfreq", 30, 0,
+     "L3 字典种子（build_business_value.py --seed）", True),
+    ("regime", "business_value", "trade_date", "day", 1, 0,
+     "L3 业务值（market_state_daily 18:45 在 L2 之后接线；按 trade_date 判新鲜度）", True),
     ("regime", "analyst_forecast_snapshot", "snapshot_date", "day", 1, 0,
      "get_analyst_forecast（逐日快照，18:40；缺一天即断档不可补）", True),
     # 事件表用 updated_at 判「采集器是否还活着」：业务日期天然稀疏（可能数日无新事件），
@@ -345,12 +355,14 @@ def _migrate_regime_monitor_config():
                     " remark = EXCLUDED.remark",
                     (db, tbl, col, period, lag, wd, remark, active),
                 )
-            # 配置修正兜底（幂等）：计算层已上线（2026-09-30 P1），三张表转 active；
-            # 若将来再次出现「表已建但数据未落地」，用同样方式临时置 false 避免误报。
+            # 配置修正兜底（幂等）：计算层已上线（2026-09-30 P1），四个字典/值表转 active；
+            # business_value 于 2026-11-06 日频接线（此前为 active=FALSE 预登记），
+            # 存量库靠这条 UPDATE 转 true；若将来「表已建但数据未落地」再临时置 false。
             cur.execute(
                 "UPDATE monitor_table_config SET active=true "
                 "WHERE db_name='regime' "
-                "AND table_name IN ('indicator_dict','indicator_value','dimension_value','dimension_dict')"
+                "AND table_name IN ('indicator_dict','indicator_value','dimension_value',"
+                "'dimension_dict','business_value')"
             )
         conn.commit()
 
@@ -410,6 +422,62 @@ def _migrate_market_config():
         log.info(f"监控日历基准迁移：{n} 张 A 股专属表 → market='CN'")
 
 
+# 北向资金监控收口（2026-11-06）：
+#   官方自 2024-08-19 起停止披露日频「净买入/买入成交额/卖出成交额」，只保留成交总额
+#   与笔数；单只证券北向持股由每日改为季度。daily_northbound_flow 的最后有效交易日 =
+#   2024-08-16，此后永久无数据 —— 保留配置行作留痕，但必须关掉 data_stale 监控，
+#   否则每天刷一条 crit（实测累计 379 次未解决告警，且把它自己刷成常驻噪音）。
+_NORTHBOUND_RETIRE_REMARK = "已封存：官方 2024-08-19 起停披露日频净买入（末次 2024-08-16）"
+
+
+def _migrate_northbound_retire():
+    """关闭北向净流入表的停滞监控并收掉遗留告警（幂等，仅首次生效）。
+
+    只在「本次确实把 active 从 true 翻成 false」时收尾告警，避免误伤人工重新启用后
+    新产生的告警。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE monitor_table_config SET active=false, remark=%s "
+                "WHERE db_name='public' AND table_name='daily_northbound_flow' AND active=true",
+                (_NORTHBOUND_RETIRE_REMARK,),
+            )
+            n = cur.rowcount
+            if n:
+                cur.execute(
+                    "UPDATE collection_alert SET resolved=true, resolved_at=NOW() "
+                    "WHERE category='data_stale' AND source='daily_northbound_flow' "
+                    "AND resolved=false"
+                )
+        conn.commit()
+    if n:
+        log.info("监控收口：daily_northbound_flow 永久停更（北向日频净买入已停披露）→ active=false")
+
+
+def _migrate_alert_dedupe():
+    """一次性清理「历史已解决行」与「当前未解决行」同 (category, source, severity) 并存。
+
+    背景：UNIQUE(category, source, severity, resolved) 把 resolved 纳入键，正常流程下
+    同一 (category, source, severity) 至多一行；但历史上有过「先 INSERT 新行、旧行已
+    resolved」的阶段，导致库中同时存在 resolved=true + resolved=false 两行，这类行在
+    收尾（set resolved=true）时必然撞唯一键、把整轮巡检打断。
+    这里删掉被未解决行遮蔽的那条已解决行（保留未解决行，计数与首次时间不丢），幂等。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM collection_alert r USING collection_alert u "
+                "WHERE u.resolved=false AND r.resolved=true "
+                "  AND r.category=u.category AND r.source=u.source "
+                "  AND r.severity=u.severity"
+            )
+            n = cur.rowcount
+        conn.commit()
+    if n:
+        log.info(f"告警表去重：删除 {n} 条被未解决行遮蔽的已解决历史行（避免收尾撞唯一键）")
+
+
 def _seed_task_config():
     """任务级配置表为空时写入 seed（幂等，已存在则跳过）。"""
     with get_conn() as conn:
@@ -445,19 +513,37 @@ def _migrate_profile_task_config():
 def _migrate_coverage_config():
     """行数覆盖度监控登记（幂等）：把 _COVERAGE_TABLE_CONFIG 写进 monitor_table_config。
 
-    与 _migrate_profile_task_config 同模式：ON CONFLICT DO NOTHING —— 人工在库里调过的
-    阈值（coverage_ratio 等）不被代码回写覆盖，只补缺失行。
+    ⚠️ 2026-11-06 修复（崩溃循环）：原实现是「直接 INSERT + ON CONFLICT DO NOTHING」，
+    但 VALUES 里没有 time_column —— 该列 NOT NULL 且无默认值，PostgreSQL 在**构造元组
+    时**就校验 NOT NULL（早于唯一冲突判定），所以只要 _COVERAGE_TABLE_CONFIG 里某张表
+    已在 monitor_table_config 中登记（hk_daily_quote 就是），ON CONFLICT 根本来不及生效
+    就抛 NotNullViolation → monitor_collector 启动即崩，launchd KeepAlive 反复重启，
+    全部采集监控停摆（告警 last_seen 冻结在 2026-10-12）。
+    现改为：
+      ① 已存在 → 只补 coverage_* 字段，且用 COALESCE 保留人工在库里调过的阈值；
+      ② 缺失 → INSERT 并显式给 time_column/period/expect_lag（用日期列当天级时间列）。
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
             for tbl, col, ratio, lookback, market, remark in _COVERAGE_TABLE_CONFIG:
                 cur.execute(
+                    "UPDATE monitor_table_config SET "
+                    "  coverage_ratio    = COALESCE(coverage_ratio, %s), "
+                    "  coverage_date_col = COALESCE(coverage_date_col, %s), "
+                    "  market            = %s, "
+                    "  remark            = COALESCE(remark, %s) "
+                    "WHERE db_name='public' AND table_name=%s",
+                    (ratio, col, market, remark, tbl),
+                )
+                if cur.rowcount:
+                    continue
+                cur.execute(
                     "INSERT INTO monitor_table_config "
-                    "(db_name, table_name, coverage_ratio, coverage_date_col, "
-                    " coverage_lookback, market, remark) "
-                    "VALUES ('public', %s, %s, %s, %s, %s, %s) "
+                    "(db_name, table_name, time_column, period, expect_lag, "
+                    " coverage_ratio, coverage_date_col, coverage_lookback, market, remark) "
+                    "VALUES ('public', %s, %s, 'day', 0, %s, %s, %s, %s, %s) "
                     "ON CONFLICT (db_name, table_name) DO NOTHING",
-                    (tbl, ratio, col, lookback, market, remark),
+                    (tbl, col, ratio, col, lookback, market, remark),
                 )
         conn.commit()
 
@@ -506,12 +592,18 @@ def record_api_call(api_name: str, success: bool, latency_s: float | None = None
 # ── 故障表写入/更新（去重合并同类未解决告警）──────────────
 def _raise_alert(category, severity, source, message):
     """已存在同 (category, source) 的未解决告警则升级/续计：UPDATE severity +
-    occurrences+1 + 刷新 last_seen/message；否则 INSERT 新行。
+    occurrences+1 + 刷新 last_seen/message；否则复用/新建一行。
 
     关键：按 (category, source) 而非 (category, source, severity) 去重，使
     严重度升级（warn→crit）时复用同一行而非新建，避免 warn/crit 两条告警同时
-    悬挂。UNIQUE(category, source, severity, resolved) 仍兼容：同一 source 任意
-    时刻至多一条 resolved=false 行，UPDATE severity 不与之冲突。
+    悬挂。
+
+    ⚠️ 2026-11-06 修复（复发即撞唯一键）：UNIQUE(category, source, severity, resolved)
+    把 resolved 也纳入键，所以「同一 source 第二次复发」时直接 INSERT 会与上一次
+    留下的 resolved=true 行撞键（实测 api_slow/futu/warn 每分钟抛 UniqueViolation，
+    连带 _resolve_alert 也抛 → data_stale 巡检整轮中断）。现改为优先**复活**同
+    (category, source, severity) 的已解决行（resolved 翻回 false、重新计一次
+    episode），无此历史行才 INSERT。
     """
     now = datetime.now(timezone.utc)
     with get_conn() as conn:
@@ -530,12 +622,20 @@ def _raise_alert(category, severity, source, message):
                     (severity, now, row[1] + 1, message, row[0]),
                 )
             else:
+                # 复活上一轮同 severity 的已解决行（新 episode：first_seen 重置、计数归 1）
                 cur.execute(
-                    "INSERT INTO collection_alert "
-                    "(category, severity, source, message, first_seen, last_seen) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
-                    (category, severity, source, message, now, now),
+                    "UPDATE collection_alert SET resolved=false, resolved_at=NULL, "
+                    "first_seen=%s, last_seen=%s, occurrences=1, message=%s "
+                    "WHERE category=%s AND source=%s AND severity=%s AND resolved=true",
+                    (now, now, message, category, source, severity),
                 )
+                if cur.rowcount == 0:
+                    cur.execute(
+                        "INSERT INTO collection_alert "
+                        "(category, severity, source, message, first_seen, last_seen) "
+                        "VALUES (%s, %s, %s, %s, %s, %s)",
+                        (category, severity, source, message, now, now),
+                    )
         conn.commit()
 
 

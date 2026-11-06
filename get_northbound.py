@@ -8,8 +8,14 @@
   因此本脚本定位：
     ① 入库 2014-11-17 ~ 2024-08-16 的历史净流入（幂等，可重复跑）；
     ② 每日运行时若源无有效值 → 打印「断流」提示并返回 0，**不写脏数据**；
-    ③ 2024-08 之后的北向替代指标（成交额 / 持股）需另找源（港交所 / 沪深交易所官网），
-       属 P1 待办，见 doc/market_profile_collection_plan.md §4.4-B。
+    ③ 替代源已于 2026-11-06 排查完毕（结论：**不存在**）：官方按日只公布「成交总额 /
+       总成交笔数 / ETF 成交总额 / 前十大成交活跃证券及成交额」——无买卖方向，无法反推
+       净流入；单只证券北向持股改为**季度**公布。当日实测：stock_hsgt_fund_flow_summary_em
+       北向行净买额/净流入 = 0、stock_hsgt_hold_stock_em / stock_hsgt_stock_statistics_em
+       报错、push2 kamt 接口 hk2sh/hk2sz.dayNetAmtIn = 0。
+       因此本表定性为「已封存的历史序列」：monitor_collector._migrate_northbound_retire
+       已把监控置 active=false（避免每日刷 data_stale crit）。详见
+       doc/market_profile_collection_plan.md §2.1 北向注 / §4.4。
   消费方注意：读 daily_northbound_flow 做指标时**必须按 2024-08-16 分段**，
   禁止跨断点做连续序列比较。
 

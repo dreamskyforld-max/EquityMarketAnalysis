@@ -5,9 +5,11 @@
       `--backfill` 后的 `regime.indicator_value.percentile`。
 下游：`regime.dimension_value`（一市场一日一维一行）。
 
-已落地聚合结构：`block_equal`（`DIM.BREADTH`，分族取代表 → 族间等权）与
-`single_anchor`（`DIM.VALUATION`，锚定档、校验项只调置信）；`build_all_dimensions()` 遍历所有
-`is_active` 维度，`--dim` 可单独重算某一维度。
+已落地聚合结构：`block_equal`（`DIM.BREADTH`，分族取代表 → 族间等权）、
+`single_anchor`（`DIM.VALUATION`，锚定档、校验项只调置信）与
+`fixed_core`（`DIM.SENTIMENT`，固定核心成员集 + 冻结有效起点 + 诊断成员）、
+按市场单锚（`DIM.FLOW`）与固定核心集 + 4 块两级等权（`DIM.STRESS`）。
+`build_all_dimensions()` 遍历所有 `is_active` 维度，`--dim` 可单独重算某一维度。
 
 **新增维度（刻意不做插件发现，保持简单）**：只需 ① 写一个独立的
 `build_xxx_dimension(...)` 函数（签名与返回结构照抄 `build_valuation_dimension`）→ ② 在
@@ -55,6 +57,10 @@ from db import get_conn, bulk_upsert, read_sql
 
 DIM_BREADTH = "DIM.BREADTH"
 DIM_VALUATION = "DIM.VALUATION"
+DIM_SENTIMENT = "DIM.SENTIMENT"
+DIM_FLOW = "DIM.FLOW"
+DIM_STRESS = "DIM.STRESS"
+DIM_TREND = "DIM.TREND"
 DIMENSION_VALUE_TABLE = "regime.dimension_value"
 MIN_PERIODS = 250          # §2.4 规则 1：有效观测不足 250 不计算分位 / 不出档
 DATA_START = {"CN": datetime.date(1990, 1, 1), "HK": datetime.date(2000, 1, 1)}
@@ -658,6 +664,198 @@ def build_valuation_dimension(
             "state_rows": 0 if (market == "CN" and cn_state_disabled) else int(gate_passed.sum())}
 
 
+def build_sentiment_dimension(
+        conn, dimension_config: dict, params_hash: str, market: str,
+        start: datetime.date, end: datetime.date, write: bool,
+        dim_code: str = DIM_SENTIMENT) -> dict:
+    """`DIM.SENTIMENT` 生产者：固定核心成员集 + 冻结有效起点（§5.3 方案 A）。
+
+    与宽度 / 估值刻意分开：本维度的难点不是聚合算法，而是**成员逐个加入会造成
+    跨期不可比**（2018 换手 / 2023 基金 / 2026 评级）。因此：
+
+    · 进 `score` 的核心集 = 字典中非 `flags_only` 且 `market_scope` 覆盖本市场的成员
+      （CN 三个：换手 + IPO 数 + 破发率；HK 一个：换手）。
+    · 成员有效性由 `params.member_valid_from[market]` 冻结的日期判定（第 250 个有效
+      分位观测日），**不读 L1 `extra.n_sample`**（情绪族未落地），PIT 安全、不触发 L1 重算。
+    · `flags.core_coverage = 1.0` 才产 score；否则整行不产出（不用低覆盖分数凑历史）。
+    · `coverage` 仍按全体 `members[]` 联 `market_scope` 计（§2.3.3 语义不变，仅描述量）；
+      产分门禁改用 `core_coverage` 与 `dispersion_core`（核心原始 std，不做 sqrt(n/10) 归一化）。
+    · `state_bands_calibrated = false` → 全时段不出档；`confidence` 按冻结的 750 达标日分档。
+    · HK 核心集只有一个成员 → 单成分代理分，恒低置信、恒不出档、禁与 CN 横比。
+
+    `members[].weight` 只是两级块平均的记录值，本函数按 `block` 两级平均，不按 weight 加权。
+    """
+    members = dimension_config["members"]
+    params = dimension_config["params"]
+    labels = list(dimension_config["state_labels"])
+    bands = list(dimension_config["state_bands"][market])
+    calibrated = bool(params.get("state_bands_calibrated", False))
+    coverage_min = float(params.get("coverage_min", 0.6))
+    dispersion_core_max = float(params.get("dispersion_core_max", 30.0))
+    core_coverage_min = float(params.get("core_coverage_min", 1.0))
+    flag_gap = float(params.get("flag_gap", FLAG_GAP))
+    hk_proxy = str(params.get("hk_proxy_member", "FLOW.TURNOVER_RATIO"))
+    low_pc1 = params.get("low_common_factor_pc1")
+    tier_core = str(params.get("availability_tier_core", "core3_fixed"))
+    tier_hk = str(params.get("availability_tier_hk", "hk_single_proxy"))
+
+    def _freeze(key):
+        raw = (params.get(key) or {}).get(market, {}) or {}
+        return {c: datetime.date.fromisoformat(d) for c, d in raw.items() if d}
+
+    valid_from = _freeze("member_valid_from")
+    confident_from = _freeze("member_confident_from")
+
+    all_codes = [m["code"] for m in members]
+    flags_only = {m["code"] for m in members if m.get("flags_only")}
+    block_of = {m["code"]: m.get("block", "诊断") for m in members}
+    expected_blocks = list(dict.fromkeys(
+        m.get("block", "诊断") for m in members if not m.get("flags_only")))
+    scopes = _load_market_scopes(conn, all_codes)
+    ok_scope = lambda c: scopes.get(c) in (market, "CN+HK", "GLOBAL")
+    eligible = [c for c in all_codes if ok_scope(c)]
+    core = [c for c in eligible if c not in flags_only]
+    if not core:
+        return {"rows": 0, "dates": 0, "state_rows": 0}
+
+    percentiles = _load_percentiles(conn, market, eligible, start, end)
+    if percentiles.empty:
+        return {"rows": 0, "dates": 0, "state_rows": 0}
+    aligned = percentiles.copy()
+    for c in eligible:
+        if c not in aligned.columns:
+            aligned[c] = np.nan
+    sign = {m["code"]: int(m.get("sign", 1)) for m in members}
+    for c in eligible:
+        if sign.get(c, 1) == -1:
+            aligned[c] = 100.0 - aligned[c]                  # §2.4 规则 2：极性只翻一次
+
+    def _ge(x, threshold):
+        d = x.date() if isinstance(x, datetime.datetime) else x
+        return d >= threshold
+
+    valid_mask = pd.DataFrame(False, index=aligned.index, columns=eligible)
+    for c in eligible:
+        d = valid_from.get(c)
+        valid_mask[c] = ([_ge(x, d) for x in aligned.index] if d
+                         else [False] * len(aligned.index))
+    core_valid = aligned[core].notna() & valid_mask[core]
+    core_coverage = core_valid.sum(axis=1) / len(core)
+    coverage = aligned[eligible].notna().sum(axis=1) / max(len(eligible), 1)
+    dispersion_core = (aligned[core].where(core_valid).std(axis=1, ddof=1)
+                       if len(core) > 1
+                       else pd.Series(np.nan, index=aligned.index))
+    dimension_completeness = round(len(eligible) / max(len(all_codes), 1), 4)
+
+    blocks = {b: [c for c in core if block_of[c] == b]
+              for b in dict.fromkeys(block_of[c] for c in core)}
+    block_score, block_cov = {}, {}
+    for b, codes in blocks.items():
+        vals = aligned[codes].where(core_valid[codes])
+        block_score[b] = vals.mean(axis=1, skipna=True)
+        block_cov[b] = vals.notna().sum(axis=1) / len(codes)
+    score = (pd.concat(list(block_score.values()), axis=1)
+             .mean(axis=1, skipna=True).clip(0, 100)
+             .where(core_coverage >= core_coverage_min))
+    disp_ok = dispersion_core.isna() | (dispersion_core <= dispersion_core_max)
+
+    is_hk_proxy = (market == "HK" and len(core) == 1 and core[0] == hk_proxy)
+    conf_dates = [confident_from[c] for c in core if c in confident_from]
+    min_conf = max(conf_dates) if len(conf_dates) == len(core) else None
+    short = (pd.Series(True, index=aligned.index) if min_conf is None else
+             pd.Series([not _ge(x, min_conf) for x in aligned.index],
+                       index=aligned.index))
+    gate = score.notna() & disp_ok
+    confidence = pd.Series("低", index=aligned.index)
+    if not is_hk_proxy:
+        confidence[gate & ~short & (coverage >= 0.8) & (dispersion_core <= 20.0)] = "高"
+        confidence[gate & ~short & (confidence == "低")] = "中"
+
+    if calibrated:
+        state = pd.Series(
+            [labels[int(i)] for i in np.digitize(score.fillna(-1).to_numpy(), bands)],
+            index=aligned.index).where(gate, None)
+    else:
+        state = pd.Series([None] * len(aligned.index), index=aligned.index)
+
+    def _contrib(d):
+        dev = (aligned.loc[d, eligible] - score.loc[d]).dropna()
+        return {
+            "pos": [{"code": c, "delta": round(float(v), 2)}
+                    for c, v in dev[dev > 0.005].nlargest(3).items()],
+            "neg": [{"code": c, "delta": round(float(v), 2)}
+                    for c, v in dev[dev < -0.005].nsmallest(3).items()],
+        }
+
+    def _blocks(d):
+        out = {}
+        for b in blocks:
+            s = block_score[b].loc[d]
+            item = {"score": None if pd.isna(s) else round(float(s), 2),
+                    "coverage": round(float(block_cov[b].loc[d]), 4)}
+            if is_hk_proxy:
+                item["proxy"] = True
+            out[b] = item
+        return out
+
+    def _flags(d):
+        live = [b for b in blocks if not pd.isna(block_score[b].loc[d])]
+        f = {
+            "availability_tier": tier_hk if is_hk_proxy else tier_core,
+            "core_coverage": round(float(core_coverage.loc[d]), 4),
+            "dimension_completeness": dimension_completeness,
+            "block_coverage": round(len(live) / max(len(expected_blocks), 1), 4),
+            "member_valid_from": {c: valid_from[c].isoformat()
+                                  for c in core if c in valid_from},
+        }
+        if low_pc1 is not None:
+            f["low_common_factor"] = True
+        dv = dispersion_core.loc[d]
+        if not pd.isna(dv):
+            f["dispersion_core"] = round(float(dv), 2)
+            if dv > dispersion_core_max:
+                f["high_dispersion"] = True
+        missing = [b for b in expected_blocks if b not in blocks]
+        if missing:
+            f["missing_block"] = missing
+            f["block_incomplete"] = True
+        if is_hk_proxy:
+            f["single_block_proxy"] = True
+        if coverage.loc[d] < coverage_min:
+            f["low_coverage"] = True
+        if bool(short.loc[d]):
+            f["short_sample"] = True
+        bs = list(block_score.values())
+        if (len(bs) == 2 and not pd.isna(bs[0].loc[d])
+                and not pd.isna(bs[1].loc[d])
+                and abs(float(bs[0].loc[d]) - float(bs[1].loc[d])) > flag_gap):
+            f["structural"] = ["交易行为与一级供给分位背离"]
+        return f
+
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    rows = []
+    for d in aligned.index:
+        if pd.isna(score.loc[d]):
+            continue
+        dv = dispersion_core.loc[d]
+        rows.append({
+            "dimension_code": dim_code, "market": market, "trade_date": d,
+            "score": round(float(score.loc[d]), 2),
+            "state": None if pd.isna(state.loc[d]) else str(state.loc[d]),
+            "coverage": round(float(coverage.loc[d]), 4),
+            "dispersion": None if pd.isna(dv) else round(float(dv), 2),
+            "blocks": _blocks(d), "contrib": _contrib(d), "flags": _flags(d),
+            "confidence": confidence.loc[d],
+            "model_version": params_hash, "updated_at": now,
+        })
+    if write and rows:
+        bulk_upsert(conn, DIMENSION_VALUE_TABLE, rows,
+                    conflict_cols=["dimension_code", "market", "trade_date"],
+                    skip_null_updates=False, only_if_changed=True)
+    return {"rows": len(rows), "dates": len(aligned.index),
+            "state_rows": int(state.notna().sum())}
+
+
 def _purge_stale_dimension_rows(conn, dimension_code, market, params_hash) -> int:
     """全量重算时删除「本轮不再产出」的旧口径行（UPSERT 不会删行）。
 
@@ -673,11 +871,516 @@ def _purge_stale_dimension_rows(conn, dimension_code, market, params_hash) -> in
         return cur.rowcount
 
 
+def build_flow_dimension(
+        conn, dimension_config: dict, params_hash: str, market: str,
+        start: datetime.date, end: datetime.date, write: bool,
+        dim_code: str = DIM_FLOW) -> dict:
+    """`DIM.FLOW` 生产者：按市场各自的**单锚**读数（§5.4，2026-11-06 定案）。
+
+    与宽度 / 估值 / 情绪刻意分开：本维度的难点不是聚合算法，而是**原 4 成员
+    里 3 个不可用**（北向断供、南向 130 天、产业资本 262 行分位退化）且
+    `MARGIN_RATIO` 分母塌陷。可用数据只有两条长历史同源净额序列：
+
+      · CN `FLOW.MARGIN_NET_20D`（Δ20 两融余额 / 同期成交额）
+      · HK `FLOW.BUYBACK_NET_20D`（Σ20 公司回购 / 同期成交额）
+
+    故取消「2 块两级等权」，每市场按 `params.proxy_member_by_market` 取唯一
+    核心成员，`score` = 该成员对齐分位；其余 6 个成员为 `flags_only` 诊断。
+    两侧都写 `single_block_proxy` / `flow_single_anchor`，恒不出档，
+    **禁止 CN 与 HK 横比或拼接成一条曲线**（§5.3 HK 代理分同款纪律）。
+
+    `member_valid_from` / `member_confident_from` 由 `tools/calibrate_flow.py`
+    按第 250 / 750 个有效分位日冻结在字典中，PIT 安全、不读 L1 `extra.n_sample`。
+    单锚无 `dispersion`；`confidence` 最高只到「中」（不伪装成完整维度分）。
+    """
+    members = dimension_config["members"]
+    params = dimension_config["params"]
+    labels = list(dimension_config["state_labels"])
+    bands = list(dimension_config["state_bands"][market])
+    calibrated = bool(params.get("state_bands_calibrated", False))
+    coverage_min = float(params.get("coverage_min", 0.6))
+    core_coverage_min = float(params.get("core_coverage_min", 1.0))
+    proxy = (params.get("proxy_member_by_market") or {}).get(market)
+    asof = (params.get("flow_asof_start") or {}).get(market)
+    tier = str(params.get("availability_tier", "flow_single_anchor"))
+
+    def _ge(x, threshold):
+        d = x.date() if isinstance(x, datetime.datetime) else x
+        return d >= threshold
+
+    def _freeze(key):
+        raw = (params.get(key) or {}).get(market, {}) or {}
+        return {c: datetime.date.fromisoformat(d) for c, d in raw.items() if d}
+
+    valid_from = _freeze("member_valid_from")
+    confident_from = _freeze("member_confident_from")
+
+    all_codes = [m["code"] for m in members]
+    flags_only = {m["code"] for m in members if m.get("flags_only")}
+    block_of = {m["code"]: m.get("block", "诊断") for m in members}
+    scopes = _load_market_scopes(conn, all_codes)
+    ok_scope = lambda c: scopes.get(c) in (market, "CN+HK", "GLOBAL")
+    eligible = [c for c in all_codes if ok_scope(c)]
+    core = [c for c in eligible if c not in flags_only]
+    if not core or not proxy or len(core) != 1 or core[0] != proxy:
+        print(f"  ⚠ L2 {market} {dim_code} 单锚配置不符"
+              f"（core={core}, proxy={proxy}），跳过")
+        return {"rows": 0, "dates": 0, "state_rows": 0}
+
+    percentiles = _load_percentiles(conn, market, eligible, start, end)
+    if percentiles.empty:
+        return {"rows": 0, "dates": 0, "state_rows": 0}
+    aligned = percentiles.copy()
+    for c in eligible:
+        if c not in aligned.columns:
+            aligned[c] = np.nan
+    sign = {m["code"]: int(m.get("sign", 1)) for m in members}
+    for c in eligible:
+        if sign.get(c, 1) == -1:
+            aligned[c] = 100.0 - aligned[c]                  # §2.4 规则 2：极性只翻一次
+
+    valid_mask = pd.DataFrame(False, index=aligned.index, columns=eligible)
+    for c in eligible:
+        d = valid_from.get(c)
+        valid_mask[c] = ([_ge(x, d) for x in aligned.index] if d
+                         else [False] * len(aligned.index))
+    core_valid = aligned[core].notna() & valid_mask[core]
+    core_coverage = core_valid.sum(axis=1) / len(core)
+    coverage = aligned[eligible].notna().sum(axis=1) / max(len(eligible), 1)
+    score = (aligned[proxy].where(core_valid[proxy])
+             .clip(0, 100).where(core_coverage >= core_coverage_min))
+    dispersion_core = pd.Series(np.nan, index=aligned.index)   # 单锚 → NULL
+    dimension_completeness = round(len(eligible) / max(len(all_codes), 1), 4)
+
+    conf_dates = [confident_from[c] for c in core if c in confident_from]
+    min_conf = max(conf_dates) if len(conf_dates) == len(core) else None
+    short = (pd.Series(True, index=aligned.index) if min_conf is None else
+             pd.Series([not _ge(x, min_conf) for x in aligned.index],
+                       index=aligned.index))
+    gate = score.notna() & (dispersion_core.isna() |
+                            (dispersion_core <= float(params.get("dispersion_core_max", 30))))
+    confidence = pd.Series("低", index=aligned.index)
+    confidence[gate & ~short] = "中"       # 单锚最高「中」，不出「高」
+
+    if calibrated:
+        state = pd.Series(
+            [labels[int(i)] for i in np.digitize(score.fillna(-1).to_numpy(), bands)],
+            index=aligned.index).where(gate, None)
+    else:
+        state = pd.Series([None] * len(aligned.index), index=aligned.index)
+
+    shift_date = datetime.date(2016, 1, 1)
+    discontinued = str(params.get("northbound_discontinued") or "2024-08-16")
+
+    def _contrib(d):
+        dev = (aligned.loc[d, eligible] - score.loc[d]).dropna()
+        return {
+            "pos": [{"code": c, "delta": round(float(v), 2)}
+                    for c, v in dev[dev > 0.005].nlargest(3).items()],
+            "neg": [{"code": c, "delta": round(float(v), 2)}
+                    for c, v in dev[dev < -0.005].nsmallest(3).items()],
+        }
+
+    def _blocks(d):
+        s = score.loc[d]
+        return {block_of[proxy]: {
+            "score": None if pd.isna(s) else round(float(s), 2),
+            "coverage": round(float(core_coverage.loc[d]), 4),
+            "proxy": True,
+        }}
+
+    def _flags(d):
+        f = {
+            "availability_tier": tier,
+            "core_coverage": round(float(core_coverage.loc[d]), 4),
+            "dimension_completeness": dimension_completeness,
+            "block_coverage": 1.0,          # 本市场应有 1 块（按市场计，不按全体 2 块）
+            "single_block_proxy": True,
+            "member_valid_from": {c: valid_from[c].isoformat()
+                                  for c in core if c in valid_from},
+        }
+        if asof:
+            f["flow_asof_start"] = asof
+        if market == "HK" and _ge(d, shift_date):
+            f["regime_shift_2016"] = True
+        if market == "CN":
+            f["northbound_discontinued"] = discontinued
+            if params.get("margin_ratio_source_discontinued"):
+                f["margin_ratio_source_discontinued"] = True
+        if coverage.loc[d] < coverage_min:
+            f["low_coverage"] = True
+        if bool(short.loc[d]):
+            f["short_sample"] = True
+        return f
+
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    rows = []
+    for d in aligned.index:
+        if pd.isna(score.loc[d]):
+            continue
+        rows.append({
+            "dimension_code": dim_code, "market": market, "trade_date": d,
+            "score": round(float(score.loc[d]), 2),
+            "state": None if pd.isna(state.loc[d]) else str(state.loc[d]),
+            "coverage": round(float(coverage.loc[d]), 4),
+            "dispersion": None,
+            "blocks": _blocks(d), "contrib": _contrib(d), "flags": _flags(d),
+            "confidence": confidence.loc[d],
+            "model_version": params_hash, "updated_at": now,
+        })
+    if write and rows:
+        bulk_upsert(conn, DIMENSION_VALUE_TABLE, rows,
+                    conflict_cols=["dimension_code", "market", "trade_date"],
+                    skip_null_updates=False, only_if_changed=True)
+    return {"rows": len(rows), "dates": len(aligned.index),
+            "state_rows": int(state.notna().sum())}
+
+
+def build_stress_dimension(
+        conn, dimension_config: dict, params_hash: str, market: str,
+        start: datetime.date, end: datetime.date, write: bool,
+        dim_code: str = DIM_STRESS) -> dict:
+    """`DIM.STRESS` 生产者：固定核心成员集 + 4 块两级等权 + 冻结有效起点（§5.5 v1.17）。
+
+    与宽度 / 估值 / 情绪 / 资金刻意分开：原 21 成员 5 块模型不可落地——
+    AA 系 4 项仅 19~27 行分位、块内相关中位 0.18（相关性块 −0.18）、
+    水平型 CREDIT_SPREAD / HIBOR / VIX 的 expanding 分位随年代漂移，
+    块均值把危机信号压成 ≈50（危机日 > 全期 P90 占比仅 36%/39%）。
+
+    本实现只取字典 `members[]` 中非 `flags_only` 且 `market_scope` 覆盖本市场的
+    核心成员（CN 8 / HK 7），按 `block` 两级等权（块内 mean → 块间 mean），
+    整块为空时由 `mean(skipna=True)` 自动从块间分母剔除、不记 0。
+    `FLOW.HIBOR_3M` 是 HK 的 `flags_only` 诊断成员，只写 coverage / contrib / flags。
+
+    · `sign`：只在此翻转一次（§2.4 规则 2）；`RISK.MAXDD_250` 与 `RISK.TERM_SPREAD`
+      取 −1（负回撤高分位＝浅回撤；倒挂低＝危险）。
+    · `member_valid_from` / `member_confident_from` 由 `tools/calibrate_stress.py`
+      按第 250 / 750 个有效分位日冻结在字典中，PIT 安全、不读 L1 `extra.n_sample`。
+    · `core_coverage_min = 1.0`：任一核心成员缺失或早于冻结日 → **整行不产出**。
+    · `dispersion` 只写描述量、**不作门禁**（块内成员低相关是设计事实，
+      用 §2.4 的 `dispersion_norm` 判门禁会几乎每天挡掉）。
+    · `state_bands_calibrated = false` → 全时段 `state = NULL`；`confidence` 最高「中」。
+    · `flags.resonance_cnt` = 对齐分位 >= `resonance_floor` 的核心成员数，
+      承载「几处同时失稳」的共振信息（业务层 `resonance_cnt` 的维度侧输入）。
+
+    `members[].weight` 只是记录值，本函数按块两级等权，不按 weight 加权。
+    """
+    members = dimension_config["members"]
+    params = dimension_config["params"]
+    labels = list(dimension_config["state_labels"])
+    bands = list(dimension_config["state_bands"][market])
+    calibrated = bool(params.get("state_bands_calibrated", False))
+    coverage_min = float(params.get("coverage_min", 0.6))
+    core_coverage_min = float(params.get("core_coverage_min", 1.0))
+    resonance_floor = float(params.get("resonance_floor", 80.0))
+    tier = str(params.get("availability_tier", "stress_core_fixed"))
+    excluded_count = len(params.get("excluded_members") or [])
+
+    def _ge(x, threshold):
+        d = x.date() if isinstance(x, datetime.datetime) else x
+        return d >= threshold
+
+    def _freeze(key):
+        raw = (params.get(key) or {}).get(market, {}) or {}
+        return {c: datetime.date.fromisoformat(d) for c, d in raw.items() if d}
+
+    valid_from = _freeze("member_valid_from")
+    confident_from = _freeze("member_confident_from")
+
+    all_codes = [m["code"] for m in members]
+    flags_only = {m["code"] for m in members if m.get("flags_only")}
+    block_of = {m["code"]: m.get("block", "诊断") for m in members}
+    scopes = _load_market_scopes(conn, all_codes)
+    ok_scope = lambda c: scopes.get(c) in (market, "CN+HK", "GLOBAL")
+    eligible = [c for c in all_codes if ok_scope(c)]
+    core = [c for c in eligible if c not in flags_only]
+    if not core:
+        return {"rows": 0, "dates": 0, "state_rows": 0}
+
+    percentiles = _load_percentiles(conn, market, eligible, start, end)
+    if percentiles.empty:
+        return {"rows": 0, "dates": 0, "state_rows": 0}
+    aligned = percentiles.copy()
+    for c in eligible:
+        if c not in aligned.columns:
+            aligned[c] = np.nan
+    sign = {m["code"]: int(m.get("sign", 1)) for m in members}
+    for c in eligible:
+        if sign.get(c, 1) == -1:
+            aligned[c] = 100.0 - aligned[c]                  # §2.4 规则 2：极性只翻一次
+
+    valid_mask = pd.DataFrame(False, index=aligned.index, columns=eligible)
+    for c in eligible:
+        d = valid_from.get(c)
+        valid_mask[c] = ([_ge(x, d) for x in aligned.index] if d
+                         else [False] * len(aligned.index))
+    core_valid = aligned[core].notna() & valid_mask[core]
+    core_coverage = core_valid.sum(axis=1) / len(core)
+    coverage = aligned[eligible].notna().sum(axis=1) / max(len(eligible), 1)
+    dispersion = (aligned[core].where(core_valid).std(axis=1, ddof=1)
+                  if len(core) > 1
+                  else pd.Series(np.nan, index=aligned.index))
+    resonance = (aligned[core].where(core_valid) >= resonance_floor).sum(axis=1)
+    dimension_completeness = round(len(eligible) / max(len(all_codes), 1), 4)
+
+    blocks = {b: [c for c in core if block_of[c] == b]
+              for b in dict.fromkeys(block_of[c] for c in core)}
+    block_score, block_cov = {}, {}
+    for b, codes in blocks.items():
+        vals = aligned[codes].where(core_valid[codes])
+        block_score[b] = vals.mean(axis=1, skipna=True)
+        block_cov[b] = vals.notna().sum(axis=1) / len(codes)
+    # 块间等权；空块由 skipna 从分母剔除（empty_block_policy=drop_from_denominator）
+    score = (pd.concat(list(block_score.values()), axis=1)
+             .mean(axis=1, skipna=True).clip(0, 100)
+             .where(core_coverage >= core_coverage_min))
+
+    conf_dates = [confident_from[c] for c in core if c in confident_from]
+    min_conf = max(conf_dates) if len(conf_dates) == len(core) else None
+    short = (pd.Series(True, index=aligned.index) if min_conf is None else
+             pd.Series([not _ge(x, min_conf) for x in aligned.index],
+                       index=aligned.index))
+    gate = score.notna()
+    confidence = pd.Series("低", index=aligned.index)
+    confidence[gate & ~short] = "中"       # 首版内部读数不出「高」
+
+    if calibrated:
+        state = pd.Series(
+            [labels[int(i)] for i in np.digitize(score.fillna(-1).to_numpy(), bands)],
+            index=aligned.index).where(gate, None)
+    else:
+        state = pd.Series([None] * len(aligned.index), index=aligned.index)
+
+    frozen_from = (max(valid_from[c] for c in core).isoformat()
+                   if all(c in valid_from for c in core) else None)
+
+    def _contrib(d):
+        dev = (aligned.loc[d, eligible] - score.loc[d]).dropna()
+        return {
+            "pos": [{"code": c, "delta": round(float(v), 2)}
+                    for c, v in dev[dev > 0.005].nlargest(3).items()],
+            "neg": [{"code": c, "delta": round(float(v), 2)}
+                    for c, v in dev[dev < -0.005].nsmallest(3).items()],
+        }
+
+    def _blocks(d):
+        out = {}
+        for b, codes in blocks.items():
+            s = block_score[b].loc[d]
+            out[b] = {
+                "score": None if pd.isna(s) else round(float(s), 2),
+                "coverage": round(float(block_cov[b].loc[d]), 4),
+                "n": int(block_cov[b].loc[d] * len(codes)),
+            }
+        return out
+
+    def _flags(d):
+        live = [b for b in blocks if not pd.isna(block_score[b].loc[d])]
+        f = {
+            "availability_tier": tier,
+            "core_coverage": round(float(core_coverage.loc[d]), 4),
+            "dimension_completeness": dimension_completeness,
+            "block_coverage": round(len(live) / max(len(blocks), 1), 4),
+            "resonance_cnt": int(resonance.loc[d]),
+            "resonance_floor": resonance_floor,
+            "dispersion_desc_only": True,
+            "excluded_members_count": excluded_count,
+            "member_valid_from": {c: valid_from[c].isoformat()
+                                  for c in core if c in valid_from},
+        }
+        if frozen_from:
+            f["frozen_from"] = frozen_from
+        empty = [b for b in blocks if b not in live]
+        if empty:
+            f["empty_block"] = empty
+        if coverage.loc[d] < coverage_min:
+            f["low_coverage"] = True
+        if bool(short.loc[d]):
+            f["short_sample"] = True
+        return f
+
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    rows = []
+    for d in aligned.index:
+        if pd.isna(score.loc[d]):
+            continue
+        dv = dispersion.loc[d]
+        rows.append({
+            "dimension_code": dim_code, "market": market, "trade_date": d,
+            "score": round(float(score.loc[d]), 2),
+            "state": None if pd.isna(state.loc[d]) else str(state.loc[d]),
+            "coverage": round(float(coverage.loc[d]), 4),
+            "dispersion": None if pd.isna(dv) else round(float(dv), 2),
+            "blocks": _blocks(d), "contrib": _contrib(d), "flags": _flags(d),
+            "confidence": confidence.loc[d],
+            "model_version": params_hash, "updated_at": now,
+        })
+    if write and rows:
+        bulk_upsert(conn, DIMENSION_VALUE_TABLE, rows,
+                    conflict_cols=["dimension_code", "market", "trade_date"],
+                    skip_null_updates=False, only_if_changed=True)
+    return {"rows": len(rows), "dates": len(aligned.index),
+            "state_rows": int(state.notna().sum())}
+
+
 def _active_dimensions(conn):
     """所有启用维度 → [dimension_code]；新维度写入字典即自动接入日频计算。"""
     df = _read_sql("SELECT dimension_code FROM regime.dimension_dict "
                    "WHERE is_active=TRUE ORDER BY dimension_code", conn)
     return list(df["dimension_code"]) if not df.empty else []
+
+
+def build_trend_dimension(
+        conn, dimension_config: dict, params_hash: str, market: str,
+        start: datetime.date, end: datetime.date, write: bool,
+        dim_code: str = DIM_TREND) -> dict:
+    """`DIM.TREND` 生产者：σ 归一化趋势强度**单锚**（§5.6 v1.19）。
+
+    与其余五维刻意分开，但**共用 §2.4 通用管线**（members[] 读 `percentile`）：
+      · `score` = `TREND.STRENGTH_T` 的 expanding 分位。原设计契约用固定 K=3 把
+        t 统计量线性压到 0–100 且 `NO_PERCENTILE` 只读 raw_value；实测 CN
+        1991/1992/2007/2015 有 100%/75%/100%/41% 的交易日顶格、HK 一半日子
+        <20 分 → 绝对刻度跨期不可比。改相对刻度后零标定参数，`raw_value`
+        仍保留「几个标准差」的语义。
+      · `TREND.TSMOM_12M` / `TREND.MA200_DEV` 是 `weight=0` 的方向腿与校验项，
+        只写 `contrib` / `blocks` / `flags`，不进 `score`。L3 方向判定直接读
+        这两个原子的 `raw_value`，本维度 `score` 不参与方向判定。
+      · `state_bands_calibrated=false` → `state` 恒 NULL（三态方向归
+        `BIZ.MARKET_REGIME`）；单锚 `dispersion` 恒 NULL。
+      · `member_valid_from` / `member_confident_from` 由 `tools/calibrate_trend.py`
+        按第 250 / 750 个有效分位日冻结在字典中，PIT 安全、不读 `extra.n_sample`。
+
+    ⚠ 不读 `state_bands` / `state_labels`（本维恒不出档），避免字典值为 null 时
+      `list(...)` 崩溃；`blocks` 按 §2.3.3 标准形状 `{块名:{score,coverage}}` 落库。
+    """
+    members = dimension_config["members"]
+    params = dimension_config["params"]
+    coverage_min = float(params.get("coverage_min", 0.6))
+    anchor = str(params.get("anchor_code") or "")
+    tier = str(params.get("availability_tier", "trend_single_anchor"))
+    asof = (params.get("trend_asof_start") or {}).get(market)
+
+    def _ge(x, threshold):
+        d = x.date() if isinstance(x, datetime.datetime) else x
+        return d >= threshold
+
+    def _freeze(key):
+        raw = (params.get(key) or {}).get(market, {}) or {}
+        return {c: datetime.date.fromisoformat(d) for c, d in raw.items() if d}
+
+    valid_from = _freeze("member_valid_from")
+    confident_from = _freeze("member_confident_from")
+
+    all_codes = [m["code"] for m in members]
+    block_of = {m["code"]: m.get("block", "诊断") for m in members}
+    scopes = _load_market_scopes(conn, all_codes)
+    ok_scope = lambda c: scopes.get(c) in (market, "CN+HK", "GLOBAL")
+    eligible = [c for c in all_codes if ok_scope(c)]
+    if not anchor or anchor not in eligible:
+        print(f"  ⚠ L2 {market} {dim_code} 单锚配置不符"
+              f"（anchor={anchor}, eligible={eligible}），跳过")
+        return {"rows": 0, "dates": 0, "state_rows": 0}
+
+    percentiles = _load_percentiles(conn, market, eligible, start, end)
+    if percentiles.empty:
+        return {"rows": 0, "dates": 0, "state_rows": 0}
+    aligned = percentiles.copy()
+    for c in eligible:
+        if c not in aligned.columns:
+            aligned[c] = np.nan
+    sign = {m["code"]: int(m.get("sign", 1)) for m in members}
+    for c in eligible:
+        if sign.get(c, 1) == -1:
+            aligned[c] = 100.0 - aligned[c]                  # §2.4 规则 2：极性只翻一次
+
+    # 锚门禁：冻结第 250 个有效分位日之前不产分；护栏前的失真样本已被 L1 挡住。
+    d_valid = valid_from.get(anchor)
+    anchor_ready = (pd.Series([_ge(x, d_valid) for x in aligned.index],
+                              index=aligned.index) if d_valid
+                    else pd.Series(False, index=aligned.index))
+    score = aligned[anchor].where(anchor_ready).clip(0, 100)
+    coverage = aligned[eligible].notna().sum(axis=1) / max(len(eligible), 1)
+    dispersion = pd.Series(np.nan, index=aligned.index)     # 单锚 → NULL
+
+    conf_dates = [confident_from[c] for c in eligible if c in confident_from]
+    min_conf = max(conf_dates) if len(conf_dates) == len(eligible) else None
+    short = (pd.Series(True, index=aligned.index) if min_conf is None else
+             pd.Series([not _ge(x, min_conf) for x in aligned.index],
+                       index=aligned.index))
+    gate = score.notna() & (coverage >= coverage_min)
+    confidence = pd.Series("低", index=aligned.index)
+    confidence[gate & ~short] = "中"                          # 单锚最高「中」，不出「高」
+    # 方向状态归 L3，本维规格上永不出档（§5.6）；state_bands_calibrated 保留作将来开关。
+    state = pd.Series([None] * len(aligned.index), index=aligned.index)
+
+    checks = [c for c in eligible if c != anchor]
+
+    def _contrib(d):
+        dev = (aligned.loc[d, checks] - score.loc[d]).dropna()
+        return {
+            "pos": [{"code": c, "delta": round(float(v), 2)}
+                    for c, v in dev[dev > 0.005].nlargest(3).items()],
+            "neg": [{"code": c, "delta": round(float(v), 2)}
+                    for c, v in dev[dev < -0.005].nsmallest(3).items()],
+        }
+
+    def _blocks(d):
+        """§2.3.3 标准形状：每块写 {score, coverage}，不写原始 t / raw_value。"""
+        grouped: dict[str, dict] = {}
+        for c in eligible:
+            b = grouped.setdefault(block_of[c], {"vals": [], "n": 0})
+            b["n"] += 1
+            if not pd.isna(aligned.loc[d, c]):
+                b["vals"].append(float(aligned.loc[d, c]))
+        return {b: {
+            "score": round(sum(v["vals"]) / len(v["vals"]), 2) if v["vals"] else None,
+            "coverage": round(len(v["vals"]) / v["n"], 4),
+        } for b, v in grouped.items()}
+
+    def _flags(d):
+        f = {
+            "availability_tier": tier,
+            "anchor_code": anchor,
+            "anchor_window": "expanding",
+            "sigma_win": int(params.get("sigma_win", 252)),
+            "tsmom_variant": str(params.get("tsmom_variant", "price")),
+            "no_state": True,
+            "member_valid_from": {c: valid_from[c].isoformat()
+                                  for c in eligible if c in valid_from},
+        }
+        if asof:
+            f["trend_asof_start"] = asof
+        if coverage.loc[d] < coverage_min:
+            f["low_coverage"] = True
+        if bool(short.loc[d]):
+            f["short_sample"] = True
+        if pd.isna(aligned.loc[d, anchor]):
+            f["no_data"] = True
+        return f
+
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    rows = []
+    for d in aligned.index:
+        # 锚缺失即 no_data：按缺行处理（与估值 / 资金 / 压力同款），不写 score=NULL 行，
+        # 也不得填 0 或 50。L1 护栏与冻结起点已保证下游按缺行处理。
+        if pd.isna(score.loc[d]):
+            continue
+        rows.append({
+            "dimension_code": dim_code, "market": market, "trade_date": d,
+            "score": round(float(score.loc[d]), 2),
+            "state": None,
+            "coverage": round(float(coverage.loc[d]), 4),
+            "dispersion": None,
+            "blocks": _blocks(d), "contrib": _contrib(d), "flags": _flags(d),
+            "confidence": confidence.loc[d],
+            "model_version": params_hash, "updated_at": now,
+        })
+    if write and rows:
+        bulk_upsert(conn, DIMENSION_VALUE_TABLE, rows,
+                    conflict_cols=["dimension_code", "market", "trade_date"],
+                    skip_null_updates=False, only_if_changed=True)
+    return {"rows": len(rows), "dates": len(aligned.index),
+            "state_rows": int(state.notna().sum())}
 
 
 def build_all_dimensions(conn, start=None, end=None, backfill=False, write=True,
@@ -729,6 +1432,22 @@ def build_all_dimensions(conn, start=None, end=None, backfill=False, write=True,
                     window_start, end, write, dim_code=dimension_code)
             elif dimension_code == DIM_VALUATION:
                 dimension_stats = build_valuation_dimension(
+                    conn, dimension_config, dimension_params_hash, market_code,
+                    window_start, end, write, dim_code=dimension_code)
+            elif dimension_code == DIM_SENTIMENT:
+                dimension_stats = build_sentiment_dimension(
+                    conn, dimension_config, dimension_params_hash, market_code,
+                    window_start, end, write, dim_code=dimension_code)
+            elif dimension_code == DIM_FLOW:
+                dimension_stats = build_flow_dimension(
+                    conn, dimension_config, dimension_params_hash, market_code,
+                    window_start, end, write, dim_code=dimension_code)
+            elif dimension_code == DIM_STRESS:
+                dimension_stats = build_stress_dimension(
+                    conn, dimension_config, dimension_params_hash, market_code,
+                    window_start, end, write, dim_code=dimension_code)
+            elif dimension_code == DIM_TREND:
+                dimension_stats = build_trend_dimension(
                     conn, dimension_config, dimension_params_hash, market_code,
                     window_start, end, write, dim_code=dimension_code)
             else:
