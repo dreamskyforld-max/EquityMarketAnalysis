@@ -47,6 +47,7 @@ from db import get_conn, bulk_upsert, read_sql
 
 TZ_CN = datetime.timezone(datetime.timedelta(hours=8))
 IV_TABLE = "regime.indicator_value"
+IV_WRITE_BATCH = 2000            # R6：indicator_value 落库单批行数（长事务逐批 commit）
 
 # A 股口径常量
 CN_EXCLUDE_PREFIX = ("SH.90", "SZ.20")          # B 股
@@ -924,9 +925,25 @@ def _clip(s, start: datetime.date, end: datetime.date) -> pd.Series:
     return s[mask]
 
 
-# 逐股滚动的分批大小（股票数/批）。每批约 500 只 × 445 天 ≈ 15 万行（峰值 ~40MB），
-# 取代原实现的一次性全市场加载（~200 万行 / 峰值 888MB，见下）。
+# 逐股滚动的分批大小（股票数/批）。日频增量 445 天窗口下每批约 15 万行
+# （峰值 ~40MB），取代原实现的一次性全市场加载（~200 万行 / 峰值 888MB，见下）。
 _WINDOW_BATCH_CODES = 500
+# R1 单批行数硬上限：单批行数 ≈ 批内股票数 × 窗口交易日数。`--backfill` 按
+# 4 年切块（+400 天预热）时固定 500 只会让单批逼近 60 万行，9 个 rolling
+# 中间列会把峰值推到近 400MB。故按实际交易日数动态压批，上限取 20 万行
+# （严于 R1 的 50 万）：增量 445 天窗口下 200000//295=678、min(500,678)
+# 仍是 500 只/批 → 日频行为零变化；4 年窗口实测 31 批 / 单批 ≤19.9 万行。
+_WINDOW_MAX_ROWS = 200_000
+# 批内查询也走服务端游标，消除 fetchall 的「全量 tuple 列表 + DataFrame」并存
+# （实测 11 批把进程水位累积到 192.9MB）；配合 dtype 瘦身让单批峰值与行数脱钩。
+# ⚠ 不要调大：200K 实测峰值反升到 177.7MB（单批 frame + concat 副本变大），
+#    50K 的 144.0MB 更稳；两者耗时差异在机器波动范围内。
+_WINDOW_STREAM_CHUNK = 50_000
+
+# ⚠ 2026-11-07 整改留痕：下方「888MB → 分批」只覆盖 _per_stock_windows。
+#   同一模块曾另有 _load_stored_raw 的一次性全历史加载（完整 run 峰值
+#   359.8MB），本次已改为流式 + 预分配宽表（见该函数注释）。两处合起来
+#   才使完整 run 降到 144.0MB —— 勿只看本函数就判定整个模块达标。
 
 
 def _per_stock_windows(conn, market: str, w_start: datetime.date, end: datetime.date) -> pd.DataFrame:
@@ -962,14 +979,31 @@ def _per_stock_windows(conn, market: str, w_start: datetime.date, end: datetime.
     if not codes:
         return pd.DataFrame()
 
+    # R1：单批行数 ≈ 批内股票数 × 窗口交易日数；按实际交易日数把「股票数」
+    # 批大小动态压到 _WINDOW_MAX_ROWS 以内，使 backfill 长窗口也不越线。
+    n_days = int(_q(conn,
+                    f"SELECT count(DISTINCT trade_date) AS n FROM {tbl} "
+                    f"WHERE trade_date BETWEEN %s AND %s AND {flt}",
+                    [w_start, end] + fparams)["n"].iloc[0])
+    batch_codes = max(1, min(_WINDOW_BATCH_CODES,
+                             _WINDOW_MAX_ROWS // max(1, n_days)))
+
+    # 惰性导入（本模块被 scheduler 常驻进程 import）；与 _load_stored_raw 同款
+    from profiling.tags._base import _read_sql_stream
+
     agg = None
-    for i in range(0, len(codes), _WINDOW_BATCH_CODES):
-        batch = codes[i:i + _WINDOW_BATCH_CODES]
-        df = _q(conn,
-                f"SELECT trade_date, stock_code, close FROM {tbl} "
-                f"WHERE stock_code = ANY(%s) AND trade_date BETWEEN %s AND %s AND {flt} "
-                f"ORDER BY stock_code, trade_date",
-                [batch, w_start, end] + fparams)
+    for i in range(0, len(codes), batch_codes):
+        batch = codes[i:i + batch_codes]
+        # R1/§4.1：服务端游标逐批回传 + 批次内 dtype 瘦身，避免 `pd.read_sql_query`
+        # 的 fetchall 中间态。SQL 的 ORDER BY 交给 PG，后续 rolling 逻辑零改动。
+        df = _read_sql_stream(
+            conn,
+            f"SELECT trade_date, stock_code, close FROM {tbl} "
+            f"WHERE stock_code = ANY(%s) AND trade_date BETWEEN %s AND %s AND {flt} "
+            f"ORDER BY stock_code, trade_date",
+            [batch, w_start, end] + fparams,
+            chunk_size=_WINDOW_STREAM_CHUNK,
+            dtypes={"trade_date": "datetime64[ns]", "close": "float64"})
         if df.empty:
             continue
         df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
@@ -2754,16 +2788,69 @@ def _ensure_dict(conn):
     return len(rows)
 
 
+# 流式读取 raw_value 历史的批大小（服务端游标 itersize）。单个指标全历史
+# 约 5 千行，峰值只与单批相关（规范 §4.1）。
+_RAW_STREAM_CHUNK = 50_000
+
+
 def _load_stored_raw(conn, market: str) -> pd.DataFrame:
-    """读已入库的 raw_value 历史（增量场景下分位必须建立在全历史上）。"""
-    df = _q(conn,
-            "SELECT indicator_code, trade_date, raw_value FROM regime.indicator_value "
-            "WHERE market = %s ORDER BY trade_date", params=[market])
-    if df.empty:
+    """读已入库的 raw_value 历史（增量场景下分位必须建立在全历史上）。
+
+    ⚠ 资源整改 2026-11-07：原实现一次 `pd.read_sql_query` 拉单市场全历史明细
+      （CN 578,299 行 / 65.8MB），fetchall 中间态 + DataFrame 并存把峰值推到
+      274.8MB，`pivot_table` 中间对象再到 339.1MB —— 完整 run 实测 359.8MB，
+      超 R3「常驻进程内 ≤200MB」红线。现改为：
+        ① 两条 DISTINCT 小查询拿到 dates / codes（PG 端去重，客户端只收几千行）；
+        ② 预分配 (n_dates, n_codes) 的 float64 矩阵（CN 约 8.7MB）；
+        ③ 按 indicator_code 逐个用 `_read_sql_stream`（服务端游标）流式读取，
+           逐列写入矩阵；绝不拼回全量明细，也不做 pivot_table。
+      峰值与总行数脱钩；每条查询都带 `market` + `indicator_code` 实体过滤（R7）。
+
+    ⚠ 分位是 expanding、参考样本必须是**全历史**，此处不能加时间下界；只改
+      读取方式与内存形态，数据范围与逐值语义不变（整改前后 pkl 逐值比对）。
+    ⚠ `aggfunc="last"` 语义：主键 (indicator_code, market, trade_date) 保证同一
+      (date, code) 唯一，故等价于按日期定位赋值；仍按 keep="last" 去重以严格复现。
+      `pivot_table` 默认 dropna=True 会丢全 NaN 列，末尾 dropna(axis=1) 复现。
+    """
+    # 惰性导入：本模块被 scheduler 常驻进程 import，避免在模块级拉入标签域包
+    from profiling.tags._base import _read_sql_stream
+
+    dates = _q(conn, "SELECT DISTINCT trade_date FROM " + IV_TABLE +
+               " WHERE market=%s ORDER BY trade_date",
+               [market])["trade_date"].tolist()
+    # 列序必须用 Python sorted 复现 pivot_table(sort=True)：PG 的 collation 与
+    # Python 字典序不同（如 MACRO.USDCNY 会排在 MACRO.US_10Y 之前，实测差 7 列），
+    # 直接沿用 SQL ORDER BY 会让宽表列序与整改前不一致。
+    codes = sorted(_q(conn, "SELECT DISTINCT indicator_code FROM " + IV_TABLE +
+                      " WHERE market=%s",
+                      [market])["indicator_code"].tolist())
+    if not dates or not codes:
         return pd.DataFrame()
-    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
-    return df.pivot_table(index="trade_date", columns="indicator_code",
-                          values="raw_value", aggfunc="last")
+
+    dates = [d.date() if isinstance(d, (pd.Timestamp, datetime.datetime)) else d
+             for d in dates]
+    date_pos = {d: i for i, d in enumerate(dates)}
+    mat = np.full((len(dates), len(codes)), np.nan, dtype=float)
+
+    sql = ("SELECT trade_date, raw_value FROM " + IV_TABLE +
+           " WHERE market=%s AND indicator_code=%s ORDER BY trade_date")
+    for j, code in enumerate(codes):
+        part = _read_sql_stream(conn, sql, [market, code],
+                                chunk_size=_RAW_STREAM_CHUNK,
+                                dtypes={"trade_date": "datetime64[ns]"})
+        if part.empty:
+            continue
+        part = part.drop_duplicates(subset="trade_date", keep="last")
+        keys = part["trade_date"].dt.date.map(date_pos)
+        valid = keys.notna().to_numpy()
+        if not valid.any():
+            continue
+        vals = pd.to_numeric(part["raw_value"], errors="coerce").to_numpy(dtype=float)
+        mat[keys[valid].to_numpy(dtype=int), j] = vals[valid]
+
+    return (pd.DataFrame(mat, index=pd.Index(dates, name="trade_date"),
+                         columns=pd.Index(codes, name="indicator_code"))
+            .dropna(axis=1, how="all"))
 
 
 def _compute_percentiles(combined: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
@@ -2887,9 +2974,15 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
     # only_if_changed=True：月/季频指标被 PIT 填充到每个交易日，值没变的行**不写**
     #   → 不再反复重写同一行；updated_at 恢复「值最后变化时间」语义（配合 indicator_dict.freq
     #     即可判断「月频指标一个月没变」是否异常）。⚠ 仅计算层可用，采集层禁用（见 bulk_upsert）
-    bulk_upsert(conn, IV_TABLE, iv_rows,
-                conflict_cols=["indicator_code", "market", "trade_date"], skip_null_updates=True,
-                only_if_changed=True)
+    # R6：单事务 upsert ≤5 万行。`--backfill` 单块 write_idx 可达上千日 × 124
+    # 指标 → iv_rows 十万级；按 IV_WRITE_BATCH 切块，中间批次即时 commit。
+    # 增量模式（数千行）只走一批且不额外 commit，行为与整改前完全一致。
+    for k in range(0, len(iv_rows), IV_WRITE_BATCH):
+        bulk_upsert(conn, IV_TABLE, iv_rows[k:k + IV_WRITE_BATCH],
+                    conflict_cols=["indicator_code", "market", "trade_date"],
+                    skip_null_updates=True, only_if_changed=True)
+        if k + IV_WRITE_BATCH < len(iv_rows):
+            conn.commit()
 
     return {"rows": len(iv_rows), "dates": len(write_idx)}
 
@@ -2959,7 +3052,7 @@ def run(codes=None, ctx=None, market: str = None, start: datetime.date = None,
             print(f"  ⚠ L2 维度层跳过（{type(e).__name__}: {e}）；"
                   f"可单独跑 build_dimension_value.py --write（标定见 tools/calibrate_breadth.py --write）")
         # L3 业务层：必须在 L2 写出 dimension_value **之后** 调用 ——
-        # BIZ.MARKET_REGIME 读 DIM.TREND.score / DIM.BREADTH.state；L2 失败时
+        # BIZ.MARKET_REGIME 读 DIM.TREND.score / DIM.BREADTH.state；BIZ.MARKET_PATTERN 读六维 score + 方向；L2 失败时
         # 不得拿上一轮维度读数继续算（l2_ok 守卫）。异常隔离与 L2 同款：
         # 业务层失败不拖垮 L1/L2 采集轮次。
         if l2_ok:

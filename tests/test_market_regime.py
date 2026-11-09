@@ -250,14 +250,20 @@ class TestNamingDiscipline(unittest.TestCase):
 class TestOrchestration(unittest.TestCase):
 
     def test_15_explicit_execution_order(self):
-        """RISK_BUDGET 必须排在 SYSTEMIC_STRESS 之后；顺序不能由 biz_code 字母序决定。"""
+        """L3 四个对象按显式顺序表遍历；风险预算已整体移出，不能由 biz_code 字母序决定。"""
         self.assertEqual(bb.BUSINESS_ORDER[0], bb.REGIME_BIZ_CODE)
-        self.assertLess(bb.BUSINESS_ORDER.index("BIZ.SYSTEMIC_STRESS"),
-                        bb.BUSINESS_ORDER.index("BIZ.RISK_BUDGET"))
-        fake = _FakeConn(all_rows=[("BIZ.RISK_BUDGET",),
+        self.assertEqual(bb.BUSINESS_ORDER[-1], "BIZ.REVERSAL_RISK")
+        self.assertEqual(len(bb.BUSINESS_ORDER), 4)
+        for code in ("BIZ.MARKET_PATTERN", "BIZ.MARKET_DIVERGENCE",
+                     "BIZ.REVERSAL_RISK"):
+            self.assertIn(code, bb.BUSINESS_ORDER)
+        for code in ("BIZ.RISK_BUDGET", "BIZ.MARKET_TEMPERATURE",
+                     "BIZ.SYSTEMIC_STRESS"):
+            self.assertNotIn(code, bb.BUSINESS_ORDER)
+        fake = _FakeConn(all_rows=[("BIZ.MARKET_PATTERN",),
                                   (bb.REGIME_BIZ_CODE,), ("BIZ.UNKNOWN",)])
         self.assertEqual(bb.active_business_codes(fake),
-                         [bb.REGIME_BIZ_CODE, "BIZ.RISK_BUDGET"])
+                         [bb.REGIME_BIZ_CODE, "BIZ.MARKET_PATTERN"])
         self.assertEqual(bb.active_business_codes(fake, only_biz=["BIZ.OTHER"]), [])
 
     def test_16_seed_hash_matches_production(self):

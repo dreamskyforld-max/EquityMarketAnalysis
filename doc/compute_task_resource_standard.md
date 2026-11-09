@@ -17,6 +17,7 @@
 | 09-30 | **内存雪崩**（8.4h） | 同上（100% 复现，卡点都在 `trd_momentum_12_1` 触发 `_compute_all`） | 恢复瞬间可用内存仅 **29MB**、commit 150%；PG 单次 `fsync` 阻塞 **139s / 983s** |
 | 10-01 ~ 10-05 | **遗留锁死**（4 天） | 上两次冻结的伤：scheduler 进程内一个 futu 调用永不返回、永久持有 `collector_runtime._call_lock`；重连只在抛异常时触发 → 全量采集超时 350+ 次/天，**只有重启进程才能恢复** | 4 天数据停采 |
 | 10-05（预防） | 同款模式被拦截 | `market_state_daily._per_stock_windows` 一次性加载 ~200 万行，实测峰值 **888MB** | 上线前改造为按股票分批：**888MB → 221MB**，结果逐值一致 |
+| 11-07（预防） | **整改只覆盖半个模块** | 10-05 的分批只改了 `_per_stock_windows`；`_load_stored_raw` 仍一次拉 `indicator_value` 单市场全历史明细（CN 57.8 万行 / 65.8MB），fetchall 中间态 + `pivot_table` 使完整 `run()` 峰值达 **359.8MB**（>R3 的 200MB）。`regime.indicator_value` 不在 R2 清单 → 自查工具零告警 | 流式取数 + 预分配宽表 + 批内服务端游标 + 动态压批：**359.8MB → 144.0MB**（`write=False` 实测），CN/HK 输出逐值相等；代价是耗时 121.9s → 约 200s（仍在 1800s timeout 内）。R2 清单补 `regime.indicator_value` |
 
 **关键机器事实**（做任何资源设计前必须记住）：
 - 物理内存 ~1.9GB、swap ~1GB；常驻服务（PG + FutuOpenD + 4 个 Python 服务 + 前端）已占 ~1.2GB → **可用余量通常只有 600~700MB**。
@@ -30,7 +31,7 @@
 | # | 规则 | 判定方式 |
 |---|---|---|
 | **R1** | 任何"一次性把大表拉进进程"的操作（`fetchall()` / `pd.read_sql_query` 无下界）必须满足 **行数 × 行宽 < 100MB**；超限必须分批（§4.1 / §4.3） | §3 速算 + §5 实测 |
-| **R2** | 大表清单（当前量级）：`a_daily_quote`、`hk_daily_quote`、`tick_data`、`daily_quote`、`daily_benchmark`。命中即触发 R1/R7 审查 | `tools/scan_big_table_loads.py` |
+| **R2** | 大表清单（当前量级）：`a_daily_quote`、`hk_daily_quote`、`tick_data`、`daily_quote`、`daily_benchmark`、`regime.indicator_value`（2026-11-07 补，已达 95 万行）。命中即触发 R1/R7 审查 | `tools/scan_big_table_loads.py` |
 | **R3** | 峰值内存红线：**常驻进程内**任务 ≤ 机器可用内存 × 30%（≈200MB）；**独立单元**任务 cgroup `MemoryMax` ≤ 可用 × 70%（≈512MB），且实测峰值 ≤ 上限的 1/2 | §5 实测 |
 | **R4** | 数据量随历史增长的重计算任务**必须独立进程**：systemd `oneshot` + `timer`，且显式给出 `MemoryMax` / `MemorySwapMax=0` / `RuntimeMaxSec` / `Nice` / `IOSchedulingPriority` / `OOMScoreAdjust` 六项（模板 §4.5） | 检查 unit 文件 |
 | **R5** | **禁止**在常驻调度进程（`market_scheduler.py` 内 `run_module`）里跑数据量随历史增长的整表计算（画像、市场状态、全市场回填） | code review |
@@ -66,6 +67,7 @@
 | 200 万行 × 3 列（含 2 object） | `pd.read_sql_query` + rolling | **888MB** | ❌ 事故（上线前拦截） |
 | 20 万行级 | 单次加载 + pivot | ~50-80MB | ✅ 可用（仍需实测） |
 | 500 只 × 300 天（≈15 万行/批） | 分批加载 | ~40MB/批 | ✅ 标准做法 |
+| 57.8 万行 × 3 列（2 object） | `pd.read_sql_query` + `pivot_table` | **339MB**（完整 run 359.8MB） | ❌ 11-07 拦截；改流式 + 预分配宽表 + 批内服务端游标后 **144MB** |
 
 > **经验法则：超过 50 万行，就必须假设"不能一次性加载"。**
 

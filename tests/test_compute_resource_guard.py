@@ -47,8 +47,33 @@ class TestBatchLoadingGuards(unittest.TestCase):
         """_per_stock_windows 曾一次加载 ~200 万行（实测 888MB），必须保持分批"""
         src = _read("market_state_daily.py")
         self.assertIn("_WINDOW_BATCH_CODES", src)
-        self.assertRegex(src, r"for i in range\(0, len\(codes\), _WINDOW_BATCH_CODES\)")
+        # 2026-11-07：固定 500 只/批在 backfill 4 年窗口会超 50 万行 → 动态压批
+        self.assertIn("_WINDOW_MAX_ROWS", src)
+        self.assertRegex(src, r"for i in range\(0, len\(codes\), batch_codes\)")
         self.assertIn("stock_code = ANY(%s)", src)   # 批次查询按股票限定
+        # 批内也须走服务端游标，否则 11 批 fetchall 会把水位累积到 192.9MB
+        self.assertIn("_WINDOW_STREAM_CHUNK", src)
+        self.assertIn("_read_sql_stream(", src)
+
+    def test_load_stored_raw_streamed(self):
+        """_load_stored_raw 曾一次拉 57.8 万行明细 → pivot 峰值 339MB"""
+        src = _read("market_state_daily.py")
+        self.assertIn("def _load_stored_raw", src)
+        self.assertIn("_RAW_STREAM_CHUNK", src)
+        self.assertIn("_read_sql_stream(", src)
+        self.assertIn("indicator_code=%s", src)     # R7 实体过滤（不再只按 market 全表）
+        # 只钉住本函数体：文件其它地方（行业序列）仍合法使用 pivot_table
+        body = src[src.index("def _load_stored_raw("):
+                   src.index("def _compute_percentiles(")]
+        self.assertNotIn(".pivot_table(", body)
+        self.assertIn("np.full((", body)             # 预分配宽表，不再拼全量明细
+
+    def test_iv_writes_batched(self):
+        """R6：indicator_value 落库单事务 ≤5 万行，长事务逐批 commit"""
+        src = _read("market_state_daily.py")
+        self.assertIn("IV_WRITE_BATCH", src)
+        self.assertRegex(src, r"for k in range\(0, len\(iv_rows\), IV_WRITE_BATCH\)")
+        self.assertIn("conn.commit()", src)
 
 
 class TestSchedulerIsolation(unittest.TestCase):
@@ -79,6 +104,11 @@ class TestStandardCarriersExist(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(ROOT, "tools", "scan_big_table_loads.py")),
             "大表全量加载自查工具缺失")
+
+    def test_big_table_list_includes_indicator_value(self):
+        """11-07 盲区：指标时序长表已达 95 万行却不在大表清单"""
+        src = _read("tools/scan_big_table_loads.py")
+        self.assertIn('"regime.indicator_value"', src)
 
 
 if __name__ == "__main__":

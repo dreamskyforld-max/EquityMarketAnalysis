@@ -30,6 +30,9 @@ BIG_TABLES = [
     "tick_data",
     "daily_quote",
     "daily_benchmark",
+    # 2026-11-07 补：指标时序长表已达 95 万行（CN 57.8 万），
+    # _load_stored_raw 曾一次拉全历史明细造成 339MB 峰值，而旧清单漏了它。
+    "regime.indicator_value",
 ]
 
 # 扫描时排除的目录（.venv/__pycache__/doc 等没有 SQL；tests 里的查询是构造数据的）
@@ -38,8 +41,8 @@ SKIP_DIRS = {".venv", "__pycache__", ".git", "doc", "tests", ".pytest_cache",
 
 # 安全信号：块内出现任意一个即认为"可能已带下界/聚合/去重/限额"（宁可少报，避免噪音）
 SAFE_PATTERN = re.compile(
-    r"BETWEEN|>=\s*%s|<=\s*%s|ANY\s*\(|DISTINCT|LIMIT\s+\d|GROUP\s+BY|ORDER\s+BY"
-    r"|count\s*\(|sum\s*\(|avg\s*\(|max\s*\(|min\s*\(|= \s*%s|\bIN\s*\(",
+    r"BETWEEN|>=\s*%s|<=\s*%s|<\s*%s|ANY\s*\(|DISTINCT|LIMIT\s+\d|GROUP\s+BY|ORDER\s+BY"
+    r"|count\s*\(|sum\s*\(|avg\s*\(|max\s*\(|min\s*\(|=\s*%s|\bIN\s*\(",
     re.I,
 )
 

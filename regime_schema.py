@@ -397,7 +397,7 @@ CREATE TABLE IF NOT EXISTS regime.dimension_value (
     state           VARCHAR(12),                        -- 定性档；NULL = 覆盖度/分歧不达标，不出档
     coverage        NUMERIC(5,4),                       -- 有效成员 / 应有成员（0-1）
     dispersion      NUMERIC(6,2),                       -- 成员分位标准差
-    blocks          JSONB,                              -- 块级分数 {"波动":{"score":..,"coverage":..},...}；SYSTEMIC_STRESS.trigger 依赖本列
+    blocks          JSONB,                              -- 块级分数 {"波动":{"score":..,"coverage":..},...}；维度层下钻 / 排障用
     contrib         JSONB,                              -- {pos:[{code,delta}],neg:[{code,delta}]} 正负各 top3
     flags           JSONB,                              -- 结构性背离/极端（如 NEW_HIGH_LOW_20 vs _60）
     confidence      VARCHAR(8),                         -- 高/中/低
@@ -416,13 +416,13 @@ CREATE INDEX IF NOT EXISTS idx_dim_value_date
     # ── v2.1 三层指标架构：L3 业务指标 ─────────────────────────────────────
     "business_dict": """
 CREATE TABLE IF NOT EXISTS regime.business_dict (
-    biz_code        VARCHAR(32)     PRIMARY KEY,        -- BIZ.MARKET_REGIME / BIZ.MARKET_TEMPERATURE / BIZ.SYSTEMIC_STRESS / BIZ.RISK_BUDGET
+    biz_code        VARCHAR(32)     PRIMARY KEY,        -- BIZ.MARKET_REGIME / BIZ.MARKET_PATTERN / BIZ.MARKET_DIVERGENCE / BIZ.REVERSAL_RISK
     biz_name        VARCHAR(40)     NOT NULL,
-    kind            VARCHAR(16)     NOT NULL,           -- state_machine / band_composite / constraint_min（MARKET_TEMPERATURE 用 band_composite）
+    kind            VARCHAR(16)     NOT NULL,           -- state_machine / rule_set（判定型规则集；constraint_min 已随风险预算移出）
     inputs          JSONB           NOT NULL,           -- [{kind:dimension|atom|external, code, sign}]
-    params          JSONB,                              -- 阈值/状态机参数（DEADBAND/CONFIRM_DAYS/MIN_DWELL/bands；MARKET_TEMPERATURE 为 TEMP_QUANTILES/TEMP_DIMS/TEMP_MIN_SAMPLE/TEMP_QUALITY_SAMPLE/TEMP_AGREEMENT_FLOOR）
+    params          JSONB,                              -- 阈值/参数（REVERSAL_RISK 5 族切点/按市场判读阈值/发布日历/原子指纹，v1.34；MARKET_PATTERN 按维冻结 ECDF 与字典规则表；MARKET_DIVERGENCE 成对阈值）
     params_hash     VARCHAR(16),                        -- 口径指纹：变化必须触发历史重算
-    output_schema   JSONB,                              -- 字段说明（state/level/since/binding_constraint/trigger...；MARKET_TEMPERATURE 必带 level_semantics/score_semantics，且 score_semantics 须标注「四维分位均值、非分位读数」）
+    output_schema   JSONB,                              -- 四个 biz_code 必带 level_semantics / score_semantics（见 §2.3.4）
     is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
     remark          TEXT,
     updated_at      TIMESTAMPTZ     DEFAULT NOW()
@@ -435,13 +435,13 @@ CREATE TABLE IF NOT EXISTS regime.business_value (
     market         VARCHAR(8)      NOT NULL,
     trade_date     DATE            NOT NULL,
     score          NUMERIC(6,2),                        -- 连续读数（纯状态类可空）
-    state          VARCHAR(16),                         -- 上行/震荡/下行；正常/关注/警戒/危机；极低/较低/适中/较高/极高（MARKET_TEMPERATURE）
-    level          SMALLINT,                            -- 档位序号（1 起，便于比较与画图；⚠ 多态列，四个 biz_code 语义互不相容，见 output_schema.level_semantics）
-    since_date     DATE,                                -- 进入当前状态的日期（状态机）
-    dwell_days     SMALLINT,                            -- 已在当前状态停留的交易日数
-    status         VARCHAR(12),                         -- 已确认 / 待确认
+    state          VARCHAR(16),                         -- 上行/震荡/下行；形态标签（PATTERN）；一致…多重背离（DIVERGENCE）；正常/警惕/高风险（REVERSAL_RISK）
+    level          SMALLINT,                            -- 档位序号（1 起；⚠ 多态列，四个 biz_code 语义互不相容；MARKET_PATTERN 恒 NULL）
+    since_date     DATE,                                -- 进入当前状态/形态的日期（状态机与游程标注）
+    dwell_days     SMALLINT,                            -- 已在当前状态/形态停留的发布日数
+    status         VARCHAR(12),                         -- 已确认 / 待确认（状态机与游程标注）
     confidence     VARCHAR(8),                          -- 高/中/低（宽度确认等外部调节项写这里）
-    detail         JSONB,                               -- {candidate,evidence,binding_constraint,trigger,spike,missing}；MARKET_TEMPERATURE={components,quality,coverage,dispersion,low_agreement,quantiles,composition_version}（components/quantiles 无条件必输出）
+    detail         JSONB,                               -- 键按 biz_code 见 §2.3.4（PATTERN / DIVERGENCE / REVERSAL_RISK 各有专属键）
     model_version  VARCHAR(16),
     updated_at     TIMESTAMPTZ     DEFAULT NOW(),
 
@@ -460,7 +460,7 @@ CREATE TABLE IF NOT EXISTS regime.signal_dict (
     signal_code    VARCHAR(40)     PRIMARY KEY,         -- SIG.REVERSAL.TOP_* / _BOTTOM_*
     signal_name    VARCHAR(60)     NOT NULL,
     direction      VARCHAR(8)      NOT NULL,            -- TOP / BOTTOM
-    category       VARCHAR(16),                         -- 宽度/估值/情绪/资金/宏观/基本面
+    category       VARCHAR(16),                         -- 宽度/估值/情绪/资金/宏观/基本面（理想清单族名；v1.34 一期的生效族清单见 §6.4，本表仍零生产者）
     market_scope   VARCHAR(16)     NOT NULL DEFAULT 'CN+HK',  -- CN / HK / CN+HK（无源市场不登记该族 → v_signal_summary.unavailable_families）
     expr           TEXT,                                -- 条件的人可读描述（非可执行 DSL）
     inputs         JSONB,                               -- 引用的原子指标清单
@@ -493,7 +493,7 @@ CREATE INDEX IF NOT EXISTS idx_signal_value_date
     ON regime.signal_value (trade_date DESC, market, hit)
 """,
 
-    # 信号汇总视图（market_profile.md §5.11 ⑥）：族去重后的顶/底计数，不新建业务指标
+    # 信号汇总视图（market_profile.md §5.10 ⑥）：族去重后的顶/底计数
     "v_signal_summary": """
 CREATE OR REPLACE VIEW regime.v_signal_summary AS
 WITH markets AS (
@@ -719,57 +719,43 @@ _COMMENTS = [
      "结构性背离与极端标记（如 NEW_HIGH_LOW_20 与 _60 反向、MA60 与 MA200 分层、等权与市值加权差极端）；"
      "这些是设计好的快慢/结构对照，不能被平均分抹掉"),
     ("TABLE", "regime.business_dict",
-     "业务指标字典（L3）：市场方向 / 市场温度 / 系统性压力 / 风险预算的输入清单、类型与参数"),
+
+     "业务指标字典（L3）：市场方向 / 市场形态 / 侧面背离 / 反转风险的输入清单、类型与参数"),
     ("COLUMN", "regime.business_dict.kind",
-     "state_machine=状态机（趋势三态，带死区/确认天数/最小停留）；band_composite=从维度分分档"
-     "（MARKET_TEMPERATURE：先各维 as-of 分位归一再等权平均，见 market_profile.md §5.9 ④；"
-     "合成值是分位均值、非分位读数，四个冻结切点值须随值输出）；"
-     "constraint_min=多约束取最紧（风险预算）"),
+
+     "state_machine=状态机（趋势三态带死区/确认天数/最小停留）；rule_set=判定型规则集（条件合取 / 成对判据 / 族级共振，四个判定型对象均单日幂等；反转风险 v1.34 撤销 SWITCH_DAYS 状态机、改游程标注）；constraint_min 已随风险预算移出到资产配置功能，不再使用"),
     ("COLUMN", "regime.business_dict.inputs",
      "输入清单 [{kind:dimension|atom|external, code, sign}]。**kind 不是装饰**："
      "连续型业务指标从 dimension 取，判定型从 atom 取（规则要精确边界），"
      "external 指第②层引用（如 §4.2 跨资产确认度），本层不得重算"),
     ("COLUMN", "regime.business_dict.output_schema",
-     "输出字段说明。⚠ **必须包含 level_semantics 与 score_semantics**（枚举值 + 方向），"
-     "供消费方在读取 level/score 前校验——没有它，多态列的误用无法在 DB 层被发现"
-     "（建议消费方按 biz_code 建独立视图，禁止跨 biz 联合查询）。"
-     "MARKET_TEMPERATURE 的 score_semantics 必须标注「四维分位均值、分布向 50 集中、非等频分位读数、非绝对泡沫」，"
-     "level_semantics 标注「升序=越热」"),
+     "输出字段说明。⚠ **必须包含 level_semantics 与 score_semantics**（枚举值 + 方向），供消费方在读取 level/score 前校验——没有它，多态列的误用无法在 DB 层被发现（建议消费方按 biz_code 建独立视图，禁止跨 biz 联合查询）。"
+     "MARKET_PATTERN 须标注「level/score 恒 NULL、形态无序」；MARKET_DIVERGENCE 须标注「score 为 0..n_valid 计数、state 按归一强度 Σdelta/(2×n_valid) 切四档、delta 是各维冻结档位序数差 0/1/2 而非分位差」；REVERSAL_RISK 须标注「score 为族去重计数、非程度读数 / 非分位，state 恒当日 raw 无状态机」"),
     ("TABLE", "regime.business_value",
      "业务指标日频读数（L3）：一市场一日一指标一行"),
     ("COLUMN", "regime.business_value.state",
-     "状态标签：MARKET_REGIME=上行/震荡/下行；SYSTEMIC_STRESS=正常/关注/警戒/危机；"
-     "MARKET_TEMPERATURE=极低/较低/适中/较高/极高（等频五档，每档约 20% 时间，相对自身历史、非绝对泡沫，"
-     "前端须附「相对自身历史」后缀，无 since/dwell）；"
-     "RISK_BUDGET 见 level。**状态带 since/dwell，不允许日频翻转**（滞后带 + 确认天数 + 最小停留）"),
+     "状态标签：MARKET_REGIME=上行/震荡/下行；MARKET_PATTERN=离散形态标签（8 选 1，无序）；MARKET_DIVERGENCE=一致/轻度背离/显著背离/多重背离；REVERSAL_RISK=正常/警惕/高风险。"
+     "四个 biz_code 的 state 语义互不相容，禁止跨 biz 比较"),
     ("COLUMN", "regime.business_value.level",
-     "⚠ **多态列，四个 biz_code 的语义互不相容，禁止跨 biz 比较/聚合/同图绘制**："
-     "MARKET_REGIME 1=下行/2=震荡/3=上行（升序=越偏多）；SYSTEMIC_STRESS 1=正常…4=危机（升序=越危险）；"
-     "MARKET_TEMPERATURE 1=极冷…5=极热（升序=越热，第四种语义）；"
-     "RISK_BUDGET 1=20%…5=100%（升序=敞口越大）。"
-     "消费方必须按 biz_code 过滤，并校验 business_dict.output_schema.level_semantics"),
+     "⚠ **多态列，四个 biz_code 的语义互不相容，禁止跨 biz 比较/聚合/同图绘制**：MARKET_REGIME 1=下行/2=震荡/3=上行（升序=越偏多）；MARKET_PATTERN 恒 NULL（形态无序）；"
+     "MARKET_DIVERGENCE 1=一致…4=多重背离（升序=背离越多越强）；REVERSAL_RISK 1=正常…3=高风险（升序=越危险）。消费方必须按 biz_code 过滤，并校验 business_dict.output_schema.level_semantics"),
     ("COLUMN", "regime.business_value.score",
-     "⚠ **同为多态列**：MARKET_REGIME=趋势强度（与方向解耦，= DIM.TREND.score）；"
-     "SYSTEMIC_STRESS=压力分（= DIM.STRESS.score）；"
-     "MARKET_TEMPERATURE=四维 as-of 分位的等权平均（0-100，分布向 50 集中，**非等频分位读数**、非绝对泡沫、"
-     "不驱动任何 cap；四个冻结切点值随值输出，禁止按「X = 历史 X 分位」解读）；"
-     "RISK_BUDGET=cap×100（敞口百分比）。禁止跨 biz 比较"),
+     "⚠ **同为多态列**：MARKET_REGIME=趋势强度（= DIM.TREND.score）；MARKET_PATTERN 恒 NULL；MARKET_DIVERGENCE=命中背离对数（0..n_valid 计数，n_valid 见 detail.n_valid_pairs）；REVERSAL_RISK=top_family_cnt（族去重计数）。"
+     "均非 0-100 程度分 / 分位读数，禁止跨 biz 比较"),
     ("COLUMN", "regime.business_value.since_date",
-     "当前状态的首次进入日（状态机产出）；配合 dwell_days 判断状态是否已稳定"),
+     "当前状态/形态的首次进入日（状态机或游程标注产出）；配合 dwell_days 判断状态是否已稳定"),
     ("COLUMN", "regime.business_value.detail",
-     "增量信息集中在此：MARKET_REGIME={candidate,evidence,breadth_confirmation,trend_state,turn_risk}（§6.1 v2）；"
-     "MARKET_TEMPERATURE={components,quality,coverage,dispersion,low_agreement,quantiles,composition_version}"
-     "（components 与 quantiles 无条件必输出；quality=low 照常发布但须标注；"
-     "不落 history_stats，前瞻验证走离线报告）；"
-     "SYSTEMIC_STRESS={trigger,spike,blocks}（压力 70 分时\"信用在扩\"还是\"波动在冲\"处置不同）；"
-     "RISK_BUDGET={binding_constraint,raw_cap,inputs,constrained_by,missing}（比数字更有用的是\"被什么卡住的\"）"),
+     "增量信息集中在此：MARKET_REGIME={candidate,evidence,breadth_confirmation,trend_state,turn_risk}（§6.1 v2）；MARKET_PATTERN={pattern,dominant_driver,evidence,matched_rules,missing_dims,candidate}（§6.2）；"
+     "MARKET_DIVERGENCE={pairs,dominant_pair,evidence,missing_pairs,n_valid_pairs,hit_ratio,strength}（§6.3 v1.33；pairs[].delta 为档位序数差 0/1/2，state 由 strength 切档而非由命中计数切档）；REVERSAL_RISK={top_state,bottom_state,top_families,bottom_families,top_cnt,bottom_cnt,unavailable_families,signal_conflict,dwell_days,missing}（§6.4 v1.34 十键齐全，另附 available_family_cnt/correlated_families/bottom_state_label/evidence）。"
+     "风险预算 RISK_BUDGET 已整体移出到资产配置功能，本表不登记"),
     ("COLUMN", "regime.dimension_value.blocks",
-     "块级分数 {\"块名\":{\"score\":..,\"coverage\":..}}。**SYSTEMIC_STRESS.trigger 的唯一数据来源**——"
-     "成员级 contrib 拿不到「信用块取最紧」的语义，没有本列只能用成员 top3 反推"),
+     "块级分数 {\"块名\":{\"score\":..,\"coverage\":..}}。维度层下钻 / 排障用，"
+     "成员级 contrib 拿不到「信用块取第二紧」的块级聚合语义；"
+     "v2.1.20 起不再作为任何 L3 trigger 的来源（DIM.STRESS 不进 cap）"),
     ("TABLE", "regime.signal_dict",
      "反转风险信号字典：顶部/底部条件清单（清单正文见 market_profile.md §8.2/§8.3）"),
     ("TABLE", "regime.signal_value",
-     "信号日频命中记录。**信号不得并入任何维度分或业务指标**——它是条件命中，不是程度读数"),
+     "信号日频命中记录。信号是条件命中，不是程度读数"),
     ("COLUMN", "regime.signal_value.days",
      "已连续命中交易日数。\"站上 MA200 比例回落 3 天\"与\"回落 40 天\"是完全不同的信息，"
      "单给计数会抹掉这个差别，故本列必填"),
@@ -782,9 +768,13 @@ _COMMENTS = [
      "该信号在哪些市场有源。港股无涨跌停/两融 → 对应信号只登记 CN；"
      "该族在 HK 因此进 v_signal_summary.unavailable_families、不进 family_cnt 的分母"),
     ("VIEW", "regime.v_signal_summary",
-     "信号汇总（§5.11 ⑥）：top_family_cnt / bottom_family_cnt 为**族去重**后的计数"
+     "信号汇总（§5.10 ⑥）：top_family_cnt / bottom_family_cnt 为**族去重**后的计数"
      "（同族命中多条只计 1 票），判读用族数、条数只作参考。"
-     "⚠ 汇总用视图表达，不新建业务指标——信号是条件命中，不是程度读数"),
+     "汇总用视图表达；信号是条件命中，不是程度读数。"
+     "⚠ 已知缺陷（v1.34 登记、一期不依赖）：fam CTE 仅含 JOIN 成功的有源族、"
+     "unavail 的 ARRAY_AGG 无 FILTER，输出的 unavailable_families 实为有源族；"
+     "available_family_cnt 不分 direction 且为市场级静态值，表达不了逐日数据起点断层。"
+     "§6.4 v1.34 一期不读本视图，二期接信号层前必须修复"),
     ("COLUMN", "regime.indicator_dict.breaks",
      "制度/源断点 [{date, reason}]（注册制、涨跌幅规则变更、北向 2024-08 停披露、港股卖空 2026-06 起等）。"
      "断点前后的分位**不可比**，前端须按断点分段显示；不登记的断点会被误读成市场信号"),

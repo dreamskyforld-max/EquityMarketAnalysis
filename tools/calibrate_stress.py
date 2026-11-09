@@ -23,7 +23,7 @@
     不依赖 L1 `extra.n_sample`（压力族未落地），PIT 安全、不触发 L1 重算。
   · `dispersion` 只作描述量、**不作门禁**（块内成员低相关是设计事实），`state` 恒 NULL
     （`state_bands_calibrated=False`），`confidence` 最高「中」。首版是内部连续读数，
-    不进 `BIZ.RISK_BUDGET`、禁 CN / HK 横比。
+    不进资产配置约束 / `cap`、禁 CN / HK 横比。
 
 零新增 L1：只用现有 `indicator_value.percentile`，不改 `market_state_daily.py`、
 不改表结构、不回补历史数据。M2 候选（Amihud / 利率 CHG20 / 5Y 信用利差）与
