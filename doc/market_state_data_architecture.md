@@ -12,7 +12,7 @@
 
 ## 0 阅读契约
 
-> ⚠ **v1.32 / 研究稿 v2.1.21 领域边界声明**：市场温度、系统性压力两个 L3 与「风险预算」均已下线 / 移出——风险预算 `BIZ.RISK_BUDGET` **整体移出到资产配置功能**（第②层 §4.3），本层不产出、不引用、不校验。现行 L3 共 4 个：`BIZ.MARKET_REGIME`（§6.1）/ `BIZ.MARKET_PATTERN`（§6.2）/ `BIZ.MARKET_DIVERGENCE`（§6.3）/ `BIZ.REVERSAL_RISK`（§6.4）。本文档正文中残留的旧编码字样属历史规格描述或编年留档，**勿按已删规格重建**；v1.24 / v1.25 / v1.26 / v1.29 / v1.30 编年保留完整变更过程。研究稿章节号见该文档文首编号迁移说明。⚠ **v1.34**：§6.4「反转风险」已按离线预检后的裁剪版落地，章首「v1.34 生效规格」为真源，其下 v1.31 全文为编年留档。
+> ⚠ **领域边界声明**：市场温度、系统性压力两个 L3 与「风险预算」均已下线 / 移出——风险预算 `BIZ.RISK_BUDGET` **整体移出到资产配置功能**（第②层 §4.3），本层不产出、不引用、不校验。现行 L3 共 4 个：`BIZ.MARKET_REGIME`（§6.1）/ `BIZ.MARKET_PATTERN`（§6.2）/ `BIZ.MARKET_DIVERGENCE`（§6.3）/ `BIZ.REVERSAL_RISK`（§6.4），四个均已落地。本文档各对象章节只描述现行生效规格与合约，不含历史版本内容。
 
 | 你要找什么 | 去哪读 |
 |---|---|
@@ -26,7 +26,7 @@
 
 **规格唯一真相源 = 本文档 + `sql/schema.sql`**；两者冲突时以 DDL 为准。本文档不写 UI / 前端展示方式，不写决策过程，不写项目进度——那些分别在 UI 工作流文档、附录 B、附录 D。
 
-**与 `doc/market_profile.md` 的关系**：该文件是可行性研究报告，保留宏观层（§3）、资产配置层（§4）、方法论依据（§7、§8）与全部变更历史；**数据层规格以本文档为准**。本文档按统一模板完整写出全局骨架与 `DIM.BREADTH`（§5.1）、`DIM.VALUATION`（§5.2）、`DIM.SENTIMENT`（§5.3）、`DIM.FLOW`（§5.4）、`DIM.STRESS`（§5.5）、`DIM.TREND`（§5.6）六个维度对象（**六个维度均已落地**；情绪按方案 A「固定核心集 + 冻结有效起点」产出内部读数，见 §5.3；资金按「按市场单锚 + 冻结有效起点」产出内部读数，见 §5.4 / 附录 D；压力按「固定核心集 + 4 块两级等权 + 冻结有效起点」产出内部连续读数，见 §5.5 / 附录 D；趋势按「σ 归一化强度 t 作 L1 `raw_value` + expanding 分位作 `score`」的单锚产出读数，`state` 恒 NULL、方向归 `BIZ.MARKET_REGIME`，见 §5.6 / 附录 D）；其余对象在对象地图中列出、按模板逐节迁移（进度见附录 D）；§5.x 编号与该文件 §5 对齐，六维总览为章首无编号索引；L3 市场方向已按模板写出并落地（§6.1 v2）；L3 市场形态、侧面背离已按实测整改并落地（§6.2 v1.32、§6.3 v1.33，生效规格）；L3 反转风险按离线 Go/No-Go 预检后的裁剪版落地（§6.4 v1.34，生效规格）。
+**与 `doc/market_profile.md` 的关系**：该文件是可行性研究报告，保留宏观层（§3）、资产配置层（§4）、方法论依据（§7、§8）与全部变更历史；**数据层规格以本文档为准**。本文档按统一模板完整写出全局骨架与 `DIM.BREADTH`（§5.1）、`DIM.VALUATION`（§5.2）、`DIM.SENTIMENT`（§5.3）、`DIM.FLOW`（§5.4）、`DIM.STRESS`（§5.5）、`DIM.TREND`（§5.6）六个维度对象（**六个维度均已落地**；情绪按方案 A「固定核心集 + 冻结有效起点」产出内部读数，见 §5.3；资金按「按市场单锚 + 冻结有效起点」产出内部读数，见 §5.4 / 附录 D；压力按「固定核心集 + 4 块两级等权 + 冻结有效起点」产出内部连续读数，见 §5.5 / 附录 D；趋势按「σ 归一化强度 t 作 L1 `raw_value` + expanding 分位作 `score`」的单锚产出读数，`state` 恒 NULL、方向归 `BIZ.MARKET_REGIME`，见 §5.6 / 附录 D）；其余对象在对象地图中列出、按模板逐节迁移（进度见附录 D）；§5.x 编号与该文件 §5 对齐，六维总览为章首无编号索引；L3 市场方向已按模板写出并落地（§6.1 v2）；L3 市场形态、侧面背离已按实测整改并落地（§6.2 v1.32、§6.3 v1.33，生效规格）；L3 反转风险已按模板写出并落地（§6.4）。
 
 ---
 
@@ -57,7 +57,7 @@ L3 业务指标   business_value      方向 / 形态 / 侧面背离 / 反转风
 |---|---|---|---|---|---|---|
 | L1 | 原子指标（约 123 个，其中 54 个进六维） | `域.名称`，如 `VAL.PE_TTM_MEDIAN` | `regime.indicator_dict` | `regime.indicator_value` | `(indicator_code, market, trade_date)` / 一市场一日一指标一行 | `market_state_daily.py`（已落地） |
 | L2 | 维度指标（6 个：宽度 / 估值 / 情绪 / 资金 / 压力 / 趋势） | `DIM.*` | `regime.dimension_dict` | `regime.dimension_value` | `(dimension_code, market, trade_date)` | `build_dimension_value.py`（已落地宽度 / 估值 / 情绪 / 资金四个生产者，按 `dimension_code` 分派） |
-| L3 | 业务指标（4 个：市场方向 / 市场形态 / 侧面背离 / 反转风险） | `BIZ.*` | `regime.business_dict` | `regime.business_value` | `(biz_code, market, trade_date)` | `build_business_value.py`（方向 / 形态 / 侧面背离已落地，仅反转风险零生产者） |
+| L3 | 业务指标（4 个：市场方向 / 市场形态 / 侧面背离 / 反转风险） | `BIZ.*` | `regime.business_dict` | `regime.business_value` | `(biz_code, market, trade_date)` | `build_business_value.py`（四个生产者均已落地，按 `biz_code` 分派） |
 | 横切 | 反转信号（约 20 条） | `SIG.REVERSAL.TOP_*` / `BOTTOM_*` | `regime.signal_dict` | `regime.signal_value` | `(signal_code, market, trade_date)` | 无（仅 DDL） |
 | 视图 | 信号汇总 | — | — | `regime.v_signal_summary` | 按市场 / 日期 | 无生产者时恒空 |
 | 外部输入 | 宏观 / 行情 / 事件 | `MACRO.*` / `bench:` 等 | `regime.macro_series_meta` 等 | `regime.macro_series`、`public.daily_benchmark`、`a_daily_quote`、`hk_daily_quote`、`regime.sector_*`、事件表 | 各自主键 | 采集层（第①②层） |
@@ -248,11 +248,11 @@ L3 业务指标   business_value      方向 / 形态 / 侧面背离 / 反转风
 |---|---|---|
 | `MARKET_REGIME` | `candidate`、`evidence`、`breadth_confirmation`、`trend_state`、`turn_risk` | 候选态、证据、宽度确认、趋势/转折二分与转折风险（§6.1 v2） |
 | `MARKET_PATTERN` | `pattern`、`dominant_driver`、`evidence`、`matched_rules`、`missing_dims`、`candidate` | 形态标签、主导侧面、六维分位证据、命中规则、降级侧面、待确认候选（§6.2 v1.32） |
-| `REVERSAL_RISK` | `top_state`、`bottom_state`、`top_families[]`、`bottom_families[]`、`signal_conflict`、`unavailable_families[]`（判读见研究稿 §5.9 ⑥） | 族级判读的两侧状态与命中族清单；冲突时降一档 |
+| `REVERSAL_RISK` | `top_state`、`bottom_state`、`top_families[]`、`bottom_families[]`、`top_cnt`、`bottom_cnt`、`unavailable_families[]`、`signal_conflict`、`dwell_days`、`missing`（另附 `available_family_cnt`、`correlated_families`、`bottom_state_label`、`evidence`） | 族级判读的两侧档位与命中族清单、无源族 / 共变簇标注、冲突降档标记、游程与口径证据（§6.4） |
 
 > ⚠ 消费方读取 `level` / `score` 前，必须按 `biz_code` 过滤并校验 `business_dict.output_schema.level_semantics` / `score_semantics`；建议按 `biz_code` 建独立视图，禁止跨 biz 联合查询。
 
-L3 一行样例：⚠ 原市场温度样例随 v2.1.20 下线删除；`BIZ.REVERSAL_RISK` 本期零生产者、无 `business_value` 行，字段形状见 `business_dict.output_schema`（研究稿 §5.9 ⑥）。
+L3 一行样例见 §6.1 / §6.2 / §6.3 / §6.4 各节「输出」。
 
 #### 2.3.5 `regime.signal_value`（横切信号命中）
 
@@ -1987,11 +1987,6 @@ for market in ("CN", "HK"):
 
 ### 6.2 市场形态 · `BIZ.MARKET_PATTERN`
 
-> ✅ **v1.32 / 2026-11-07 已按实测整改并落地**：本节为**生效规格**，非规划稿。
-> 原 v1.30 规格（绝对 70/30 切点、8 条先验规则、`flags.EQ_VS_CAP_20D`、
-> `switch_confirm_days` 状态机、5 项待标定参数）经数据核查与离线模拟证伪后整体重写，
-> 论证与废弃结论见附录 B（B-13）与附录 C（v1.32）。
-
 #### 定义
 
 回答「当前市场由哪些侧面组合成什么局面」——把六个维度并列的 0–100 读数收敛成**一个可命名的离散形态**，让用户一眼读懂市场，并可下钻看主导维度与证据。`kind = rule_set`（已落代码、已落字典）。
@@ -2228,32 +2223,92 @@ for market in ("CN", "HK"):
 
 ### 6.3 侧面背离 · `BIZ.MARKET_DIVERGENCE`
 
-> ⚠ **v1.33 生效口径（2026-11-07 按实测整改并落地，覆盖下方 v1.32 历史规格正文）**
-> 下面 `#### 定义` ~ `上线前验收门禁` 是 v1.32 的规划规格（零生产者、零读数、全部待标定），
-> 其中「六维 `score` 量纲归一后可直接相减」、`pair_thresholds=25`、`divergence_bands=[0,1,3,5]`、
-> `flags.EQ_VS_CAP_20D` 等原子键、A/D 派生量作输入 **均已作废**，按编年留档保留，勿据此重建。
-> 实现与消费端以本修订块 + 字典 `params_hash=2a8870ee5900d93c` 为准。
+#### 定义
 
-#### v1.33 生效规格
+回答「当前市场状态内部哪些侧面对不上」——对六个维度做**成对**的一致性检验，把「意愿强但真金白银没进」「指数涨但参与面窄」这类单看任一维都发现不了的矛盾，收敛成一个可读结论，并可下钻到主导矛盾对与逐对证据。`kind = rule_set`（判定型规则集）；`state` = 一致 / 轻度背离 / 显著背离 / 多重背离（按归一强度切四档），`level` = 1…4（升序 = 归一强度越大 / 背离越多越强，**仅为序数**，无好坏极性），`score` = 命中背离对数（`0..n_valid` 的整数**计数**，不是 0–100 程度分 / 分位 / 预测值）；日频落库、**单日幂等（无状态机）**，`since_date` / `dwell_days` / `status` 恒 NULL；粒度 `(biz_code, market, trade_date)`，`market ∈ {CN, HK}`，两市场**同定义、切点按 `(market, dimension)` 分别冻结、禁止横比**。
+
+**定位与下游约束（v1.33）**：本指标只回答侧面之间**互斥**的矛盾，与 §6.2 形态（侧面**组合**成什么局面）、§6.4 反转风险（几个侧面**同向**处于极端）正交，是「组合 / 互斥 / 共振」三种独立读法之一，不重复计权；「背离」不是 §5.1 的 A/D 与指数价格背离，也不作跨维分位差（v1.33 已撤销 `|score_a − score_b|`，见「原理与背景」2）。冻结切点存在参数层前视，本指标为**描述性读数**，不预测拐点、不驱动任何仓位 / 配置建议；下游只读 `state` + `detail.pairs[]` 出「哪里对不上」及下钻证据。
+
+**边界（不回答什么）**：① 不表达方向（§6.1）；② 不表达冷热 / 泡沫 / 危险程度（§6.4）；③ 不合成 0–100 连续读数、不重算任何维度分、不新增数据源；④ 不产出仓位 / 比例 / 配置建议；⑤ 不预测拐点 / 未来涨跌；⑥ 不替代逐对证据的判读（`detail.pairs[]` 才是答案）；⑦ 低置信读数不作决策依据（`confidence` 与 `detail.missing_pairs` 标注）。
 
 | 项 | 内容 |
 |---|---|
-| 定位 | 侧面之间「互相矛盾」的成对检验（组合 / 共振 / 互斥三分不变）；单日幂等、无状态机；粒度 `(biz_code, market, trade_date)`，`market ∈ {CN, HK}`，切点按市场冻结、禁止横比 |
-| 类型 | `kind = rule_set`；`params_hash = 2a8870ee5900d93c`；`is_active = true` |
-| 生产者 | `build_business_value.py::build_divergence_business()`；`tools/calibrate_divergence.py --write` / `--seed` 写字典；`tools/validate_divergence.py` 验收；`tests/test_market_divergence.py` 防回退 |
+| 编码 | `BIZ.MARKET_DIVERGENCE`（中文「侧面背离」） |
+| 类型 | `kind = rule_set`；`params_hash = 2a8870ee5900d93c`；`is_active = true`；**无待标定参数** |
+| 生产者 | `build_business_value.py::build_divergence_business()`（取数 `divergence_load_frame` / 纯计算 `divergence_compute`）；由 `build_all_business` 按 `biz_code` 分派，**日频由 `market_state_daily.run()` 在 L2 之后调用 `build_all_business()`**（`market_scheduler` 工作日 18:45）；字典常规写入口 `tools/calibrate_divergence.py --write`（`--seed` 走同一 `divergence_build_dict_row()`），验收 `tools/validate_divergence.py`，防回退 `tests/test_market_divergence.py` |
+| 业界依据 | 不移植单一模型；方法约束来自 §1.1 铁律①②（判定型业务指标走规则、要精确边界）与 §2.4 规则 7（六维分不可横比 / 加减）——故 v1.33 撤销跨维分位差、改按各维自身冻结档位取序数差；完整整改依据见 `build_business_value.py::DIVERGENCE_REMARK` 与本节「原理与背景」 |
 | 核心变更 | 撤销跨维分位差 `\|score_a − score_b\|`，改为**各维自身冻结档位的序数差**（`doc/market_profile.md` 硬约束「六维分不可跨维加减」）；`state` 改按归一强度切档 |
 
-**输入（零新增数据源，全部为库内真实字段）**
+#### 输入
 
-| 输入 | 来源 | 口径 |
+来源表 `regime.dimension_value`（六维 `score` 与 `DIM.BREADTH.flags.structural`）、`regime.indicator_value`（`BREADTH.EQ_VS_CAP_20D.percentile`）与 `regime.business_value`（`BIZ.MARKET_REGIME.state`）。全部输入均已真实落地，**零新增数据源**。
+
+| 输入 | 口径 | 缺失 / 不足时的降级 |
 |---|---|---|
-| 六维 `score` | `regime.dimension_value` | 按 `(market, dim)` 冻结 P30/P70 切 L/M/H |
-| `BREADTH.EQ_VS_CAP_20D.percentile` | `regime.indicator_value` | D1 双侧极端 `≤20 或 ≥80`（与 §6.2 同款） |
-| `dimension_value.flags.structural` | `DIM.BREADTH` | D5 读中文文案数组（只读不重算）；映射常量在 `params.structural_flag_texts` |
-| `BIZ.MARKET_REGIME.state` | `regime.business_value` | D4 方向条件；缺失时该对退出，**不强制统一发布日历** |
+| 六维 `DIM.*.score` | `regime.dimension_value.score`，按 `(market, dimension)` 冻结 P30/P70 切 L/M/H（ord 0/1/2） | 该维 `score` 缺失 → 涉及该维的对退出并记 `detail.missing_pairs`；**strict，不按中性填充** |
+| `BREADTH.EQ_VS_CAP_20D.percentile` | `regime.indicator_value.percentile`，D1 双侧极端 `≤20 或 ≥80`（与 §6.2 规则 5 同款） | 无该行 → D1 退出 |
+| `dimension_value.flags.structural` | `DIM.BREADTH` 的中文文案数组，D5 只读不重算；映射常量在 `params.structural_flag_texts` | L2 未产出 `flags` → D5 退出 |
+| `BIZ.MARKET_REGIME.state` | `regime.business_value.state`，D4 方向条件 | 无该行 → D4 退出；**不强制统一发布日历** |
 | A/D 派生量 | — | **已移出**（不落表、零 L3 消费方、恒 `benchmark_mismatch`） |
 
-**计算模型**
+> **统一降级（A8）**：输入缺失一律「该对退出 + 标注」，不得静默按中性处理；`n_valid < min_pairs(4)` 或涉及维度数 `< min_distinct_dims(3)` → **整行不发布**，不写「一致」兜底，`detail.missing_pairs` 只出现在发布日。
+
+本指标参数定义在「计算模型」的「本环节参数」表；下方是 `business_dict` 的一行**字典种子**（物化形态，不是定义）。
+
+**业务指标注册**  
+对应表为 `regime.business_dict`（已落库）  
+```json
+{
+  "biz_code": "BIZ.MARKET_DIVERGENCE", "biz_name": "侧面背离",
+  "kind": "rule_set", "is_active": true,
+  "inputs": [
+    {"kind":"dimension","code":"DIM.BREADTH","role":"band"},
+    {"kind":"dimension","code":"DIM.VALUATION","role":"band"},
+    {"kind":"dimension","code":"DIM.SENTIMENT","role":"band"},
+    {"kind":"dimension","code":"DIM.FLOW","role":"band"},
+    {"kind":"dimension","code":"DIM.STRESS","role":"band"},
+    {"kind":"dimension","code":"DIM.TREND","role":"band"},
+    {"kind":"atom","code":"BREADTH.EQ_VS_CAP_20D","role":"eq_extreme"},
+    {"kind":"business","code":"BIZ.MARKET_REGIME","role":"direction_axis"}
+  ],
+  "params": {"band_low_u":0.30,"band_high_u":0.70,"min_pairs":4,
+             "min_distinct_dims":3,"publish_policy":"pair_level_degrade",
+             "state_rule":"normalized_strength","score_rule":"hit_count",
+             "calib_end":"2025-12-31",
+             "band_cuts":"<12 组按市场按维冻结 P30/P70>",
+             "strength_bands":[0.15,0.30,0.50],
+             "state_labels":["一致","轻度背离","显著背离","多重背离"],
+             "eq_vs_cap_extreme":{"low":20.0,"high":80.0},
+             "structural_flag_texts":"<short_fade / mid_unrepaired 两条中文文案>",
+             "pair_rules":"<D1..D6 六对，见背离对清单表>",
+             "upstream_dim_params_hashes":"<六维 params_hash 快照>"},
+  "params_hash": "2a8870ee5900d93c",
+  "output_schema": {
+    "level_semantics": "1=一致 / 2=轻度背离 / 3=显著背离 / 4=多重背离（升序=归一强度越大；按 biz_code 过滤，禁止跨 biz 横比）",
+    "score_semantics": "命中背离对数（0..n_valid 计数；非 0-100 程度分 / 非分位 / 非预测值）",
+    "state_semantics": "按归一强度 strength=Σdelta/(2×n_valid) 切四档，非按命中计数切档；不表达方向 / 不预测拐点 / 不产出仓位建议",
+    "detail_keys": ["pairs","dominant_pair","evidence","missing_pairs",
+                    "n_valid_pairs","hit_ratio","strength"]
+  }
+}
+```
+
+> `params_hash` 只覆盖 `biz_code` / `kind` / `inputs` / `params` / `output_schema` 五键（`divergence_build_dict_row` 的 payload），`biz_name` / `is_active` / `remark` / `updated_at` 不进指纹；`params.upstream_dim_params_hashes` 含六维字典指纹快照 → 任一维口径、冻结切点或对清单变更须换指纹并触发本指标**全量重算**（§2.2），不得只重算维度层。
+
+#### 计算模型
+
+**原理与背景**
+
+1. **为什么做成对检验而非再合成一个分数**：单看任何一维都发现不了「意愿强但真金白银没进」「指数涨但参与面窄」这类矛盾；按 §1.1 铁律①判定型业务指标走规则路径，输出离散结论。与 §6.2 形态（**组合**）、§6.4 反转风险（**共振**）分别是「组合 / 互斥 / 共振」三种独立读法，不重复计权、不叠加计分。
+2. **为什么撤销跨维分位差（v1.33 核心整改）**：六维 `score` 是各自历史分位，分位基数 / 分布宽度 / 有效起点均不同（实测 HK `DIM.FLOW` 冻结 P30/P70 = 55.68/87.35、`DIM.SENTIMENT` = 22.97/59.13，见「已知限制」①），直接相减违反「六维分不可跨维加减」硬约束。实测同一阈值 25 下 D2 命中率 CN 36.8% / HK 64.3%，原命中计数切点 `[0,1,3,5]` 的第 4 档（≥5 命中）全历史 0 天。改为各维按 `(market, dimension)` 冻结 P30/P70 切 L/M/H，成对取**序数档位差** `delta ∈ {0,1,2}`（结构型对只有 0 / 2）。
+3. **为什么 `state` 按归一强度切档、不由命中计数切档**：有效对数逐日漂移（实测 CN `4:9 / 5:249 / 6:1638`、HK `4:1149 / 5:4 / 6:2748`），命中计数在不同 `n_valid` 下不可比；`strength = Σdelta / (2 × n_valid)` 把分母归一到 0~1 同刻度，`score` 保留计数语义，并把 `n_valid_pairs` / `hit_ratio` / `strength` 落 `detail` 供消费端归一。
+4. **为什么设 `min_pairs` + `min_distinct_dims` 双门禁**：方向输入缺失时不强制 inner join（D4 退出），但 D1 / D5 都只依赖 `DIM.BREADTH`，需防「四对全靠 BREADTH」的一因多计；有效对数 <4 或涉及维度数 <3 即整行不发布（A8）。
+5. **为什么 D1 / D5 改读 L1 原子与 `flags` 文案**：A/D 派生量不落表、零 L3 消费方、恒 `benchmark_mismatch`；L2 `flags.structural` 已有中文文案，只读不重算即可执行，零新增采集。D4 用 `band(STRESS)=H` 定义「高」，避免绝对阈值跨市场不可比。
+6. **为什么无状态机**：背离是当日截面的侧面矛盾，不是带时间语义的状态；`state` 恒当日 raw，`since_date` / `dwell_days` / `status` 恒 NULL，天然单日幂等、无需递推（但 `params_hash` 或上游口径变更仍须**全量重算**，§2.2）。
+7. **为什么 `dominant_pair` 取 `max(delta)`**：`delta` 恒为整数 0/1/2，不出现 `None` 比较；并列按 D1→D6 顺序取先者，无命中为 NULL。
+8. **为什么切点冻结至 2025-12-31**：12 组 P30/P70 由 `divergence_calibrate()` 在截至 `calib_end` 的样本上冻结，2026 起为样本外；存在参数层前视，PIT 敏感性见「已知限制」③，本指标不作前瞻预测。
+
+**指标计算方法（简述）**
 
 ```
 band_i = L/M/H（ord 0/1/2），按该维该市场冻结 P30/P70
@@ -2266,11 +2321,12 @@ state/level = 按 strength 查 strength_bands[0.15, 0.30, 0.50] → 四档
 发布门禁：n_valid ≥ min_pairs(4) 且 涉及维度数 ≥ min_distinct_dims(3)，否则整行不发布（A8）
 ```
 
-`state` 由 `strength` 切档而非由命中计数切档，消除「有效对数漂移导致 `score` 不可比」；
-`score` 保留计数语义，`n_valid_pairs` / `hit_ratio` / `strength` 落 `detail` 供消费端归一。
-`dominant_pair` 取命中对中 `delta` 最大者（并列按 D1→D6），`delta` 恒为整数，不出现 `None` 比较。
+1. **第一层（刻度）**：按 `(market, dimension)` 取冻结 P30/P70 切 L/M/H；`score` 缺失 → `None`（strict，不按中性填充）。
+2. **第二层（成对判定）**：逐对按 `params.pair_rules` 算 `delta` 与 `hit`；任一输入缺失 → 该对退出并记 `detail.missing_pairs`。
+3. **第三层（归一与切档）**：按上式算 `strength` / `score` / `state` / `level`；`dominant_pair` 取命中对中 `delta` 最大者（并列按 D1→D6）；`confidence = 低 if n_valid < 6 或 涉及维度数 < 4 else 中`。
+4. **落库**：`model_version = params_hash`，`detail` 七键齐全，`since_date` / `dwell_days` / `status` 恒 NULL；`only_if_changed` 保证幂等（重跑 `updated_at` 逐值不变）。
 
-**背离对清单（`params.pair_rules`，改任一处触发全量重算）**
+**背离对清单**（`params.pair_rules`，改任一处触发全量重算）
 
 | 对 | 判据 | 类型 |
 |---|---|---|
@@ -2281,11 +2337,100 @@ state/level = 按 strength 查 strength_bands[0.15, 0.30, 0.50] → 四档
 | D5 短窗 vs 长窗 | `flags.structural` 含「短窗动能衰竭（中期趋势未破）」或「短期反弹但中期未修复」 | 结构 |
 | D6 参与面 vs 情绪 | `\|band(BREADTH) − band(SENTIMENT)\|` | 幅度 |
 
-**参数（全部在 `business_dict.params` 并纳入 `params_hash`）**：`band_cuts`（12 组按市场按维冻结 P30/P70，标定窗口截至 2025-12-31）、`strength_bands`、`state_labels`、`min_pairs`、`min_distinct_dims`、`eq_vs_cap_extreme`、`structural_flag_texts`、`pair_rules`、`upstream_dim_params_hashes`（六维字典指纹）。**已无「待标定」参数**。
+> ⚠ D3 只报档位互斥、不作估值—趋势因果解读（`DIM.TREND.score` 是 `|t|` 的无符号强度）；D4 的「压力高」由 `band(STRESS)=H` 定义，与绝对分位无关。
 
-**输出契约**（`detail` 七键，DDL COMMENT 已同步）：`pairs[]`（逐对 `{id,name,delta,hit,criterion,left,right,...}`，`delta` 为序数档位差 0/1/2）、`dominant_pair`（无命中为 NULL）、`evidence`、`missing_pairs`、`n_valid_pairs`、`hit_ratio`、`strength`。`score` 为 0..n_valid 计数、`level` 1..4，均禁止跨 `biz_code` 横比。
+**本环节参数**（全部在 `business_dict.params` 并纳入 `params_hash`，**无待标定项**）
 
-**落地实测（2026-11-07，本机 `market_db`）**
+| 参数 | 值 | 生效步骤 | 作用 | 取值依据 / 变更后果 |
+|---|---|---|---|---|
+| `band_low_u` / `band_high_u` | 0.30 / 0.70 | 第 1 步 | 各维自身历史分位切 L/M/H | 先验固定、不按市场另调；变更触发 `params_hash` + 全量重算 |
+| `band_cuts` | 12 组 `(market, dim)` 冻结 P30/P70 | 第 1 步 | band 的实际切点 | `divergence_calibrate()` 在 ≤ `calib_end` 窗口标定，与 §6.2 同款；纳入 `params_hash` |
+| `calib_end` | `2025-12-31` | 第 1 步 | 冻结窗口上界，2026 起样本外 | 参数层前视，见「已知限制」③ |
+| `pair_rules` | D1…D6（上表） | 第 2 步 | 成对判据与涉及维度 | 新增 / 调整须重标切点并全量重算，不得只改代码 |
+| `eq_vs_cap_extreme` | `{low:20, high:80}` | 第 2 步 | D1 双侧极端判据（L1 原子分位） | 与 §6.2 规则 5 同款 |
+| `structural_flag_texts` | `short_fade` / `mid_unrepaired` 两条中文文案 | 第 2 步 | D5 `flags.structural` 文案映射 | L2 只读不重算 |
+| `strength_bands` | `[0.15, 0.30, 0.50]` | 第 3 步 | 四档切点，作用于 `strength`、**不作用于 `score`** | 撤销 v1.32 命中计数切点 `[0,1,3,5]`；验收四档全可达、无 0% 档 |
+| `state_labels` | 一致 / 轻度背离 / 显著背离 / 多重背离 | 第 3 步 | `state` 四档标签 | 长度须 = `strength_bands` + 1（`divergence_compute` 校验） |
+| `min_pairs` | 4 | 门禁 | 有效对数下限 | A8；不足整行不发布 |
+| `min_distinct_dims` | 3 | 门禁 | 涉及维度数下限 | 防「四对全靠 BREADTH」的一因多计 |
+| `publish_policy` / `state_rule` / `score_rule` | `pair_level_degrade` / `normalized_strength` / `hit_count` | 全环节 | 声明降级、切档与计数语义 | 纳入 `params_hash` |
+| `upstream_dim_params_hashes` | 六维快照 | 全环节 | 口径指纹 | 任一维变更 → 本指标 `params_hash` 同步变化 → 全量重算（§2.2） |
+
+**落地形态**（`build_business_value.py`）
+
+```python
+for market in ("CN", "HK"):
+    cfg = load_business_dict(conn, "BIZ.MARKET_DIVERGENCE")
+    frame = divergence_load_frame(conn, market, cfg)     # 六维 score + flags + L1 原子 + 方向
+    rows, stats = divergence_compute(frame, market, cfg["params"], cfg["params_hash"])
+    write_business_rows(conn, rows, write)               # only_if_changed 幂等
+```
+
+#### 输出
+
+目标表 `regime.business_value`，字段字典见 §2.3.4。
+
+| 输出字段 | 含义 | 落表列 |
+|---|---|---|
+| `state` | 一致 / 轻度背离 / 显著背离 / 多重背离（按 `strength` 切档） | `state` |
+| `level` | 1…4（升序 = 归一强度越大 / 背离越多越强，仅为序数） | `level` |
+| `score` | 命中背离对数（`0..n_valid` 整数计数，非分位） | `score` |
+| `confidence` | 中 / 低（`n_valid < 6` 或涉及维度数 `< 4` 时低） | `confidence` |
+| `since_date` / `dwell_days` / `status` | 恒 NULL（无状态机） | 同名列 |
+| `detail.pairs[]` | 逐对 `{id, name, delta, hit, criterion, left, right, ...}`，`delta` 为序数档位差 0/1/2 | `detail` |
+| `detail.dominant_pair` | 主导背离对编号（无命中为 NULL） | `detail` |
+| `detail.evidence` | `strength_bands` / `calib_end` / `eq_vs_cap_extreme` / `upstream_dim_params_hashes` / `delta_semantics` | `detail` |
+| `detail.missing_pairs` | 当日退出判定的对清单 | `detail` |
+| `detail.n_valid_pairs` / `hit_ratio` / `strength` | 有效对数 / `score`÷`n_valid` / 归一强度（供消费端归一） | `detail` |
+| `model_version` | 恒等于 `business_dict.params_hash` | `model_version` |
+
+```json
+{
+  "biz_code": "BIZ.MARKET_DIVERGENCE", "market": "CN", "trade_date": "2026-11-09",
+  "score": 1, "state": "一致", "level": 1, "confidence": "中",
+  "detail": {
+    "pairs": [
+      {"id": "D1", "name": "参与面 vs 指数", "delta": 0, "hit": false,
+       "criterion": "structural", "left": 39.89, "right": "M",
+       "flag": "eq_vs_cap_extreme"},
+      {"id": "D2", "name": "意愿 vs 净流", "delta": 1, "hit": true,
+       "criterion": "amplitude", "left": "M", "right": "L",
+       "left_score": 51.47, "right_score": 1.40}
+    ],
+    "dominant_pair": "D2",
+    "evidence": {"calib_end": "2025-12-31", "strength_bands": [0.15, 0.3, 0.5],
+                 "delta_semantics": "序数档位差 0/1/2（非分位差）",
+                 "eq_vs_cap_extreme": {"low": 20.0, "high": 80.0},
+                 "upstream_dim_params_hashes": {"DIM.BREADTH": "4852d3274f07f359",
+                     "DIM.VALUATION": "88391451881125eb", "DIM.SENTIMENT": "71c3e5e253ccec1e",
+                     "DIM.FLOW": "67d92d2240e4d593", "DIM.STRESS": "17952671d0fa0438",
+                     "DIM.TREND": "5038af6aebc31c43"}},
+    "missing_pairs": [], "n_valid_pairs": 6, "hit_ratio": 0.1667,
+    "strength": 0.0833
+  },
+  "model_version": "2a8870ee5900d93c"
+}
+```
+
+> ✅ **库内真实读数（2026-11-09 CN，节选；`pairs` 仅列 2/6，其余四对 `delta=0`）**。样例可读作：六对全部有效，仅 D2「意愿 vs 净流」档位互斥（情绪 M / 资金 L，`delta=1`），归一强度 `0.0833 < 0.15` → `state=一致`、`level=1`；`score=1` 是命中对数（计数），`strength` 才决定档位。
+> ⚠ **`state` 与 `score` 不同源**：`score>0` 与 `state=一致` 同时出现合法，不得据此判为数据错误；`level` / `score` 为多态列，禁止跨 `biz_code` 比较或同图绘制（§2.3.4）；`detail` 七键齐全（DDL COMMENT 已同步）。
+
+**失效与监控**
+
+| 情形 | 处置 |
+|---|---|
+| `n_valid < min_pairs` 或涉及维度数 < `min_distinct_dims` | **整行不发布**（A8），不写「一致」兜底；无行可写 `detail.missing_pairs`，由监控日志记数 |
+| 某维 `score` 缺失 | 涉及该维的对退出并记 `detail.missing_pairs`；strict，不按中性填充 |
+| L2 未产出 `flags.structural` | D5 退出，其余对照常判定 |
+| 方向输入缺失 | D4 退出；不强制统一发布日历 |
+| 低置信 | `n_valid < 6` 或涉及维度数 `< 4` → `confidence=低`；实测 CN 258 / HK 1153 行，只作描述性读数，**不得作决策依据** |
+| 单对长期 100% / 0% 命中 | 提示复核判据，必要时从 `pair_rules` 移除并全量重算（D4 命中率 4.98%~7.17%，未达门槛） |
+| 上游六维 `params_hash` / 切点 / 对清单变化 | 本指标 `params_hash` 同步变化 → 全量重算（§2.2） |
+| 日频断供 | 由 `market_state_daily.run()` 在 L2 之后触发；内嵌 import 有模块缓存，**需重启常驻 `market_scheduler`** 才自动接入（见「已知限制」⑤） |
+
+下游接口（只声明数据字段，不规定展示）：前端「市场状态」功能读 `state` + `detail.pairs[]` 出「哪里对不上」及下钻证据；**不驱动任何仓位 / 配置建议**；与 §6.2 形态（共享 `EQ_VS_CAP_20D`）、反转风险（族共振）并列，消费端不得叠加计分或当作互相印证的独立证据。
+
+**实测验收（2026-11-07，本机 `market_db`）**
 
 | 项 | CN | HK |
 |---|---|---|
@@ -2295,231 +2440,33 @@ state/level = 按 strength 查 strength_bands[0.15, 0.30, 0.50] → 四档
 | 有效对数分布 | 4:9 / 5:249 / 6:1638 | 4:1149 / 5:4 / 6:2748 |
 | 低置信行数 | 258 | 1153 |
 
-**验收（全部通过）**：`model_version` 全等于 `params_hash`；列级校验（`score` 整数计数 / `level` 1–4 / `state` 四选一 / `detail` 七键 / `strength`·`hit_ratio`·`score` 自洽）零异常；独立复算逐值一致（CN 1896/1896、HK 3901/3901，多发行 0 / 漏发行 0 / 不符 0）；四档全部可达、无 0% 档、无 <1% 稀有档；重跑 `updated_at` 逐值不变（幂等）；峰值 RSS 84–86 MB；全量测试 622 passed。
+> ✅ **验收（全部通过）**：`model_version` 全等于 `params_hash`；列级校验（`score` 整数计数 / `level` 1–4 / `state` 四选一 / `detail` 七键 / `strength`·`hit_ratio`·`score` 自洽）零异常；独立复算逐值一致（CN 1896/1896、HK 3901/3901，多发行 0 / 漏发行 0 / 不符 0）；四档全部可达、无 0% 档、无 <1% 稀有档。
+> 幂等与资源：重跑 `updated_at` 逐值不变；峰值 RSS **84–86 MB**（< 200MB 进程内红线，R4）；全量测试 **622 passed**。
 
 **已知限制 / 异常披露**：① HK D2 命中率 72.03%（CN 52.63%），源于 HK `DIM.FLOW` 与 `DIM.SENTIMENT` 分布中心系统性错位（冻结 P30/P70 分别 55.68/87.35 与 22.97/59.13），属上游构念 / 样本期错配的真实反映，非计算错误；② D4 命中率仅 4.98%~7.17%（「STRESS 高档 + 上行」本身稀有），未达「长期 0% 移出清单」门槛；③ PIT 敏感性（仅用截至 2022 / 2023 / 2024 样本重标切点）`state` 一致率 CN 79.22%~92.41% / HK 90.77%~92.51%，冻结切点存在参数层前视，本指标为描述性读数、不作前瞻预测；④ CN 可发布区仅 7.8 年、L1 全期 `survivorship_bias=true`，分位只作趋势参考；⑤ 日频自动接入需重启常驻 `market_scheduler`（`market_state_daily.run()` 内嵌 import 有模块缓存）。
 
----
+### 6.4 反转风险 · `BIZ.REVERSAL_RISK`
 
-#### 定义（v1.32 历史规格，编年留档）
+#### 定义
 
-回答「当前状态内部哪些侧面对不上」——对六个维度与方向做**成对检验**，输出背离清单、主导背离与强度。用户看单个维度分或看 §6.2 的形态都得不到的「内部矛盾」，在本节成为一等结论。
+回答「现在是不是有**多个侧面同时处于极端**（阶段性顶 / 底）」。判读单位是按族去重后的计数：固定 5 族各取 1 个 L1 原子代表，触顶 / 触底各计 1 票；族间共变实测显著，故 `score` 只表达「几个侧面同时处于极端」，**不宣称「几个独立侧面」**。`kind = rule_set`；`state` = 正常 / 警惕 / 高风险，`level` = 1=正常 / 2=警惕 / 3=高风险（升序 = 越危险，**仅承载顶部**），`score` = `top_family_cnt`（0..5 整数计数，**不是 0–100 程度分 / 分位读数**）；日频落库、**单日幂等（无状态机）**，稳定性由 `since_date` / `dwell_days` / `status` 游程标注承载；粒度 `(biz_code, market, trade_date)`，`market ∈ {CN, HK}`，两市场同定义、**判读阈值按市场分别冻结、禁止横比**。
 
-- `state` = 一致 / 轻度背离 / 显著背离 / 多重背离（**有序**）；`level` = 1…4（升序 = 背离越多越强）；`score` = 命中背离对数（**计数，不是 0–100 分位、不是程度分**）。
-- 日频、**单日幂等（无状态机）**；粒度 `(biz_code, market, trade_date)`，`market ∈ {CN, HK}`；两市场同定义、阈值按市场分别冻结、禁止横比。
-- **与相邻指标正交**：§6.2 形态是「侧面**组合**成什么局面」（条件合取）；反转风险是「几个侧面**同向**报警」（族共振）；本节是「侧面之间**互相矛盾**」（成对差值 / 方向相反）。三者分别是组合 / 共振 / 互斥三种独立读法，不重复计权。
+**定位与下游约束**：本指标只回答侧面之间**同向共振**的极端状态，与 §6.2 形态（侧面**组合**成什么局面）、§6.3 侧面背离（侧面**互斥**的矛盾）正交，是「组合 / 互斥 / 共振」三种独立读法之一，不重复计权；族级判读档单一真源在本对象，下游只读 `state` + `detail` 出结论。冻结切点存在参数层前视，本指标为**描述性读数**：不预测拐点、不产出仓位 / 配置建议、不宣称可交易；消费端不得叠加计分，也不得把四个 L3 当作互相印证的独立证据。
 
-**边界（不回答什么）**：① 不表达方向（§6.1）；② 不产出仓位 / 配置建议；③ 不预测拐点；④ 不是单个原子级背离读数（A/D 背离等是**输入**）；⑤ 不产出变化分位 / 边际变化指标；⑥ 不重算维度分或 `flags`。
+**边界（不回答什么）**：① 不表达方向（§6.1）；② 不表达冷热 / 泡沫（市场温度已下线）；③ 不产出仓位 / 比例 / 配置建议（资产配置功能）；④ 不预测拐点时间 / 未来涨跌；⑤ 不落逐条 `hit` / `days` 清单（族计数在生产者内部由 L1 原子计算，当前零消费方需要逐条清单，暂不写 `signal_value` / `v_signal_summary`）；⑥ 不把 `level` 解读为底部「高价值区」（底部只写 `detail.bottom_state` / `bottom_state_label`）；⑦ 不重算 L1 原子、不新增数据源。
 
 | 项 | 内容 |
 |---|---|
-| 编码 | `BIZ.MARKET_DIVERGENCE`（中文「侧面背离」，与 A/D 背离等原子级读数区分） |
-| 类型 | `kind = rule_set`（同 §6.2 的新增枚举）；参数 4 组，**全部待标定**，`params_hash` 落库时生成 |
-| 生产者 | 规划 `build_divergence_business()`；**本期仅规格，未落地、无字典种子、无读数** |
-| 业界依据 | 不移植单一模型；方法依据是「同一对读数的相对位置比各自绝对水平更有信息」，且六维 `score` 已是 as-of 分位、量纲归一后可直接比对 |
+| 编码 | `BIZ.REVERSAL_RISK`（中文「反转风险」） |
+| 类型 | `kind = rule_set`；`params_hash = 8bf8f6d067b3ef38`；`is_active = true`；**无待标定参数**（族切点与判读阈值由标定脚本冻结） |
+| 生产者 | `build_business_value.py::build_reversal_business()`（取数 `reversal_load_frame` / 纯计算 `reversal_compute`）；由 `build_all_business` 按 `biz_code` 分派，**日频由 `market_state_daily.run()` 在 L2 之后调用 `build_all_business()`**（`market_scheduler` 工作日 18:45） |
+| 字典 / 标定 / 验收 | `regime.business_dict` 一行；`tools/calibrate_reversal.py --write` 是字典常规写入口（`--seed` 走同一 `reversal_build_dict_row()`）；`tools/validate_reversal.py` 只读验收；防回退 `tests/test_reversal_risk.py` |
+| 读数 | `regime.business_value` CN 1887 / HK 3234 行（验收时点），`model_version` 全部 = 字典 `params_hash` |
+| 业界依据 | 不移植单一模型；族去重针对「PE 贵 + ERP 低 + 换手高 + 基金爆款往往只是一轮过热的四种表述」，方法依据是条件命中的**共振计数**而非加权平均；约束来自 §1.1 铁律②（判定型指标从原子算）与 §2.4 规则 7 |
 
 #### 输入
 
-来源表 `regime.dimension_value`（六维 `score` / `flags` / `dispersion`）、`regime.indicator_value`（宽度原子 `percentile`）、`BIZ.MARKET_REGIME.state`，以及 A/D Line / 双高点背离等**不落表派生量**（`build_dimension_value.py --derived`，§5.1 ④）。**零新增数据源**。
-
-| 输入 | 口径 | 缺失 / 不足时的降级 |
-|---|---|---|
-| 六维 `DIM.*.score` | 各自 as-of 分位（0–100），成对比较的基准 | 某维缺失 → 含该维的背离对退出，记 `detail.missing_pairs`；不填 50 |
-| `dimension_value.flags` | 宽度内三对快慢 / 结构背离（`NEW_HIGH_LOW_20` vs `_60`、`PCT_ABOVE_MA60` vs `MA200`、`EQ_VS_CAP_20D`） | 无 `flags` → D5 退出；其余对不受影响 |
-| 宽度原子 `percentile` | `BREADTH.NEW_HIGH_LOW_20/60`、`PCT_ABOVE_MA60/MA200`、`EQ_VS_CAP_20D` | 缺失 → 对应对退出 |
-| A/D 派生量 | 去趋势相对位置的顶 / 底背离（`--derived`，不落表） | 不可用 → D1 只保留 `flags` 判据 |
-| `BIZ.MARKET_REGIME.state` | 方向轴，用于 D3 / D4 的「方向相反」判据 | 无该行 → 这两对只保留幅度判据、`require_direction_opposed` 不生效 |
-
-> **统一降级（A8）**：有效对数 < `min_pairs` → **整行不发布**；不得把退出判为「一致」。`flags` 直接复用 L2 产出，本节不重算（§4 单一真相源）。
-
-**业务指标注册（规划，未落库）**  
-对应表为 `regime.business_dict`  
-```json
-{
-  "biz_code": "BIZ.MARKET_DIVERGENCE",
-  "biz_name": "侧面背离",
-  "kind": "rule_set",
-  "inputs": [
-    {"kind": "dimension", "code": "DIM.BREADTH", "role": "pair_and_flags"},
-    {"kind": "dimension", "code": "DIM.SENTIMENT", "role": "pair"},
-    {"kind": "dimension", "code": "DIM.FLOW", "role": "pair"},
-    {"kind": "dimension", "code": "DIM.VALUATION", "role": "pair"},
-    {"kind": "dimension", "code": "DIM.STRESS", "role": "pair"},
-    {"kind": "dimension", "code": "DIM.TREND", "role": "pair"},
-    {"kind": "business", "code": "BIZ.MARKET_REGIME", "role": "direction_axis"},
-    {"kind": "atom", "code": "BREADTH.NEW_HIGH_LOW_20", "role": "pair"},
-    {"kind": "atom", "code": "BREADTH.NEW_HIGH_LOW_60", "role": "pair"},
-    {"kind": "atom", "code": "BREADTH.PCT_ABOVE_MA60", "role": "pair"},
-    {"kind": "atom", "code": "BREADTH.PCT_ABOVE_MA200", "role": "pair"},
-    {"kind": "atom", "code": "BREADTH.EQ_VS_CAP_20D", "role": "pair"}
-  ],
-  "params": {"pair_thresholds": {"D1": 25, "D2": 25, "D3": 25,
-                                  "D4": 25, "D5": 20, "D6": 25},
-             "min_pairs": 4, "divergence_bands": [0, 1, 3, 5],
-             "require_direction_opposed": ["D3", "D4"],
-             "upstream_dim_params_hashes": {}},
-  "params_hash": "<待生成>",
-  "output_schema": {
-    "level_semantics": "1=一致 / 2=轻度背离 / 3=显著背离 / 4=多重背离（升序=背离越多越强）",
-    "score_semantics": "命中背离对数（计数，非 0-100 分位、非程度分）",
-    "state_semantics": "状态内部一致性的有序档位；不是方向 / 冷热 / 危险度",
-    "detail_keys": ["pairs", "dominant_pair", "evidence", "missing_pairs"]
-  },
-  "is_active": false
-}
-```
-
-#### 计算模型
-
-**原理与背景**
-
-1. **为什么成对检验而非跨维平均**：「情绪 84 / 资金 41」与「情绪 62 / 资金 60」的平均分接近，但前者是明确的意愿—净流矛盾；信息在**相对位置与符号**，不在总量。六维 `score` 已是各自 as-of 分位，量纲归一后可直接相减。
-2. **为什么与形态指标不重复**：§6.2 用条件合取回答「组合成什么」，本节用成对差值回答「哪里对不上」。同一天可同时是「情绪驱动」形态且 D2 背离命中——前者命名局面、后者指出矛盾点，两者服务不同下钻路径。
-3. **为什么与反转风险不重复**：反转风险数的是「几个不同侧面**同向**报警」（族共振，顶部清单里 PE 贵 + ERP 低 + 换手高往往只是一轮过热的四种表述）；本节看的是两个侧面**反向**。共振与互斥是正交的两种风险形态，前者做族去重、后者做成对比较，不会重复计权。
-4. **为什么 `score` 用计数而非分位**：`business_value.score` 是多态列（§2.3.4），若本节再产出一个 0–100 连续分，会与已下线的市场温度、压力分混淆；计数语义清晰且可直接解释「命中几对」。
-5. **为什么不做方向合成 / 预测**：D3 / D4 的方向判据只用于判断「估值与趋势强度是否背离」「压力与方向是否背离」，不构成对未来的判断；效标不用前瞻收益 IC（同 §6.2 原理 7），改用「同期可解释性 + 与公认背离区间对照 + 命中率分层」。
-6. **为什么复用 `flags` 而不重算**：宽度内三对快慢 / 结构背离已由 L2 按 §5.1 ④ 产出，本节重算会产生两套口径（§4 单一真相源）。
-
-**指标计算方法（简述）**
-
-```
-delta_i  = |score_a − score_b|                      # 幅度判据（幅度型对）
-hit_i    = delta_i >= pair_thresholds[i]
-        or (sign 相反 / flags 命中 / 方向相反)        # 结构型对
-divergence_cnt = Σ hit_i
-state    = 按 divergence_cnt 与 max(delta_i) 查 divergence_bands
-```
-
-1. **第一层**：逐对取当日读数，按幅度判据或结构型判据得 `hit_i`；任一输入缺失 → 该对退出并记 `missing_pairs`。
-2. **第二层**：有效对数 < `min_pairs` → 不发布；否则 `score = divergence_cnt`，按 `divergence_bands` 定 `state` / `level`。
-3. **第三层**：`dominant_pair` = `delta_i` 最大且命中的对；`detail.pairs[]` 逐对写 `delta` / `hit` / 判据类型 / 两侧读数；`detail.evidence` 写当日阈值版本。
-4. **落库**：`model_version = business_dict.params_hash`，`only_if_changed` 保证幂等。
-
-**背离对清单**（`business_dict.params.pair_rules` 落库）
-
-| 对 | 两侧读数 / 判据 | 命中含义 | 类型 |
-|---|---|---|---|
-| D1 参与面 vs 指数 | `DIM.BREADTH.score` 低 + `flags.EQ_VS_CAP_20D` 极端 + A/D 顶背离 | 指数在涨但多数股票没参与 | 结构型 |
-| D2 意愿 vs 净流 | `\|DIM.SENTIMENT.score − DIM.FLOW.score\|` | 情绪亢奋但真金白银没进（或反之） | 幅度型 |
-| D3 估值 vs 趋势 | `\|DIM.VALUATION.score − DIM.TREND.score\|` + 「方向相反」（可选） | 估值已高但趋势强度衰减 | 幅度 + 方向 |
-| D4 压力 vs 方向 | `DIM.STRESS.score` 高 且 `MARKET_REGIME.state` = 上行 | 方向向上但系统压力抬升 | 结构型 |
-| D5 短窗 vs 长窗（宽度内） | `flags.NEW_HIGH_LOW_20` vs `_60`、`PCT_ABOVE_MA60` vs `MA200` | 中期未破但短期动能衰竭 | 结构型（复用 `flags`） |
-| D6 参与面 vs 情绪 | `\|DIM.BREADTH.score − DIM.SENTIMENT.score\|` | 情绪热但参与面不广（局部炒作） | 幅度型 |
-
-> ⚠ **D1 与 §6.2「权重主导」形态共享 `EQ_VS_CAP_20D`**：两处是同一原子在不同结论里的合法复用，但消费端不得把「形态=权重主导」与「D1 命中」当成两个独立证据（§5.0 准入③ / §5.13 跨层登记表同款纪律）。
-
-**本环节参数**（逐个对应生效步骤；**全部待标定**）
-
-| 参数 | 值 | 生效步骤 | **作用** | 取值依据 / 变更后果 |
-|---|---|---|---|---|
-| `pair_thresholds` | D1–D4/D6 = 25、D5 = 20（分位点初值，按市场标定） | 第 1 步 | 每对「分位差多大算背离」 | 六维分位标度、**不是绝对收益率**；变更改变命中率与档位分布，触发 `params_hash` + 全量重算 |
-| `min_pairs` | 4（初值，共 6 对） | 第 2 步 | 最少有效对数 | 低于则不发布，避免「只看了两对就说一致」；变更影响可发布天数 |
-| `divergence_bands` | `[0, 1, 3, 5]`（初值，待标定） | 第 2 步 | 计数 → 四档切点 | 须报告各档样本内时间占比；任一档长期 0% 视为失效（研究稿 §5.11 ③ 同款） |
-| `require_direction_opposed` | `["D3","D4"]`（初值） | 第 1 步 | 哪些对额外要求方向相反 / 方向条件 | 方向输入缺失时这些对只保留幅度判据；变更触发全量重算 |
-
-> ⚠ **标定输出（强制）**：各对命中率、各档时间占比、`dominant_pair` 分布；单对长期 100% 或 0% 命中须复核阈值或移出清单（研究稿 §5.11 ⑦ 同款）。阈值冻结含参数层前视，离线报告须注明。
-
-**落地形态**（规划，未落地）：
-
-```python
-for market in ("CN", "HK"):
-    p = load_business_dict(conn, "BIZ.MARKET_DIVERGENCE")["params"]
-    for d in sorted_dates:
-        readings = read_pair_readings(conn, market, d)   # 六维 + flags + 宽度原子 + 方向
-        pairs, missing = evaluate_pairs(readings, p)     # 逐对 hit / delta / criterion
-        if len(pairs) < p["min_pairs"]:
-            continue                                     # 不发布，不填「一致」
-        cnt = sum(x["hit"] for x in pairs)
-        state, level = band_of(cnt, p["divergence_bands"])
-        write_one_row(
-            business_value,
-            PK=("BIZ.MARKET_DIVERGENCE", market, d),
-            state=state, level=level, score=cnt,
-            detail={"pairs": pairs,
-                    "dominant_pair": max(pairs, key=lambda x: x["delta"])["id"],
-                    "evidence": {"thresholds": p["pair_thresholds"],
-                                 "bands": p["divergence_bands"]},
-                    "missing_pairs": missing},
-            model_version=params_hash)
-```
-
-**边界与并列**
-
-| 项 | 规则 |
-|---|---|
-| 初始化 | 单日幂等，无状态向量、无 `since` / `dwell` |
-| 并列 | 多对同 delta 时按 D1→D6 固定顺序取 `dominant_pair` |
-| 幂等 | 单日可重算；`only_if_changed` 保证重复跑逐字段不变 |
-| 分数语义 | `score` 是 **0–6 的计数**，`level` 是本节档位；均禁止与 §6.1 / 反转风险的 `level` / `score` 横比 |
-| 与 `flags` 的关系 | 只读不写；L2 未产出 `flags` 时 D5 退出，不影响其他对 |
-| 监控阈值 | 单对长期 100% / 0% 命中、某档长期 0% → 提示复核阈值 |
-
-#### 输出
-
-目标表 `regime.business_value`，字段字典见 §2.3.4。
-
-| 输出字段 | 含义 | 落表列 |
-|---|---|---|
-| `state` | 一致 / 轻度背离 / 显著背离 / 多重背离 | `state` |
-| `level` | 1…4（升序 = 背离越多越强） | `level` |
-| `score` | 命中背离对数（0–6，**计数**） | `score` |
-| `detail.pairs[]` | 逐对 `{id, delta, hit, criterion, left, right}` | `detail` |
-| `detail.dominant_pair` | 主导背离对编号 | `detail` |
-| `detail.evidence` | 当日阈值版本与档位切点 | `detail` |
-| `detail.missing_pairs` | 当日退出判定的对清单 | `detail` |
-
-```json
-{
-  "biz_code": "BIZ.MARKET_DIVERGENCE",
-  "market": "CN",
-  "trade_date": "2026-11-06",
-  "score": 2,
-  "state": "轻度背离",
-  "level": 2,
-  "detail": {
-    "pairs": [
-      {"id": "D2", "delta": 43.2, "hit": true, "criterion": "amplitude",
-       "left": 84.5, "right": 41.3},
-      {"id": "D6", "delta": 26.8, "hit": true, "criterion": "amplitude",
-       "left": 78.2, "right": 51.4},
-      {"id": "D1", "delta": null, "hit": false, "criterion": "structural",
-       "left": null, "right": null}
-    ],
-    "dominant_pair": "D2",
-    "evidence": {"thresholds": {"D2": 25, "D6": 25}, "bands": [0, 1, 3, 5]},
-    "missing_pairs": []
-  },
-  "model_version": "<待生成>"
-}
-```
-
-> ⚠ **示意行，非库内真实读数**；本指标本期无生产者、无字典行、无读数。样例可读作：情绪—净流差 43.2 分位、参与面—情绪差 26.8 分位，两对命中 → 轻度背离，主导矛盾在「意愿强、真金白银没跟上」。
-
-**失效与监控**
-
-| 情形 | 处置 |
-|---|---|
-| 有效对数 < `min_pairs` | **整行不发布**，写 `detail.missing_pairs` |
-| L2 未产出 `flags` | D5 退出，其余对照常判定 |
-| 方向输入缺失 | D3 / D4 只保留幅度 / 结构判据，`require_direction_opposed` 不生效 |
-| 单对长期 100% / 0% 命中 | 提示复核阈值，必要时从清单移除并全量重算 |
-| 上游 `params_hash` 变化 | 本指标 `params_hash` 同步变化 → 全量重算（§2.2） |
-
-下游接口（只声明数据字段，不规定展示）：前端「市场状态」功能读 `state` + `detail.pairs[]` 出「哪里对不上」及下钻证据；**不驱动任何仓位 / 配置建议**；与 §6.2 形态（共享 `EQ_VS_CAP_20D`）、反转风险（族共振）并列，消费端不得叠加计分。
-
-**上线前验收门禁（未执行）**：① 六对阈值按市场标定并冻结；② 各对命中率 / 各档占比 / `dominant_pair` 分布报告；③ 与公认区间（同上 §6.2）的背离对照；④ `score` 为 0–6 整数、`level` 1–4 的列级校验；⑤ 全量重算逐值一致。**本期零实测数字、零落库行数**。
-
----
-
-### 6.4 反转风险 · `BIZ.REVERSAL_RISK`
-
-#### v1.34 生效规格（2026-11-07，离线 Go/No-Go 预检通过后落地）
-
-> ⚠ v1.31 迁入的是「规格先行、零生产者」，输入链 `signal_dict` / `signal_value` / `v_signal_summary` 全项目只有 DDL。经数据核查与离线预检后按**方案 C（数据驱动裁剪）**整改落地：族清单收缩为固定 5 族、输入改读 L1 原子、`SWITCH_DAYS` 状态机撤销、绝对阈值按市场重标。下方 v1.31 全文为编年留档，**勿按已废规格重建**（与 §6.3 保留 v1.32 历史规格同款结构）。
-
-**定义**：回答「现在是不是有**多个侧面同时处于极端**（阶段性顶 / 底）」。判读单位仍是族去重计数，但族间共变实测显著，故**不宣称「几个独立侧面」**；`score = top_family_cnt`（0..5 整数），`level` 1=正常 / 2=警惕 / 3=高风险（升序 = 越危险，仅承载顶部），`state` 三档。日频，粒度 `(biz_code, market, trade_date)`，`market ∈ {CN, HK}`；两市场同定义、**判读阈值按市场分别冻结、禁止横比**。`kind = rule_set`，单日幂等、无状态机。
-
-**输入（零新增数据源、零新增 L1）**：10 个 L1 原子按「市场 × 族」各取 1 个代表，读 `indicator_value.percentile`，`inputs[].kind = atom`：
+来源表 `regime.indicator_value`（`percentile`）。10 个 L1 原子按「市场 × 族」各取 1 个代表，`inputs[].kind = atom`；全部输入均已真实落地，**零新增数据源、零新增 L1**。
 
 | 族 | CN 原子 | HK 原子 | 顶部判据 | 底部判据 |
 |---|---|---|---|---|
@@ -2529,158 +2476,131 @@ for market in ("CN", "HK"):
 | 压力 | `RISK.RV20` | 同左 | 同上 | 同上 |
 | 资金 | `FLOW.MARGIN_NET_20D` | `FLOW.BUYBACK_NET_20D` | 同上 | 同上 |
 
-切点按 `(market, family)` 在 `[REVERSAL_DATA_START, 2025-12-31]` 窗口内冻结该原子 `percentile` 的 P90 / P10（输入本身是 0–100 as-of 分位，切点同尺度），2026 起为样本外。**宏观 / 基本面 / 结构**因短样本或无源移出分母，写进 `detail.unavailable_families[]` —— 这才是该字段的正确语义（`v_signal_summary` 原视图把「有源族」误标为无源，一期不依赖它）。发布日历按市场冻结 CN `2019-01-02` / HK `2013-09-10`，且**当日须 5 族分位齐全，缺一即整行不发布**（A8，不按「正常」填充）。
+> **切点冻结**：按 `(market, family)` 在 `[REVERSAL_DATA_START=1990-01-01, 2025-12-31]` 窗口内冻结该原子 `percentile` 的 P90 / P10（输入本身是 0–100 as-of 分位，切点同尺度），2026 起为样本外。宏观 / 基本面 / 结构因短样本或无源移出分母，写进 `detail.unavailable_families[]`（不进分母）；本指标不依赖 `v_signal_summary` 视图，族计数在生产者内部由 L1 原子计算。
+> **统一降级（A8）**：发布日历按市场冻结 CN `2019-01-02` / HK `2013-09-10`；当日须 **5 族分位齐全**，缺一即**整行不发布**，不得按「正常」填 0 族。
 
-**计算模型**：族去重计数 → 两侧分别判档（1..3，**显式 1-based**，修正 v1.31 伪代码 `level_raw = ts + 1` 与输出样例 `top_state:3, level:3` 的 0/1-based 混用）→ 顶底冲突各降一档 → `level = top_state`（底部只写 `detail.bottom_state`）。判读阈值由标定脚本在「5 族全齐 + 发布起点后」样本里选使高风险档占比最接近 10% 的整数族数切点，按市场冻结：CN `warn_from=1 / high_from=3`（标定高风险 6.68%）、HK `warn_from=1 / high_from=2`（8.85%）。原绝对 `[0,2,4]` 实测 HK 全历史仅 1 日高风险，按 §8.5 属阈值失效，已废弃。**撤销 `SWITCH_DAYS=3` 状态机**（§6.2 v1.32 已实测其对稀有档的压制），`state` 恒当日 raw，稳定性由 `since_date` / `dwell_days` / `status` 游程标注承载；`dwell_days` 是全量序列上的累计量，须全量重算（§2.4 规则 5）。
+本指标参数定义在「计算模型」的「本环节参数」表；下方是 `business_dict` 的一行**字典种子**（物化形态，不是定义）。
 
-**参数真源**：`business_dict.params` 含族清单版本 `v1.34-5fam-20261107`、5 族原子映射、10 组冻结切点、按市场判读阈值、发布日历、`min_available_families=5`、`conflict_downgrade=true`、`confirm_days=3`、共变簇清单与 6 个去重 L1 原子的 `indicator_dict.params_hash` 快照（10 条 `inputs` 条目、10 组切点）；`params_hash = 8bf8f6d067b3ef38`。任一变更触发 `model_version` 变化与全量重算。字典常规写入口 `tools/calibrate_reversal.py --write`；`build_business_value.py --seed` 走同一入口。
-
-**输出**：`business_value` 的 `score` / `state` / `level` / `since_date` / `dwell_days` / `status` / `confidence` / `detail` / `model_version`；`detail` 十键齐全（见 §2.3.4），另附 `available_family_cnt` / `correlated_families` / `bottom_state_label` / `evidence`。`confidence` 按共变程度标 CN 低 / HK 中。下游只读 `state` + `detail` 出族级共振结论，与 §6.1 / §6.2 / §6.3 并列，**不驱动仓位 / 配置建议，消费端不得叠加计分**。
-
-**一期偏离与边界**：① 族计数在 `build_reversal_business()` 内部由 L1 原子算，**暂不落 `signal_value` / `v_signal_summary`**（当前零消费方需要逐条 `hit` / `days` 清单）；二期接清单层时须递增 `params_hash` 并全量重算。② 不预测拐点时间；③ CN 无公认顶底历史效标（族起点晚于 2015 / 2018 区间），效标只保留「各档样本内占比 + 与已落地 L3 的区分度」，不宣称可交易；④ 族间共变只作描述性标注：CN 宽度 / 估值 / 情绪 / 资金 同期分位相关最高 0.756，HK 宽度 / 估值 0.667。
-
-**上线验收（已执行，2026-11-07）**：`tools/validate_reversal.py` 全 PASS —— 字典契约、多态列语义、`detail` 十键、独立复算逐值一致（0 处不符）、两市场无 0% 档、各族无长期 0% / 100% 命中、发布日历与 5 族门禁、重跑幂等（`max(updated_at)` 逐值不变）、`model_version` 全一致。落库 CN **1887 行**（2019-01-02~2026-11-05，正常 75.46% / 警惕 19.29% / 高风险 5.25%，冲突降档 123 日）/ HK **3234 行**（2013-09-10~2026-11-06，73.16% / 21.61% / 5.23%，冲突降档 377 日）；峰值 RSS **102.9MB**（进程内任务 ≤200MB 红线内）；全量 pytest 635 passed / 329 subtests。
-
-**已知限制（披露项，非 FAIL）**：① 参数层前视 —— PIT 敏感性（仅用截至 t 的样本重标切点）`state` 一致率 CN 76.7~79.2% / HK 93.8~95.8%，CN 因族起点晚、标定样本短而更敏感，重标须全量重算；② 与 `BIZ.MARKET_DIVERGENCE` 的高档分布 TVD 仅 CN 0.1308 / HK 0.0942（重合较高），与 `BIZ.MARKET_PATTERN` 为 0.3017 / 0.5113（区分明显），消费端不得把四者当作互相印证的独立证据。
-
-#### 定义（v1.31 历史规格，编年留档）
-
-回答「现在是不是有**多个不同侧面同时**在提示阶段性顶 / 底」——判读单位是「族」而不是「条」，族去重后的计数表达「几个独立侧面同时报警」；这是 `DIM.*` 维度分（程度读数）与逐条信号（条件命中）都表达不出的信息。`kind = rule_set`（判定型规则集；带切换确认，见「计算模型」）。
-
-- `state` = 正常 / 警惕 / 高风险；`level` = 1…3（升序 = 风险递增）；`score` = `top_family_cnt`（**族去重计数，不是 0–100 程度分、不是分位读数**）。
-- 日频；粒度 `(biz_code, market, trade_date)`，`market ∈ {CN, HK}`；两市场同定义、判读阈值按**可用族数**重标（C5）、禁止横比。
-- **单一真相源**：清单 / 命中 / 族去重 / `days` 归 `SIG.REVERSAL` 与 `signal_value`；**判读档只在本对象产出**，避免清单层与结论层同时对外给「高风险」。
-
-**边界（不回答什么）**：① 不表达方向（§6.1）；② 不产出仓位 / 比例 / 配置建议（资产配置功能）；③ 不预测拐点时间；④ 不替代逐条信号清单；⑤ 不重算命中、不复制清单；⑥ 不产出变化分位 / 边际变化指标。
-
-| 项 | 内容 |
-|---|---|
-| 编码 | `BIZ.REVERSAL_RISK`（中文「反转风险」） |
-| 类型 | `kind = rule_set`；参数 4 组，**全部待标定**，`params_hash` 落库时生成 |
-| 生产者 | 规划 `build_reversal_business()`；依赖 `signal_value` 生产者先落地，**本期仅规格，未落地、无字典种子、无读数** |
-| 业界依据 | 不移植单一模型；族去重针对「顶部清单里 PE 贵 + ERP 低 + 换手高 + 基金爆款往往只是一轮过热的四种表述」，方法依据是条件命中的**共振计数**而非加权平均 |
-
-#### 输入
-
-来源视图 `regime.v_signal_summary`（族去重后的顶 / 底计数与族清单），底层为 `regime.signal_value`。**零新增数据源**（均为已登记的横切信号对象）；当前 `signal_value` 零生产者、视图恒空（附录 D）。
-
-| 输入 | 口径 | 缺失 / 不足时的降级 |
-|---|---|---|
-| `top_family_cnt` / `bottom_family_cnt` | 族去重后的顶 / 底计数（同族命中多条只计 1 票） | 视图无当日行 → **整行不发布**，写 `detail.missing` |
-| `top_families[]` / `bottom_families[]` | 命中族名清单 | 空数组按 0 族处理 |
-| `unavailable_families[]` / `available_family_cnt` | 该市场无源族数与有源族数 | 无源族**不进分母**，判读阈值须按可用族数重标（C5） |
-| `hit` / `days` | 逐条命中与连续天数（`signal_value`） | 仅用于 `detail` 排障，不参与判读计数 |
-
-> **统一降级（A8）**：`top_cnt` / `bottom_cnt`（按**条数**）只作 `detail` 参考，不参与判档；输入缺失一律「退出计算 + 标注」，不得按「正常」填充。
-
-**业务指标注册（规划，未落库）**  
-对应表为 `regime.business_dict`  
+**业务指标注册**  
+对应表为 `regime.business_dict`（已落库）  
 ```json
 {
-  "biz_code": "BIZ.REVERSAL_RISK",
-  "biz_name": "反转风险",
-  "kind": "rule_set",
+  "biz_code": "BIZ.REVERSAL_RISK", "biz_name": "反转风险",
+  "kind": "rule_set", "is_active": true,
   "inputs": [
-    {"kind": "external", "code": "v_signal_summary.top_family_cnt", "role": "top_band"},
-    {"kind": "external", "code": "v_signal_summary.bottom_family_cnt", "role": "bottom_band"},
-    {"kind": "external", "code": "v_signal_summary.top_families", "role": "detail"},
-    {"kind": "external", "code": "v_signal_summary.bottom_families", "role": "detail"},
-    {"kind": "external", "code": "v_signal_summary.unavailable_families", "role": "coverage_gate"}
+    {"kind":"atom","code":"BREADTH.PCT_ABOVE_MA200","role":"family_atom","market":"CN","family":"width"},
+    {"kind":"atom","code":"VAL.PE_TTM_MEDIAN","role":"family_atom","market":"CN","family":"valuation"},
+    {"kind":"atom","code":"FLOW.TURNOVER_RATIO","role":"family_atom","market":"CN","family":"sentiment"},
+    {"kind":"atom","code":"RISK.RV20","role":"family_atom","market":"CN","family":"stress"},
+    {"kind":"atom","code":"FLOW.MARGIN_NET_20D","role":"family_atom","market":"CN","family":"flow"},
+    {"kind":"atom","code":"BREADTH.PCT_ABOVE_MA200","role":"family_atom","market":"HK","family":"width"},
+    {"kind":"atom","code":"VAL.PE_TTM_MEDIAN","role":"family_atom","market":"HK","family":"valuation"},
+    {"kind":"atom","code":"FLOW.TURNOVER_RATIO","role":"family_atom","market":"HK","family":"sentiment"},
+    {"kind":"atom","code":"RISK.RV20","role":"family_atom","market":"HK","family":"stress"},
+    {"kind":"atom","code":"FLOW.BUYBACK_NET_20D","role":"family_atom","market":"HK","family":"flow"}
   ],
-  "params": {"top_bands": [0, 2, 4], "bottom_bands": [0, 2, 4],
-             "conflict_downgrade": true, "switch_days": 3,
-             "family_list_version": "<待冻结>"},
-  "params_hash": "<待生成>",
+  "params": {"family_list_version":"v1.34-5fam-20261107",
+             "families":["width","valuation","sentiment","stress","flow"],
+             "family_labels":"<5 族中文标签>","family_atoms":"<市场 × 族，见输入表>",
+             "family_cuts":"<10 组 (market, family) 冻结 P90/P10>",
+             "market_bands":{"CN":{"warn_from":1,"high_from":3,"calib_n":1691,"high_share":0.0668},
+                             "HK":{"warn_from":1,"high_from":2,"calib_n":3029,"high_share":0.0885}},
+             "publish_from":{"CN":"2019-01-02","HK":"2013-09-10"},
+             "min_available_families":5,"top_q":0.90,"bottom_q":0.10,
+             "target_high_share":0.10,"confirm_days":3,"conflict_downgrade":true,
+             "calib_end":"2025-12-31","calib_n_obs":"<标定样本行数>",
+             "excluded_families":"<宏观 / 基本面 / 结构：无源原因>",
+             "correlated_families":{"CN":[["宽度","估值","情绪","资金"]],"HK":[["宽度","估值"]]},
+             "state_labels":["正常","警惕","高风险"],
+             "bottom_state_labels":["正常","关注","高价值区"],
+             "upstream_atom_params_hashes":"<6 个去重 L1 原子 params_hash 快照>",
+             "publish_policy":"all_families_present",
+             "state_rule":"top_state_only_no_state_machine",
+             "score_rule":"top_family_cnt"},
+  "params_hash": "8bf8f6d067b3ef38",
   "output_schema": {
-    "level_semantics": "1=正常 / 2=警惕 / 3=高风险（升序=越危险）",
-    "score_semantics": "族去重计数 top_family_cnt（非 0-100 程度分、非分位读数）",
-    "state_semantics": "顶部风险的离散档位；底部判读只写 detail，不驱动任何仓位",
-    "detail_keys": ["top_state", "bottom_state", "top_families", "bottom_families",
-                    "top_cnt", "bottom_cnt", "unavailable_families",
-                    "signal_conflict", "dwell_days", "missing"]
-  },
-  "is_active": false
+    "level_semantics":"1=正常 / 2=警惕 / 3=高风险（升序=越危险，仅承载顶部）",
+    "score_semantics":"top_family_cnt，族去重计数（0..5 整数），非 0-100 程度分 / 非分位读数",
+    "state_semantics":"顶部风险离散档，恒当日 raw（无状态机）；底部只写 detail.bottom_state，不驱动 level / score",
+    "detail_keys":["top_state","bottom_state","top_families","bottom_families",
+                   "top_cnt","bottom_cnt","unavailable_families","signal_conflict",
+                   "dwell_days","missing"],
+    "no_state_machine":true,
+    "polymorphic":"level / score 为多态列，禁止与 §6.1 / §6.3 横比"
+  }
 }
 ```
 
-> `params_hash` 覆盖族清单版本、两侧判读阈值、冲突降档规则与 `switch_days`；**信号清单增删须重标阈值并重算历史**（C5），只改清单不改阈值属口径事故。
+> `params_hash` 只覆盖 `biz_code` / `kind` / `inputs` / `params` / `output_schema` 五键（`reversal_build_dict_row` 的 payload）；`params.upstream_atom_params_hashes` 含 6 个去重 L1 原子的口径指纹 → 任一切点、判读阈值、发布日历、族清单或上游原子口径变更须换指纹并触发本指标**全量重算**（§2.2），不得只重算原子层。
 
 #### 计算模型
 
 **原理与背景**
 
-1. **为什么按族去重而非按条累加**：顶部 18 条里估值 2 条、结构 2 条、情绪 3 条彼此高度相关；「PE 贵 + ERP 低 + 换手高 + 基金爆款」往往只是**一轮过热**的四种表述。按条数累加会让一轮普通过热冲成「高风险」，阈值形同虚设。族计数回答的是「几个不同侧面同时报警」。
-2. **为什么判读档升格为 L3、清单层不重复出结论**：单一真相源（§5.0 准入③）；若 `v_signal_summary` 与 `business_value` 同时对外给「高风险」，消费端无法判断哪个是生效结论。清单层只交付计数与命中明细。
-3. **为什么 `level` 只承载顶部风险**：本层的结论用于风险提示，只能被风险收紧；底部「高价值区」是机会提示，不构成减仓依据，更不应被反向解读为加仓许可。两侧在 `detail` 并列输出，避免把方向信息塞进同一个档位字段。
-4. **为什么顶 / 底冲突要降一档**：震荡市里两侧同时命中通常意味着假信号；不降档会把噪声放大成「高风险 + 高价值区」并存的自相矛盾结论。
-5. **为什么阈值与可用族数绑定**：港股缺涨跌停 / 两融等族，若分母含无源族则永远达不到「≥4 族」高档；阈值必须按 `available_family_cnt` 重标（C5）。
-6. **为什么效标不用前瞻收益 IC**：§6.1 三态、市场温度、系统性压力均被前瞻收益分离度 / IC 判无效；本对象是**共振型风险提示**，效标改为「与公认顶底区间对照 + 各档样本内时间占比 + 冲突场景命中率」，不宣称可交易。
+1. **为什么按族去重计票**：同族条目高度相关（「PE 贵 + ERP 低 + 换手高 + 基金爆款」往往只是一轮过热的四种表述），按条累加会把一轮普通过热冲成「高风险」；族计数回答「几个侧面同时报警」，这是维度分（程度读数）与逐条命中都表达不出的信息，故升格为 L3。
+2. **为什么固定 5 族 × 每族 1 代表原子**：宏观（CN `MACRO.CREDIT_IMPULSE` 2021-02-18 起）、基本面（CN `FORECAST.REVISION_BREADTH` 仅 22 行、HK 无源）、结构（仅 `EQ_VS_CAP_20D` 且 CN 2019-01-23 起）因短样本或无源移出分母，写 `detail.unavailable_families[]`；每族固定 1 个 L1 原子使「5 族分位齐全」的门禁可判定、口径可复算。
+3. **为什么切点按 `(market, family)` 冻结 P90/P10**：各族代表原子的分位分布宽度不同（实测冻结顶切点 CN 80.121~97.459 / HK 79.49~97.22），同一绝对切点会让部分族长期不命中；按自身标定窗口的 P90 / P10 冻结后，各族极端命中率处于同尺度。冻结窗口截至 2025-12-31，2026 起为样本外。
+4. **为什么判读阈值按市场冻结**：两市场族代表原子分布宽度不同，统一族数切点会让一侧高档长期不可达；标定脚本在「5 族全齐 + 发布起点后」样本里选使高风险档占比最接近 10% 的整数族数切点，按市场冻结 CN `warn_from=1 / high_from=3`（标定高风险 6.68%，n=1691）、HK `warn_from=1 / high_from=2`（8.85%，n=3029），两市场禁止横比。
+5. **为什么顶 / 底冲突各降一档**：震荡市两侧同时命中通常意味着假信号，不降档会把噪声放大成「高风险 + 高价值区」并存的自相矛盾结论；降档后写 `detail.signal_conflict = true`。
+6. **为什么 `level` 只承载顶部**：本层结论用于风险提示，只能被风险收紧；底部「高价值区」是机会提示，不构成减仓依据，更不应被反向解读为加仓许可。两侧在 `detail` 并列输出，避免把方向信息塞进同一个档位字段。
+7. **为什么无状态机、单日幂等**：`state` 恒当日 raw，`confirm_days=3` 只决定 `status` 标注、不改写 `state`；稳定性由 `since_date` / `dwell_days` / `status` 游程标注承载。`dwell_days` 是全量序列上的累计量，须全量重算（§2.4 规则 5）。
+8. **为什么效标不是前瞻收益 IC**：CN 无公认顶底历史效标（族起点晚于 2015 / 2018 区间），效标只保留「各档样本内占比 + 与已落地 L3 的区分度」；本指标是描述性读数，不预测拐点时间、不宣称可交易。
+9. **为什么族间共变只作描述性标注**：CN 宽度 / 估值 / 情绪 / 资金 同期分位相关最高 0.756、HK 宽度 / 估值 0.667 → 族计数不能读作「几个独立侧面」；`confidence` 按共变程度标 CN 低 / HK 中，`detail.correlated_families` 落共变簇清单。
 
 **指标计算方法（简述）**
 
 ```
-top_state    = 按 top_family_cnt 查 top_bands
-bottom_state = 按 bottom_family_cnt 查 bottom_bands
-if top_state >= 警惕 and bottom_state >= 关注: 两侧各降一档   # 顶/底冲突
-level_raw = 按 top_state 映射 level（1 正常 / 2 警惕 / 3 高风险）
-level = level_raw 连续 switch_days 日成立才生效，否则保持上期
+top_fams    = [f | p_f >= family_cuts[market][f].top]        # 5 族各 1 票
+bottom_fams = [f | p_f <= family_cuts[market][f].bottom]
+tfc, bfc    = len(top_fams), len(bottom_fams)
+top_state, bottom_state = band_of(tfc), band_of(bfc)        # 1..3，显式 1-based
+if top_state >= 2 and bottom_state >= 2: 两侧各降一档，signal_conflict = true
+level = top_state; state = state_labels[level-1]; score = tfc
+发布门禁：5 族分位齐全 且 trade_date >= publish_from[market]，否则整行不发布（A8）
 ```
 
-1. **第一层**：从 `v_signal_summary` 取当日族计数；视图无行 → 不发布。
-2. **第二层**：两侧分别查档；冲突时各降一档并写 `detail.signal_conflict = true`。
-3. **第三层**：`level` 只取顶部档位，切换需连续 `switch_days` 日成立；底部档位只写 `detail.bottom_state`。
-4. **落库**：`score = top_family_cnt`，`model_version = business_dict.params_hash`，`detail` 十键齐全；`only_if_changed` 保证幂等。
+1. **第一层（计数）**：逐族按冻结 P90 / P10 判顶 / 底，族去重计票；任一族分位缺失 → 整行不发布（A8）。
+2. **第二层（判档）**：两侧分别按 `market_bands` 查 1..3 档；冲突时各降一档并写 `signal_conflict`。
+3. **第三层（标注）**：`level` / `state` 只取降档后的 `top_state`，底部写 `detail.bottom_state` / `bottom_state_label`；`score` 恒为降档前的 `tfc`；`since_date` / `dwell_days` / `status` 按游程标注（`dwell_days >= 3` 为「已确认」）；`confidence` 按市场共变程度固定 CN 低 / HK 中。
+4. **落库**：`model_version = params_hash`，`detail` 十键齐全并附 4 个描述性键；`only_if_changed` 保证幂等（重跑 `updated_at` 逐值不变）。
 
-**本环节参数**（逐个对应生效步骤；**全部待标定**）
+**本环节参数**（全部在 `business_dict.params` 并纳入 `params_hash`，**无待标定项**）
 
 | 参数 | 值 | 生效步骤 | **作用** | 取值依据 / 变更后果 |
 |---|---|---|---|---|
-| `top_bands` | `[0, 2, 4]`（初值，按可用族数重标） | 第 2 步 | 顶部族数 → 三档切点 | C5：新增 / 下线信号须重标；变更触发 `params_hash` + 全量重算 |
-| `bottom_bands` | `[0, 2, 4]`（初值，与顶部对称） | 第 2 步 | 底部族数 → 三档切点 | 同上；**只影响 `detail.bottom_state`，不改 `level`** |
-| `conflict_downgrade` | `true`（已定） | 第 2 步 | 顶 / 底同时达档时各降一档 | 震荡市假信号；关闭须在验证报告注明 |
-| `switch_days` | 3（初值，待标定） | 第 3 步 | 档位切换防抖 | **仅稳定性参数**，不产出变化分位；变更改变 `dwell_days` 与切换次数 |
-| `family_list_version` | `<待冻结>` | 输入 | 族清单版本，绑定阈值分母 | 清单增删必须递增版本并重算历史 |
+| `family_list_version` / `families` / `family_atoms` | `v1.34-5fam-20261107` / 5 族 / 市场 × 族原子映射 | 输入 | 固定分母与代表原子 | 清单增删须递增版本并全量重算 |
+| `family_cuts` | 10 组 `(market, family)` 冻结 P90 / P10 | 第 1 步 | 顶 / 底判据 | `reversal_calibrate()` 在 ≤ `calib_end` 窗口标定；纳入 `params_hash` |
+| `top_q` / `bottom_q` / `calib_end` | 0.90 / 0.10 / `2025-12-31` | 第 1 步 | 切点分位与冻结窗口上界 | 2026 起样本外；参数层前视见「已知限制」① |
+| `market_bands` | CN `warn_from=1 / high_from=3`；HK `1 / 2` | 第 2 步 | 族数 → 三档切点 | 标定样本高风险占比最接近 10%；按市场冻结、禁止横比 |
+| `target_high_share` | 0.10 | 第 2 步 | 判读阈值标定目标 | 实测 `high_share` CN 6.68% / HK 8.85% |
+| `conflict_downgrade` | `true` | 第 2 步 | 顶 / 底同时达档时各降一档 | 震荡市假信号；关闭须在验证报告注明 |
+| `publish_from` / `min_available_families` | CN `2019-01-02` / HK `2013-09-10`；5 | 门禁 | 发布日历与 5 族齐全门禁 | A8；缺一整行不发布，不得按「正常」填充 |
+| `confirm_days` | 3 | 第 3 步 | `status` 标注阈值 | 仅稳定性标注，不改写 `state` |
+| `state_labels` / `bottom_state_labels` | 正常 / 警惕 / 高风险；正常 / 关注 / 高价值区 | 第 3 步 | 两侧状态标签 | 长度须为 3，`reversal_compute` 按 1-based 索引取值 |
+| `correlated_families` / `excluded_families` | CN / HK 共变簇；3 个无源族 | 全环节 | 描述性标注与分母口径 | 只写 `detail`，不参与判档 |
+| `publish_policy` / `state_rule` / `score_rule` | `all_families_present` / `top_state_only_no_state_machine` / `top_family_cnt` | 全环节 | 声明降级、判读与计数语义 | 纳入 `params_hash` |
+| `upstream_atom_params_hashes` | 6 个去重 L1 原子快照 | 全环节 | 口径指纹 | 任一原子口径变更 → `params_hash` 同步变化 → 全量重算（§2.2） |
 
-> ⚠ **标定输出（强制）**：各档在标定样本内的时间占比、两侧冲突场景占比、单族长期 100% / 0% 命中清单；任一档长期 0% 视为阈值失效（研究稿 §5.11 ③ 同款纪律）。阈值冻结含参数层前视，离线报告须注明。
-
-**落地形态**（规划，未落地）：
+**落地形态**（`build_business_value.py`）
 
 ```python
 for market in ("CN", "HK"):
-    p = load_business_dict(conn, "BIZ.REVERSAL_RISK")["params"]
-    for d in sorted_dates:
-        v = read_signal_summary(conn, market, d)
-        if v is None:
-            continue                                    # 不发布，写 missing
-        ts = band_of(v["top_family_cnt"], p["top_bands"])
-        bs = band_of(v["bottom_family_cnt"], p["bottom_bands"])
-        if p["conflict_downgrade"] and ts >= 2 and bs >= 2:
-            ts, bs = ts - 1, bs - 1
-        level_raw = ts + 1
-        level, dwell = confirm(level_prev, level_raw, p["switch_days"])
-        write_one_row(
-            business_value,
-            PK=("BIZ.REVERSAL_RISK", market, d),
-            state=STATE_LABELS[level], level=level, score=v["top_family_cnt"],
-            detail={"top_state": ts, "bottom_state": bs,
-                    "top_families": v["top_families"], "bottom_families": v["bottom_families"],
-                    "top_cnt": v["top_cnt"], "bottom_cnt": v["bottom_cnt"],
-                    "unavailable_families": v["unavailable_families"],
-                    "signal_conflict": ts != band_of(v["top_family_cnt"], p["top_bands"]),
-                    "dwell_days": dwell, "missing": None},
-            model_version=params_hash)
+    cfg = load_business_dict(conn, "BIZ.REVERSAL_RISK")
+    frame = reversal_load_frame(conn, market, cfg)      # 5 族代表原子的 L1 分位宽表
+    rows, stats = reversal_compute(frame, market, cfg["params"], cfg["params_hash"])
+    write_business_rows(conn, rows, write)              # only_if_changed 幂等
 ```
 
 **边界与并列**
 
 | 项 | 规则 |
 |---|---|
-| 初始化 | 首个可算日直接取 `level_raw`，不做防抖，`dwell_days=1` |
-| 判读单位 | 一律按族数；条数只作 `detail` 参考 |
+| 初始化 | 首个发布日 `since_date=当日`、`dwell_days=1`、`status=待确认` |
+| 判读单位 | 一律按族数（每族 1 票）；`top_cnt` / `bottom_cnt` 与族数同值，仅作 `detail` 排障参考 |
 | 无源族 | 不进分母，在 `detail.unavailable_families[]` 显式标注 |
-| 顶 / 底并列 | 允许共存，写 `signal_conflict` 并各降一档 |
-| 幂等 | 依赖当日族汇总 + 前 `switch_days-1` 日 `level_raw`；重算须回溯到档位进入日 |
-| 分数语义 | `score` 是族计数、`level` 是本对象档位；禁止与 §6.1 / §6.3 的 `level` / `score` 横比 |
+| 顶 / 底并列 | 允许共存，冲突时各降一档并写 `signal_conflict` |
+| 幂等 | 当日读数只依赖当日 5 族分位（单日幂等）；`since_date` / `dwell_days` 是全量序列累计量，重算须全量重跑（§2.4 规则 5） |
+| 分数语义（A3） | `score` 是族计数、`level` 是本对象档位；禁止与 §6.1 / §6.3 的 `level` / `score` 横比（§2.3.4） |
 
 #### 输出
 
@@ -2688,54 +2608,80 @@ for market in ("CN", "HK"):
 
 | 输出字段 | 含义 | 落表列 |
 |---|---|---|
-| `state` | 正常 / 警惕 / 高风险 | `state` |
-| `level` | 1…3（升序 = 越危险，只承载顶部） | `level` |
-| `score` | `top_family_cnt`（族去重计数） | `score` |
-| `detail.top_state` / `bottom_state` | 两侧判读档（底部**不驱动** `level`） | `detail` |
-| `detail.top_families[]` / `bottom_families[]` | 命中族名清单 | `detail` |
-| `detail.top_cnt` / `bottom_cnt` | 按条数的计数（仅排障参考） | `detail` |
-| `detail.unavailable_families[]` | 无源族清单（分母口径） | `detail` |
-| `detail.signal_conflict` | 顶 / 底冲突标记 | `detail` |
-| `detail.dwell_days` / `missing` | 档位停留日数 / 缺失原因 | `detail` |
+| `state` | 正常 / 警惕 / 高风险（顶部判读档，恒当日 raw） | `state` |
+| `level` | 1=正常 / 2=警惕 / 3=高风险（升序 = 越危险，仅承载顶部） | `level` |
+| `score` | `top_family_cnt`（0..5 整数族计数，非程度分 / 分位） | `score` |
+| `since_date` / `dwell_days` / `status` | 当前档位游程起点 / 连续发布日数 / 已确认·待确认（`dwell_days >= 3`） | 同名列 |
+| `confidence` | 中 / 低（按市场共变程度固定：CN 低 / HK 中） | `confidence` |
+| `detail.top_state` / `bottom_state` | 两侧判读档 1..3（底部**不驱动** `level` / `score`） | `detail` |
+| `detail.top_families[]` / `bottom_families[]` | 命中族中文名清单 | `detail` |
+| `detail.top_cnt` / `bottom_cnt` | 两侧族计数（降档前，仅排障参考） | `detail` |
+| `detail.available_family_cnt` / `unavailable_families[]` | 当日有源族数（恒 5）/ 无源族清单 | `detail` |
+| `detail.correlated_families` | 共变簇清单（描述性标注） | `detail` |
+| `detail.signal_conflict` | 顶 / 底冲突降档标记 | `detail` |
+| `detail.bottom_state_label` | 底部状态中文标签（正常 / 关注 / 高价值区） | `detail` |
+| `detail.dwell_days` / `missing` | 游程日数 / 缺失原因（发布日恒 NULL） | `detail` |
+| `detail.evidence` | `calib_end` / `family_list_version` / `market_bands` / `upstream_atom_params_hashes` | `detail` |
+| `model_version` | 恒等于 `business_dict.params_hash` | `model_version` |
 
 ```json
 {
-  "biz_code": "BIZ.REVERSAL_RISK",
-  "market": "HK",
-  "trade_date": "2026-11-06",
-  "score": 4,
-  "state": "高风险",
-  "level": 3,
+  "biz_code": "BIZ.REVERSAL_RISK", "market": "HK", "trade_date": "2026-11-06",
+  "score": 0, "state": "正常", "level": 1,
+  "since_date": "2026-11-06", "dwell_days": 1, "status": "待确认",
+  "confidence": "中",
   "detail": {
-    "top_state": 3, "bottom_state": 1,
-    "top_families": ["估值", "情绪", "结构", "压力"],
-    "bottom_families": [],
-    "top_cnt": 7, "bottom_cnt": 0,
-    "unavailable_families": ["宏观"],
-    "signal_conflict": false,
-    "dwell_days": 3, "missing": null
+    "top_state": 1, "bottom_state": 1,
+    "top_families": [], "bottom_families": [],
+    "top_cnt": 0, "bottom_cnt": 0,
+    "unavailable_families": ["宏观", "结构", "基本面"],
+    "signal_conflict": false, "dwell_days": 1, "missing": null,
+    "available_family_cnt": 5, "correlated_families": [["宽度", "估值"]],
+    "bottom_state_label": "正常",
+    "evidence": {"calib_end": "2025-12-31",
+                 "family_list_version": "v1.34-5fam-20261107",
+                 "market_bands": {"warn_from": 1, "high_from": 2},
+                 "upstream_atom_params_hashes": "<6 个去重 L1 原子口径指纹>"}
   },
-  "model_version": "<待生成>"
+  "model_version": "8bf8f6d067b3ef38"
 }
 ```
 
-> ⚠ **示意行，非库内真实读数**；本对象本期无生产者、无字典行、无读数。样例可读作：4 个独立族同时报警（按条数 7 条），顶部判为高风险、底部无命中，「宏观」族无源已退出分母。
+> ✅ **库内真实读数（2026-11-06 HK，节选；`evidence` 仅列部分键）**。样例可读作：当日 5 族分位齐全、无任何族触及顶 / 底切点 → `top_family_cnt = 0` → `state = 正常` / `level = 1`；`dwell_days = 1` 表示当日刚换入该档（`status = 待确认`）。`bottom_state = 1` 与 `bottom_state_label = 正常` 只作 `detail` 参考，不驱动 `level` / `score`。
+> ⚠ **冲突降档时 `score` 与 `level` 不同源是合法的**：降档只改 `top_state` / `level`，`score` 恒为降档前的族计数，不得据此判为数据错误；`level` / `score` 为多态列，禁止跨 `biz_code` 比较或同图绘制（§2.3.4）；`detail` 十键齐全（`output_schema.detail_keys`），另附 4 个描述性键。
 
 **失效与监控**
 
 | 情形 | 处置 |
 |---|---|
-| `signal_value` 无生产者 / 视图恒空 | **不发布**（当前状态），只登记字典与顺序表，不写 `business_value` |
-| 某族全部无源 | 退出分母并在 `unavailable_families[]` 标注 |
-| 信号清单增删 | 重标判读阈值（C5）、递增 `family_list_version` → 全量重算 |
-| 单族长期 100% / 0% 命中 | 提示复核该族阈值，必要时从清单移除 |
-| 连续 60 交易日停留「正常」 | 提示复核（可能清单未接入或族覆盖不足） |
+| 某族 L1 分位缺失 / 早于 `publish_from[market]` | **整行不发布**（A8），不按「正常」填 0 族；由监控日志记数 |
+| 无源族 | 退出分母，写 `detail.unavailable_families[]`（宏观 / 基本面 / 结构） |
+| 低置信 | CN 恒「低」/ HK 恒「中」（族间共变程度）；只作描述性读数，**不得作决策依据** |
+| 单族长期 100% / 0% 命中 | 提示复核该族切点，必要时重标 `family_cuts` 并全量重算 |
+| 三档任一长期 0% | 视为阈值失效，重标 `market_bands`（`tools/validate_reversal.py` 门禁） |
+| 上游 6 个 L1 原子 `params_hash` / 切点 / 判读阈值 / 发布日历 / 族清单变化 | 本指标 `params_hash` 同步变化 → 全量重算（§2.2） |
+| 日频断供 | 由 `market_state_daily.run()` 在 L2 之后触发 `build_all_business()`；该表 `only_if_changed=True`，状态不变时 `updated_at` 不刷新，故按业务日期判新鲜度 |
 
-下游接口（只声明数据字段，不规定展示）：前端「市场状态」功能读 `state` + `detail` 出族级共振结论；与 §6.1 方向、§6.2 形态、§6.3 侧面背离并列，**不驱动仓位 / 配置建议**；判读档单一真源在本节，信号章节只交付计数。
+下游接口（只声明数据字段，不规定展示）：前端「市场状态」功能读 `state` + `detail` 出族级共振结论与命中族清单；与 §6.1 方向、§6.2 形态、§6.3 侧面背离并列，**不驱动任何仓位 / 配置建议**，消费端不得叠加计分。
 
-**上线前验收门禁（未执行）**：① 族清单与阈值按市场冻结并登记 `available_family_cnt`；② 各档样本内时间占比 + 冲突场景占比报告；③ 与公认顶底区间对照；④ `score` 为族计数（非负整数）、`level` 1–3 的列级校验；⑤ 全量重算逐值一致。**本期零实测数字、零落库行数**。
+**实测验收（2026-11-07，`tools/validate_reversal.py`，全 PASS）**
 
-**落地顺序（本期未执行）**：① `signal_dict` 种子 + 清单阈值 + `signal_value` 生产者 → ② `v_signal_summary` 有真实数据 → ③ 本对象字典种子 + `build_reversal_business()` → ④ 前端接线。本期只落规格、白名单与顺序表，不新增生产者、不改运行时计算代码。
+| 项 | CN | HK |
+|---|---|---|
+| 落库行数 / 起止 | 1887 / `2019-01-02 ~ 2026-11-05` | 3234 / `2013-09-10 ~ 2026-11-06` |
+| 三档占比 正常·警惕·高风险 | 75.46 / 19.29 / 5.25 % | 73.16 / 21.61 / 5.23 % |
+| 冲突降档日数 | 123 | 377 |
+| 标定高风险档占比 / 标定样本 | 6.68% / 1691 | 8.85% / 3029 |
+| `confidence` | 低 | 中 |
+| PIT 敏感性 `state` 一致率 | 76.7~79.2 % | 93.8~95.8 % |
+| 与 `BIZ.MARKET_DIVERGENCE` / `BIZ.MARKET_PATTERN` 高档分布 TVD | 0.1308 / 0.3017 | 0.0942 / 0.5113 |
+
+> ✅ **验收（全部通过）**：字典契约、多态列语义、`detail` 十键、独立复算逐值一致（0 处不符）、两市场三档无 0% 档、各族无长期 0% / 100% 命中、发布日历与 5 族门禁、重跑幂等（`max(updated_at)` 逐值不变）、`model_version` 全等于字典 `params_hash`。
+> 幂等与资源：峰值 RSS **102.9MB**（< 200MB 进程内红线，R4）；全量 pytest **635 passed / 329 subtests**。
+
+**已知限制（披露项，非 FAIL）**：① 参数层前视 —— 切点按截至 2025-12-31 的全历史样本冻结，PIT 敏感性（仅用截至 t 的样本重标切点）`state` 一致率 CN 76.7~79.2% / HK 93.8~95.8%，CN 因族起点晚、标定样本短而更敏感，重标须全量重算；② 与 `BIZ.MARKET_DIVERGENCE` 高档分布 TVD 仅 CN 0.1308 / HK 0.0942（重合较高），与 `BIZ.MARKET_PATTERN` 为 0.3017 / 0.5113（区分明显），消费端不得把四者当作互相印证的独立证据；③ 族间共变实测显著，`score` 只表达「几个侧面同时处于极端」，不宣称「几个独立侧面」；④ CN 无公认顶底历史效标，本指标不宣称可交易。
+
+**扩展性约定**：接清单层（逐条 `hit` / `days` 落 `signal_value`）时须递增 `params_hash` 并全量重算；新增 L3 指标仍走 `build_business_value.py` 单文件 `if/elif` 分派（§6.1）。
 
 ---
 
