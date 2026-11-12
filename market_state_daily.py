@@ -637,8 +637,8 @@ INDICATORS: list[dict] = [
          formula="(lv − HP单边(lv, λ=1600))/HP × 100；lv = 100·Π(1+CN.GDP_QOQ/100)"),
     dict(code="MACRO.CLOCK_QUADRANT", name="美林投资时钟象限", scope="MACRO", dimension="景气",
          market_scope="CN", unit="code", direction="neutral", freq="quarter",
-         remark="定义：产出缺口方向 × CPI 同比 6 个月方向组合出的美林时钟象限（分类标签，非连续值）　·　判读：**1=复苏（增长↑通胀↓）→股 / 2=过热（↑↑）→商品 / 3=滞胀（↓/通胀↑）→现金 / 4=衰退（↓↓）→债**；增长轴取产出缺口环比方向，通胀轴取 CPI 同比 6 个月方向（去单月噪声）　·　数据：⚠ **分类值不做历史分位**（percentile 恒为空），勿当连续指标用；季频",
-         formula="quadrant(sign(ΔMACRO.OUTPUT_GAP), sign(CPI_YOY(t) − CPI_YOY(t−6)))"),
+         remark="定义：增长轴（产出缺口方向 × 单季实际同比方向双口径投票）× 通胀轴（CPI 同比 6 个日历月方向 + 通缩水平门控）组合出的美林时钟象限（分类标签，非连续值）　·　判读：1=复苏(↑↓) / 2=过热(↑↑) / 3=滞胀(↓↑) / 4=衰退(↓↓)；⚠ 「→股 / →商品 / →现金 / →债」是 Merrill Lynch(2004) 的**理论映射，在中国市场不适用**——经济周期与股市不同步属常态（长样本验证见 §7.21c），不得当配置信号；本指标的正确验收是「是否忠实刻画经济状态」而非「是否预测股市」　·　口径 v2（2026-11-11）：**纯季频**（只在季度 GDP 发布时点重算，通胀取该时点 PIT 可见值）；两轴各带 0.2pp 死区 + 滞回，死区内保持上一状态；增长轴需 Δgap 与 Δ单季同比一致才更新，分歧不动；通缩期跌幅收窄不判通胀上行。v1 零阈值下 ±0.1pp 扰动即改写 24% 标签　·　数据：⚠ **分类值不做历史分位**（percentile 恒为空）、不入合成、勿当连续指标用；2014Q2 起约 50 季　·　已知限制：macro_series 仅 revision=0（PIT 锁时点未锁修订后数值）、release_time 为 period+lag 估计值",
+         formula="quadrant(vote(sign_eps(Δgap,0.2), sign_eps(ΔGDP_YOY_Q,0.2)), infl_flag(CPI_YOY[t], CPI_YOY[t−6], 0.2))；季频 PIT；死区滞回"),
     dict(code="MACRO.US_10Y", name="美债10年期收益率", scope="MACRO", dimension="资金",
          market_scope="GLOBAL", unit="pct", direction="neutral", freq="day",
          remark="定义：美国 10 年期国债收益率（%），全球资产定价的无风险利率锚　·　判读：**无单一方向**（同 MACRO.BOND_10Y 的双重性质）——既是全球贴现率（上行压估值）也是增长/通胀预期（上行反映景气）；须与美元指数、VIX 联读以辨识驱动来源　·　数据：1990-12 起长样本；⚠ 美债休市日（如哥伦布日）源无报价，属正常非缺采；亦是 HK VAL.ERP 的无风险利率输入",
@@ -971,20 +971,25 @@ def _per_stock_windows(conn, market: str, w_start: datetime.date, end: datetime.
         flt = "close IS NOT NULL AND close <> 'NaN'::numeric AND amount >= %s"
         fparams = [HK_MIN_AMOUNT]
 
-    # 窗口内有数据的股票清单（DISTINCT / ORDER 交给 PG，客户端只收几千行）
-    codes = _q(conn,
-               f"SELECT DISTINCT stock_code FROM {tbl} "
-               f"WHERE trade_date BETWEEN %s AND %s AND {flt} ORDER BY stock_code",
-               [w_start, end] + fparams)["stock_code"].tolist()
-    if not codes:
+    # 股票清单 + 窗口交易日数：一条 GROUP BY 同时取回，不再为
+    # count(DISTINCT trade_date) 单独再扫一遍 445 天 × 5000 只明细
+    # （实测 CN 增量 13.4s→6.9s、HK 4.3s→2.2s、backfill 4 年块 14.2s→6.4s）。
+    #   ① codes 仍是窗口内出现过行情的全部股票，与旧 DISTINCT 逐值一致（实测）；
+    #   ② n_days 取「单只股票的最大有效行数」：主键 (stock_code, trade_date) 唯一
+    #      → 等于 count(DISTINCT trade_date)（实测 CN 293 / HK 300 / 4 年块 1236 全等）。
+    #      它只参与 batch_codes 压批，而分批大小不影响结果（逐股 rolling 互不跨股）。
+    g = _q(conn,
+           f"SELECT stock_code, count(*) AS n FROM {tbl} "
+           f"WHERE trade_date BETWEEN %s AND %s AND {flt} "
+           f"GROUP BY stock_code ORDER BY stock_code",
+           [w_start, end] + fparams)
+    if g.empty:
         return pd.DataFrame()
+    codes = g["stock_code"].tolist()
 
     # R1：单批行数 ≈ 批内股票数 × 窗口交易日数；按实际交易日数把「股票数」
     # 批大小动态压到 _WINDOW_MAX_ROWS 以内，使 backfill 长窗口也不越线。
-    n_days = int(_q(conn,
-                    f"SELECT count(DISTINCT trade_date) AS n FROM {tbl} "
-                    f"WHERE trade_date BETWEEN %s AND %s AND {flt}",
-                    [w_start, end] + fparams)["n"].iloc[0])
+    n_days = int(g["n"].max())
     batch_codes = max(1, min(_WINDOW_BATCH_CODES,
                              _WINDOW_MAX_ROWS // max(1, n_days)))
 
@@ -1742,11 +1747,10 @@ def calc_cn(conn, start: datetime.date, end: datetime.date, warmup_days: int = 4
     # ⑩ 行业层（申万一级行业宽度/动量分化 + 行业资金流；不入合成）
     out.update(_sector_indicators(conn, out["BREADTH.ADV_RATIO"].index))
 
-    # ⑪ 产出缺口 + 美林时钟（季度输入 + 月度通胀方向；逐期单边滤波 → 无前视；不入合成）
+    # ⑪ 产出缺口 + 美林时钟（v2：纯季频 + PIT 通胀方向；逐期单边滤波 → 无前视；不入合成）
     gap_pts = _output_gap_points(conn)
     out["MACRO.OUTPUT_GAP"] = _pit_fill(out["BREADTH.ADV_RATIO"].index, gap_pts)
-    out["MACRO.CLOCK_QUADRANT"] = _pit_fill(out["BREADTH.ADV_RATIO"].index,
-                                            _clock_points(conn, gap_pts))
+    out["MACRO.CLOCK_QUADRANT"] = _pit_fill(out["BREADTH.ADV_RATIO"].index, _clock_points(conn))
 
     # ⑫ §3.4 外部环境 + §5.4 跨资产成分（复用已采序列；供风险偏好指数用）
     out.update(_global_block(conn, out["BREADTH.ADV_RATIO"].index))
@@ -1999,6 +2003,20 @@ def _pit_fill(idx, points: list) -> pd.Series:
 _HP_LAMBDA = 1600.0      # HP 滤波 λ：标准季频「水平」序列取值
 _GAP_MIN_Q = 12          # 产出缺口前 12 个季度不出值（HP 在极短样本上不稳）
 
+# ── 美林时钟 v2 口径参数（2026-11-11）────────────────────────────────────────
+# ⚠ 任一变更必须同步 indicator_dict 的 formula（formula 进 params_hash → 口径变更
+#   自动换 model_version，按 §5.7 PIT 铁律须全量重算历史）。详见 §7.21 v2 评测。
+CLOCK_GAP_EPS = 0.20
+"""增长轴 Δgap 死区（pp）。实测 |Δgap| 的 P25≈−0.18 / P75≈0.14、29.4% 落在 ±0.1
+   内；0.20 约覆盖 P80，死区内保持上一状态而非硬判方向。"""
+CLOCK_YOY_EPS = 0.20
+"""增长轴 Δ单季实际同比 死区（pp）；同比比环比平滑、且与单边 HP 末点独立。"""
+CLOCK_CPI_EPS = 0.20
+"""通胀轴 CPI 同比 6 月差分死区（pp）。实测中位 0.099、7.3% 落在 ±0.1 内、3.6%
+   恰为 0 —— v1 的 `>0` 把 0 硬判成「通胀↓」，系统性偏向下。"""
+CLOCK_CPI_WINDOW = 6
+"""通胀方向回看月数，按**日历月**索引（v1 按行序 k−6，缺月即错位）。"""
+
 
 def _hp_trend(y: np.ndarray, lam: float = _HP_LAMBDA) -> np.ndarray:
     """Hodrick-Prescott 趋势（scipy 稀疏三对角解；本环境未装 statsmodels）。"""
@@ -2013,28 +2031,60 @@ def _hp_trend(y: np.ndarray, lam: float = _HP_LAMBDA) -> np.ndarray:
                               np.asarray(y, dtype=float))).ravel()
 
 
-def _output_gap_points(conn) -> list:
-    """产出缺口（水平口径 %）→ [(release_time, gap)]。
+def _gap_frame(conn) -> pd.DataFrame:
+    """季度 GDP 输入 → [period_date, release_time, qoq, yoy, gap]（时钟两轴共用）。
 
-    · 实际水平：用 NBS **已季调**的单季环比（`CN.GDP_QOQ`）链成水平指数
-      （基期任取 —— 缺口是「相对潜在水平的百分比」，与基期无关）；
+    · 实际水平：NBS **已季调**单季环比（`CN.GDP_QOQ`）链成水平指数（基期任取，
+      缺口是「相对潜在水平的百分比」，与基期无关）；
     · 潜在水平：**单边** HP（λ=1600）—— 对第 i 期只用 `lv[:i+1]` 重算并取末点。
-      ⚠ HP 默认是**双边**滤波（用到未来期），全样本跑一遍取趋势 = 前视，必须逐期重算；
-    · 样本不足 12 个季度不出值（季频 → 因此缺口自 2014Q1 起有值）。
+      ⚠ HP 默认双边（趋势点用未来期），全样本跑一遍取趋势 = 前视，必须逐期重算；
+    · 样本不足 12 季不出值（因此缺口自 2014Q1 起）。
+
+    v2 防御（2026-11-11）：
+      · **按 period_date 排序**（v1 按 release_time）：链式水平的语义顺序是统计期，
+        不是发布时点；一旦修订导致两者不同序，v1 会把环比链错季度。
+      · **季度连续性校验**：相邻统计期必须隔 3 个月，缺季直接抛错 —— cumprod
+        跳期会把「两季增长」误记成一季。
+      · **NaN 插值而非填 0**：v1 的 `np.where(isnan, 0.0)` 把缺测当零增长、
+        永久偏移水平；现线性插值，仍全空才退化为 0。
+      · **同表带出 `CN.GDP_YOY_Q`**（单季实际同比，1993Q1 起）：增长轴的第二个
+        独立口径，避免只靠单边 HP 末点（逐期重估噪声见 §7.21 v2）。
     """
-    df = _q(conn, """SELECT release_time, value FROM regime.macro_series
-                     WHERE series_code='CN.GDP_QOQ' AND revision=0 ORDER BY release_time""")
+    df = _q(conn, """
+        SELECT q.period_date, q.release_time, q.value AS qoq, y.value AS yoy
+        FROM regime.macro_series q
+        LEFT JOIN (SELECT period_date, max(value) AS value FROM regime.macro_series
+                   WHERE series_code = 'CN.GDP_YOY_Q' AND revision = 0
+                   GROUP BY period_date) y
+          ON y.period_date = q.period_date
+        WHERE q.series_code = 'CN.GDP_QOQ' AND q.revision = 0
+        ORDER BY q.period_date
+    """)
+    cols = ["period_date", "release_time", "qoq", "yoy", "gap"]
     if df.empty:
-        return []
-    qoq = pd.to_numeric(df["value"], errors="coerce").to_numpy(dtype=float)
-    qoq = np.where(np.isnan(qoq), 0.0, qoq)
+        return pd.DataFrame(columns=cols)
+    per = pd.to_datetime(df["period_date"])
+    months = per.dt.year.to_numpy() * 12 + per.dt.month.to_numpy()
+    if len(months) > 1 and np.any(np.diff(months) != 3):
+        raise ValueError("CN.GDP_QOQ 季度序列不连续（相邻统计期间隔 != 3 个月），链式水平不可用")
+    qoq = pd.to_numeric(df["qoq"], errors="coerce")
+    qoq = qoq.interpolate(limit_direction="both").fillna(0.0).to_numpy(dtype=float)
+    yoy = pd.to_numeric(df["yoy"], errors="coerce").to_numpy(dtype=float)
     lv = 100.0 * np.cumprod(1.0 + qoq / 100.0)
-    out = []
+    gap = np.full(len(lv), np.nan)
     for i in range(_GAP_MIN_Q - 1, len(lv)):
         pot = float(_hp_trend(lv[: i + 1])[-1])
         if pot:
-            out.append((df["release_time"].iloc[i], (lv[i] - pot) / pot * 100.0))
-    return out
+            gap[i] = (lv[i] - pot) / pot * 100.0
+    return pd.DataFrame({"period_date": df["period_date"],
+                         "release_time": df["release_time"],
+                         "qoq": qoq, "yoy": yoy, "gap": gap})
+
+
+def _output_gap_points(conn) -> list:
+    """产出缺口（水平口径 %）→ [(release_time, gap)]，口径详见 `_gap_frame`。"""
+    g = _gap_frame(conn).dropna(subset=["gap"])
+    return list(zip(g["release_time"].tolist(), g["gap"].tolist()))
 
 
 def _clock_map(growth_up: bool, infl_up: bool) -> int:
@@ -2044,33 +2094,93 @@ def _clock_map(growth_up: bool, infl_up: bool) -> int:
     return 3 if infl_up else 4
 
 
-def _clock_points(conn, gap_pts: list) -> list:
-    """美林四象限 → [(release_time, 1..4)]。
+def _sign_eps(d, eps: float):
+    """带死区的方向：>eps→True / <−eps→False / 死区内或非有限→None（保持上一状态）。"""
+    if d is None or not np.isfinite(d):
+        return None
+    if d > eps:
+        return True
+    if d < -eps:
+        return False
+    return None
 
-    增长轴 = 产出缺口的方向（本季 vs 上季）；通胀轴 = CPI 同比的**6 个月**方向（去掉单月噪声）。
-    两条轴各按自己的源 release_time 推进，任一轴更新时重算象限 → 无前视。
+
+def _infl_flag(v_now: float, v_prev: float, eps: float):
+    """通胀轴方向（含**水平门控**）。
+
+    通缩期（CPI 同比 < 0）「跌幅收窄」不等于通胀上行 —— v1 只看差分符号，
+    实测 23 个通缩月有 4 个被打成过热/滞胀。此时返回 None → 保持上一状态。
     """
-    if len(gap_pts) < 2:
+    s = _sign_eps(v_now - v_prev, eps)
+    if v_now < 0 and s is True:
+        return None
+    return s
+
+
+def _clock_points(conn) -> list:
+    """美林四象限 v2 → [(release_time, 1..4)]，纯季频、无前视。
+
+    相对 v1 的四处修正（v1 评测见 doc/market_profile_collection_plan.md §7.21）：
+      ① **统一季频**：只在季度 GDP 的 release_time 上重算；通胀轴在该时点按 PIT
+         取「已可见的最新 CPI」及其 6 个日历月前值。v1 让月度 CPI 单独触发象限
+         （实测 54 次切换中 28 次 = 52% 由月度 CPI 触发），而字典却标 freq=quarter。
+      ② **双轴死区 + 滞回**：`_sign_eps` 落在死区内不翻转，替代 `>0` 硬阈值。
+         v1 加 ±0.1pp 死区就有 24% 的交易日标签改变 → 标签由边界噪声决定。
+      ③ **增长轴双口径投票**：Δgap 与 Δ单季实际同比一致才更新方向；分歧或双缺失
+         时保持上一状态。v1 只靠单边 HP 末点的 Δgap，与单季同比方向一致率仅
+         62.7%（HP 逐期重估把趋势变化混进了「增长动能」）。
+      ④ **通胀水平门控**：见 `_infl_flag`。
+    """
+    gf = _gap_frame(conn).dropna(subset=["gap"]).reset_index(drop=True)
+    if len(gf) < 2:
         return []
-    cpi = _q(conn, """SELECT release_time, value FROM regime.macro_series
-                      WHERE series_code='CN.CPI_YOY' AND revision=0 ORDER BY release_time""")
-    if len(cpi) < 7:
+    cpi = _q(conn, """SELECT period_date, release_time, value FROM regime.macro_series
+                      WHERE series_code='CN.CPI_YOY' AND revision=0 ORDER BY period_date""")
+    if len(cpi) < CLOCK_CPI_WINDOW + 1:
         return []
-    cvals = pd.to_numeric(cpi["value"], errors="coerce").to_numpy(dtype=float)
-    events = [(gap_pts[i][0], "g", gap_pts[i][1] - gap_pts[i - 1][1] > 0)
-              for i in range(1, len(gap_pts))]
-    events += [(cpi["release_time"].iloc[k], "i", cvals[k] - cvals[k - 6] > 0)
-               for k in range(6, len(cvals))]
-    events.sort(key=lambda x: x[0])
+    cy = pd.to_datetime(cpi["period_date"])
+    ym = (cy.dt.year.to_numpy() * 12 + cy.dt.month.to_numpy()).astype(int)
+    val = pd.to_numeric(cpi["value"], errors="coerce").to_numpy(dtype=float)
+    val_by_ym = {int(k): float(v) for k, v in zip(ym, val) if np.isfinite(v)}
+    cpi_rel = _naive_local(cpi["release_time"]).to_numpy()
+    q_rel = _naive_local(gf["release_time"]).to_numpy()
+    if not np.all(q_rel[1:] >= q_rel[:-1]):
+        raise ValueError("季度 GDP release_time 未按时间递增（PIT 前提被破坏）")
+    # PIT：季度事件 t 上只能用 release_time <= t 的最近一条 CPI
+    pit = pd.merge_asof(
+        pd.DataFrame({"t": q_rel}),
+        pd.DataFrame({"rel": cpi_rel, "ym": ym, "v": val}).sort_values("rel"),
+        left_on="t", right_on="rel", direction="backward")
     cur_g = cur_i = None
     out = []
-    for rel, kind, up in events:
-        if kind == "g":
-            cur_g = up
-        else:
-            cur_i = up
-        if cur_g is not None and cur_i is not None:
-            out.append((rel, float(_clock_map(cur_g, cur_i))))
+    for i in range(1, len(gf)):
+        # —— 增长轴：Δgap × Δ单季实际同比 双口径投票 ——
+        d_gap = gf["gap"].iloc[i] - gf["gap"].iloc[i - 1]
+        s_gap = _sign_eps(d_gap, CLOCK_GAP_EPS)
+        y_prev, y_now = gf["yoy"].iloc[i - 1], gf["yoy"].iloc[i]
+        s_yoy = (_sign_eps(y_now - y_prev, CLOCK_YOY_EPS)
+                 if np.isfinite(y_prev) and np.isfinite(y_now) else None)
+        if s_gap is not None and s_yoy is not None:
+            if s_gap == s_yoy:
+                cur_g = s_gap                # 一致才确认；分歧 → 保持上一状态
+        elif s_gap is not None:
+            cur_g = s_gap
+        elif s_yoy is not None:
+            cur_g = s_yoy
+        if cur_g is None:
+            cur_g = bool(d_gap > 0)          # 首个事件兜底
+        # —— 通胀轴：PIT 最新 CPI + 6 个日历月前（缺月/缺值 → 保持上一状态）——
+        k = pit["ym"].iloc[i]
+        if np.isfinite(k):
+            v_now = val_by_ym.get(int(k))
+            v_prev = val_by_ym.get(int(k) - CLOCK_CPI_WINDOW)
+            if v_now is not None and v_prev is not None:
+                s_infl = _infl_flag(v_now, v_prev, CLOCK_CPI_EPS)
+                if s_infl is not None:
+                    cur_i = s_infl
+        if cur_i is None:
+            continue                          # 通胀轴尚未初始化 → 不输出
+        out.append((gf["release_time"].iloc[i], float(_clock_map(cur_g, cur_i))))
     return out
 
 
@@ -2908,9 +3018,16 @@ def _write_market(conn, market: str, series_map: dict, start: datetime.date,
         combined = pd.concat([hist, new_raw])
     else:
         combined = new_raw
-    for c in codes:
-        if c not in combined.columns:
-            combined[c] = np.nan
+    # 缺失指标列一次性补齐：codes 有 128 个，逐列 `combined[c] = np.nan` 走的是
+    # frame.insert，每插一列多一个 block → 100+ blocks 后 pandas 每次插入都发
+    # PerformanceWarning，且插入成本随 block 数线性增长。改为 pd.concat(axis=1)
+    # 一次成型（不再按列堆 block），列顺序 / float64 NaN / 逐值结果与旧写法一致。
+    missing = [c for c in codes if c not in combined.columns]
+    if missing:
+        combined = pd.concat(
+            [combined,
+             pd.DataFrame(np.nan, index=combined.index, columns=missing)],
+            axis=1)
     combined = combined.sort_index()
 
     # CN 估值锚口径护栏（分位输入层）：_load_stored_raw 读的是库内全历史 raw_value，

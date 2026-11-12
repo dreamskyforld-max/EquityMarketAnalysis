@@ -402,5 +402,46 @@ class TestWriteMarketInvalidDays(unittest.TestCase):
         self.assertEqual(conn.deletes, [])
 
 
+# ── ⑥ _write_market 缺失列补齐：不许退回逐列 frame.insert（2026-11-11）────────
+class TestWriteMarketColumnPadding(unittest.TestCase):
+    """128 个 code 逐列赋 NaN 会堆出 100+ blocks，pandas 每次 insert 都发
+    PerformanceWarning；改为一次性 pd.concat(axis=1)。锁住：无警告、补齐列仍是
+    全 NaN 的 float64、原有列数值不变。
+    """
+
+    def test_no_fragmentation_warning_and_padding_intact(self):
+        import warnings
+        import pandas as pd
+
+        idx = [D(2026, 10, 13), D(2026, 10, 14)]
+        series = {"BREADTH.ADV_RATIO": pd.Series([38.0, 34.0], index=idx)}
+        seen = {}
+        real_pct = msd._compute_percentiles
+
+        def spy(combined):
+            seen["frame"] = combined
+            return real_pct(combined)
+
+        conn = _FakeWriteConn()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with mock.patch.object(msd, "_load_stored_raw",
+                                   lambda c, m: pd.DataFrame()), \
+                 mock.patch.object(msd, "_compute_percentiles", spy), \
+                 mock.patch("db.bulk_upsert", lambda *a, **k: None), \
+                 mock.patch.object(msd, "bulk_upsert", lambda *a, **k: None):
+                msd._write_market(conn, "HK", series, D(2026, 10, 13), True)
+
+        self.assertFalse([w for w in caught
+                          if "highly fragmented" in str(w.message)])
+        frame = seen["frame"]
+        codes = [m["code"] for m in msd.INDICATORS]
+        self.assertTrue(set(codes).issubset(frame.columns))
+        padded = [c for c in frame.columns if c not in series]
+        self.assertTrue(frame[padded].isna().all().all())
+        self.assertTrue((frame[padded].dtypes == "float64").all())
+        self.assertEqual(frame["BREADTH.ADV_RATIO"].tolist(), [38.0, 34.0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

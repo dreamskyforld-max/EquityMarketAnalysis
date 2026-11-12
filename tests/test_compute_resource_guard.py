@@ -54,6 +54,10 @@ class TestBatchLoadingGuards(unittest.TestCase):
         # 批内也须走服务端游标，否则 11 批 fetchall 会把水位累积到 192.9MB
         self.assertIn("_WINDOW_STREAM_CHUNK", src)
         self.assertIn("_read_sql_stream(", src)
+        # B1（2026-11-11）：股票清单 + n_days 由一条 GROUP BY 取回，
+        # 不再为 count(DISTINCT trade_date) 单独全窗口扫描（实测省 ~9s/轮）。
+        self.assertIn("SELECT stock_code, count(*) AS n", src)
+        self.assertNotIn("SELECT count(DISTINCT trade_date)", src)
 
     def test_load_stored_raw_streamed(self):
         """_load_stored_raw 曾一次拉 57.8 万行明细 → pivot 峰值 339MB"""
