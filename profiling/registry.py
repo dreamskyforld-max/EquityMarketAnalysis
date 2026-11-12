@@ -208,7 +208,10 @@ def validate_enum_uniqueness() -> None:
         for name in (n for n in names[:2] if n):  # 只查 label / short_label
             nkey = (et, name)
             owner = name_owner.get(nkey)
-            if owner:
+            # 同一个 code 的全称与简称允许相同（如「低位缩量」既是 label 又是 short_label）；
+            # 只有「不同 code 共用同一名称」才是概念冲突。结论层 35 个 enum 全部填了
+            # short_label（doc/stock_profile_l2_l3.md 附录 D），需排除自比较。
+            if owner and owner != code:
                 raise ValueError(
                     f"枚举概念冲突：enum_type={et} 中名称 {name!r} 同时被 "
                     f"{owner} 与 {code} 使用（一个概念只能有一个名称、一个 code）"

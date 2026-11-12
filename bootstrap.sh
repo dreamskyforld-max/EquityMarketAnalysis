@@ -309,6 +309,8 @@ render_services(){
     monitor-collector.service wecom-collector-a.service
     compute-profile.service compute-profile.timer
   )
+  # 结论层全量重建不注册服务：需要时手动执行 compute_conclusions_rebuild.py --yes
+  # （破坏性操作，默认预演；不加入 TIMERS 以免 deploy.sh up 误触发）。
   for u in "${units[@]}"; do
     local tpl="$APP_DIR/system/$u"
     [[ -f "$tpl" ]] || { warn "缺 $tpl, 跳过 $u"; continue; }

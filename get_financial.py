@@ -58,7 +58,8 @@ def _build_hk_record(row, cf_data: dict) -> dict | None:
     revenue = row["OPERATE_INCOME"]
     ocf_sales = row["OCF_SALES"]
     operating_cash_flow = (ocf_sales / 100) * revenue if ocf_sales is not None and revenue is not None else None
-    free_cash_flow = _calc_hk_fcf(cf_data.get(report_date_str))
+    cf = cf_data.get(report_date_str) or {}
+    free_cash_flow = _calc_hk_fcf(cf)
 
     return {
         "report_date": date.fromisoformat(report_date_str),
@@ -75,6 +76,12 @@ def _build_hk_record(row, cf_data: dict) -> dict | None:
         "net_profit_yoy": _safe_float(row["HOLDER_PROFIT_YOY"]),
         "operating_cash_flow": _safe_float(operating_cash_flow),
         "free_cash_flow": _safe_float(free_cash_flow),
+        # P1 补数：ROIC 来自港股分析指标接口，CAPEX / 并购现金流来自现金流量表。
+        # A 股 record 不含这些键，bulk_upsert 会按 keys 并集补 None（db.py:264-271）。
+        "roic": _safe_float(row.get("ROIC_YEARLY")),
+        "capex_fixed": _safe_float(cf.get("capex_fixed")),
+        "capex_intangible": _safe_float(cf.get("capex_intangible")),
+        "acquisition_cash_flow": _safe_float(cf.get("acquisition_cash")),
     }
 
 
@@ -115,6 +122,16 @@ A_INDICATOR_MAP = {
     "营业总收入增长率":        "revenue_yoy",
     "归属母公司净利润增长率":   "net_profit_yoy",
     "经营现金流量净额":        "operating_cash_flow",
+    # P1 补数（doc/stock_profile_l2_l3.md §8.1）：零新增请求，同一张新浪长表未映射行。
+    # 指标名已用 ak.stock_financial_abstract(symbol='600519') 实测逐字核对；
+    # 「扣非净利润」在常用指标/成长能力各出现一次且数值相同，dict 覆盖无害。
+    # 这些字段按 §8.4 只进 evidence，不进 L2/L3 判定。
+    "扣非净利润":              "net_profit_excl_nonrec",
+    "商誉":                    "goodwill",
+    "投入资本回报率":           "roic",
+    "存货周转率":              "inventory_turnover",
+    "应收账款周转率":           "receivable_turnover",
+    "总资产周转率":             "total_asset_turnover",
 }
 
 
@@ -281,9 +298,11 @@ def _fetch_hk_cash_flow(symbol: str) -> dict[str, dict]:
 
     result = {}
     targets = {
-        "ocf":               "经营业务现金净额",
-        "capex_fixed":       "购建固定资产",
-        "capex_intangible":  "购建无形资产及其他资产",
+        "ocf":                 "经营业务现金净额",
+        "capex_fixed":         "购建固定资产",
+        "capex_intangible":    "购建无形资产及其他资产",
+        # P1 补数：并购现金流代理（年报 19/25 有值），只进 evidence
+        "acquisition_cash":    "收购附属公司",
     }
     for _, row in df.iterrows():
         item_name = row.get("STD_ITEM_NAME", "")

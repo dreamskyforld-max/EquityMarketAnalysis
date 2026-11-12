@@ -132,9 +132,11 @@ def main(argv=None) -> int:
         if args.cmd in ("init", "sync"):
             if args.cmd == "init":
                 schema.ensure_schema(conn)
-                log.info("profile schema 就绪")
+                log.info("profile schema 就绪（含结论层 JSONB 列幂等迁移）")
             ins, upd = registry.sync_registry(conn)
-            log.info("同步结果：新增 %d，更新 %d", ins, upd)
+            from .conclusions import rules as conclusion_rules
+            n_dict = conclusion_rules.sync_conclusion_dict(conn)
+            log.info("同步结果：标签新增 %d / 更新 %d，规则契约 %d 个", ins, upd, n_dict)
             return 0
 
         if args.cmd == "compute":
@@ -153,10 +155,13 @@ def main(argv=None) -> int:
                             log.error("未注册的标签: %s", t)
                         else:
                             out.append(m)
-                    return out
-                if args.domain:
-                    return registry.by_domain(args.domain)
-                return registry.all_tags()
+                elif args.domain:
+                    out = registry.by_domain(args.domain)
+                else:
+                    out = registry.all_tags()
+                # 结论标签（source_type=derived）由 conclusions.producer 统一生产，
+                # 不走 engine.compute_tag()（后者 snapshot 会 UPDATE key_value）。
+                return [m for m in out if m.source_type != "derived"]
 
             metas = _resolve_metas()
             if not metas:

@@ -31,6 +31,8 @@ from datetime import date
 from db import get_conn
 from profiling import engine, registry
 from profiling import tags  # noqa: F401  触发全部标签注册（不可删！）
+from profiling.conclusions import producer as conclusion_producer
+from profiling.conclusions import rules as conclusion_rules
 from log_utils import setup_logger
 
 log = setup_logger("compute_profile")
@@ -103,6 +105,13 @@ def _compute():
     except Exception:
         log.exception("【全量画像】标签字典同步失败（不影响本次计算，需人工检查）")
 
+    # 结论规则契约：version 校验必须硬失败，不能像字典同步那样只记 error ——
+    # 否则会出现「标签 active 但 conclusion_dict 为 NULL / 旧版」的静默错配
+    # （doc/stock_profile_l2_l3.md §12.3.1 风险 2）。
+    with get_conn() as conn_sync:
+        n_dict = conclusion_rules.sync_conclusion_dict(conn_sync)
+    log.info("【全量画像】结论规则契约同步：%d 个标签", n_dict)
+
     # 逐标签独立事务（不要改回「一个连接跑完所有标签」）：
     #   · 77 个标签共用一个事务时，写入会全憋到最后一次 commit 集中爆发。实测写峰值
     #     88k 块/s（tag_value 单行插入要同步维护 4 个索引），叠加 autovacuum /
@@ -111,6 +120,10 @@ def _compute():
     results = []
     t0 = time.monotonic()
     for meta in registry.all_tags():
+        # 结论标签不走 engine.compute_tag()：它依赖多个上游标签，且 snapshot 会
+        # UPDATE key_value，与 §4.6 事件行语义冲突。按元数据识别，不用编码前缀。
+        if meta.source_type == "derived":
+            continue
         try:
             with get_conn() as conn:
                 results.append(engine.compute_tag(
@@ -122,6 +135,12 @@ def _compute():
     n_err = sum(1 for r in results if r.get("status") == "error")
     log.info("【全量画像】完成 as_of=%s, 标签数=%d, 失败=%d, 耗时=%.0fs",
              as_of, len(results), n_err, time.monotonic() - t0)
+
+    # ③ 结论生产者：必须在 ② 全部提交之后跑（§9.1 约束 2/3），内部先 4 个 L2 再 2 个 L3。
+    # 接在 compute-profile.service 同链路第二段，不进 market_scheduler（R5）。
+    conclusion_result = conclusion_producer.produce(as_of=as_of, sync_dict=False)
+    log.info("【全量画像】结论层：status=%s stats=%s",
+             conclusion_result.get("status"), conclusion_result.get("stats"))
 
     # 释放各域缓存：大对象（窗口行情等）在模块级缓存里不会随函数返回释放，
     # 会驻留到下一轮覆盖。独立进程退出时本可自然归还，保留调用是为兼容

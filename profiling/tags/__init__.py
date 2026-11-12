@@ -23,3 +23,4 @@ from . import shareholder  # noqa: F401
 from . import technical    # noqa: F401
 from . import attention    # noqa: F401
 from . import trend        # noqa: F401
+from . import conclusion   # noqa: F401  L2/L3 结论标签（source_type=derived，仅注册元数据，不参与逐标签计算）

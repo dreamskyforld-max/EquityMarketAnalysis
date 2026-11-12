@@ -15,6 +15,16 @@
     eff_from / eff_to 为闭区间，当前有效行的 eff_to = 9999-12-31。
     标签值变化时：关闭旧行（eff_to = as_of - 1）+ 插入新行（eff_from = as_of）。
     同一天内重复计算不会产生新版本，直接原地修正（避免 eff_to < eff_from 的无效区间）。
+
+结论层例外（doc/stock_profile_l2_l3.md §4.6）：
+    source_type='derived' 的 6 个结论标签不走 engine.compute_tag()，由
+    profiling.conclusions.producer 按「事件行」写入；其 conclusion_detail 中的
+    日变量在当前有效行原地刷新。**仅在规则升级时**由手动脚本
+    compute_conclusions_rebuild.py 全量重建（不注册 systemd 服务）
+    （删光 6 个 tag_code 的历史行后按 as_of 重算），日常增量仍沿用版本链语义。
+
+⚠ CREATE TABLE IF NOT EXISTS 不会给存量表加列，故 ensure_schema() 必须执行
+   _MIGRATIONS 中的 ALTER TABLE ... ADD COLUMN IF NOT EXISTS（本文件第 170 行起）。
 """
 import logging
 from datetime import date
@@ -35,9 +45,10 @@ _DDL = [
         value_range     JSONB,                     -- 取值说明：tier/float 用 {code: label}；enum 的规范值域见 profile.enum_value
         value_ref       TEXT,                      -- 值域来源：'enum:<enum_type>' 引用 enum_value 表，
                                                    -- 或 'table:<表>.<列>[过滤]' 引用已有权威表（行业/指数/概念）
+        conclusion_dict JSONB,                     -- 结论标签的当前生效规则契约（只读发布物，由 sync_conclusion_dict 写入）
         num_unit        TEXT,                      -- num_value 的计量单位（x/pct/pp/percentile_0_100/CNY|HKD/years/count/rank），
                                                    -- enum/bool 标签为空。前端格式化展示与跨标签比较依赖此列
-        source_type     TEXT    NOT NULL,          -- rule / stat / model / external / manual
+        source_type     TEXT    NOT NULL,          -- rule / stat / model / external / manual / derived
         compute_logic   TEXT,                      -- 计算口径描述
         update_freq     TEXT    NOT NULL,          -- daily / weekly / monthly / quarterly / event / static
         data_sources    TEXT[],                    -- 依赖的数据表（血缘用）
@@ -86,6 +97,7 @@ _DDL = [
         tag_code     TEXT             NOT NULL,
         key_value    TEXT             NOT NULL,   -- 离散取值：筛选用（枚举 code / 分档 / 布尔）
         num_value    DOUBLE PRECISION,            -- 连续取值：研究回测用，保留信息量
+        conclusion_detail JSONB,                 -- 结论标签的判定依据（含日变量，见 §4.6）；L1 标签恒 NULL
         confidence   REAL             NOT NULL DEFAULT 1.0,
         eff_from     DATE             NOT NULL,   -- 生效日（含）
         eff_to       DATE             NOT NULL,   -- 失效日（含），当前有效 = 9999-12-31
@@ -98,7 +110,7 @@ _DDL = [
     """,
     """
     COMMENT ON TABLE profile.tag_value IS
-        '股票标签值（EAV + 版本化，按 eff_from 按年分区）。key_value 供筛选，num_value 保留连续值供回测'
+        '股票标签值（EAV + 版本化，按 eff_from 按年分区）。key_value 供筛选，num_value 保留连续值供回测。例外：source_type=derived 的结论标签在规则升级时全量重建历史行，日常增量仍按版本链写入'
     """,
     "COMMENT ON COLUMN profile.tag_value.key_value  IS '离散取值，组合筛选与位图索引的键。enum 类型存规范 code（如 XSHG）而非中文名，中文显示名查 profile.enum_value'",
     "COMMENT ON COLUMN profile.tag_value.num_value  IS '连续取值（如真实 PE=87.3），分档会损失边界信息，此列保留原始数值供回测/排序/重标定'",
@@ -126,6 +138,15 @@ _DDL = [
     COMMENT ON TABLE profile.tag_run_log IS
         '标签计算运行日志：每次计算的行数变化与耗时，用于监控标签稳定性（新增/关闭行数异常 = 口径可能有问题）'
     """,
+]
+
+# 存量库迁移：CREATE TABLE IF NOT EXISTS 对已存在的表不加列（AGENTS.md 最高优先级约束）。
+# tag_value 是分区表，对父表 ADD COLUMN 会自动传播到全部年份分区与 default 分区。
+_MIGRATIONS = [
+    "ALTER TABLE profile.tag_registry ADD COLUMN IF NOT EXISTS conclusion_dict JSONB",
+    "ALTER TABLE profile.tag_value ADD COLUMN IF NOT EXISTS conclusion_detail JSONB",
+    "COMMENT ON COLUMN profile.tag_registry.conclusion_dict IS '结论标签当前生效规则契约的只读发布物（真源为代码 RULES）；仅 source_type=derived 的标签非空，规则升级时由 sync_conclusion_dict 覆写'",
+    "COMMENT ON COLUMN profile.tag_value.conclusion_detail IS '结论标签的判定依据（rule_id/evidence/coverage/gates + 游程日变量）；日变量只在当前有效行原地刷新，不产生新行'",
 ]
 
 _INDEXES = [
@@ -167,6 +188,8 @@ def ensure_schema(conn, years=None) -> None:
     with conn.cursor() as cur:
         cur.execute("CREATE SCHEMA IF NOT EXISTS profile")
         for stmt in _DDL:
+            cur.execute(stmt)
+        for stmt in _MIGRATIONS:
             cur.execute(stmt)
         # 兜底分区：未预建年份的数据落这里，避免插入时因无分区而报错
         cur.execute(

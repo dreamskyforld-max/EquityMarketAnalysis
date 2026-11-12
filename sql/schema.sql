@@ -783,7 +783,19 @@ CREATE TABLE IF NOT EXISTS financial_indicator (
     revenue_yoy         NUMERIC(12,4),                      -- 营业收入同比增长率(%)
     net_profit_yoy      NUMERIC(12,4),                      -- 归母净利润同比增长率(%)
     operating_cash_flow NUMERIC(18,2),                      -- 经营活动现金流量净额（元）
-    free_cash_flow      NUMERIC(18,2),                      -- 自由现金流（元），暂留空，待补充 CAPEX
+    free_cash_flow      NUMERIC(18,2),                      -- 自由现金流（元）；已落库：港股 OCF−CAPEX、A 股每股 FCFF×股本
+    -- P1 补数（doc/stock_profile_l2_l3.md §8.1）：零新增请求，按 §8.4 只进 evidence，不进 L2/L3 判定。
+    -- 比率/周转率列统一 NUMERIC(12,4)（AGENTS.md：百分比列禁用 8,4，避免整批 INSERT 溢出）。
+    net_profit_excl_nonrec NUMERIC(18,2),                  -- 扣非净利润（元，仅 A 股新浪长表）
+    goodwill            NUMERIC(18,2),                      -- 商誉（元，仅 A 股）
+    roic               NUMERIC(12,4),                      -- 投入资本回报率(%)：A 股「投入资本回报率」/ 港股 ROIC_YEARLY
+    inventory_turnover  NUMERIC(12,4),                      -- 存货周转率（次，仅 A 股）
+    receivable_turnover NUMERIC(12,4),                      -- 应收账款周转率（次，仅 A 股）
+    total_asset_turnover NUMERIC(12,4),                    -- 总资产周转率（次，仅 A 股）
+    capex_fixed         NUMERIC(18,2),                      -- 购建固定资产（元，仅港股现金流量表）
+    capex_intangible    NUMERIC(18,2),                      -- 购建无形资产及其他资产（元，仅港股）
+    acquisition_cash_flow NUMERIC(18,2),                   -- 收购附属公司现金流（元，仅港股，并购代理）
+    rd_expense          NUMERIC(18,2),                      -- 研发费用（元）；仅登记列，P4 独立 unit 才采集
     announce_date       DATE,                               -- 财报实际披露/公告日（A股取东方财富业绩报表「最新公告日期」；港股暂无数据源，恒为 NULL）
     fiscal_year_start   DATE,                               -- 财年起始日（港股取东财 START_DATE，如阿里 2025-04-01；A股为自然年 1-1）
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
@@ -804,12 +816,36 @@ COMMENT ON COLUMN financial_indicator.debt_ratio               IS '资产负债�
 COMMENT ON COLUMN financial_indicator.revenue_yoy              IS '营业收入同比增长率(%)';
 COMMENT ON COLUMN financial_indicator.net_profit_yoy           IS '归母净利润同比增长率(%)';
 COMMENT ON COLUMN financial_indicator.operating_cash_flow      IS '经营活动现金流量净额（元）。港股由 OCF_SALES% × OPERATE_INCOME 推算，A股直接取自抽象表';
-COMMENT ON COLUMN financial_indicator.free_cash_flow           IS '自由现金流（元），暂留空 NULL，后续补充 CAPEX 数据后计算（FCF = OCF - CAPEX）';
+COMMENT ON COLUMN financial_indicator.free_cash_flow           IS '自由现金流（元），已落库：港股 FCF=OCF−购建固定资产−购建无形资产，A 股=每股 FCFF×总股本；两市场口径不同，结论层只取符号';
+COMMENT ON COLUMN financial_indicator.net_profit_excl_nonrec    IS '扣非净利润（元，仅 A 股）。P1 补数，只进 evidence';
+COMMENT ON COLUMN financial_indicator.goodwill                 IS '商誉（元，仅 A 股）。P1 补数，并购代理，只进 evidence';
+COMMENT ON COLUMN financial_indicator.roic                    IS '投入资本回报率(%)：A 股新浪长表「投入资本回报率」/ 港股 ROIC_YEARLY';
+COMMENT ON COLUMN financial_indicator.inventory_turnover      IS '存货周转率（次，仅 A 股）';
+COMMENT ON COLUMN financial_indicator.receivable_turnover     IS '应收账款周转率（次，仅 A 股）';
+COMMENT ON COLUMN financial_indicator.total_asset_turnover    IS '总资产周转率（次，仅 A 股）';
+COMMENT ON COLUMN financial_indicator.capex_fixed             IS '购建固定资产（元，仅港股现金流量表）。P1 补数：CAPEX 明细落库，此前只在内存用于算 FCF';
+COMMENT ON COLUMN financial_indicator.capex_intangible         IS '购建无形资产及其他资产（元，仅港股现金流量表）';
+COMMENT ON COLUMN financial_indicator.acquisition_cash_flow    IS '收购附属公司现金流（元，仅港股）。现金流代理，不是并购公告解析';
+COMMENT ON COLUMN financial_indicator.rd_expense               IS '研发费用（元）。仅登记列，P4 东财利润表独立 unit 才采集';
 COMMENT ON COLUMN financial_indicator.announce_date            IS '财报实际披露/公告日（A股来自东方财富业绩报表「最新公告日期」；港股暂无数据源，恒为 NULL）';
 COMMENT ON COLUMN financial_indicator.fiscal_year_start        IS '财年起始日（港股取自东方财富 START_DATE；A股为报告期所在自然年 1 月 1 日）。按财年分组做单季化拆解，避免非自然年财年公司（如阿里 4 月财年）被跨财年误减';
 COMMENT ON COLUMN financial_indicator.created_at               IS '数据写入数据库的时间';
 
 CREATE INDEX IF NOT EXISTS idx_financial_indicator_stock_date ON financial_indicator (stock_code, report_date DESC);
+
+-- 存量库幂等迁移：P1 补数列。CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
+-- 由 sql/sync_schema.sh → _schema_diff.py 生成等价 ADD COLUMN，或人工在目标库执行本段。
+ALTER TABLE financial_indicator ADD COLUMN IF NOT EXISTS net_profit_excl_nonrec NUMERIC(18,2);
+ALTER TABLE financial_indicator ADD COLUMN IF NOT EXISTS goodwill NUMERIC(18,2);
+ALTER TABLE financial_indicator ADD COLUMN IF NOT EXISTS roic NUMERIC(12,4);
+ALTER TABLE financial_indicator ADD COLUMN IF NOT EXISTS inventory_turnover NUMERIC(12,4);
+ALTER TABLE financial_indicator ADD COLUMN IF NOT EXISTS receivable_turnover NUMERIC(12,4);
+ALTER TABLE financial_indicator ADD COLUMN IF NOT EXISTS total_asset_turnover NUMERIC(12,4);
+ALTER TABLE financial_indicator ADD COLUMN IF NOT EXISTS capex_fixed NUMERIC(18,2);
+ALTER TABLE financial_indicator ADD COLUMN IF NOT EXISTS capex_intangible NUMERIC(18,2);
+ALTER TABLE financial_indicator ADD COLUMN IF NOT EXISTS acquisition_cash_flow NUMERIC(18,2);
+ALTER TABLE financial_indicator ADD COLUMN IF NOT EXISTS rd_expense NUMERIC(18,2);
+COMMENT ON COLUMN financial_indicator.free_cash_flow IS '自由现金流（元），已落库：港股 FCF=OCF−购建固定资产−购建无形资产，A 股=每股 FCFF×总股本；两市场口径不同，结论层只取符号';
 
 -- 21. 港股全市场（主板）总成交额快照
 CREATE TABLE IF NOT EXISTS daily_market_turnover (
@@ -1363,10 +1399,11 @@ CREATE TABLE IF NOT EXISTS profile.tag_registry (
     value_range     JSONB,                     -- 取值说明：tier/float 用 {code: label}；enum 的规范值域见 profile.enum_value
     value_ref       TEXT,                      -- 值域来源：'enum:<enum_type>' 引用 enum_value 表，
                                                -- 或 'table:<表>.<列>[过滤]' 引用已有权威表（行业/指数/概念）
+    conclusion_dict JSONB,                     -- 结论标签当前生效规则契约（只读发布物；真源为代码 RULES）
     num_unit        TEXT,                      -- num_value 的计量单位（受控枚举）：x=倍数 / pct=百分比 /
                                                -- pp=百分点 / percentile_0_100=分位 / CNY|HKD=按市场原币 /
                                                -- years=年 / count=计数 / rank=排名；enum/bool 标签为空
-    source_type     TEXT    NOT NULL,          -- rule / stat / model / external / manual
+    source_type     TEXT    NOT NULL,          -- rule / stat / model / external / manual / derived（结论层）
     compute_logic   TEXT,                      -- 计算口径描述
     update_freq     TEXT    NOT NULL,          -- daily / weekly / monthly / quarterly / event / static
     data_sources    TEXT[],                    -- 依赖的数据表（血缘用）
@@ -1415,6 +1452,7 @@ CREATE TABLE IF NOT EXISTS profile.tag_value (
     tag_code     TEXT             NOT NULL,
     key_value    TEXT             NOT NULL,   -- 离散取值：组合筛选与位图索引的键（enum 存规范 code）
     num_value    DOUBLE PRECISION,            -- 连续取值：研究回测用，保留分档损失的信息量
+    conclusion_detail JSONB,                 -- 结论标签的判定依据（含游程日变量，见 doc/stock_profile_l2_l3.md §4.6）
     confidence   REAL             NOT NULL DEFAULT 1.0,
     eff_from     DATE             NOT NULL,   -- 生效日（含）
     eff_to       DATE             NOT NULL DEFAULT '9999-12-31',  -- 失效日（含），当前有效=9999-12-31
@@ -1425,7 +1463,7 @@ CREATE TABLE IF NOT EXISTS profile.tag_value (
     UNIQUE (stock_code, tag_code, key_value, eff_from)
 ) PARTITION BY RANGE (eff_from);
 
-COMMENT ON TABLE  profile.tag_value         IS '股票标签值（EAV + 版本化）。标签变更不覆盖旧值而是关闭旧版本，天然支持 as_of_date 时间旅行';
+COMMENT ON TABLE  profile.tag_value         IS '股票标签值（EAV + 版本化）。标签变更不覆盖旧值而是关闭旧版本，天然支持 as_of_date 时间旅行。例外：source_type=derived 的结论标签在规则升级时由手动脚本 compute_conclusions_rebuild.py 全量重建历史行（不注册 systemd 服务）；日常增量仍沿用版本链，日变量只在当前有效行原地刷新';
 COMMENT ON COLUMN profile.tag_value.key_value  IS '离散取值，组合筛选与位图索引的键。enum 类型存规范 code（如 XSHG）而非中文名，中文显示名查 profile.enum_value';
 COMMENT ON COLUMN profile.tag_value.num_value  IS '连续取值（如真实 PE=87.3）。分档会损失边界信息，此列保留原始数值供回测/排序/重标定';
 COMMENT ON COLUMN profile.tag_value.confidence IS '置信度 0-1：规则/统计类恒为 1.0，模型类为校准后的预测概率，筛选时用于阈值过滤';
@@ -1460,6 +1498,14 @@ CREATE TABLE IF NOT EXISTS profile.tag_run_log (
 );
 
 COMMENT ON TABLE profile.tag_run_log IS '标签计算运行日志：行数变化与耗时。新增/关闭行数异常通常意味着口径变动或上游数据异常';
+
+-- 存量库幂等迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
+-- tag_value 为分区表，对父表 ADD COLUMN 会自动传播到全部年份分区与 default 分区。
+-- 与 profiling/schema.py:_MIGRATIONS 保持一致（该文件由 ensure_schema() 执行）。
+ALTER TABLE profile.tag_registry ADD COLUMN IF NOT EXISTS conclusion_dict JSONB;
+ALTER TABLE profile.tag_value    ADD COLUMN IF NOT EXISTS conclusion_detail JSONB;
+COMMENT ON COLUMN profile.tag_registry.conclusion_dict IS '结论标签当前生效规则契约的只读发布物（真源为代码 RULES）；仅 source_type=derived 的标签非空，规则升级时由 sync_conclusion_dict 覆写';
+COMMENT ON COLUMN profile.tag_value.conclusion_detail IS '结论标签的判定依据（rule_id/evidence/coverage/gates + 游程日变量）；日变量只在当前有效行原地刷新，不产生新行';
 
 -- ============================================================================
 -- 分红送配明细（全市场：A股 + 港股）

@@ -201,7 +201,12 @@ def load_financial_latest(conn, as_of: date, report_type: str = "annual") -> pd.
         SELECT DISTINCT ON (stock_code)
                stock_code, report_date, revenue, net_profit, roe,
                gross_profit_rate, net_profit_rate, debt_ratio,
-               operating_cash_flow, free_cash_flow, revenue_yoy, net_profit_yoy
+               operating_cash_flow, free_cash_flow, revenue_yoy, net_profit_yoy,
+               -- P1 补数（doc/stock_profile_l2_l3.md §8.3）：显式列 SELECT 必须逐处同步，
+               -- 否则新列不会自动进入标签底表。按 §8.4 当前只作 evidence 备用，不进判定。
+               net_profit_excl_nonrec, goodwill, roic,
+               inventory_turnover, receivable_turnover, total_asset_turnover,
+               capex_fixed, capex_intangible, acquisition_cash_flow, rd_expense
         FROM financial_indicator
         WHERE report_type = %s AND report_date <= %s {std}
           -- 披露日可信度护栏：announce_date 回填存在污染（历史行普遍后移约 1 年，
