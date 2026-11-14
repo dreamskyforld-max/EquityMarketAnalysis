@@ -1532,7 +1532,7 @@ GET https://sdmx.oecd.org/public/rest/data/OECD.SDD.STES,DSD_STES@DF_CLI,4.1/{ar
 
 - **评测框架订正（复盘）**：初版把「象限 → 股/债」映射反向列作算法缺陷，属**循环论证**——拿一条在中国市场未经验证的理论映射当真值，去检验一个「经济周期分类算法」。用户指出经济周期与股市本就不同步，§7.21c 的长样本验证证实该命题。故**资产映射反向不构成算法缺陷**，从评测判据中移除；`remark` 里「→股/→商品/→现金/→债」仍标注为理论示意、不得当配置信号，但这是**适用边界**问题，不是算法 bug。
 - **CPI 窗口 6→12 月一致率仍只有 0.76、6→4 月 0.638**：这里的差异主要是「6 月动量 vs 年度趋势 / 短动量」属不同口径，不全是噪声；未通过调参强行贴合，避免过拟合。
-- **PIT 只锁时点、不锁数值**：`macro_series` 全表 `revision=0`（26.7 万行），历史 GDP 季调环比用的是今天修订后的值；`release_time = period_date + lag` 是保守估计而非真实发布日（CPI 偏晚约 1 周）。补历史修订版本需改采集侧唯一约束 + 全量回填，且首次发布值已不可追溯 → **列为独立 workstream，本次不做**。
+- **PIT 只锁时点、不锁数值**：`macro_series` 全表 `revision=0`（26.7 万行），历史 GDP 季调环比用的是今天修订后的值；`release_time = period_date + lag` 是保守估计而非真实发布日（CPI 偏晚约 1 周；**通胀四条序列已由 §7.25 用首次观测时间收紧，其余序列仍如此**）。补历史修订版本需改采集侧唯一约束 + 全量回填，且首次发布值已不可追溯 → **列为独立 workstream，本次不做**。
 - **口径变更必须回填**：`formula` 已同步改写（含 0.2pp / 6 月参数），它进入 `_params_hash` → `indicator_dict.params_hash` 与 `indicator_value.model_version` 换新值。按 §5.7 PIT 铁律，需执行 `python3 market_state_daily.py --backfill` 才能让库内历史值切换到 v2；**本次只改代码与文档，未写库、未回填、未重启服务**。
 
 **测试**：`tests/test_regime_clock.py` 由 10 项扩到 **18 项**（新增 `_sign_eps` / `_infl_flag` 纯函数 2 项、`_gap_frame` 排序与覆盖 1 项、纯季频 PIT 时点 1 项、增长轴一致率 1 项、切换率 1 项、参数扰动回归 2 项）。全量 pytest 结果见交付说明。
@@ -1756,6 +1756,72 @@ GET https://sdmx.oecd.org/public/rest/data/OECD.SDD.STES,DSD_STES@DF_CLI,4.1/{ar
 值域高达 **+43.15**，正是旧代理口径的痕迹），与新口径（−5.5~+5.9）混在同一序列里。
 → 已按新首值日清理；`TestCreditImpulseInDb` 的**值域三重门禁 + 首值不早于 2021** 断言就是这类问题的门禁
 （**正是它先报的警**）。口径变更的清单见风险表 #22。
+
+---
+
+### 7.25 PIT 收紧：用「首次观测时间」替代单一保守估算（2026-11-13）
+
+**起因**：宏观页「通胀与价格」主图看起来不更新，追到上游发现 `CN.CPI_YOY` 的 10 月值
+（`0.7%`）在 **2026-11-09 18:21** 已被 akshare 抓到并入库，但 `release_time` 钉在
+**11-15 18:00**（`period 2026-10-01 + lag 45d`）→ 指标层按 `_macro_pit_map` 的
+`release_time ≤ 当日 23:59` 过滤，白等 6 天，页面继续用 9 月值（`0.9%`）。
+
+**根因不是刷新机制**：源无「发布日期」列时，`_mk_row` 用 `period_date + lag` 兜底
+（月 45 / 季 100~110 天，注释「宁可偏晚，绝不前视」）。45 天是覆盖**长假月**的单一上限，
+正常月（实测发布滞后 +39d，长假月 +43d）必然偏晚数天；调小 lag 又会在长假月前视。
+
+**方案**：`release_time = min(首次入库时间 created_at, period + lag)`，只作用于
+`release_basis` 以 `period+` 开头的兜底行。
+
+- `created_at` 是事实表首次 INSERT 的时间（`bulk_upsert` 不覆盖），采集每工作日 18:20
+  全量跑批 → 「源上出现了才抓得到」 ⇒ 真实发布 ≤ created_at，是另一个**上界**；两个上界取
+  min 只收紧、不前视。
+- **历史回灌天然免疫**：224 条历史行是 2026-09-30 一次性补录的，其 created_at 远晚于
+  各自的 `period+45d` → min 自然取回估算值，**无需判断是否回灌**；重建库全量灌入时
+  （created_at 全为 today）同理。⇒ **历史 PIT 时点零变化**，时钟象限 / 历史分位 / 回测结论
+  全部不用重算。
+- **幂等**：`release_time` 每天被全量 upsert 覆盖，故每轮跑批都重算；首次观测时间显式落
+  `extra.first_seen_at`（不依赖审计列的偶然行为），重算结果逐字一致。
+- **双边界保护**：SQL 只返回 `period+30d ≤ created_at < period+lag 18:00` 的行；Python
+  侧再按 freq 校验（月 30 / 季 90 天下界，防源提前放表把可得时点标早）。
+
+**白名单（有意收窄，不是打补丁）**：仅 `CN.CPI_YOY` / `CN.CPI_MOM` / `CN.PPI_YOY` /
+`CN.CORE_CPI_YOY` 四条 —— 判据是「源上出现即代表官方已发布」。不纳入：
+
+| 序列 | 理由 |
+|---|---|
+| `CN.CLI` / `GLOBAL.CLI_*`（OECD SDMX） | 源会给预估 / 未定稿值；§7.18 与 `tests/test_macro_oecd.py::test_pit_not_before_release` 把「≥ period+45d」作为防前视不变量钉死 |
+| `CN.POWER_GEN_YOY` 等 NBS 月度 | 实测次月中旬发布，45 天口径贴合，`tests/test_macro_nbs.py` 同样钉死 |
+| 其余序列 | 暂无真实发布日基准；扩充前必须先核对「首次抓到 ≥ 官方发布日」 |
+
+**派生序列同步**（否则错配）：`CN.PPI_CPI_SCISSOR` / `CN.M1_M2_SCISSOR` 原硬编码
+`period+45d`，上游收紧后会出现「CPI/PPI 已是 10 月值、剪刀差还停在 9 月」。改为
+`release_time = GREATEST(两条输入的 release_time)` —— 两个输入都可得了，做差才成立；
+输入缺 release_time 时回退原估算。`CN.M1_M2_SCISSOR` 的两个输入不在白名单 → 取值与改前一致。
+
+**dry-run 差异清单（只读模拟，实际未写库）**：7 行，全部为 2026-09/10 两期；
+`period < 2026-01-01` 的历史行 **0 行**。例：`CN.CPI_YOY 2026-10-01 11-15 18:00 → 11-09 18:21`、
+`CN.CPI_YOY 2026-09-01 10-16 18:00 → 10-14 12:20`。
+
+**影响面**：计算层 `_macro_pit_map` 一行不动；stock-realtime 侧只读 `indicator_value`，
+指标层重算后 `updated_at` 前进 → `regime_indicator` 版本门控自动重绘。11-09~11-12 四天的
+CPI/PPI/剪刀差会从 9 月值切到 10 月值。
+
+**验证**：`tests/test_macro_pit_first_seen.py` 8 项（实时收紧 / 历史不变 / 白名单与源真值豁免 /
+下界保护 / 幂等 / 断供不倒挂 / 派生 max / 派生缺值回退）；全量 `pytest tests/ -v`
+**686 passed, 329 subtests**。本次**只改代码与文档，未写库、未重启服务**。
+
+**⚠ 生效前提（部署侧）**：`market_scheduler` 是常驻进程内 `importlib` 惰性导入
+（`run_script → collector_runtime.run_module`，**每个进程只 import 一次**），运行中的进程
+仍持有旧的 `get_macro_monthly` 模块 → 代码同步到采集端后**必须重启 market-scheduler 进程**
+才生效，光改文件下次跑批不会变。重启会一并激活本地与服务器的其他待发版差异，时机由用户定。
+重启后：18:20 宏观月频跑批收紧 7 行 `release_time` → 18:45 市场状态计算重算
+`indicator_value`（近 45 天增量窗口）→ stock-realtime 侧 `regime_indicator` 版本前进自动重绘。
+
+**已知限制（不变）**：仍是「首次观测」代理真实发布日，不是官方发布日程；源提前放表会
+标早（30 天下界兜底），采集断供会标晚（≤ 45 天估算）。若要逐期真值，须接官方发布日程
+（次月 9 日 09:30 + 节假日顺延），属独立 workstream。`revision` 全表为 0 的历史修订
+缺口另见 §7.21b。
 
 ---
 

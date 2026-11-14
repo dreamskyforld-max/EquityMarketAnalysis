@@ -323,6 +323,13 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     ("一致预期快照", "get_analyst_forecast.py",
      {"hour": 18, "minute": 40, "day_of_week": "mon-fri"}, None, True, None, 600),
 
+    # 申万一级行业成分主数据（PIT 版本链）：18:05，早于 18:50 的行业配置计算层。
+    # ⚠ 必须**每交易日**跑：源只给当前成分 + 计入日期、无剔除记录，
+    #    eff_to 只能靠逐日快照对比累积（阶段 0 探测结论），漏采一天即永久断链。
+    #    31 次 AKShare 调用实测 ~10s；清单塌陷时脚本自带质量闸门拒绝写库。
+    ("行业成分主数据", "get_sector_constituent.py",
+     {"hour": 18, "minute": 5, "day_of_week": "mon-fri"}, None, True, None, 600),
+
     # 申万一级行业指数增量更新：18:10（早于 18:45 计算层，行业层指标当日可用）。
     # 注：调度器在进程内调 run(codes, ctx=...)，不传命令行参数 →
     #     backfill_sw_industry.run 的 incremental 默认为 True（只 upsert 尾部，避免每日写 20 万行）。

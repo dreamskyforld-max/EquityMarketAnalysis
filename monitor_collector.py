@@ -256,6 +256,7 @@ _SEED_TABLE_CONFIG = [
 # 只有连续 ≥1.5 天没跑（如任务被 OOM 杀掉、timer 失效）才告警。
 _SEED_TASK_CONFIG = [
     ("全量画像计算", 1440, "compute-profile.timer 每日 17:30（独立 systemd 单元）"),
+    ("行业配置计算", 1440, "sector-layer.timer 工作日 18:50（独立 systemd 单元，第④层）"),
 ]
 
 
@@ -331,6 +332,22 @@ _REGIME_TABLE_CONFIG = [
      "market_state_daily（逐行业横截面，18:45 计算层写入）", True),
     ("regime", "sector_valuation_snapshot", "updated_at", "day", 1, 0,
      "get_sector_valuation（行业估值快照，18:15；源无历史，漏采即永久缺失）", True),
+    # 第④层行业配置计算层（sector_layer.py，sector-layer.timer 工作日 18:50）
+    ("regime", "sector_indicator_dict", "updated_at", "lowfreq", 30, 0,
+     "sector_layer（行业指标字典，每次运行幂等 upsert）", True),
+    ("regime", "sector_indicator_value", "trade_date", "day", 1, 0,
+     "sector_layer（第④层 L1 原子指标，18:50；按 trade_date 判新鲜度）", True),
+    ("regime", "sector_score_daily", "trade_date", "day", 1, 0,
+     "sector_layer（第④层 L2 维度读数，18:50）", True),
+    ("regime", "sector_biz_daily", "trade_date", "day", 1, 0,
+     "sector_layer（第④层 L3 业务读数，18:50；增量默认回退 3 天自愈）", True),
+    # 第④层阶段 2 行业成分主数据（get_sector_constituent.py，交易日 18:05）。
+    # ⚠ 两表都是**事件驱动**：成分无变更的日子不写新行，用 day/1 会天天误报。
+    #    表级用 lowfreq/7 兜底；采集是否停摆由调度器的 collection_task_log 判。
+    ("regime", "sector_constituent", "created_at", "lowfreq", 7, 0,
+     "get_sector_constituent（PIT 版本链，18:05；事件驱动，无变更日不写）", True),
+    ("regime", "sector_constituent_change", "created_at", "lowfreq", 7, 0,
+     "get_sector_constituent（成分变更日志，18:05；事件驱动）", True),
     ("public", "trading_calendar", "updated_at", "lowfreq", 7, 0,
      "init_trading_calendar（年度追加 + 日增量）", True),
 ]
@@ -402,6 +419,13 @@ _CN_MONITOR_TABLES = {
     ("regime", "sector_mapping"),
     ("regime", "sector_daily"),
     ("regime", "sector_valuation_snapshot"),
+    # 第④层行业配置：阶段 1/2 均仅 CN 申万一级，按 A 股日历判停滞
+    ("regime", "sector_indicator_dict"),
+    ("regime", "sector_indicator_value"),
+    ("regime", "sector_score_daily"),
+    ("regime", "sector_biz_daily"),
+    ("regime", "sector_constituent"),
+    ("regime", "sector_constituent_change"),
 }
 
 

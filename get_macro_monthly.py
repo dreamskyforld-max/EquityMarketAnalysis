@@ -964,14 +964,23 @@ def _collect_one(defn: dict, cache: dict) -> list:
 
 
 def _build_derived(conn) -> list:
-    """派生序列：从库里已入库的原始序列做差（同 period_date 对齐）。"""
+    """派生序列：从库里已入库的原始序列做差（同 period_date 对齐）。
+
+    PIT：做差只有在**两条输入都可得**之后才成立，故 release_time = max(两条输入的
+    release_time)（2026-11-13 起）。此前硬编码 `period+45d`：上游 CPI/PPI 按首次
+    观测收紧后，剪刀差会仍钉在 11-15 → 通胀页出现「CPI/PPI 是 10 月值、剪刀差是
+    9 月值」的错配。本函数在 `upsert_macro_series(all_rows)` 之后执行，读到的正是
+    收紧后的输入。输入缺 release_time 时回退原估算（保守，不前视）。
+    """
     import pandas as pd
     rows = []
     for d in DERIVED:
         a, b = d["expr"]
         df = read_sql(
             conn,
-            """SELECT a.period_date, a.value - b.value AS v
+            """SELECT a.period_date, a.value - b.value AS v,
+                      CASE WHEN a.release_time IS NULL OR b.release_time IS NULL THEN NULL
+                           ELSE GREATEST(a.release_time, b.release_time) END AS rel
                FROM regime.macro_series a JOIN regime.macro_series b
                  ON a.period_date = b.period_date AND a.revision=0 AND b.revision=0
                WHERE a.series_code=%s AND b.series_code=%s ORDER BY 1""",
@@ -980,19 +989,123 @@ def _build_derived(conn) -> list:
             if r["v"] is None or pd.isna(r["v"]):
                 continue
             dd = r["period_date"]
+            rel = r["rel"]
+            if rel is None or pd.isna(rel):
+                rel = datetime.datetime.combine(dd + datetime.timedelta(days=45),
+                                                datetime.time(18, 0), tzinfo=TZ_CN)
+                basis = "period+45d"
+            else:
+                rel = rel.to_pydatetime() if hasattr(rel, "to_pydatetime") else rel
+                basis = "max(inputs)"
             rows.append({
                 "series_code": d["code"], "series_name": d["name"], "period_date": dd,
                 "value": round(float(r["v"]), 4), "unit": d["unit"], "freq": d["freq"],
                 "market": "CN", "source": "derived:get_macro_monthly",
-                "release_time": datetime.datetime.combine(dd + datetime.timedelta(days=45),
-                                                          datetime.time(18, 0), tzinfo=TZ_CN),
+                "release_time": rel,
                 "lag_days": d.get("lag", 45), "collect_params": {"expr": f"{a} - {b}"},
                 "remark": d.get("remark"),
-                "revision": 0, "extra": {"release_basis": "period+45d"},
+                "revision": 0, "extra": {"release_basis": basis},
                 "updated_at": datetime.datetime.now(TZ_CN),
             })
         print(f"    · {d['code']}: {len(rows)} 条累计（派生）")
     return rows
+
+
+# ── PIT 收紧：用「首次观测时间」补 period+lag 估算的过度保守（2026-11-13）──────
+# 背景：源无发布时间列时 _mk_row 用 `period+lag` 兜底（月 45 / 季 100~110 天），这是覆盖
+# 最坏情况的**保守上界**，正常月会白等若干天。实测 10 月 CPI 在 2026-11-09（period+39d）
+# 已被 akshare 抓到并入库，估算却钉在 11-15（period+45d）→ 指标层白等 6 天。
+# 采集是每工作日 18:20 全量跑批，故 `created_at`（首次 INSERT，bulk_upsert 不覆盖）是
+# 另一个上界：源上出现了才抓得到，真实发布 ≤ 它。两者取 min 只收紧、不前视。
+#
+# ⚠ 不能无条件用 created_at：历史 224 条是 2026-09-30 一次性回灌的，与发布日无关。但那些
+#   行的 `period+lag` 更早，min 会自然取回估算值 → **无需判断是否回灌**，重建库全量灌入
+#   时同样成立（created_at 全为 today，历史 period 的估算仍更早）。
+# ⚠ release_time 每天被全量 upsert 覆盖（skip_null_updates=True），故本函数每次跑批都要
+#   重算；first_seen_at 显式落 extra 保证重算结果逐字一致，不依赖审计列的偶然行为。
+# ⚠ 白名单口径：**源上「出现」即代表官方已发布**（akshare 抓的是已发布的统计表）。
+#   不纳入的序列（扩充前必须先核对「首次抓到 ≥ 官方发布日」）：
+#     · OECD CLI（CN.CLI / GLOBAL.CLI_*）：源会给预估/未定稿值，文档 §7.18 与
+#       tests/test_macro_oecd.py 把「≥ period+45d」作为防前视不变量钉死；
+#     · NBS 发电量等（CN.POWER_GEN_YOY）：实测次月中旬发布，45 天口径贴合，测试同样钉死；
+#     · 其余序列暂无真实发布日基准，保持原估算。
+# 【2026-11-14 扩充】货币与信用 7 条月频金融统计：央行《金融统计数据报告》于次月
+#   10~15 日发布，akshare / PBC 直连抓到的都是**已发布**统计表，符合白名单口径。
+#   修复的实测问题：2026-10 的 M1/M2/社融 11-13 21:56 已入库，release_time 却钉在
+#   period+45d = 11-15 18:00 → 宏观环境页「货币与信用」在 11-14 仍用 9 月值判立场
+#   （结论「货币紧缩 · 信用紧缩」与央行「适度宽松」明显冲突）。收紧到首次观测即可。
+#   ⚠ CN.M1_M2_SCISSOR 是派生序列，_build_derived 已用 max(输入 release_time) 自动跟随，
+#     不在此列（它的 basis 是 max(inputs) / period+45d 回退，cand 过滤会跳过）。
+_PIT_FIRST_SEEN_CODES = frozenset({
+    "CN.CPI_YOY", "CN.CPI_MOM", "CN.PPI_YOY", "CN.CORE_CPI_YOY",
+    "CN.M1_YOY", "CN.M2_YOY", "CN.M0_YOY", "CN.NEW_LOAN",
+    "CN.TSF_STOCK", "CN.TSF_STOCK_YOY", "CN.TSF_FLOW_M",
+})
+_PIT_MIN_LAG = {"month": 30, "quarter": 90}   # 首次观测的最小合理滞后（防源提前放表）
+
+
+def _pit_first_seen_map(conn):
+    """{key: (created_at, extra.first_seen_at)} —— 只含「首次观测早于估算时点」的行。
+
+    SQL 双边界把事实表压到实时采集期的几十行：下界 period+30 天（排除异常早的
+    created_at / 脏数据），上界 period+lag_days 18:00（即现有估算时点，早于它才有收紧空间）。
+    历史回灌行 created_at 远晚于其上界 → 不返回 → 保持估算，历史 PIT 零变化。
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT s.series_code, s.period_date, s.revision, s.created_at,
+                   s.extra->>'first_seen_at'
+            FROM regime.macro_series s
+            JOIN regime.macro_series_meta m ON m.series_code = s.series_code
+            WHERE s.revision = 0
+              AND s.created_at IS NOT NULL
+              AND m.lag_days IS NOT NULL
+              AND s.series_code = ANY(%s)
+              AND s.created_at >= ((s.period_date + INTERVAL '30 days')
+                                   AT TIME ZONE 'Asia/Shanghai')
+              AND s.created_at <  ((s.period_date + (m.lag_days * INTERVAL '1 day')
+                                   + TIME '18:00') AT TIME ZONE 'Asia/Shanghai')
+        """, (list(_PIT_FIRST_SEEN_CODES),))
+        return {(c, p, v): (ca, fs) for c, p, v, ca, fs in cur.fetchall()}
+
+
+def _tighten_release_time(conn, rows, now=None):
+    """把白名单内「period+lag 估算」的 release_time 用首次观测时间收紧。
+
+    返回 (changes, n_cand)：changes = [(code, period, 旧 release_time, 新 release_time)]，
+    供 dry-run 审计 —— 正常只应出现实时采集期的少量月度点，历史回灌行一条都不该有。
+    """
+    now = now or datetime.datetime.now(TZ_CN)
+    cand = [r for r in rows
+            if r.get("series_code") in _PIT_FIRST_SEEN_CODES
+            and str((r.get("extra") or {}).get("release_basis") or "").startswith("period+")]
+    if not cand:
+        return [], 0
+    seen = _pit_first_seen_map(conn)
+    changes = []
+    for r in cand:
+        k = (r["series_code"], r["period_date"], r.get("revision") or 0)
+        ca, fs = seen.get(k, (None, None))
+        if fs:
+            first_seen = datetime.datetime.fromisoformat(fs)
+        elif ca is not None:
+            first_seen = ca
+        else:
+            first_seen = now            # 本轮首次抓到：created_at 尚未落库
+        est = r["release_time"]
+        min_lag = _PIT_MIN_LAG.get(r.get("freq") or "month", 30)
+        floor = datetime.datetime.combine(
+            r["period_date"] + datetime.timedelta(days=min_lag),
+            datetime.time(0, 0), tzinfo=TZ_CN)
+        if not (floor <= first_seen < est):
+            continue
+        ex = dict(r.get("extra") or {})
+        r["release_time"] = first_seen
+        ex["release_basis"] = f"min(first_seen, {ex['release_basis']})"
+        ex["first_seen_at"] = first_seen.isoformat()
+        r["extra"] = ex
+        changes.append((r["series_code"], r["period_date"], est, first_seen))
+    return changes, len(cand)
 
 
 def _dedupe(rows: list) -> list:
@@ -1073,8 +1186,16 @@ def run(codes=None, ctx=None, dry_run: bool = False):
     print(f"  原始合计 {before} 条 → 去重后 {len(all_rows)} 条")
 
     with get_conn() as conn:
+        # PIT 收紧：必须在 upsert 之前（release_time 每天被全量覆盖，故每轮重算一次）。
+        # dry-run 也走这一步并打印差异清单，用于确认只有实时采集期的点被改、历史零变化。
+        changes, n_cand = _tighten_release_time(conn, all_rows)
+        print(f"  ── PIT 收紧 ── 白名单候选 {n_cand} 行，本次变化 {len(changes)} 行")
+        for code, d, old, new in changes[:20]:
+            print(f"    · {code} {d}: {old:%Y-%m-%d %H:%M} → {new:%Y-%m-%d %H:%M}")
+        if len(changes) > 20:
+            print(f"    · … 其余 {len(changes) - 20} 行")
         if dry_run:
-            print("  --dry-run：不写库")
+            print("  --dry-run：不写库（派生序列按 max(输入 release_time) 跟随）")
             return len(all_rows)
         upsert_macro_series(conn, all_rows)
         print(f"  ── 派生序列 ──")

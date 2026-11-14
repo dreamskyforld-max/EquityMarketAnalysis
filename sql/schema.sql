@@ -2239,3 +2239,158 @@ CREATE INDEX IF NOT EXISTS idx_force_round_daily_lookup
 COMMENT ON TABLE  force_round_daily      IS '多空力量回合日表（一票一日一行，回合明细在 rounds jsonb）。由 build_force_rounds.py 盘中每分钟一轮 + 17:05 盘后收口兜底生成；四档阈值取 fund_flow_settings.thresholds_json（线上生效口径，与分时图同源）。';
 COMMENT ON COLUMN force_round_daily.rounds IS '回合列表。窗口=股价趋势段（rounds_by_trend，非资金相位切分）。λ_pct=每亿元投入推动的百分点（跨票口径，阈值须按票用自身历史中位数校准）；lq=负方投入÷胜方投入；keep=冲击÷胜方方向最大位移（0~1）；win_side=胜方（ΔP>0 多/+1、<0 空/-1、横盘 0）；ongoing=true 表示盘中未收口，前端显示「进行中」不画结果。';
 COMMENT ON COLUMN force_round_daily.applicable IS '适用性：近 20 个已落库交易日回合数合计 ≥20。大盘股/ETF 资金流分散、无回合结构（SH.600941/SH.520900 恒为 false），不得输出博弈结论。';
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 21~24. 第④层 行业配置（阶段 1，sector_layer.py）
+--     生产：sector_layer.py（独立 systemd oneshot + sector-layer.timer，工作日 18:50；
+--           ⚠ 不得挂进 market_scheduler —— 资源规范 R4/R5）
+--     输入：regime.sector_daily / sector_valuation_snapshot / sector_fund_flow
+--     口径：doc/industry_allocation_feasibility.md（§3 指标体系 / §4.2 阶段 1）
+--     ⚠ 实体键含 (market, classification)：CN 与 HK 物理分行，禁止混合排名/混合分位。
+--     ⚠ 输出只作状态度量与风险闸门，**不含超配/低配建议**（主报告 §0 判断 1）。
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS regime.sector_indicator_dict (
+    indicator_code  VARCHAR(64)     PRIMARY KEY,
+    indicator_name  VARCHAR(100)    NOT NULL,
+    domain          VARCHAR(24)     NOT NULL,       -- TREND/VAL/FLOW/CROWD/FUND/BREADTH
+    side            VARCHAR(12)     NOT NULL,       -- state=状态侧 / risk=风险侧
+    market_scope    VARCHAR(16)     NOT NULL DEFAULT 'CN',
+    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
+    unit            VARCHAR(16),
+    direction       VARCHAR(12)     NOT NULL,       -- 方向唯一真源，消费端不得二次翻转
+    freq            VARCHAR(8)      NOT NULL DEFAULT 'day',
+    source          VARCHAR(160),
+    formula         TEXT,
+    model_key       VARCHAR(8),                    -- M0~M8，见设计文档 §3.2
+    params          JSONB,
+    params_hash     VARCHAR(16),                   -- 口径变更触发历史重算
+    min_periods     INT             NOT NULL DEFAULT 0,
+    pit_capable     BOOLEAN         NOT NULL DEFAULT TRUE,
+    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
+    remark          TEXT,
+    created_at      TIMESTAMPTZ     DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     DEFAULT NOW()
+);
+COMMENT ON TABLE  regime.sector_indicator_dict IS '第④层行业指标字典（代码即字典：sector_layer.INDICATOR_DEFS 幂等 upsert）。阶段2依赖成分主数据的指标以 is_active=false 登记，避免「字典有、代码无」';
+COMMENT ON COLUMN regime.sector_indicator_dict.direction IS 'high_good/high_risk/neutral；**方向只在此定义一次**，维度合成按 DIMENSION_DEFS.sign 翻转，消费端禁止二次翻转（§7.1）';
+COMMENT ON COLUMN regime.sector_indicator_dict.model_key IS '计算模型编号（设计文档 §3.2）：M1横截面分位 / M2时序分位 / M3相对强度 / M4归一滚动 / M5条件命中 / M6 PIT成分聚合 / M7快照差分 / M8自算指数';
+
+CREATE TABLE IF NOT EXISTS regime.sector_indicator_value (
+    market          VARCHAR(8)      NOT NULL,       -- CN / HK（禁止混合分位）
+    classification  VARCHAR(16)     NOT NULL,       -- SW_L1 / HS_L3
+    sector_code     VARCHAR(20)     NOT NULL,
+    trade_date      DATE            NOT NULL,
+    indicator_code  VARCHAR(64)     NOT NULL,
+    raw_value       NUMERIC(20,6),
+    percentile_xsec NUMERIC(6,2),                   -- M1 当日横截面分位（短历史期主用）
+    percentile_ts   NUMERIC(6,2),                   -- M2 as-of 时序分位（min_periods=250）
+    n_sample        INT,
+    coverage        NUMERIC(5,4),
+    quality         VARCHAR(16),                    -- ok / short_sample / unavailable
+    model_version   VARCHAR(16),                    -- = sector_indicator_dict.params_hash
+    extra           JSONB,                          -- rank_n / pit_capable / label / crowd k
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (market, classification, sector_code, trade_date, indicator_code)
+);
+CREATE INDEX IF NOT EXISTS idx_sector_iv_code_date
+    ON regime.sector_indicator_value (indicator_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_sector_iv_date
+    ON regime.sector_indicator_value (trade_date DESC);
+COMMENT ON TABLE  regime.sector_indicator_value IS '第④层 L1 原子指标（行业×日×指标）。横截面分位与时序分位分列存放：阶段1估值/资金流仅27个快照日 << min_periods=250，时序分位一律 NULL 并写 n_sample，禁止用短样本分位填充';
+COMMENT ON COLUMN regime.sector_indicator_value.extra IS 'rank_n=当日有效行业数（实测 16→28→31 时变）；pit_capable=false 的历史段含幸存者偏差；crowd k/partial 记录拥挤度实际参与因子数';
+
+CREATE TABLE IF NOT EXISTS regime.sector_score_daily (
+    market          VARCHAR(8)      NOT NULL,
+    classification  VARCHAR(16)     NOT NULL,
+    sector_code     VARCHAR(20)     NOT NULL,
+    trade_date      DATE            NOT NULL,
+    dimension_code  VARCHAR(24)     NOT NULL,
+    side            VARCHAR(12)     NOT NULL,
+    score           NUMERIC(6,2),                   -- 0-100；规则判定/未启用维度恒 NULL
+    coverage        NUMERIC(5,4),
+    dispersion      NUMERIC(6,2),
+    confidence      VARCHAR(12),                   -- normal / low
+    members_used    JSONB,
+    params_hash     VARCHAR(16),
+    extra           JSONB,                          -- structure / anchor / crowd_gate / k
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (market, classification, sector_code, trade_date, dimension_code)
+);
+CREATE INDEX IF NOT EXISTS idx_sector_score_date
+    ON regime.sector_score_daily (trade_date DESC);
+COMMENT ON TABLE  regime.sector_score_daily IS '第④层 L2 维度读数（六维）。成员 <4 时按 §7.2 走「单锚」而非扁平等权（等权会让单成员 33% 超过 25% 上限）；CROWDING 走规则判定 score 恒 NULL，档位在 extra.crowd_gate；FUNDAMENTAL/BREADTH 阶段1 未启用';
+
+CREATE TABLE IF NOT EXISTS regime.sector_biz_daily (
+    market          VARCHAR(8)      NOT NULL,
+    classification  VARCHAR(16)     NOT NULL,
+    sector_code     VARCHAR(20)     NOT NULL,
+    trade_date      DATE            NOT NULL,
+    state_side      NUMERIC(6,2),                   -- 状态侧（阶段1 = TREND + FLOW 均值）
+    risk_side       NUMERIC(6,2),                   -- 风险侧（阶段1 = VALUATION）
+    quadrant        VARCHAR(24),                   -- 2×2 状态矩阵；**名称只描述当前状态**
+    rank_no         INT,                            -- 当日同一 (market,classification) 内排名
+    rank_n          INT,
+    coverage        NUMERIC(5,4),                   -- 可用维度/当期已启用维度（阶段2 分母变化=口径断点）
+    gate_flags      JSONB,                          -- DATA_COVERAGE/SHORT_SAMPLE/BREAK/CROWDING/PARTIAL_STATE
+    applicable      BOOLEAN         NOT NULL DEFAULT FALSE,
+    confidence      VARCHAR(12),
+    params_hash     VARCHAR(16),
+    extra           JSONB,                          -- state_members / partial / crowd_k / rank_n
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (market, classification, sector_code, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_sector_biz_date
+    ON regime.sector_biz_daily (trade_date DESC);
+COMMENT ON TABLE  regime.sector_biz_daily IS '第④层 L3 业务读数：状态侧/风险侧分离，**不产出单一综合分**（§7.2 异质信息扁平平均只产生权重幻觉）；排序仅为当日横截面状态描述，未完成前瞻 IC 验证前不得升格为配置建议';
+COMMENT ON COLUMN regime.sector_biz_daily.quadrant IS '强势·未拥挤 / 强势·偏贵拥挤 / 冷门·未拥挤 / 弱势·偏贵拥挤 / NA。**只描述当前状态，不含超配/低配/买卖含义**';
+COMMENT ON COLUMN regime.sector_biz_daily.applicable IS '近20交易日有效读数≥15日 且 coverage≥0.6 且无 DATA_COVERAGE 闸门。false 时前端只提示数据不足，不显示排名与象限';
+COMMENT ON COLUMN regime.sector_biz_daily.rank_no IS 'applicable=true 才出排名；按 state_side 降序、method=min。⚠ 不同 market/classification 之间绝不合并排名';
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 25~26. 第④层 行业成分主数据（阶段 2，PIT 版本链）
+--     生产：get_sector_constituent.py（market_scheduler 交易日 18:05，早于 18:50 计算层）
+--     源  ：AKShare index_component_sw（申万官方指数详情，31 个一级行业 × 5 列）
+--     口径：doc/industry_allocation_feasibility.md §2.2.1 / §4.2 阶段 2
+--     ⚠ 决策 A：自下而上指标有效起点限 **2021-12-13**（申万 2021 版分类启用日）。
+--       源只有「计入日期」**没有剔除记录**，eff_to 只能靠逐日快照对比累积；
+--       更早历史不得用当前成分回算后声称 PIT。
+--     ⚠ 决策 B：权重只落本表，**不回写 public.stock_sector**（后者是证监会/富途分类，
+--       口径不同且无生效日，混写会造成不同分类的权重同列）。
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS regime.sector_constituent (
+    market          VARCHAR(8)      NOT NULL DEFAULT 'CN',
+    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
+    sector_code     VARCHAR(20)     NOT NULL,       -- 申万一级代码，如 801010
+    stock_code      VARCHAR(20)     NOT NULL,       -- 项目格式 SH./SZ./BJ. + 6 位
+    eff_from        DATE            NOT NULL,       -- = max(计入日期, 2021-12-13)
+    eff_to          DATE,                           -- NULL = 至今；由后续快照关闭
+    weight          NUMERIC(8,4),                   -- 百分数（源原值，单行业合计≈100）
+    source          VARCHAR(64)     NOT NULL DEFAULT 'akshare:index_component_sw',
+    created_at      TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (market, classification, sector_code, stock_code, eff_from)
+);
+CREATE INDEX IF NOT EXISTS idx_sector_const_stock
+    ON regime.sector_constituent (stock_code, eff_from, eff_to);
+CREATE INDEX IF NOT EXISTS idx_sector_const_active
+    ON regime.sector_constituent (sector_code, eff_to);
+COMMENT ON TABLE  regime.sector_constituent IS '第④层行业成分主数据 PIT 版本链（阶段2）。每交易日快照与 active 行对比生成 ADD/REMOVE/WEIGHT 变更；eff_from 最小 2021-12-13，eff_to 由后续快照关闭。⚠ 无历史剔除记录，2021-12-13 前的成分不可还原';
+COMMENT ON COLUMN regime.sector_constituent.eff_from IS '生效日 = max(源计入日期, 2021-12-13)；PIT 取用条件 trade_date >= eff_from AND (eff_to IS NULL OR trade_date < eff_to)';
+COMMENT ON COLUMN regime.sector_constituent.weight IS '申万指数成分权重，**百分数**（如 8.72 = 8.72%，单行业合计≈100，不是 0~1 小数）；权重变化 ≥0.01 个百分点才关旧开新，微小波动只更新当前行';
+
+CREATE TABLE IF NOT EXISTS regime.sector_constituent_change (
+    id              BIGSERIAL       PRIMARY KEY,
+    snapshot_date   DATE            NOT NULL,
+    market          VARCHAR(8)      NOT NULL DEFAULT 'CN',
+    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
+    sector_code     VARCHAR(20)     NOT NULL,
+    stock_code      VARCHAR(20)     NOT NULL,
+    change_type     VARCHAR(12)     NOT NULL,       -- ADD / REMOVE / WEIGHT
+    old_weight      NUMERIC(8,4),
+    new_weight      NUMERIC(8,4),
+    eff_from        DATE,
+    created_at      TIMESTAMPTZ     DEFAULT NOW(),
+    UNIQUE (snapshot_date, market, classification, sector_code, stock_code, change_type)
+);
+CREATE INDEX IF NOT EXISTS idx_sector_const_change_date
+    ON regime.sector_constituent_change (snapshot_date DESC);
+COMMENT ON TABLE regime.sector_constituent_change IS '行业成分变更日志（逐日快照审计）：ADD/REMOVE/WEIGHT 三类，可据此重建任意历史截面。⚠ 只在首次采到之后才逐步累积，不是历史回填产物';

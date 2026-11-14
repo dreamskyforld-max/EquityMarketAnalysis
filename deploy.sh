@@ -41,7 +41,7 @@ ROOT_HOST="106.55.42.60"                          # 生产服务器 IP
 APP_DIR="/home/mkt/EquityMarketAnalysis"          # 服务器代码目录
 SERVICES=(market-scheduler ticker-collector monitor-collector wecom-collector-a)
 # 定时单元（非常驻：不随 restart 重启，由 systemd 排期；改 unit 后 ./deploy.sh up 会重载）
-TIMERS=(compute-profile.timer)
+TIMERS=(compute-profile.timer sector-layer.timer)
 RSYNC_SSH="ssh -i $SYNC_KEY -o IdentitiesOnly=yes -o ConnectTimeout=15"
 
 # rsync 排除清单 = 保护服务器侧产物 + 过滤本地垃圾。
