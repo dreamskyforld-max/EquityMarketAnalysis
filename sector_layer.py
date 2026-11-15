@@ -778,8 +778,11 @@ def sync_dict(conn) -> int:
                  min_periods=MIN_PERIODS if d["model_key"] == "M2" else 0,
                  pit_capable=True, is_active=d["is_active"], remark=d["remark"],
                  updated_at=dt.datetime.now().astimezone()) for d in INDICATOR_DEFS]
+    # 阶段 3：字典主键扩为 (market_scope, classification, indicator_code)，
+    # 冲突键必须同步带上市场与分类，否则 ON CONFLICT 匹配不到唯一约束直接报错。
+    # 只改冲突键，不改任何指标口径 → CN 读数与 params_hash 逐值不变。
     bulk_upsert(conn, "regime.sector_indicator_dict", _clean_rows(rows),
-                conflict_cols=["indicator_code"])
+                conflict_cols=["market_scope", "classification", "indicator_code"])
     conn.commit()
     return len(rows)
 

@@ -257,6 +257,7 @@ _SEED_TABLE_CONFIG = [
 _SEED_TASK_CONFIG = [
     ("全量画像计算", 1440, "compute-profile.timer 每日 17:30（独立 systemd 单元）"),
     ("行业配置计算", 1440, "sector-layer.timer 工作日 18:50（独立 systemd 单元，第④层）"),
+    ("行业配置计算HK", 1440, "sector-layer-hk.timer 工作日 19:05（独立 systemd 单元，第④层阶段3）"),
 ]
 
 
@@ -348,6 +349,10 @@ _REGIME_TABLE_CONFIG = [
      "get_sector_constituent（PIT 版本链，18:05；事件驱动，无变更日不写）", True),
     ("regime", "sector_constituent_change", "created_at", "lowfreq", 7, 0,
      "get_sector_constituent（成分变更日志，18:05；事件驱动）", True),
+    # 第④层阶段 3 / D4：HK 行业日聚合与自算指数（sector-layer-hk.timer 工作日 19:05）。
+    # ⚠ 按 trade_date 判新鲜度；CN/HK 输出共用 4 张表，表级监控按 CN 日历（见下方已知残差）。
+    ("regime", "hk_sector_index_daily", "trade_date", "day", 1, 0,
+     "hk_sector_index（阶段3 自算行业指数，19:05；按 trade_date 判新鲜度）", True),
     ("public", "trading_calendar", "updated_at", "lowfreq", 7, 0,
      "init_trading_calendar（年度追加 + 日增量）", True),
 ]
@@ -419,7 +424,11 @@ _CN_MONITOR_TABLES = {
     ("regime", "sector_mapping"),
     ("regime", "sector_daily"),
     ("regime", "sector_valuation_snapshot"),
-    # 第④层行业配置：阶段 1/2 均仅 CN 申万一级，按 A 股日历判停滞
+    # 第④层行业配置：阶段 1/2 均仅 CN 申万一级，按 A 股日历判停滞。
+    # ⚠ 阶段 3 已知残差（2026-11-14 决策「沿用现有 4 表」）：HK / HS_L3 行写入
+    #   同一张表，表级 MAX(trade_date) 仍按 CN 日历。港股独家交易日可能晚一日，
+    #   最多产生 1 天 lag 的边界告警；任务是否真停摆以 collection_task_log 的
+    #   「行业配置计算HK」埋点为准。不新建 HK 专用表即可避免重复告警配置。
     ("regime", "sector_indicator_dict"),
     ("regime", "sector_indicator_value"),
     ("regime", "sector_score_daily"),

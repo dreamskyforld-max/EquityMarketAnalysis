@@ -1226,13 +1226,15 @@ CREATE TABLE IF NOT EXISTS sector_hierarchy (
     parent_code   VARCHAR(30)   NOT NULL,        -- 一级部门 code（GICS：ENERGY/MATERIALS/...）
     parent_name   VARCHAR(50),                    -- 一级部门中文名（如 能源/金融）
     sector_type   VARCHAR(20)   DEFAULT 'INDUSTRY',
+    as_of         DATE,                           -- 本次映射快照归属日（阶段3 D4；不是 PIT 生效日）
     updated_at    TIMESTAMPTZ   DEFAULT NOW(),
     PRIMARY KEY (sector_code)
 );
 
-COMMENT ON TABLE  sector_hierarchy              IS '行业层级映射：富途细粒度 INDUSTRY → GICS 一级部门（参考数据，低频刷新）';
+COMMENT ON TABLE  sector_hierarchy              IS '行业层级映射：富途细粒度 INDUSTRY → GICS 一级部门（参考数据，低频刷新）；阶段3 起由 market_scheduler 每周二 18:30 刷新并写 as_of';
 COMMENT ON COLUMN sector_hierarchy.parent_code  IS '一级部门 code：GICS 11 部门 + CONGLOMERATES(综合企业) + OTHER(兜底)';
 COMMENT ON COLUMN sector_hierarchy.parent_name  IS '一级部门中文名';
+COMMENT ON COLUMN sector_hierarchy.as_of        IS '映射快照归属日（build_sector_hierarchy 每次运行写当天）。⚠ 只标快照日，不是 PIT 版本链；GICS 仅作展示层标签，不作行业配置计算口径（阶段3 用 HS_L3 113 行业）';
 
 -- 3.4 个股-基准相关性（benchmark_correlation_daily.py）
 CREATE TABLE IF NOT EXISTS benchmark_correlation (
@@ -2250,7 +2252,7 @@ COMMENT ON COLUMN force_round_daily.applicable IS '适用性：近 20 个已落�
 --     ⚠ 输出只作状态度量与风险闸门，**不含超配/低配建议**（主报告 §0 判断 1）。
 -- ═══════════════════════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS regime.sector_indicator_dict (
-    indicator_code  VARCHAR(64)     PRIMARY KEY,
+    indicator_code  VARCHAR(64)     NOT NULL,
     indicator_name  VARCHAR(100)    NOT NULL,
     domain          VARCHAR(24)     NOT NULL,       -- TREND/VAL/FLOW/CROWD/FUND/BREADTH
     side            VARCHAR(12)     NOT NULL,       -- state=状态侧 / risk=风险侧
@@ -2269,9 +2271,11 @@ CREATE TABLE IF NOT EXISTS regime.sector_indicator_dict (
     is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
     remark          TEXT,
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ     DEFAULT NOW()
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+    -- 阶段 3：CN / HK 共用同一套指标 code，字典按市场+分类隔离，避免 HK 覆盖 CN 行
+    PRIMARY KEY (market_scope, classification, indicator_code)
 );
-COMMENT ON TABLE  regime.sector_indicator_dict IS '第④层行业指标字典（代码即字典：sector_layer.INDICATOR_DEFS 幂等 upsert）。阶段2依赖成分主数据的指标以 is_active=false 登记，避免「字典有、代码无」';
+COMMENT ON TABLE  regime.sector_indicator_dict IS '第④层行业指标字典（代码即字典：sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS 幂等 upsert）。⚠ 阶段3 起主键含 market_scope+classification：CN(SW_L1) 与 HK(HS_L3) 同名指标各占一行，冲突键必须带这两个字段';
 COMMENT ON COLUMN regime.sector_indicator_dict.direction IS 'high_good/high_risk/neutral；**方向只在此定义一次**，维度合成按 DIMENSION_DEFS.sign 翻转，消费端禁止二次翻转（§7.1）';
 COMMENT ON COLUMN regime.sector_indicator_dict.model_key IS '计算模型编号（设计文档 §3.2）：M1横截面分位 / M2时序分位 / M3相对强度 / M4归一滚动 / M5条件命中 / M6 PIT成分聚合 / M7快照差分 / M8自算指数';
 
@@ -2394,3 +2398,51 @@ CREATE TABLE IF NOT EXISTS regime.sector_constituent_change (
 CREATE INDEX IF NOT EXISTS idx_sector_const_change_date
     ON regime.sector_constituent_change (snapshot_date DESC);
 COMMENT ON TABLE regime.sector_constituent_change IS '行业成分变更日志（逐日快照审计）：ADD/REMOVE/WEIGHT 三类，可据此重建任意历史截面。⚠ 只在首次采到之后才逐步累积，不是历史回填产物';
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 27. 第④层 港股行业层数据底座（阶段 3 / D4，hk_sector_index.py）
+--     生产：sector_layer_hk.py → hk_sector_index.build_index_daily()
+--           （独立 systemd sector-layer-hk.timer，工作日 19:05；不挂 market_scheduler）
+--     源  ：hk_daily_quote × stock_sector(INDUSTRY, HK.LIST*, 113 个恒生三级行业)
+--           + daily_ggt_hold（南向 est_net_inflow，2026-04-20 起仅 136 个交易日）
+--     口径：doc/industry_allocation_feasibility.md §2.2 D4 / §3.2 M8 / §4.2 阶段 3
+--     ⚠ 与 CN 的 31 个申万一级官方指数**不同构**（113 vs 31，粒度细 3.6 倍），
+--       只各自看分位，禁止跨市场混合排名 / 混合分位。
+--     ⚠ M8 口径变更（2026-11-14 实测）：hk_daily_quote.circular_market_val
+--       2000-2023 全空、2024-05-14 起仅 65 个交易日有值 → 加权版改用
+--       total_market_val（2002 起覆盖率 97%+）；等权版 2000-01-03 起。
+--     ⚠ 成分只有 stock_sector 当前快照（无 PIT / 无生效日）→ 所有自下而上
+--       聚合含幸存者偏差，消费端必须透出 pit_capable=false / confidence=low。
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS regime.hk_sector_index_daily (
+    trade_date      DATE            NOT NULL,
+    sector_code     VARCHAR(20)     NOT NULL,       -- HK.LIST1019 等恒生三级行业
+    sector_name     VARCHAR(100),
+    ret_eq          NUMERIC(12,6),                 -- 等权日收益（%）= avg(成分 change_pct)
+    ret_cap         NUMERIC(12,6),                 -- 总市值加权日收益（%）= Σ(change_pct×tmv)/Σtmv
+    idx_eq          NUMERIC(18,6),                 -- 等权指数点位（基期 1000，全史连续）
+    idx_cap         NUMERIC(18,6),                 -- 总市值加权指数点位
+    amount          NUMERIC(20,2),                 -- 行业成交额（港元，amount>=10万门槛后合计）
+    n_constituent   INT,                           -- 当日有效成分数
+    coverage        NUMERIC(5,4),                  -- 有行情成分数 / 有映射成分数
+    pe_agg          NUMERIC(20,6),                 -- 市值加权调和 PE = Σw/Σ(w/pe)，仅 pe>0
+    pb_agg          NUMERIC(20,6),                 -- 市值加权调和 PB
+    div_yield_agg   NUMERIC(12,4),                 -- 市值加权股息率（%）
+    up_ratio        NUMERIC(8,4),                  -- 成分股收涨占比（%）
+    above_ma60      NUMERIC(8,4),                  -- 成分股 close > MA60 占比（%）
+    new_high_low    NUMERIC(8,4),                  -- 60 日新高−新低归一净占比（−100~100）
+    ret_dispersion  NUMERIC(12,6),                 -- 成分股 20 日收益横截面 std
+    southbound_net  NUMERIC(16,2),                 -- 南向净流入（亿港元，仅 2026-04 起）
+    model_version   VARCHAR(16),
+    created_at      TIMESTAMPTZ     DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (trade_date, sector_code)
+);
+CREATE INDEX IF NOT EXISTS idx_hk_sector_index_code_date
+    ON regime.hk_sector_index_daily (sector_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_hk_sector_index_date
+    ON regime.hk_sector_index_daily (trade_date DESC);
+COMMENT ON TABLE  regime.hk_sector_index_daily IS '第④层 HK 行业日聚合与自算指数（M8 两版并列）。⚠ 成分取 stock_sector 当前快照，非 PIT，历史读数含幸存者偏差；⚠ 113 个恒生三级行业与 CN 31 个申万一级不同构，不得混合分位/排名';
+COMMENT ON COLUMN regime.hk_sector_index_daily.ret_cap IS 'M8 口径变更：文档原文「流通市值加权」，实测 circular_market_val 长期缺失（2024-05 起仅 65 日有值）→ 改用 total_market_val。权重取当日市值（非前收市值），与 market_state_daily 的 HK cap_ret 同源；与 CN 用 circular_market_val 的口径差异已登记';
+COMMENT ON COLUMN regime.hk_sector_index_daily.pe_agg IS '行业估值 = 成分股市值加权调和均值 Σw/Σ(w/pe)（等价「行业总市值 / 行业总盈利」），仅取 pe>0 的成分；不是官方行业指数 PE，与 CN sector_valuation_snapshot 不同构。覆盖成分 <60% 时置 NULL';
+COMMENT ON COLUMN regime.hk_sector_index_daily.southbound_net IS 'daily_ggt_hold.est_net_inflow 按行业求和（亿港元）。⚠ 源 2026-04-20 起仅 136 个交易日、est_ 为估算值、按当前成分回算 → survivorship_bias=true';

@@ -27,10 +27,13 @@
     python3 build_sector_hierarchy.py --dry-run  # 只打印归类统计，不写库
     python3 build_sector_hierarchy.py --list     # 打印每个板块 → 一级部门 的完整映射
 
-常驻调用：run() —— 由 market_scheduler 通过 collector_runtime 调用（低频，每周一次即可）。
+常驻调用：run(codes=None, ctx=None) —— 阶段 3 起由 market_scheduler 在每周二 18:30
+    （get_stock_sector.py 18:00 之后）通过 collector_runtime 调用。
+    ⚠ 本表只作**展示层 GICS 标签**，不是第④层行业配置的计算口径
+    （阶段 3 用 HS_L3 的 113 个恒生三级行业，见 hk_sector_index.py）。
 """
 import sys
-from datetime import datetime
+from datetime import date, datetime
 
 from db import get_conn, bulk_upsert
 
@@ -64,17 +67,20 @@ CREATE TABLE IF NOT EXISTS sector_hierarchy (
     parent_code   VARCHAR(30)   NOT NULL,        -- 一级部门 code（GICS：ENERGY/MATERIALS/...）
     parent_name   VARCHAR(50),                    -- 一级部门中文名（如 能源/金融）
     sector_type   VARCHAR(20)   DEFAULT 'INDUSTRY',
+    as_of         DATE,                           -- 本次映射快照归属日（阶段3 D4；不是 PIT 生效日）
     updated_at    TIMESTAMPTZ   DEFAULT NOW(),
     PRIMARY KEY (sector_code)
 )
 """
 _COMMENTS = [
     ("TABLE", "sector_hierarchy",
-     "行业层级映射：富途细粒度 INDUSTRY → GICS 一级部门（参考数据，低频刷新）"),
+     "行业层级映射：富途细粒度 INDUSTRY → GICS 一级部门（参考数据，低频刷新）；阶段3 起由 market_scheduler 每周二 18:30 刷新并写 as_of"),
     ("COLUMN", "sector_hierarchy.parent_code",
      "一级部门 code：GICS 11 部门 + CONGLOMERATES(综合企业) + OTHER(兜底)"),
     ("COLUMN", "sector_hierarchy.parent_name",
      "一级部门中文名"),
+    ("COLUMN", "sector_hierarchy.as_of",
+     "映射快照归属日（build_sector_hierarchy 每次运行写当天）。⚠ 只标快照日，不是 PIT 版本链；GICS 仅作展示层标签，不作行业配置计算口径（阶段3 用 HS_L3 113 行业）"),
 ]
 
 # ── 映射表：富途板块 code → (parent_code, parent_name) ─────────────────────
@@ -299,6 +305,8 @@ def _ensure_table():
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(_SECTOR_HIERARCHY_SQL)
+            # 阶段 3：存量库没有 as_of 列，CREATE TABLE IF NOT EXISTS 不会补 → 显式幂等 ALTER
+            cur.execute("ALTER TABLE sector_hierarchy ADD COLUMN IF NOT EXISTS as_of DATE")
             cur.execute("SELECT to_regclass('sector_hierarchy')")
             if cur.fetchone():
                 for obj_type, obj_name, comment in _COMMENTS:
@@ -402,14 +410,19 @@ def _build_rows():
             "parent_code": parent_code,
             "parent_name": parent_name,
             "sector_type": "INDUSTRY",
+            "as_of": date.today(),
             "updated_at": datetime.now(),
         })
         stats[parent_code] = stats.get(parent_code, 0) + 1
     return rows, stats
 
 
-def run():
-    """构建入口：建表 + 采集 + 写入 sector_hierarchy。"""
+def run(codes=None, ctx=None):
+    """构建入口：建表 + 采集 + 写入 sector_hierarchy。
+
+    参数签名兼容 collector_runtime.run_module 的 run(codes, ctx=...) 调用；
+    本任务只处理板块级映射（~194 行），忽略 codes。
+    """
     _ensure_table()
     rows, stats = _build_rows()
     if not rows:

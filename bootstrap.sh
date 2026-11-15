@@ -309,6 +309,7 @@ render_services(){
     monitor-collector.service wecom-collector-a.service
     compute-profile.service compute-profile.timer
     sector-layer.service sector-layer.timer
+    sector-layer-hk.service sector-layer-hk.timer
   )
   # 结论层全量重建不注册服务：需要时手动执行 compute_conclusions_rebuild.py --yes
   # （破坏性操作，默认预演；不加入 TIMERS 以免 deploy.sh up 误触发）。
@@ -346,6 +347,10 @@ enable_services(){
   systemctl enable --now sector-layer.timer >/dev/null 2>&1 \
     && log "  sector-layer.timer 已启用（工作日 18:50）" \
     || warn "  sector-layer.timer 启用失败 (日志 journalctl -u sector-layer)"
+  # 第④层阶段 3 HK：同为 oneshot + timer，19:05 与 CN 错峰，service 无 [Install]。
+  systemctl enable --now sector-layer-hk.timer >/dev/null 2>&1 \
+    && log "  sector-layer-hk.timer 已启用（工作日 19:05）" \
+    || warn "  sector-layer-hk.timer 启用失败 (日志 journalctl -u sector-layer-hk)"
   # FutuOpenD 需先手动登录
   if [[ -x "$FUTU_OPEND_DIR/FutuOpenD" ]]; then
     if confirm "FutuOpenD 是否已完成首次登录并启动? (若否则先 cd $FUTU_OPEND_DIR && ./FutuOpenD)"; then

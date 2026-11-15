@@ -146,6 +146,13 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     # 港股指数成分权重（恒生官网 factsheet 解析，每周二 19:00 刷新；
     ("指数成分权重", "get_stock_sector_weight.py", {"day_of_week": 2, "hour": 19, "minute": 0}, None, True, None, 180),
 
+    # 行业层级映射 GICS 展示标签（阶段 3 / D4）：每周二 18:30，紧跟
+    # get_stock_sector.py 18:00 之后取其刚刷新的 INDUSTRY 板块清单，写 sector_hierarchy.as_of。
+    # ⚠ 只作展示层标签，不是第④层 HS_L3 计算口径（hk_sector_index.py 用 113 个 HK.LIST 板块）；
+    #   轻量任务（~194 行映射，不读大表）可挂调度进程，不违反资源规范 R4/R5。
+    ("行业层级映射", "build_sector_hierarchy.py",
+     {"day_of_week": 2, "hour": 18, "minute": 30}, None, True, None, 180),
+
     # 股票 vs 全球指数日收益率相关性分析（读 daily_quote/daily_benchmark 日频数据，
     # 盘后跑即可，盘中重算结果不变；单 job 内循环全部 STOCKS 逐票执行）
     #("指数相关性分析", "benchmark_correlation_daily.py",

@@ -16,13 +16,16 @@
 | 重设后的目标是否可行 | **可行**。主报告 §9.1 判定「行业层数据可得性中低、最大瓶颈」的前提是「中观景气需外采」；而项目现已落地 5 类行业数据（申万一级行业指数长历史、行业估值快照、行业资金流、行业横截面 `sector_daily`、一致预期快照），瓶颈已从「数据有无」转为「**成分主数据 PIT 缺失** + **快照类数据历史深度不足**」。把目标从「给配置建议」改为「给状态读数 + 风险闸门」，即可在不外采、不预测的前提下落地大部分指标。 |
 | 落地的关键约束 | ① 必须先解决「股票→行业」成分主数据与生效日，否则一切自下而上聚合都有幸存者偏差；② 首期标准化以**当日横截面分位**为主，时序分位对快照类数据一律标注 `n_sample` 并降置信，不得用短样本分位冒充；③ CN / HK 必须分表分口径，**不产出跨市场统一排序、不产出单一综合分**；④ 排序有效性未完成前瞻检验前，不得升格为配置建议。 |
 
-**执行状态（2026-11-14）**：**阶段 0 / 1 / 2 已完成**。
+**执行状态（2026-11-14）**：**阶段 0 / 1 / 2 / 3 / 4 已完成**。
 
 - **阶段 0**（只读探测）：`tools/probe_sector_constituent.py` + §2.1 实测盘点 + §2.2.1 决策点。三项结论改变后续设计：① D2 成交额标定**通过**，拥挤度第一因子解禁、无需新表；② D1 完整 PIT 历史**不可得**（官方 Excel HTTP 508，主源仅 2021-12-13 起计入日期且无剔除记录）；③ 一致预期仅 25 个快照日，30 快照窗口尚未满。
 - **阶段 1**：4 张新表 + `sector_layer.py` + 独立 systemd timer + 监控登记 + 39 项测试；全量回填峰值经一次 892MB → 236MB 修复后达标（§4.2 实施记录）。
 - **阶段 2**：`regime.sector_constituent` PIT 版本链（5,222 行 / 31 行业）+ 变更日志 + 交易日 18:05 采集 + `sector_stage2_agg.py` 按月×按股票分批聚合 + 14 个指标激活 + 六维口径 + 三因子拥挤闸门。全量 `pytest` **757 passed / 497 subtests**；峰值经 617MB → 176MB 修复后达标（§4.2 阶段 2 实施记录）。
 - **三项决策已定并落地**：阶段 2 指标起点**限 2021-12-13 起**；权重只落新表 `sector_constituent`、不回写 `stock_sector`；接受 PIT 边界，官方 Excel / 付费源单独立项。
-- **剩余**：阶段 3（HK）、阶段 4（前瞻验证）；全量回填写库与服务器部署由用户择机执行。
+- **阶段 3**（HK）：`tools/probe_hk_sector.py` 只读探测 → `regime.hk_sector_index_daily`（第 27 号表，M8 两版自算指数）+ `sector_hierarchy.as_of` 与周频调度 + `sector_layer_hk.py`（L1/L2/L3）+ 独立 systemd unit/timer（19:05）+ 监控登记 + 35 项测试。与 `SECTOR.UP_RATIO` HK 等权合成 **52 个交易日逐日完全一致（max_abs_diff=0.0）**；全量 `pytest` **792 passed / 709 subtests**；峰值 210.7MB（见 §4.2 阶段 3 实施记录）。
+- **阶段 3 三项用户决策**：① CN/HK **沿用现有 4 张输出表**（字典 PK 扩为 `(market_scope, classification, indicator_code)`）；② M8 加权版改用 `total_market_val`（2002 起）、等权版 2000 起；③ HK 本期只做 A/B/D/F + 南向，**L3 不排名**。
+- **阶段 4**（验证闭环）：`tools/validate_sector.py` 只读工作台 + `doc/sector_validation_report.md` 报告 + 25 项测试。**决策闸门判定「不通过」**：三个前瞻窗口样本外 IC 的 bootstrap 95% 区间全部跨 0、分组单调性不显著 → 排序维持「当前状态描述」、权重维持等权、不得宣称有效（即系统现状）。拥挤闸门有效性 / 快照类时序分位启用 / HK 排序有效性 3 项因数据不足判 `NOT_EVALUABLE`，不拿短样本硬凑结论。全量 `pytest` **见 §4.2 阶段 4 实施记录**；峰值 235.8MB。
+- **剩余**：全量回填写库与服务器部署由用户择机执行；阶段 4 的复跑判定随样本积累持续进行（尤其快照类满 250 观测、EXTREME 满 60 日前瞻窗口之后）。
 
 ---
 
@@ -156,6 +159,27 @@
 3. **A/H 分类口径未统一且不可比**（HK 粒度细 3.6 倍）；
 4. **资金流是行业级快照**，无个股主力资金明细，无法自下而上重算。
 
+#### 港股行业层实测盘点（阶段 3 探测，2026-11-14）
+
+复跑命令：`.venv/bin/python3 tools/probe_hk_sector.py`（只读，不写库 / 不建表 / 不改配置）。
+
+| 项 | 实测 | 对设计的影响 |
+|---|---|---|
+| `stock_sector` 港股 INDUSTRY | 2,771 行 / 2,771 只 / **113** 个 `HK.LIST*` 行业；1 股 1 行业；107 个行业 ≥5 只、88 个 ≥10 只；`weight` 全 NULL | 分类基数定为 113，与 `SECTOR.UP_RATIO` 的 113 恒生三级一致 |
+| `hk_daily_quote` | 2000-01-03 ~ 2026-11-13，6,637 日 / 2,877 只 / 844 万行 | 必须分批取数（R1/R3） |
+| `circular_market_val` / `turnover_rate` | 2000–2023 全 NULL；首次非空均 2024-05-14，且仅 **65 / 75** 个交易日零星有值 | 🔴 推翻 M8 原文的「流通市值加权」与 D 组 `TURNOVER_PCT`：加权版改用 `total_market_val`，拥挤度降为 k=2 部分模式 |
+| `total_market_val` / `pe_ttm` / `pb` | 2002 起覆盖率 97.5%+（PE/PB 95%+） | 加权版与估值聚合起点定 **2002-01-01**；等权版 2000-01-03 起 |
+| `change_pct` vs `close/prev_close−1` | 最近一日 2,230 行中 **0 行**偏差 >0.5 | M8 直接用 `change_pct`，与 `SECTOR.UP_RATIO` 同源（一致性验收前提） |
+| `financial_indicator` 港股 | 2,830 只 / 38,619 行，但 **`announce_date` 全 NULL** | 🔴 E 组财务 PIT（M6）不可套用；一致预期仅 A 股 → HK 本期不做 E 组 |
+| `daily_ggt_hold` | 2026-04-20 起 136 日 / 691 只，其中 686 只可映射行业（99.3%）；`est_net_inflow` 79,682/80,374 非空 | C 组只剩 `SOUTHBOUND_NET`，须标 `survivorship_bias=true` |
+| `sector_hierarchy` | 194 行 / 111 个 HK.LIST，最后更新 2026-08-24 | GICS 只作展示标签、缺 2 个行业；已补 `as_of` + 周二 18:30 调度 |
+| `sector_indicator_dict`（改前） | 41 行全 `CN/SW_L1`，PK 仅 `indicator_code` | HK 复用同名 `SEC.*` code 会覆盖 CN 行 → PK 扩为复合键 |
+
+**三条口径变更（均写进字典 `remark` / 表注释 / `extra`）**：
+① M8 加权列 `circular_market_val` → `total_market_val`（用户决策，2002 起）；
+② HK 全期 `pit_capable=false` / `survivorship_bias=true` / `confidence=low`（成分只有当前快照，无 PIT）；
+③ 113 恒生三级 vs CN 31 申万一级**不同构**，各自看分位、绝不混合排名或混合分位。
+
 ## 2.2 需补采 / 需建设的数据清单
 
 | ID | 数据项 | 落点 | 源与频率 | 为什么必须 | 优先级 |
@@ -163,7 +187,7 @@
 | **D1** | **行业成分主数据（PIT）**：`(market, classification, sector_code, stock_code, eff_from, eff_to, weight, source)` + 变更日志 | 新建 `regime.sector_constituent`（+ `..._change`） | **阶段 0 已定主源**：AKShare `index_component_sw(symbol=<sw_code>)`（申万官方指数详情），31 次调用；返回 `证券代码 / 证券名称 / 最新权重 / 计入日期`，4 个抽测行业权重合计 99.99~100.00%。备选（**均不采为主源**）：`index_stock_cons`（`纳入日期` 含 `1900-01-01` 哨兵值）、`stock_industry_change_cninfo`（逐股查询，仅作增量校验）、东财 `stock_board_industry_name_em`（实测 ConnectionError）、`sw_index_third_cons`（实测列数失配）。完整 PIT 历史源 `stock_industry_clf_hist_sw` **不可用**（本机 SSLError；绕证书直连源站返回 **HTTP 508 / 0 字节**） | 所有自下而上聚合（行业内宽度、离散度、估值离散、换手率、财务聚合、盈利修正下沉）都依赖它；C4 要求「用当时成分股」 | ✅ **阶段 2 已落地**（`get_sector_constituent.py` 交易日 18:05；5,222 行 / 31 行业） |
 | **D2** | ~~行业成交额口径标定 / 必要时新建 `sector_amount_daily`~~ → **已完成，无需建设** | 无新表，仅标定结论 | `regime.sector_daily.turnover` ↔ `a_daily_market_turnover.total_turnover` | 实测 8 日 ratio 0.998088~0.999661 → 单位亿元、完备覆盖全 A；拥挤度第一因子可直接用，§7.11 决策 5 的保守限制在本层解除 | ✅ **阶段 0 关闭** |
 | **D3** | **一致预期快照的持续性与可选补字段**：逐日不可断（监控 `day/1`）；可选 `fy1_net_profit` / `fy1_revenue` / `target_price` | 现有 `regime.analyst_forecast_snapshot` | 东财 `stock_profit_forecast_em`（已落地 18:40） | 无历史序列、漏采一天即永久断档；行业修正宽度需 ≥30 快照且要按 `report_count` 做覆盖度门禁 | **P1**（不新增表，只加监控 + 可选列） |
-| **D4** | **港股行业层基础**：`sector_hierarchy` 补 `as_of` 并挂调度；自算 `regime.hk_sector_index_daily`（等权 + 市值加权两版） | 1 张新表 + 1 个调度 | `hk_daily_quote` × `stock_sector` | HK 无官方行业指数表；自算指数是 HK 侧一切指标的前置；两版并列以标注方法论差异 | **P1 · 阻塞阶段 3** |
+| **D4** | ~~**港股行业层基础**：`sector_hierarchy` 补 `as_of` 并挂调度；自算 `regime.hk_sector_index_daily`（等权 + 市值加权两版）~~ → **已完成（阶段 3）** | 第 27 号表 + 周频调度 + 独立计算 unit | `hk_daily_quote` × `stock_sector` × `daily_ggt_hold` | ✅ 已落地：`tools/probe_hk_sector.py` 实测 113 个 `HK.LIST*` 行业 / 2,771 只股票（1 股 1 行业，107 个行业 ≥5 只）；`sector_hierarchy` 补 `as_of` 并挂周二 18:30；表 27 产出等权(2000 起) + 总市值加权(2002 起) 两版指数与行业日聚合 | ✅ **阶段 3 关闭** |
 | **D5** | **行业估值 / 资金流 / 一致预期的历史深度** | 现有表逐日累积 | 已挂 18:15 / 15:35 / 18:40 | 只能靠时间累积，**越早越好**；断档即永久缺失。若未来采购付费历史源，属独立决策 | **P0（运维纪律，非开发）** |
 
 ### 2.2.1 阶段 0 探测结论：D1 的 PIT 边界（决策点）
@@ -229,6 +253,12 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 
 `regime.sector_constituent`（D1）与 `regime.hk_sector_index_daily`（D4）属数据层，同期建表。全部新表须同步 `sql/schema.sql` **与** `regime_schema.py`（两处逐字一致），并登记 `monitor_table_config`。
 
+> **阶段 3 落地调整（2026-11-14 用户决策，与本文初稿的「物理分表」表述不同）**：
+> ① **不新建 HK 专用 4 表**，CN / HK 沿用同一套 21–24 号表，靠主键里的 `(market, classification)` 区分 —— 即 `sql/schema.sql:2249` 注释所写的「物理分行」，不是物理分表。理由：消费端统一、避免双份写库逻辑；代价是 L1 表从 211 万行 CN 读数增至约 900 万行（HK 全量回填后），表级监控按 CN 日历（已知 1 天 lag 残差，已在 `monitor_collector.py` 注释登记）。
+> ② 因为两市场共用 `SEC.*` 指标 code，**字典 PK 从 `indicator_code` 扩为 `(market_scope, classification, indicator_code)`**；`sector_layer.sync_dict` / `sector_layer_hk.sync_dict_hk` 的 `ON CONFLICT` 键同步带上市场与分类。存量库由 `regime_schema._migrate_sector_dict_pk()` 幂等自愈（`CREATE TABLE IF NOT EXISTS` 不会改已有主键）。
+> ③ HK 侧另建独立计算模块 `sector_layer_hk.py`（口径版本 `hk1.0`，`params_hash` payload 含市场），**不改动 `sector_layer.py` 的计算主流程**（CN 侧只改字典冲突键）。已用 `git worktree` 取改动前代码逐值对比：41 条字典 / 41 个 `params_hash` / 6 个维度 / `CALIB_VERSION=s2.1` 全部一致。
+> ④ 新增第 27 号表 `regime.hk_sector_index_daily`；25/26 号表为阶段 2 的成分主数据。
+
 ## 3.2 计算模型字典（指标「计算模型」的可复现单元）
 
 > 指标表内只引用 `M*`，参数写在字典表 `params`；`params_hash` 变化触发该指标历史重算（§`schema.sql:2212`）。
@@ -242,7 +272,9 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 | **M5** | 条件命中 / 闸门 | `hit = Σ 1{cond_i}`；`gate = f(hit, coverage)` | 用于拥挤度等「共振型」读数，**不取加权平均**（乘积会把任一为 0 的因子整体归零，且 0–100 分位相乘后不可读）；对齐 §7.2「规则判定」结构 |
 | **M6** | PIT 成分聚合 | `JOIN sector_constituent c ON c.stock_code = q.stock_code AND t ∈ [c.eff_from, c.eff_to)`；财务取 `max(report_date) WHERE announce_date ≤ t`；按 `median` / `mean` / `count-if` 聚合 | 覆盖度 `coverage = 有值成分数 / 成分数`；`coverage < 0.6` 作废并清库（复用 `market_state_daily._coverage_gate` 标定，0.6 是实测值，不得随手调）；`pit_capable=false` 的段标注 `survivorship_bias=true` |
 | **M7** | 快照差分（盈利修正） | 同一 `stock_code`、同一 `fy1_year` 的相邻两次快照 `fy1_eps` 比较：`Δ > +0.5% → 上调(+1)`，`< −0.5% → 下调(−1)`，否则 0；`breadth = (Σ上调 − Σ下调) / Σ可比样本 × 100`，滚动 30 快照 | 沿用已落地的 `FORECAST.REVISION_BREADTH` 口径（`market_state_daily.py:2454-2486`）下沉到行业；财年标签不一致的样本剔除；行业 `report_count` 覆盖门禁（覆盖成分 <30% 或有效样本 <5 家 → `NULL`）；快照日本身即 PIT，按 ffill 对齐交易日不产生前视 |
-| **M8** | 自算行业指数（HK） | `idx_t = Σ w_i · (close_i,t / close_i,t−1 − 1)`，`w` 取等权或流通市值加权，两版并存 | 沿用 `SECTOR.UP_RATIO` HK 侧的等权合成思路（`market_state_daily.py:1404`）；须设流动性门槛剔除仙股（§7.6 已知口径限制 4）；粒度与 CN 不可比，只各自看分位 |
+| **M8** | 自算行业指数（HK） | `idx_t = Σ w_i · (close_i,t / close_i,t−1 − 1)`，`w` 取等权或**总市值**加权，两版并存 | 沿用 `SECTOR.UP_RATIO` HK 侧的等权合成思路（`market_state_daily.py:1404`）；须设流动性门槛剔除仙股（§7.6 已知口径限制 4）；粒度与 CN 不可比，只各自看分位 |
+
+> **M8 口径变更（阶段 3 实测）**：原文「流通市值加权」不可得 —— 实测 `hk_daily_quote.circular_market_val` 2000–2023 全 NULL、2024-05-14 起仅 65 个交易日零星有值。改用 `total_market_val`（2002 起 97.5%+），权重取**当日**市值（非前收市值），与 `market_state_daily` 的 HK `cap_ret` 同源；等权版 2000-01-03 起、加权版 2002-01-01 起。行业估值用**市值加权调和均值** `Σw/Σ(w/pe)`（仅 `pe>0`，等价「行业总市值/行业总盈利」），因为中位数无法用充分统计量跨股票批次无损合并（R3 分批要求）；这不是官方行业指数 PE，与 CN `sector_valuation_snapshot` 不同构。已写入字典 `remark` 与 `hk_sector_index_daily` 列注释。
 
 **方向与冗余**：方向统一只在 `sector_indicator_dict.direction` + `dimension_dict.members[].sign` 定义一次，消费端不得二次翻转（§7.1）；同维度内成员**一阶差分相关 >0.8** 视为冗余，只留历史更长 / 口径更纯的一个（§7.2）；单成员权重上限 25%，成员 <4 时走规则判定或单锚封印（§7.2 三种标准结构）。
 
@@ -406,6 +438,7 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 > ① **`SHORT_SAMPLE` 按「参与维度分的锚指标」判定，不按行业整体**。阶段 1 的锚全部是横截面分位（不依赖时序样本），若按 §5.7 的 `n_sample<750` 全局触发，估值快照的 27 日会让 **所有行业 `applicable=false`**，阶段 1 将完全没有排名输出。短样本信息仍由 `SEC.VAL.PE_TS_PCT` 等原子行的 `n_sample` / `quality=short_sample` 完整透出，不丢失。
 > ② **`state_side` 只聚「当期已启用」的维度**，并把 `extra.state_members` / `extra.partial` / `extra.state_n` 随行写出。阶段 1 恒 `PARTIAL_STATE`；✅ 阶段 2 六维齐备后 `state_n=4`、闸门自动消失，实测 31 行业全部 `applicable=true` / `coverage=1.0`。两期状态分不可直接比较。
 > ③ **阶段 2 的 `coverage` 分母从 3 变 6**：2021-12-13 之前的长历史段因缺 4 组自下而上维度，`coverage` 最高 0.5 < 0.6 → `applicable=false`、不出行排名，但**阶段 1 的原子读数（A/B/C/D 价格类）仍完整保留**。这正是决策 A「长历史由不依赖成分的价格类指标承担、两段不混排」的落地形态。`extra.pit_capable` 随行标注。
+> ④ **HK 侧 L3 不排名（阶段 3 用户决策）**：HK 本期只做 A/B/D/F + 南向，`FLOW`（仅 136 日南向）与 `FUNDAMENTAL`（`announce_date` 全 NULL）不可用 → `ENABLED_DIMENSIONS` 为 4 组（`TREND / VALUATION / CROWDING / BREADTH`），状态侧只有 `TREND + BREADTH` 两组，`PARTIAL_STATE` 闸门**恒开**。`rank_no` 恒 `NULL`、`extra.no_rank=true` + `extra.no_rank_reason`，`applicable` 仍按真实 `coverage` 与近 20 日有效读数计算（**不为凑排名放宽门槛**）。排序留待阶段 4 前瞻验证后再议。`rank_n` 只记录当日有效行业数（实测 109~112），不作排名分母使用。全部行 `pit_capable=false` / `confidence=low`。
 
 **出向契约**：只承诺「表 + 列 + `params_hash` 语义」，不承诺行数（维度/业务读数可能增删）；消费方按 `dimension_code` / 白名单读取，**不得 `SELECT *`**（主报告 §5.11 引用稳定性条款）。
 
@@ -431,11 +464,11 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 ## 4.1 分期与依赖
 
 ```
-阶段 0 数据闸门（探测 + 标定）
-   └─→ 阶段 1 CN 纯价格/资金层（可立即开工，不依赖新增采集）
-         ├─→ 阶段 4 验证闭环（持续，不早于阶段 1 + 数据累积）
-         └─→ 阶段 2 成分主数据 + 基本面/宽度层（依赖 D1）
-                └─→ 阶段 3 HK 行业层（依赖 D4）
+阶段 0 数据闸门（探测 + 标定）                        ✅ 完成
+   └─→ 阶段 1 CN 纯价格/资金层                       ✅ 完成
+         ├─→ 阶段 4 验证闭环（持续复跑）             ✅ 首轮完成（闸门不通过）
+         └─→ 阶段 2 成分主数据 + 基本面/宽度层       ✅ 完成
+                └─→ 阶段 3 HK 行业层（依赖 D4）      ✅ 完成（本轮）
 ```
 
 ## 4.2 各期交付与验收
@@ -555,16 +588,130 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 - **成分历史只能向前累积**：`eff_to` 由 18:05 每日快照逐步生成，2021-12-13 之前无成分、也不回算（决策 A）。服务器部署后需 `./deploy.sh up`（同步 `sql/schema.sql` + 重启调度器使 18:05 任务生效）；监控配置由 `monitor_collector` 启动时幂等迁移。本机未重启任何服务。
 - `REVISION_BREADTH` 的 30 快照窗口仍只有 25 个快照日，按实际 `revision_n` 出值 + `confidence=low`，未冒充 30 快照。
 
-### 阶段 3 · HK 行业层（约 2 周，依赖 D4）
+### 阶段 3 · HK 行业层（✅ 已完成，2026-11-14）
 
-- **交付**：`sector_hierarchy` 补 `as_of` 并挂调度；`regime.hk_sector_index_daily`（等权 + 市值加权两版，M8）；HK 侧 A/B/C/F 组与 `SOUTHBOUND_NET`。
-- **纪律**：CN/HK 物理分表、分口径、各自分位，**不做统一排序**；GICS 只作展示标签；港股仙股设流动性门槛；南向仅近 1 年 + 当前成分偏差，须标注。
-- **验收**：与现有 `SECTOR.UP_RATIO` HK 等权合成的一致性；粒度差异（113 三级 vs 31 一级）在字典 `remark` 与 `extra` 双处标注；两版指数差异报告。
+#### 阶段 3 实施记录（2026-11-14）
 
-### 阶段 4 · 验证闭环（持续，不早于阶段 1 完成 + 数据累积）
+**三项用户决策（实施前确认）**：① CN/HK 沿用现有 4 张输出表、字典 PK 扩为复合键；② M8 加权版改 `total_market_val`（2002 起）、等权版 2000 起；③ HK 本期只做 A/B/D/F + 南向，**L3 不排名**。
 
-- 按 §3.7 跑前瞻检验，产出报告；**决策闸门**：通过 → 排序可标注「有效性已验证的状态排序」（仍不出配置建议）；不通过 → 保持「状态描述」+ 等权。
-- 快照类数据满 250 观测后，逐项启用时序分位（B 组 `PE_TS_PCT`、C 组滚动窗口），启用前做 `params_hash` 变更登记与全历史重算。
+**交付物清单**
+
+| 文件 | 变更 |
+|---|---|
+| `tools/probe_hk_sector.py` | **新增**只读探测（14 条聚合 SQL，可复跑）：§2.1 港股实测盘点的数字来源 |
+| `hk_sector_index.py` | **新增**数据层 D4：按月 × 按股票(1000 只/批)双层分批、充分统计量跨批无损合并、M8 两版指数、增量接续 `idx_eq/idx_cap`、南向聚合、`--verify` 一致性 + 两版差异报告、CLI |
+| `sector_layer_hk.py` | **新增**指标层：25 条字典（24 active）、六维定义（4 启用）、L1/L2/L3、`hk1.0` 独立口径（payload 含市场）、2 年分块 + 10 天切片、任务埋点、CLI |
+| `sql/schema.sql` / `regime_schema.py` | 追加第 **27** 号表 + 索引 + COMMENT，**逐字双同步**；字典 PK 扩为 `(market_scope, classification, indicator_code)`；新增 `_migrate_sector_dict_pk()` 幂等迁移、`_SECTOR_DDL_KEYS` / `_SECTOR_COMMENTS` 登记 |
+| `build_sector_hierarchy.py` | 补 `as_of` 列 / 注释 / 幂等 `ALTER`；`run(codes=None, ctx=None)` 兼容调度器进程内调用 |
+| `sector_layer.py` | **CN 侧唯一改动**：`sync_dict` 冲突键扩为三列（口径与 `params_hash` 完全不变） |
+| `market_scheduler.py` | 注册「行业层级映射」周二 **18:30**（紧跟 `get_stock_sector.py` 18:00） |
+| `monitor_collector.py` | `_SEED_TASK_CONFIG` 加「行业配置计算HK」；`_REGIME_TABLE_CONFIG` 登记表 27；CN 日历共表残差注释 |
+| `system/sector-layer-hk.service` / `.timer` | **新增** oneshot 六项资源上限 / 工作日 **19:05**（与 CN 18:50 错峰，避免两个 512M cgroup 同时抢 1.9GB 小机） |
+| `deploy.sh` / `bootstrap.sh` | `TIMERS` / `units` / `enable --now` 接线 |
+| `tests/test_sector_stage3.py` | **新增** 35 测试 / 208 subtests（M8 口径、覆盖门禁、分批无损合并、业务契约、不混排、工程红线） |
+| 本文 | §0 / §2.1 / §2.2 / §3.1 / §3.2 / §3.6 / §4.2 / §4.4 同步 |
+
+**数据实测**
+
+| 项 | 结果 |
+|---|---|
+| 分类基数 | 113 个 `HK.LIST*` 行业 / 2,771 只股票，1 股 1 行业；最近交易日 112 个行业有行情 |
+| 表 27 小窗口（2026-09-01~11-13） | 52 日 / 112 行业 / **5,777 行**，其中 4,605 行有南向；平均成分覆盖 0.9999、平均调和 PE 14.19 |
+| 字典 | 41 条 CN + 25 条 HK = **66 行 / 2 组**（复核主键迁移生效） |
+| 与 `SECTOR.UP_RATIO` HK 等权合成一致性 | **52 日逐日完全一致**：`max_abs_diff=0.0` / `mean_abs_diff=0.0` / `exact_days=52`；`rank_n` 109~112 |
+
+**资源实测**（macOS 开发机，`/usr/bin/time -l`）
+
+| 场景 | 峰值 RSS | 耗时 |
+|---|---|---|
+| 数据层 3 个月小窗口（真实写库 5,777 行） | **208.3 MB** | 24.8 s |
+| 数据层 12 个月（dry-run） | **210.7 MB** | 86.8 s |
+| 指标层端到端 44 日（dry-run） | **107.3 MB** | 1.9 s |
+| 指标层 44 日真实写库（80,246 行） | — | 13.8 s |
+
+> 🔴 **R3 分批有效性验证**：3 个月 208.3MB → 12 个月 210.7MB，峰值几乎不变，证明**与 844 万行总规模脱钩**，满足「独立单元实测 ≤ 上限 512M 的一半（256MB）」。全量回填（2000 起约 26 年）按 87s/年估算约 35~40 分钟，**超过 timer 的 `RuntimeMaxSec=1800`** → 属手工运维动作，须低峰期单独执行；timer 默认增量 45 天不依赖回填即可工作。
+
+**验收结果**
+
+| 项 | 结果 |
+|---|---|
+| 真实写库小窗口（2026-10-01~11-13） | L1 **56,803** / L2 **20,094** / L3 **3,349** 行；`rank_no` 非空 **0**；`confidence` 仅 `low`；`gate_flags` 为 `PARTIAL_STATE` 或 `DATA_COVERAGE+PARTIAL_STATE` |
+| 不混排 | `JOIN ... WHERE v.market='HK' AND b.market<>'HK'` = **0 行**；L1 分布 CN 2,112,102 / HK 56,803 |
+| CN 口径未变 | `git worktree` 取改动前代码逐值对比：41 条字典 / 41 个 `params_hash` / 6 个维度 / `CALIB_VERSION=s2.1` **全部一致**；`git diff sector_layer.py` 仅 3 行注释 + 1 行冲突键 |
+| 两版指数差异报告 | `--verify` 可复跑：5,331 行业日，平均绝对差 **1.4151pp**、最大 **96.6676pp**、相关系数 **0.6275**、方向相反 **1,253** 次（见下方已知限制） |
+| DDL 双源 | `sql/_schema_diff.py` 差异收敛到 **3 项既有项**（`daily_market_turnover.trade_date` NOT NULL、`a_daily_quote.ps_ttm/pcf_ttm` 下线列）；表 27 / 字典复合 PK / `as_of` 与真实库一致 |
+| `py_compile`（8 文件） | 通过 |
+| `tools/scan_big_table_loads.py` | 新增模块零命中；全库 2 处疑似均为既有 `migrate_v_daily_quote.py` |
+| `sql/_code_schema_diff.py` | 无漏写 |
+| 全量 `.venv/bin/python3 -m pytest tests/ -q` | **792 passed, 2 warnings, 709 subtests**（新增 35 / 208） |
+
+**口径落地核对**：`SEC.CROWD.TURNOVER_PCT` 登记 `is_active=false`（`turnover_rate` 仅 75 日）；拥挤度 k=2 部分模式、不开 `EXTREME`；`FLOW` / `FUNDAMENTAL` 维度写 `score=NULL` 行并带 `extra.reason`；L3 `rank_no` 恒 `NULL` + `extra.no_rank=true`、`PARTIAL_STATE` 恒开、`pit_capable=false`；2002 前加 `BREAK` 闸门；短样本期 `amt_share_pct` 全 NULL → `CROWDING` 恒 `NA` → 1,396 行触发 `DATA_COVERAGE`（**诚实标注，不用短样本分位填充**）。
+
+**已知限制 · 两版指数极端差异**：等权与加权日收益相关系数仅 0.63、约 23% 行业日方向相反；最大差异集中在**成分数很少**的行业（如 `HK.LIST1089` 仅 3 只成分，等权 +96.52% / 加权 −0.15%），小成分股极端 `change_pct`（疑似除权/合股未复权或新股首日）会主导等权版。本期**不静默截尾、不改值**：`n_constituent` 随行透出，消费方按成分数自行门禁；是否对个股收益 winsorize 或加最小成分数门槛，列为**阶段 4 待排查项**。
+
+**未执行 / 待决定**
+
+- **全量回填写库未跑**（只跑 3 个月小窗口写库 + 12 个月 dry-run）：数据层全量约 35~40 分钟，指标层另需按 2 年块跑；属批量运维动作，建议低峰期单独执行 `python3 sector_layer_hk.py --backfill`。timer 默认增量 45 天，不依赖回填即可工作。
+- **服务器部署未执行**：需 `./deploy.sh up`（增量同步 `sql/schema.sql` + 渲染两个新 unit + enable `sector-layer-hk.timer`）+ **重启 `market-scheduler`** 使周二 18:30 的「行业层级映射」生效；监控配置由 `monitor_collector` 启动时幂等迁移。本机未重启任何服务。
+- ⚠ **字典 PK 迁移部署注意**：`sql/_schema_diff.py` 生成的低风险修复 SQL 里的 `ADD CONSTRAINT ... PRIMARY KEY (...)` **不要直接执行** —— 存量库的旧单列 PK 还在（脚本把 `DROP INDEX` 列进了高风险注释段），直接 ADD 会失败。运行时自愈由 `regime_schema._migrate_sector_dict_pk()` 完成（先 DROP 再 ADD，幂等），首次跑 `sector_layer_hk.py --init-schema` 即生效；本机已验证。
+- ⚠ 本机验证产生了 `sql/schema_fix_20261114_*.sql` 两个本地产物，均**未执行**；`deploy.sh` 的 rsync 排除清单已含 `sql/schema_fix_*.sql`，不会推到服务器。勿与 2026-10-05 那份服务器待执行 SQL 混淆。
+- **表级监控日历残差**：CN/HK 共表后，4 张输出表仍按 CN 日历判停滞，港股独家交易日最多产生 1 天 lag 的边界告警；任务真停摆以 `collection_task_log` 的「行业配置计算HK」埋点为准。
+- `system/` 整目录被 `.gitignore` 忽略（阶段 1 已记录），两个新 unit 靠 `deploy.sh` rsync 同步，不进版本控制。
+- 前端页面契约仍未覆盖（`market_profile_ui_handoff.md` 无 ④ 层内容）。
+
+### 阶段 4 · 验证闭环（✅ 已完成首轮，2026-11-14；后续为持续复跑）
+
+#### 阶段 4 实施记录（2026-11-14）
+
+**四项用户决策**：① 只做能判定的 5 项，其余出「不可判定」清单；② 只出报告 + 文档登记，**不动生产代码 / 字典 / `params_hash` / 历史读数**；③ `tools/` 脚本 + `doc/` 报告落点；④ HK 两版指数做描述性敏感性分析，不改生产口径。
+
+**交付物清单**
+
+| 文件 | 变更 |
+|---|---|
+| `tools/validate_sector.py` | **新增**只读验证工作台：未来 20/60/120 日行业超额收益标签（M3 等权基准）、5 分组、逐日 Spearman IC、样本外切分、**按行业×月二维 block bootstrap**、标准化 Cronbach α / 一阶差分 PC1、各档占比、`pit_capable` 全史分段、口径分段、不可判定清单、HK 敏感性；`--out` 落本地 JSON/CSV |
+| `doc/sector_validation_report.md` | **新增**验证报告（结论 + 全部数字 + 限制 + 复跑命令） |
+| `tests/test_sector_validation.py` | **新增** 25 测试 / 20 subtests（统计口径、决策闸门、只读与 R7 红线） |
+| 本文 | §0 / §4.1 / §4.2 阶段 4 / §4.4 / 附录 A 同步 |
+
+**数据闸门（只读探测）**：CN `sector_biz_daily` 1999-12-30~2026-11-11 共 156,468 行，但 `rank_no` / `applicable` 仅 **34,195 行 ≈ 2021-12-13 起 1,182 交易日 × 31 行业**，`params_hash` 只有一段；`risk_side` / 象限非 NA 仅 775 行；`GATE=EXTREME` **45 行且全在最近 30 日**（可观测前瞻 20 日 5 行、60 日 0 行）；快照类 27 / 27 / 25 日 « `min_periods=250`；HK 52 日且 L3 不排名。→ 阶段 4 原定「快照类时序分位启用」本期**物理不可执行**。
+
+**检验结果（完整数字见 `doc/sector_validation_report.md`）**
+
+| 检验 | 结果 |
+|---|---|
+| ① 排序有效性 | 20/60/120 日全样本 IC −0.0179 / −0.0187 / −0.0218；样本外 IC −0.0008 / −0.0356 / −0.0511，bootstrap 95% CI **全部跨 0**（主检验 20 日 [−0.05795, 0.01793]）；分组单调性 ρ 符号翻转、p=0.285~0.505 全不显著 → **闸门不通过** |
+| ② 构念效度 | 单锚 / 规则判定 4 维显式标 `NOT_APPLICABLE`（成员=1，α/载荷/PCA 无定义）；FUNDAMENTAL α=0.6271 但 `REVISION_BREADTH` 载荷 0.156 <0.3、差分相关 `INSUFFICIENT_OVERLAP`；BREADTH α=0.2133、`RET_DISPERSION` 载荷 0.160 <0.3 → **2 个成员未通过 §8.5 门禁，只登记不改代码** |
+| ③ 各档占比 | 5 分组 22.58%/19.35%×4（31 行业不可被 5 整除的**整数效应**，非漂移）；象限非 NA n=775，各档 19.5%~28.8%（预期 25%，只提示分布漂移、不改判据）；EXTREME 仅 0.12% |
+| ④ 幸存者偏差 | 全史分段：`pit_capable=false` 1999-12-30~2021-12-10 共 119,826 行，state_side 全 NULL、排名覆盖 0、coverage 0.1487；`true` 段 36,642 行，state_side 50.02、排名覆盖 0.933 → 差异可解释，早期年份单列且未混入验证 |
+| ⑤ 口径变更 | 库内只有一段 `params_hash`，前后逐值对比走 `git worktree`（阶段 3 已证 41/41 一致）；本期零生产代码改动，无需重跑 |
+
+**决策闸门结论（§3.7）**：**不通过**。排序保持「当前状态描述」定位、不得宣称有效、不得用于配置、**权重维持等权** —— 这恰好是系统现状，故本期不改任何生产代码。⚠ 负 IC **不得反向解读为做空信号**（区间跨 0、样本内重叠窗口、未扣成本；与项目既有 AUC 0.44~0.54 系列负面结论一致）。统计功效有限（样本外 353~453 日 IC，`IC 标准误 <0.05` 的 §7.2 准入前提勉强不达标），结论应读作「**未发现有效性**」而非「已证明无效」。
+
+**⛔ 不可判定清单（含监控登记，不新增 `monitor_collector.py` 配置）**：拥挤闸门有效性（EXTREME 45 行 / 后 60 日 0 行可观测）、三张快照表时序分位启用（27/27/25 日 « 250，按 21 交易日/月估算还需 223 日 ≈ 10.6 个月）、HK 排序有效性（52 日 + L3 不排名）共 5 项判 `NOT_EVALUABLE`。表级断供告警已由既有 `monitor_table_config` 覆盖；额外按工作台 `--out` 产物盯 EXTREME 行数/日期跨度与快照观测日数，达标后复跑本脚本重判。按 §3.7，拥挤闸门在验证完成前只作纯展示标记。
+
+**🔍 HK 两版指数敏感性**（阶段 3 待排查项，描述性、不改口径）：`n_constituent ≥5` 可把最大差异 96.67pp → 67.14pp（丢弃 17% 行业日），`≥20` → 38.01pp（只剩 16% 样本）；行业日收益截尾 p1–p99 / p5–p95 反而把最大差异扩大到 108.67 / 112.65pp，**说明异常来自个别成分股，须在个股 `change_pct` 层面 winsorize 才有效**；方向翻转率在各门槛下稳定 24~26%，差异是结构性而非离群值造成。「最小成分数 ≥5 + 个股级 winsorize」登记为待评估项，落地须换 `model_version` / `params_hash` 并重算表 27。
+
+**验收结果**
+
+| 项 | 结果 |
+|---|---|
+| 只读纪律 | 脚本不含 `bulk_upsert` / `conn.commit()` / `INSERT` / `UPDATE` / `DELETE`；`--out` 只落本地文件 |
+| R1/R7 | 所有大表查询带 `BETWEEN %s AND %s` 或 `trade_date >= %s`；L1 明细按 `indicator_code = ANY(%s)` 白名单 + 按维度分批读取，逐批 `del` + `gc.collect()` |
+| R3 峰值 | **235.8 MB** / 35.5s（macOS `/usr/bin/time -l`，bootstrap 200）≤ 256MB 目标。首版 467MB，经四步优化（bootstrap 块索引化 → 构念效度按维度分批 → 档位占比 SQL 聚合 → 面板 category 瘦身 + 每窗口只取 5 列）降下来 |
+| 新增依赖 | **零**（scipy / numpy / pandas 已在 `requirements.txt`） |
+| 全量 `.venv/bin/python3 -m pytest tests/ -q` | **817 passed, 2 warnings, 729 subtests**（新增 25 / 20） |
+| 生产代码改动 | **零**（只新增验证脚本、测试、报告与本文） |
+
+**口径修正留痕（实施期发现，均已修）**：① 单锚维度强算 α/PCA 会产出伪结果 → 显式 `NOT_APPLICABLE`；② 含 NaN 的相关矩阵 `nan_to_num(0)` 会产出 `PC1=1/k` 伪结果 → 判 `INSUFFICIENT_OVERLAP`；③ Cronbach α 未标准化时完全相关的成员只算出 0.9375 → 改为成员 z-score 后的**标准化 α**；④ 只跑 2021-12-13 起验证窗口会漏掉 `pit_capable=false` 早期段 → 补一次全史轻量聚合。
+
+**未执行 / 待决定**
+
+- **快照类时序分位启用**（B 组 `PE_TS_PCT`、C 组滚动窗口）：须等 250 观测（约 2027 年秋），启用前做 `params_hash` 变更 + `breaks` 登记 + 全历史重算，再跑 `git worktree` 逐值对比。
+- **两处构念效度门禁未通过成员**（`REVISION_BREADTH` / `RET_DISPERSION`）：按 §8.5 应移出或重构维度，本期只登记；改动属口径变更，须单独立项。
+- **拥挤闸门 / HK 排序**：等样本充足后复跑 `tools/validate_sector.py`；HK 护栏（最小成分数 + 个股 winsorize）待评估。
+- **权重不重估**：§7.2「二期按前瞻 IC 重估」在闸门通过前不启动，本期未授权任何权重改动。
+- 全量回填写库与服务器部署仍由用户择机执行；本机未重启任何服务。
 
 ### 明确不在本计划内
 
@@ -593,11 +740,17 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 | D1 免费源无历史成分 → 幸存者偏差 | **高**（已按约束落地） | 阶段 0 实测完整 PIT 源 HTTP 508 不可用；✅ 阶段 2 已按决策 A 把自下而上指标起点限定在 2021-12-13 之后，`get_sector_constituent.py` 建 PIT 版本链、`eff_to` 由每日快照累积，`sector_stage2_agg.py` 按 `[eff_from, eff_to)` 取用，`extra.pit_capable` 随行标注。**残留限制**：`eff_to` 只能向前累积，无法回溯历史剔除；任何回算段须标 `pit_capable=false` / 降置信、早期年份单列 |
 | 快照类历史深度不足（估值/资金/预期均 2026-09 起） | **高** | 首期只出横截面分位；时序分位 `NULL` + `n_sample`；满 250 观测后逐项启用并登记 `params_hash`；断档监控 `day/1` |
 | 分类口径不一致（THS 90 ↔ SW 31；申万三批起点） | 中高 | 强制走 `sector_mapping` 且只纳入 `confirmed OR corr≥0.6`；`mapped_ths_count` / `rank_n` 透出；月度复核任务已存在 |
-| A/H 混用 | 中高 | 主键含 `market` + `classification`，分表分口径；测试钉住「不得混排」 |
-| 把状态读数当预测 / 排序被误读为建议 | **高** | 字段注释 + 字典 `remark` + 前端文案三重声明「不含配置建议」；`quadrant` 名只描述当前状态；验证未通过不升格 |
+| A/H 混用 | 中高 | ✅ 阶段 3 落地：主键含 `market` + `classification`，两市场共用 4 张表但**物理分行**、各自分位，横截面 groupby 只按 `trade_date`（HK 模块的输入 SQL 只查表 27，物理上无 CN 行）；字典 PK 扩为复合键避免 HK 覆盖 CN；测试钉住「不得混排」，真实库 JOIN 验证 0 行混排 |
+| 把状态读数当预测 / 排序被误读为建议 | **高** | 字段注释 + 字典 `remark` + 前端文案三重声明「不含配置建议」；`quadrant` 名只描述当前状态。✅ **阶段 4 已实证**：前瞻 20/60/120 日 IC 样本外区间全部跨 0、分组单调性不显著 → 决策闸门不通过，排序维持「当前状态描述」、等权、不得宣称有效；⚠ 负 IC 不得反向解读为做空信号 |
+| 验证数据不足却硬凑结论 | **高**（阶段 4 新增） | 拥挤闸门 EXTREME 仅 45 行 / 后 60 日 0 行可观测、快照 27 日 « 250、HK 52 日 → 5 项判 `NOT_EVALUABLE` 并列监控复跑条件；按 §3.7 拥挤闸门在验证完成前只作纯展示标记 |
+| 构念效度门禁未通过 | 中高（阶段 4 新增） | `REVISION_BREADTH` / `RET_DISPERSION` 载荷 <0.3、BREADTH α=0.213 → 按 §8.5 应移出或重构；本期只登记不改代码，改则须换 `params_hash` + 全历史重算 |
+| 统计功效不足误判「已证明无效」 | 中（阶段 4 新增） | 样本外仅 353~453 日 IC，`IC 标准误 <0.05` 的 §7.2 准入前提勉强不达标 → 结论统一表述为「未发现有效性」，不是「已证明无效」；后续随样本积累持续复跑 |
 | 权重幻觉 / 重复计权 | 中 | 首期等权 + 字典表；单成员 ≤25%；一阶差分相关 >0.8 去重；跨层复用登记（§3.4 D 组注） |
 | 单一综合分制造伪精确 | 中 | 状态侧 / 风险侧分离，只出矩阵不出合成分 |
-| 资源雪崩（1.9GB 小机、四次事故） | **高** | 独立 unit/timer + 六项上限 + 分批 + 峰值实测；`regime.indicator_value` 已达 95 万行（R2 清单），行业层不得再制造一次性全表加载 |
+| 资源雪崩（1.9GB 小机、四次事故） | **高** | 独立 unit/timer + 六项上限 + 分批 + 峰值实测；`regime.indicator_value` 已达 95 万行（R2 清单），行业层不得再制造一次性全表加载。✅ 阶段 3 实测：数据层 3 月 208.3MB / 12 月 210.7MB（与 844 万行总规模脱钩）；HK timer 19:05 与 CN 18:50 错峰，避免两个 512M cgroup 同时抢内存 |
+| HK 成分无 PIT / 幸存者偏差 | **高**（阶段 3 新增） | `stock_sector` 只有当前快照（无 `as_of`、无剔除记录、`weight` 全 NULL）→ HK 全期 `pit_capable=false` / `survivorship_bias=true` / `confidence=low`，字典 `remark` 与 `extra` 双处标注；不回算历史后声称 PIT |
+| HK 两版指数极端差异 / 小成分行业 | 中高（阶段 3 新增） | 相关性 0.63、23% 行业日方向相反，最大差异来自 3 只成分行业的极端 `change_pct`；`n_constituent` 随行透出供消费方门禁，本期不静默截尾；winsorize / 最小成分数门槛列为阶段 4 待排查 |
+| 字典主键迁移部署失败 | 中（阶段 3 新增） | `_schema_diff.py` 生成的 `ADD CONSTRAINT` 直接执行会因旧单列 PK 未删而失败；改由 `regime_schema._migrate_sector_dict_pk()` 运行时幂等自愈，本机已验证 `['market_scope','classification','indicator_code']` |
 | ~~`sector_daily.turnover` 量纲未标定~~ | ✅ **已关闭** | 阶段 0 实测 ratio 0.998088~0.999661 → 亿元口径、完备覆盖；无需新表。遗留约束：同源占比分母取「当日有效行业合计」，`rank_n<31` 的早期段不可与后期比 |
 
 ---
@@ -606,6 +759,22 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 
 > 本附录保留可复跑 SQL；**2026-11-14 的实测结果已写入 §2.1「实测盘点」**。等价的一键复跑命令：
 > `.venv/bin/python3 tools/probe_sector_constituent.py --sources`（只读；不加 `--sources` 则只跑本地库盘点 + D2 标定）。
+>
+> **阶段 3 港股侧复跑命令**（均为只读 / 或带 `--dry-run`）：
+> ```bash
+> .venv/bin/python3 tools/probe_hk_sector.py                       # 港股数据底数盘点（只读）
+> .venv/bin/python3 hk_sector_index.py --verify --start 2026-09-01 --end 2026-11-13
+>     # 与 SECTOR.UP_RATIO HK 等权合成一致性 + 两版指数差异报告（只读）
+> .venv/bin/python3 sector_layer_hk.py --start 2026-10-01 --end 2026-11-13 --skip-index --dry-run
+>     # 指标层只算不写（需表 27 已有数据）
+> ```
+>
+> **阶段 4 验证闭环复跑**（纯只读、不写库；结论落点 `doc/sector_validation_report.md`）：
+> ```bash
+> .venv/bin/python3 tools/validate_sector.py --bootstrap 200 --out /tmp/sector_val
+> .venv/bin/python3 -m pytest tests/test_sector_validation.py -q
+> ```
+> 快照类观测满 250 日、或 `GATE=EXTREME` 最早日 +60 交易日之后，用同一命令复跑重判决策闸门。
 
 ```sql
 -- 每张行业层表的起点 / 有效日数 / 最新日（数字写回 §2.1）

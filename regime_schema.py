@@ -27,6 +27,7 @@ P1 已落地（随采集脚本）：
     python3 regime_schema.py          # 直接建表（幂等，可重复执行）
     from regime_schema import ensure_schema; ensure_schema(conn)
 """
+import re
 import sys
 
 # ── DDL（与 sql/schema.sql 对应章节逐字一致）────────────────────────────────
@@ -567,7 +568,7 @@ ALTER TABLE regime.indicator_value ADD COLUMN IF NOT EXISTS model_version VARCHA
     #     口径：doc/industry_allocation_feasibility.md §3
     "sector_indicator_dict": """
 CREATE TABLE IF NOT EXISTS regime.sector_indicator_dict (
-    indicator_code  VARCHAR(64)     PRIMARY KEY,
+    indicator_code  VARCHAR(64)     NOT NULL,
     indicator_name  VARCHAR(100)    NOT NULL,
     domain          VARCHAR(24)     NOT NULL,       -- TREND/VAL/FLOW/CROWD/FUND/BREADTH
     side            VARCHAR(12)     NOT NULL,       -- state=状态侧 / risk=风险侧
@@ -586,7 +587,9 @@ CREATE TABLE IF NOT EXISTS regime.sector_indicator_dict (
     is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
     remark          TEXT,
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ     DEFAULT NOW()
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+    -- 阶段 3：CN / HK 共用同一套指标 code，字典按市场+分类隔离，避免 HK 覆盖 CN 行
+    PRIMARY KEY (market_scope, classification, indicator_code)
 )
 """,
     "sector_indicator_value": """
@@ -704,6 +707,42 @@ CREATE TABLE IF NOT EXISTS regime.sector_constituent_change (
 CREATE INDEX IF NOT EXISTS idx_sector_const_change_date
     ON regime.sector_constituent_change (snapshot_date DESC)
 """,
+
+    # ── 第④层 阶段 3：HK 行业层数据底座（sql/schema.sql 第 27 号表）──────
+    #     决策（2026-11-14）：M8 加权版改用 total_market_val（流通市值列长期缺失），
+    #     等权版 2000-01-03 起、加权版 2002-01-01 起。
+    "hk_sector_index_daily": """
+CREATE TABLE IF NOT EXISTS regime.hk_sector_index_daily (
+    trade_date      DATE            NOT NULL,
+    sector_code     VARCHAR(20)     NOT NULL,       -- HK.LIST1019 等恒生三级行业
+    sector_name     VARCHAR(100),
+    ret_eq          NUMERIC(12,6),                 -- 等权日收益（%）= avg(成分 change_pct)
+    ret_cap         NUMERIC(12,6),                 -- 总市值加权日收益（%）= Σ(change_pct×tmv)/Σtmv
+    idx_eq          NUMERIC(18,6),                 -- 等权指数点位（基期 1000，全史连续）
+    idx_cap         NUMERIC(18,6),                 -- 总市值加权指数点位
+    amount          NUMERIC(20,2),                 -- 行业成交额（港元，amount>=10万门槛后合计）
+    n_constituent   INT,                           -- 当日有效成分数
+    coverage        NUMERIC(5,4),                  -- 有行情成分数 / 有映射成分数
+    pe_agg          NUMERIC(20,6),                 -- 市值加权调和 PE = Σw/Σ(w/pe)，仅 pe>0
+    pb_agg          NUMERIC(20,6),                 -- 市值加权调和 PB
+    div_yield_agg   NUMERIC(12,4),                 -- 市值加权股息率（%）
+    up_ratio        NUMERIC(8,4),                  -- 成分股收涨占比（%）
+    above_ma60      NUMERIC(8,4),                  -- 成分股 close > MA60 占比（%）
+    new_high_low    NUMERIC(8,4),                  -- 60 日新高−新低归一净占比（−100~100）
+    ret_dispersion  NUMERIC(12,6),                 -- 成分股 20 日收益横截面 std
+    southbound_net  NUMERIC(16,2),                 -- 南向净流入（亿港元，仅 2026-04 起）
+    model_version   VARCHAR(16),
+    created_at      TIMESTAMPTZ     DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (trade_date, sector_code)
+)
+""",
+    "hk_sector_index_daily_idx": """
+CREATE INDEX IF NOT EXISTS idx_hk_sector_index_code_date
+    ON regime.hk_sector_index_daily (sector_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_hk_sector_index_date
+    ON regime.hk_sector_index_daily (trade_date DESC)
+""",
 }
 
 # 第④层新表在 _DDL 中的 key（ensure_sector_schema 只执行这些，不重刷全库 DDL）
@@ -713,6 +752,8 @@ _SECTOR_DDL_KEYS = (
     "sector_biz_daily", "sector_biz_daily_idx",
     "sector_constituent", "sector_constituent_idx",
     "sector_constituent_change", "sector_constituent_change_idx",
+    # 阶段 3 / D4：HK 行业日聚合与自算指数
+    "hk_sector_index_daily", "hk_sector_index_daily_idx",
 )
 
 # 与 sql/schema.sql 对应的 COMMENT（单独执行，保证既有库补注释）
@@ -1089,7 +1130,7 @@ def apply_series_defs(rows: list, defs: dict) -> list:
 # 第④层表的 COMMENT（与 sql/schema.sql 第 21~24 号表逐字一致）
 _SECTOR_COMMENTS = [
     ("TABLE", "regime.sector_indicator_dict",
-     "第④层行业指标字典（代码即字典：sector_layer.INDICATOR_DEFS 幂等 upsert）。阶段2依赖成分主数据的指标以 is_active=false 登记，避免「字典有、代码无」"),
+     "第④层行业指标字典（代码即字典：sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS 幂等 upsert）。⚠ 阶段3 起主键含 market_scope+classification：CN(SW_L1) 与 HK(HS_L3) 同名指标各占一行，冲突键必须带这两个字段"),
     ("COLUMN", "regime.sector_indicator_dict.direction",
      "high_good/high_risk/neutral；**方向只在此定义一次**，维度合成按 DIMENSION_DEFS.sign 翻转，消费端禁止二次翻转（§7.1）"),
     ("COLUMN", "regime.sector_indicator_dict.model_key",
@@ -1116,14 +1157,60 @@ _SECTOR_COMMENTS = [
      "申万指数成分权重，**百分数**（如 8.72 = 8.72%，单行业合计≈100，不是 0~1 小数）；权重变化 ≥0.01 个百分点才关旧开新，微小波动只更新当前行"),
     ("TABLE", "regime.sector_constituent_change",
      "行业成分变更日志（逐日快照审计）：ADD/REMOVE/WEIGHT 三类，可据此重建任意历史截面。⚠ 只在首次采到之后才逐步累积，不是历史回填产物"),
+    # 阶段 3 / D4（与 sql/schema.sql 第 27 号表逐字一致）
+    ("TABLE", "regime.hk_sector_index_daily",
+     "第④层 HK 行业日聚合与自算指数（M8 两版并列）。⚠ 成分取 stock_sector 当前快照，非 PIT，历史读数含幸存者偏差；⚠ 113 个恒生三级行业与 CN 31 个申万一级不同构，不得混合分位/排名"),
+    ("COLUMN", "regime.hk_sector_index_daily.ret_cap",
+     "M8 口径变更：文档原文「流通市值加权」，实测 circular_market_val 长期缺失（2024-05 起仅 65 日有值）→ 改用 total_market_val。权重取当日市值（非前收市值），与 market_state_daily 的 HK cap_ret 同源；与 CN 用 circular_market_val 的口径差异已登记"),
+    ("COLUMN", "regime.hk_sector_index_daily.pe_agg",
+     "行业估值 = 成分股市值加权调和均值 Σw/Σ(w/pe)（等价「行业总市值 / 行业总盈利」），仅取 pe>0 的成分；不是官方行业指数 PE，与 CN sector_valuation_snapshot 不同构。覆盖成分 <60% 时置 NULL"),
+    ("COLUMN", "regime.hk_sector_index_daily.southbound_net",
+     "daily_ggt_hold.est_net_inflow 按行业求和（亿港元）。⚠ 源 2026-04-20 起仅 136 个交易日、est_ 为估算值、按当前成分回算 → survivorship_bias=true"),
 ]
 
 
+def _migrate_sector_dict_pk(conn, verbose: bool = False) -> bool:
+    """阶段 3：把 sector_indicator_dict 的 PK 幂等扩成 (market_scope, classification, indicator_code)。
+
+    存量库（阶段 1/2 建的）PK 只有 indicator_code；HK 侧复用同名 SEC.* 指标 code
+    会覆盖 CN 字典行。`CREATE TABLE IF NOT EXISTS` 不会改已有表 → 必须显式迁移。
+    幂等：已是复合主键则直接返回 False；表不存在（随后由 DDL 创建）也返回 False。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('regime.sector_indicator_dict')")
+        if cur.fetchone()[0] is None:
+            return False
+        cur.execute("""
+            SELECT c.conname, array_agg(a.attname ORDER BY k.ord)
+            FROM pg_constraint c
+            CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+            WHERE c.conrelid = 'regime.sector_indicator_dict'::regclass
+              AND c.contype = 'p'
+            GROUP BY c.conname
+        """)
+        row = cur.fetchone()
+        if row and list(row[1] or []) == ["market_scope", "classification", "indicator_code"]:
+            return False
+        if not row:
+            return False        # 无主键的异常表不在这里强行改，交给 _schema_diff 报告
+        name = row[0]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise RuntimeError(f"sector_indicator_dict 主键约束名异常：{name!r}")
+        cur.execute(f"ALTER TABLE regime.sector_indicator_dict DROP CONSTRAINT {name}")
+        cur.execute("ALTER TABLE regime.sector_indicator_dict "
+                    "ADD PRIMARY KEY (market_scope, classification, indicator_code)")
+    if verbose:
+        print("  ✅ sector_indicator_dict 主键已扩为 (market_scope, classification, indicator_code)")
+    return True
+
+
 def ensure_sector_schema(conn=None, verbose: bool = False) -> None:
-    """只建第④层行业配置的 4 张表（幂等），供 `sector_layer.py --init-schema` 调用。
+    """只建第④层行业配置的表（幂等），供 `sector_layer.py --init-schema` 调用。
 
     不调 ensure_schema：后者会执行 _DDL 全部 60+ 项并重刷全库注释，
     而日频计算只需要本层新表存在即可。
+    ⚠ 阶段 3 新增：建表后跑字典复合主键迁移（存量库自愈），CN / HK 共用一张字典表。
     """
     from db import get_conn
 
@@ -1137,6 +1224,7 @@ def ensure_sector_schema(conn=None, verbose: bool = False) -> None:
             cur.execute(_DDL[name])
             if verbose:
                 print(f"  ✅ {name}")
+        _migrate_sector_dict_pk(conn, verbose=verbose)
         for kind, target, text in _SECTOR_COMMENTS:
             cur.execute(f"COMMENT ON {kind} {target} IS %s", (text,))
     conn.commit()
