@@ -345,11 +345,11 @@ enable_services(){
     || warn "  compute-profile.timer 启用失败 (日志 journalctl -u compute-profile)"
   # 第④层行业配置：同为 oneshot + timer，service 无 [Install]，只 enable timer。
   systemctl enable --now sector-layer.timer >/dev/null 2>&1 \
-    && log "  sector-layer.timer 已启用（工作日 18:50）" \
+    && log "  sector-layer.timer 已启用（工作日 19:10）" \
     || warn "  sector-layer.timer 启用失败 (日志 journalctl -u sector-layer)"
-  # 第④层阶段 3 HK：同为 oneshot + timer，19:05 与 CN 错峰，service 无 [Install]。
+  # 第④层阶段 3 HK：同为 oneshot + timer，19:20 与 CN 错峰，service 无 [Install]。
   systemctl enable --now sector-layer-hk.timer >/dev/null 2>&1 \
-    && log "  sector-layer-hk.timer 已启用（工作日 19:05）" \
+    && log "  sector-layer-hk.timer 已启用（工作日 19:20）" \
     || warn "  sector-layer-hk.timer 启用失败 (日志 journalctl -u sector-layer-hk)"
   # FutuOpenD 需先手动登录
   if [[ -x "$FUTU_OPEND_DIR/FutuOpenD" ]]; then

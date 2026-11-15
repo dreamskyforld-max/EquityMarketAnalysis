@@ -2244,7 +2244,7 @@ COMMENT ON COLUMN force_round_daily.applicable IS '适用性：近 20 个已落�
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 21~24. 第④层 行业配置（阶段 1，sector_layer.py）
---     生产：sector_layer.py（独立 systemd oneshot + sector-layer.timer，工作日 18:50；
+--     生产：sector_layer.py（独立 systemd oneshot + sector-layer.timer，工作日 19:10；
 --           ⚠ 不得挂进 market_scheduler —— 资源规范 R4/R5）
 --     输入：regime.sector_daily / sector_valuation_snapshot / sector_fund_flow
 --     口径：doc/industry_allocation_feasibility.md（§3 指标体系 / §4.2 阶段 1）
@@ -2269,7 +2269,7 @@ CREATE TABLE IF NOT EXISTS regime.sector_indicator_dict (
     min_periods     INT             NOT NULL DEFAULT 0,
     pit_capable     BOOLEAN         NOT NULL DEFAULT TRUE,
     is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
-    remark          TEXT,
+    remark          TEXT,                               -- 规范化三段式：【定义】是什么 /【判读】怎么看 /【数据】样本与断点（与 indicator_dict 同款）
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
     -- 阶段 3：CN / HK 共用同一套指标 code，字典按市场+分类隔离，避免 HK 覆盖 CN 行
@@ -2278,6 +2278,7 @@ CREATE TABLE IF NOT EXISTS regime.sector_indicator_dict (
 COMMENT ON TABLE  regime.sector_indicator_dict IS '第④层行业指标字典（代码即字典：sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS 幂等 upsert）。⚠ 阶段3 起主键含 market_scope+classification：CN(SW_L1) 与 HK(HS_L3) 同名指标各占一行，冲突键必须带这两个字段';
 COMMENT ON COLUMN regime.sector_indicator_dict.direction IS 'high_good/high_risk/neutral；**方向只在此定义一次**，维度合成按 DIMENSION_DEFS.sign 翻转，消费端禁止二次翻转（§7.1）';
 COMMENT ON COLUMN regime.sector_indicator_dict.model_key IS '计算模型编号（设计文档 §3.2）：M1横截面分位 / M2时序分位 / M3相对强度 / M4归一滚动 / M5条件命中 / M6 PIT成分聚合 / M7快照差分 / M8自算指数';
+COMMENT ON COLUMN regime.sector_indicator_dict.remark IS '规范化三段式（与 regime.indicator_dict 事实标准一致）：单行 定义：…　·　判读：…　·　数据：…（全角空格包围中点分隔），可扩展 口径：/⚠/已知限制：；无换行、无方括号标题。定义写公式+单位+值域，判读写高低位业务含义与联读，数据写起点/覆盖门禁/口径断点/跨市场可比性。⚠ 只改 remark 不进 params_hash、不触发历史重算；但代码即字典，须改 sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS，库内手改会被幂等 upsert 覆盖';
 
 CREATE TABLE IF NOT EXISTS regime.sector_indicator_value (
     market          VARCHAR(8)      NOT NULL,       -- CN / HK（禁止混合分位）
@@ -2352,7 +2353,7 @@ COMMENT ON COLUMN regime.sector_biz_daily.rank_no IS 'applicable=true 才出排�
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 25~26. 第④层 行业成分主数据（阶段 2，PIT 版本链）
---     生产：get_sector_constituent.py（market_scheduler 交易日 18:05，早于 18:50 计算层）
+--     生产：get_sector_constituent.py（market_scheduler 交易日 18:05，早于 19:10 计算层）
 --     源  ：AKShare index_component_sw（申万官方指数详情，31 个一级行业 × 5 列）
 --     口径：doc/industry_allocation_feasibility.md §2.2.1 / §4.2 阶段 2
 --     ⚠ 决策 A：自下而上指标有效起点限 **2021-12-13**（申万 2021 版分类启用日）。
@@ -2402,7 +2403,7 @@ COMMENT ON TABLE regime.sector_constituent_change IS '行业成分变更日志�
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 27. 第④层 港股行业层数据底座（阶段 3 / D4，hk_sector_index.py）
 --     生产：sector_layer_hk.py → hk_sector_index.build_index_daily()
---           （独立 systemd sector-layer-hk.timer，工作日 19:05；不挂 market_scheduler）
+--           （独立 systemd sector-layer-hk.timer，工作日 19:20；不挂 market_scheduler）
 --     源  ：hk_daily_quote × stock_sector(INDUSTRY, HK.LIST*, 113 个恒生三级行业)
 --           + daily_ggt_hold（南向 est_net_inflow，2026-04-20 起仅 136 个交易日）
 --     口径：doc/industry_allocation_feasibility.md §2.2 D4 / §3.2 M8 / §4.2 阶段 3

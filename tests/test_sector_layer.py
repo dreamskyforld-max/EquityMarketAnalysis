@@ -288,7 +288,7 @@ class TestEngineeringGuards(unittest.TestCase):
 
     def test_timer_wired(self):
         t = _read("system/sector-layer.timer")
-        self.assertIn("OnCalendar=Mon-Fri 18:50:00", t)
+        self.assertIn("OnCalendar=Mon-Fri 19:10:00", t)
         self.assertIn("Unit=sector-layer.service", t)
         self.assertIn("sector-layer.timer", _read("deploy.sh"))
         b = _read("bootstrap.sh")

@@ -330,7 +330,7 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     ("一致预期快照", "get_analyst_forecast.py",
      {"hour": 18, "minute": 40, "day_of_week": "mon-fri"}, None, True, None, 600),
 
-    # 申万一级行业成分主数据（PIT 版本链）：18:05，早于 18:50 的行业配置计算层。
+    # 申万一级行业成分主数据（PIT 版本链）：18:05，早于 19:10 的行业配置计算层。
     # ⚠ 必须**每交易日**跑：源只给当前成分 + 计入日期、无剔除记录，
     #    eff_to 只能靠逐日快照对比累积（阶段 0 探测结论），漏采一天即永久断链。
     #    31 次 AKShare 调用实测 ~10s；清单塌陷时脚本自带质量闸门拒绝写库。

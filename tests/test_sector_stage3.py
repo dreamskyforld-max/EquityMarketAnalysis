@@ -371,7 +371,7 @@ class TestEngineeringGuards(unittest.TestCase):
 
     def test_timer_wired_and_staggered_from_cn(self):
         t = _read("system/sector-layer-hk.timer")
-        self.assertIn("OnCalendar=Mon-Fri 19:05:00", t)
+        self.assertIn("OnCalendar=Mon-Fri 19:20:00", t)
         self.assertIn("Unit=sector-layer-hk.service", t)
         self.assertIn("sector-layer-hk.timer", _read("deploy.sh"))
         b = _read("bootstrap.sh")
