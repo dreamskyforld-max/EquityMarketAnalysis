@@ -86,7 +86,7 @@ class TestConfigStructure(unittest.TestCase):
         self.assertIsInstance(a.get("extras"), list, "A 缺少 extras")
 
     def test_short_selling_retry_times(self):
-        """全日沽空数据应为全局任务且至少采集 2 次（18:30 主采 + 19:30 补采）"""
+        """全日沽空数据应为全局任务且至少采集 2 次（16:50 主采 + 17:40/18:30 补采）"""
         short_names = [n for n, *_ in self.globals if "沽空" in n]
         self.assertGreaterEqual(len(short_names), 2,
                                 f"全日沽空全局任务只找到 {len(short_names)} 次，期望至少2次")

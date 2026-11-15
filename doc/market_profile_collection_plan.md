@@ -28,7 +28,7 @@
 
 1. ✅ **已完成**：`_probe_macro_sources.py` 实跑完毕（39 个候选 → 32 可用），报告见 `doc/macro_source_probe_report.md`，结论速查见本文 **§4.4**。**探测推翻了 3 项原计划**：① 南向持股回填**不可行**（东财源仅近 1 年）；② 港股卖空历史回填**未解决**（港交所日报归档 404）；③ 北向在东财源**完全断流**（日频资金字段自 2024-08-19 全空，持股市值改**季度披露**，替代源待定位）。
 2. ✅ **已完成**：恒指 → 2013-08、FRED 长历史（NASDAQ/VIX → 1990）、中债收益率曲线 → **2006-03**、申万一级行业 → 1999-12、交易日历（CN 8798 + HK 1906 行）、退市名单 361 条、北向净流入历史 2264 行（截断 2024-08-16）。
-3. ✅ **已完成**：`regime` schema + 4 张表（`macro_series`/`indicator_dict`/`indicator_value`/`trading_calendar`）建成并登记 `sql/schema.sql`；3 个采集脚本已挂调度（19:00 / 19:10 / 08:45）并重启调度器生效。
+3. ✅ **已完成**：`regime` schema + 4 张表（`macro_series`/`indicator_dict`/`indicator_value`/`trading_calendar`）建成并登记 `sql/schema.sql`；3 个采集脚本已挂调度（初始 19:00 / 19:10 / 08:45；**前两条 2026-11-15 已前移至 18:22 / 18:28，见 §6.2.1**）并重启调度器生效。
 
 ---
 
@@ -654,12 +654,12 @@ COMMENT ON COLUMN stock_info.delist_date IS '退市日期（NULL=未退市）；
 **已落地（P0-2，`market_scheduler.py` 的 `GLOBAL_TASKS`，重启后运行进程日志显示「共计注册 107 个任务」）：**
 
 ```python
-# 中债收益率曲线（国债 + 中短期票据AAA + 商业银行普通债AAA，官方盘后发布）
+# 中债收益率曲线（国债 + 中短期票据AAA + 商业银行普通债AAA）— 2026-11-15 前移至 18:22
 ("中债收益率曲线", "get_cn_bond.py",
- {"hour": 19, "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
-# 全A 市场级估值（乐咕乐股，月频序列但月内滚动更新）
+ {"hour": 18, "minute": 22, "day_of_week": "mon-fri"}, None, True, None, 300),
+# 全A 市场级估值（乐咕乐股，月频序列但月内滚动更新）— 2026-11-15 前移至 18:28
 ("全A市场估值", "get_macro_valuation.py",
- {"hour": 19, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 300),
+ {"hour": 18, "minute": 28, "day_of_week": "mon-fri"}, None, True, None, 300),
 # 交易日历维护（A股 AKShare 预排 + 港股由成交额表派生）
 ("交易日历维护", "init_trading_calendar.py",
  {"hour": 8, "minute": 45, "day_of_week": "mon-fri"}, None, True, None, 300),
@@ -703,6 +703,23 @@ COMMENT ON COLUMN stock_info.delist_date IS '退市日期（NULL=未退市）；
 | 北向（待替代源） | 待定 | — | 东财源已断流；待定位港交所/交易所源后再挂 |
 
 > 说明：调度器代码改动**必须重启进程**才生效（`launchctl kickstart -k gui/501/com.equity.a-scheduler`，本机 macOS）。
+
+### 6.2.1 时间重排（2026-11-15，依赖倒置修复）
+
+初期把「中债收益率曲线 / 全A市场估值」排在 19:00 / 19:10，是因为当时定位为补长历史、不参与当日计算；后续陆续新增的中债指数（19:05）、美债代理（19:06）、中证股息率 / 乐咕股息率 / 沪深总市值（19:20）却是给 `market_state_daily.py` **当日算指标**用的，沿用 19:xx 时段后形成「采集在 18:45 计算之后」的倒置 → 当日 `indicator_value` 慢一天，靠 45 天增量窗口次日补，且任务仍记 `ok`、监控无感。
+
+按 §7.7「宏观必须排在计算之前」铁律调整为：
+
+| 类别 | 任务 | 时点 |
+|---|---|---|
+| T 日 18:00 PIT、被当日计算消费 | 中债收益率曲线 / 中债指数 / 美债代理 / 全A估值 / 沪深总市值 | 18:22 / 18:24 / 18:26 / 18:28 / 18:32 |
+| T+1 18:00 PIT、供次日重算 | 中证指数股息率 / 乐咕股息率 | 20:00 / 20:05 |
+| 周频参考数据 | 指数成分权重（周二） | 20:30 |
+| 撞点错峰 | 全日沽空补采1 / 行业层级映射（周二） | 17:40 / 18:35 |
+
+前移的 5 条均为一次取全历史 / 日检幂等，源当晚才出 T 日值时次日重跑照样补齐，前移零风险。两条股息率 `release_time` 本就是 T+1 18:00，后移不改变 PIT 语义，但中证源只回 20 日窗口、漏采即永久缺失，仍须每日必采。
+
+「市场事件采集」19:30 保持不动（原设计已写明滞后一日口径的豁免，见 `market_scheduler.py` 该条注释）。**P1 盘中任务全部冻结**（前端分钟级窗口内部聚合依赖每分钟 0 秒起采，禁止秒位分层）。两个独立 unit `sector-layer.timer` 19:10 / `sector-layer-hk.timer` 19:20 本轮不动。完整分段与三条铁律见 `market_scheduler.py` 的 `GLOBAL_TASKS` 上方「调度时段地图」。
 
 ### 6.3 新脚本命名与实现约定
 

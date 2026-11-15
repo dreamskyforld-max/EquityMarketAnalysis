@@ -115,261 +115,148 @@ STOCKS = load_stocks()
 #   market  : 交易时段判断用的市场标识（"HK"/"A"），仅当 force=False 时生效
 #   timeout : 单脚本超时秒数（默认 180）
 GlobalTask = tuple[str, str | list[str], dict[str, int | str], list[str] | None, bool, str | None, int]
+# ═══════════════════════════════════════════════════════════════════════════
+# GLOBAL_TASKS 按 P0→P5 排列、段内按时间升序；新增 / 改时间前先读三条铁律：
+#  ① 依赖：T 日口径且被 18:45「市场状态计算」消费的采集必须排在 18:45 前；
+#     排在其后的必须写明 T+1 / 滞后口径与「供次日 45 天窗口重算」。
+#  ② 盘中：P1 全部冻结（前端分钟级窗口聚合依赖 0 秒起采），禁止改秒位 / 分层。
+#  ③ 资源：两个 512M cgroup（sector-layer / -hk）间隔 ≥10min；20 线程池；
+#     共享 FutuOpenD 锁的任务不可并发。
+# 新增任务先答：写哪张表 / 谁消费 · 源发布时点与 PIT 口径 · 漏跑后果 ·
+#               周期与实测耗时 · 属于哪一段。
+# ═══════════════════════════════════════════════════════════════════════════
 GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType, reportAssignmentType]
-    # 删除 3 年前过期数据（tick_data / trend_snapshot / realtime_order_size / collection_run_log 共 4 表）
-    #("数据清理", "cleanup_old_data.py", {"hour": 4, "minute": 0}, None, True, None, 180),
-
-    # 全市场采集清单刷新（quote_universe）：每日 08:30 盘前一次。
-    # 富途 get_stock_basicinfo 全量拉取（无额度限制）→ 计数护栏（±10% / 绝对下限）→
-    # upsert + 30 天软删 → 新增代码同步进 stock_info（仅名称字典，不进实时采集池）。
-    # 三市场各自重试，单市场失败不影响其它市场；清单读取方：get_a/hk_market_turnover（v_quote_scope）。
-    ("全市场清单刷新", "sync_quote_universe.py", {"hour": 8, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
-
-    # 每小时刷新: 富途系盘中实时, FRED/债券/汇率为日频(T-1)
-    ("全球指数采集(每小时)", "get_global_benchmarks.py", {"hour": "*", "minute": 0}, None, True, None, 180),
-
-    # 指数分钟采集 · 快源（恒生指数/恒生科技/上证/深证成指）：每 1 分钟。
-    # 时段覆盖 A股(9:30-15:00)+港股(9:30-16:00)；单批 4 次请求（富途 2 + 腾讯 2，均不支持多代码），
-    # 正常 <5s；增量写库（只写 MAX(ts) 回退 2 分钟后的 bar）。
-    # 历史全量/手动补采仍走 get_global_benchmarks_minute.py（已不在调度注册）。
-    ("指数分钟-快源", "get_index_minute_fast.py",
-     {"minute": "*", "hour": "9-11,13-16", "day_of_week": "mon-fri"}, None, True, None, 120),
-
-    # 指数分钟采集 · 国际（日经225/KOSPI，东财 push2）：东财反爬敏感，保持 5 分钟。
-    # 单批最多 2 指数 × 2 次短重试失败即弃（成功一批即补齐当天全部分钟，故失败无损）。
-    ("指数分钟-国际", "get_index_minute_intl.py",
-     {"minute": "*/5", "hour": "8-14", "day_of_week": "mon-fri"}, None, True, None, 120),
-
-    # 股票-指数成分归属（参考数据，每周二 18:00 刷新；run 忽略 codes，全局只跑一次）
-    ("指数成分归属", "get_stock_sector.py", {"day_of_week": 2, "hour": 18, "minute": 0}, None, True, None, 180),
-
-    # 港股指数成分权重（恒生官网 factsheet 解析，每周二 19:00 刷新；
-    ("指数成分权重", "get_stock_sector_weight.py", {"day_of_week": 2, "hour": 19, "minute": 0}, None, True, None, 180),
-
-    # 行业层级映射 GICS 展示标签（阶段 3 / D4）：每周二 18:30，紧跟
-    # get_stock_sector.py 18:00 之后取其刚刷新的 INDUSTRY 板块清单，写 sector_hierarchy.as_of。
-    # ⚠ 只作展示层标签，不是第④层 HS_L3 计算口径（hk_sector_index.py 用 113 个 HK.LIST 板块）；
-    #   轻量任务（~194 行映射，不读大表）可挂调度进程，不违反资源规范 R4/R5。
-    ("行业层级映射", "build_sector_hierarchy.py",
-     {"day_of_week": 2, "hour": 18, "minute": 30}, None, True, None, 180),
-
-    # 股票 vs 全球指数日收益率相关性分析（读 daily_quote/daily_benchmark 日频数据，
-    # 盘后跑即可，盘中重算结果不变；单 job 内循环全部 STOCKS 逐票执行）
-    #("指数相关性分析", "benchmark_correlation_daily.py",
-    # {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS], True, None, 180),
-
-    # 宏观环境三维评分（股/债/汇；读 daily_benchmark，盘后跑；单 job 内循环全部 STOCKS 逐票执行）
-    #("宏观环境评分", "macro_environment_score.py",
-    # {"hour": 18, "minute": 0, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS], True, None, 180),
-
-    # 港股全市场总成交额：富途 get_market_snapshot 批量（~30秒）聚合全港股成交额，
-    # 落 daily_market_turnover 作为「市场总体流动性水位」分母。
-    # 富途快照盘中实时更新，交易时段内每 5 分钟跑一次（force=False + market="HK"），
-    # 盘中拿实时累计；收市竞价结束后盘后再补采全天完整终值（下一条）。
-    ("港股全市场成交额", "get_hk_market_turnover.py",
-     {"minute": "*/5", "second": 0}, None, False, "HK", 300),
-
-    # 港股全市场成交额-盘后补采：收市竞价（16:00–16:10）结束后，富途快照结算出
-    # 当天全天完整值，16:30 盘后固定补采一次落库（force=True 不受交易时段门控限制）。
-    ("港股全市场成交额-盘后补采", "get_hk_market_turnover.py",
-     {"hour": 16, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
-
-    # A股全市场成交额：富途 get_market_snapshot 批量（~3秒）聚合全 A 股（SH+SZ）成交额，
-    # 落 a_daily_market_turnover + a_daily_quote，作为 A 股市场总体流动性水位分母。
-    # 盘中实时累计：交易时段内每 5 分钟跑一次（force=False + market="A"，受 A 股时段门控）。
-    ("A股全市场成交额", "get_a_market_turnover.py",
-     {"minute": "*/5", "second": 0}, None, False, "A", 120),
-
-    # A股全市场成交额-盘后补采：A股收市竞价（15:00–15:30）结束后，富途快照结算出
-    # 当天全天完整值，16:10 盘后固定补采一次落库（force=True 不受交易时段门控限制）。
-    ("A股全市场成交额-盘后补采", "get_a_market_turnover.py",
-     {"hour": 16, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 120),
-    
-    # 南向资金（港股通持股）：AKShare 批量接口一次拉全市场 ~1200 只港股通标的，
-    # 落 daily_ggt_hold。盘前 8:00、盘后 19:00 各跑一次（run 忽略 codes，全局批量，force=True）。
-    ("南向资金", "get_south_flow.py",
-     {"hour": "8,19", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
-
-    # 融资融券全量明细（A股沪深两市）：AKShare 拉取交易所逐日公布的融资融券明细，
-    # 全市场全标的 + 融资融券双向全字段，落 daily_margin_balance（全局任务，run 忽略 codes）。
-    # 交易所约盘后披露当日数据，9 + 18 兜底补采两次（周一至周五，force=True）。
-    ("融资融券全量", "get_margin_balance.py",
-     {"hour": "9,18", "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
-
-    # 多空力量回合日表（force_round_daily）：从 tick_data 四档 + trend_snapshot 价格派生
-    # 分钟级攻防回合与 λ_pct/LQ/留存率，供 stock-realtime 分时图「攻守状态 / 博弈结果」
-    # 两个 grid 消费。范围 = realtime_collect_target.collect_tick=TRUE（打开实时交易流水的票）；
-    # 四档阈值读 fund_flow_settings（线上生效口径，与分时图同源）。
-    # 频率：**盘中每分钟一轮**（不是盘后一次）——分时图是分钟级视图，盘中要能看到
-    # 「这一波谁占优、效率多少」，等收盘后才有数据就失去了实时决策价值。
-    # 单轮范围只算「当天」（days_back=1，见下方 GLOBAL_TASK_KWARGS）：此前按最近 5 个
-    # 交易日全量重算，单轮实测 100~135s 超过 60s cron 间隔，被 max_instances=1 合并成
-    # 约 2 分钟一轮；只算当天单轮约 20~25s（瓶颈是 tick_data 的 CASE WHEN+GROUP BY 聚合）。
-    # 适用性判定（近 20 日回合数累计）由 recent_round_count 读库中 trade_date<当天 的历史行，
-    # 与本次跑批范围无关，故只算当天不影响正确性。历史日期漏跑（服务停/失败）用
-    # `python3 build_force_rounds.py --days N` 回填。
-    # 盘中未收口的最后回合会被标 ongoing，前端显示「进行中」不画结果。
-    # second=5 避开整点，与其他整点任务错开；hour 9-16 覆盖港股 9:30-16:10 与 A 股 9:30-15:00。
-    ("多空力量回合", "build_force_rounds.py",
-     {"minute": "*", "second": 5, "hour": "9-16", "day_of_week": "mon-fri"}, None, True, None, 900),
-
-    # 多空力量回合-盘后收口（兜底）：把盘中各轮次写入的 ongoing 标记清掉、以收盘数据定稿。
-    # 分钟轮正常时 16:16 起就已覆盖成收口版（_is_live 在 16:15 后返回 False），本条的
-    # 真正价值在于「16:16~16:59 所有分钟轮都失败」时自愈（进程崩溃 / DB 超时），
-    # 否则当天会残留 ongoing=true，前端那一段永远显示「进行中」而不画结果。
-    # 时机 17:05：避开 16:59 分钟轮与 16:30/16:50 的港股补采，也没撞 18:45 的市场状态计算；
-    # 与分钟轮用不同 job id，故 max_instances=1 挡不住并发（两者同时跑会让 tick_data 聚合负载翻倍），
-    # 因此不要把兜底线放到 x:00~x:59 分钟轮覆盖的窗口内。
-    # kwargs 走 GLOBAL_TASK_KWARGS（days_back=1），run() 默认 only_missing=False → 幂等重算覆盖。
-    ("多空力量回合-盘后收口", "build_force_rounds.py",
-     {"hour": 17, "minute": 5, "day_of_week": "mon-fri"}, None, True, None, 900),
-
-    # 港股全日沽空（全市场全量）：一次抓取港交所全日沽空快照页，解析全部港股
-    # 并全量入库 daily_short_selling（全局任务，不依赖股票列表，run 忽略 codes）。
-    # 港交所约 16:50 发布，17:30、18:30 兜底补采。
-    ("全日沽空数据", "get_realtime_short_selling_fullday.py",
-     {"hour": 16, "minute": 50, "day_of_week": "mon-fri"}, None, True, None, 300),
-     ("全日沽空数据-补采1", "get_realtime_short_selling_fullday.py",
-     {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
-    ("全日沽空数据-补采2", "get_realtime_short_selling_fullday.py",
-     {"hour": 18, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
-
-    # 港股牛熊证街货分布（全市场全量）：一次抓取港交所 CBBC 完整列表 CSV，
-    # 解析全部有牛熊证的标的并全量入库 daily_cbbc（全局任务，run 忽略 codes）。
-    # 日更数据，盘后 16:25 跑一次（避开 16:20 收盘批量高峰）。
-    ("牛熊证街货分布", "get_cbbc.py",
-     {"hour": 16, "minute": 25, "day_of_week": "mon-fri"}, None, True, None, 300),
-
-    # 港股公司回购（全市场全量）：东财数据中心 RPT_HK_BUYBACK 按 TRADE_DATE 过滤分页，
-    # 全量入库 daily_buyback_event（全局任务，run 忽略 codes）。
-    # 回购公告盘后陆续披露，21:00 跑一次覆盖当日全部。
+    # ══ P0 盘前 07:00–09:20 · 清单 / 日历 / 参考数据 / 昨日兜底 ══════════════
+    # 公司回购 07:00 补昨日 / 17:00 当日盘后（后者属 P2）。
     ("公司回购", "get_buyback.py",
      {"hour": "7,17", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
 
-    # 财务指标全量采集（港股 + A 股全部代码）：run(codes=None) 时忽略 codes，
-    # 内部通过 AKShare 全量代码接口拉港股+全部A股代码，逐只 fetch 后批量入库
-    # financial_indicator（单只异常隔离，不中断整批）。财务数据为低频（年报/季报），
-    # 财务数据为低频（年报/季报），每周一凌晨 2 点跑一次全量即可。全市场约 8300+ 只、
-    # 逐只 HTTP 调用耗时较长；超时设为 2 小时，且 execute_task 超时后后台线程仍会
-    # 续跑直至自然完成（数据照常入库）。
-    ("财务指标全量", "get_financial.py",
-     {"hour": 2, "minute": 0, "day_of_week": "mon"}, None, True, None, 7200),
+    # 南向资金 → daily_ggt_hold；08:00 昨日兜底 / 19:00 盘后终值（后者属 P4，
+    # 是 sector-layer-hk.timer 19:20 的直接上游，不可后移）。
+    ("南向资金", "get_south_flow.py",
+     {"hour": "8,19", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
 
-    # 分红送配明细全量（A股 + 港股全市场）：A股东财 RPT_SHAREBONUS_DET 分页全量 +
-    # 港股同花顺 F10 逐票全历史，落 dividend_history（run 忽略 codes，全局任务）。
-    # 分红为低频事件（预案→实施进度推进时原地 upsert），全市场回填约 20-40 分钟；
-    # 周六 09:00 跑一次（A股分红公告多为周五盘后披露），超时同财务任务设 2 小时。
-    ("分红明细全量", "get_dividend_history.py",
-     {"hour": 9, "minute": 0, "day_of_week": "sat"}, None, True, None, 7200),
-
-    # 公司资料（全市场简介 + 关注池主营构成）：富途 get_company_profile（1 票 1 次）+
-    # get_financials_revenue_breakdown（1 票 1 期 1 次；仅 realtime_collect_target 关注池最近 4 期，
-    # 全市场 × 全历史 40+ 期调用量不可接受）。静态低频数据（简介基本不变、主营构成随
-    # 财报更新），周日 03:00 跑一次全量。
-    # 富途「公司详情」限流 30 次/30 秒（脚本已按 26 次/30 秒 节流留余量），
-    # 全市场约 9100 只逐票调用 ≈ 2.7 小时，超时设 4 小时。
-    ("公司资料全量", "get_company_profile.py",
-     {"hour": 3, "minute": 0, "day_of_week": "sun"}, None, True, None, 14400),
-
-    # 全量画像计算（已迁出，2026-10-05）：改由独立 systemd 单元
-    # compute-profile.service + compute-profile.timer（Mon-Fri 17:30，模板见
-    # system/ 目录）运行。迁出原因：画像的大内存计算（全市场行情窗口 ~220 万行）
-    # 曾两次把整机拖入内存-IO 雪崩（2026-09-29、09-30 各 5.5h / 8.4h），并遗留
-    # 调度器进程内的 futu 锁死（10-01~10-05 全量采集超时）；独立进程 + cgroup
-    # 内存上限可把故障限制在画像自身。任务监控改走 collection_task_log 埋点
-    # （compute_profile.run 内置），见 monitor_collector._PROFILE_TASK_CONFIG。
-
-    # ── 市场状态分析系统（regime schema）采集 ─────────────────────────────
-    # 2026-09-30 起（P0-2 落地）：数据写入 regime.macro_series / public.trading_calendar，
-    # 监控登记见 monitor_collector._REGIME_TABLE_CONFIG。
-    # 中债收益率曲线（国债 + 中短期票据AAA + 商业银行普通债AAA，官方盘后发布）：19:00 取。
-    ("中债收益率曲线", "get_cn_bond.py",
-     {"hour": 19, "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
-    # 中债指数（综合 / 国债，**总回报口径**）：19:05。与上面同源同发布节奏，错开 5 分钟。
-    #   → §4.3.1 的 σ_b 与组合波动率完整式、§4.4.1 的 60/40 债腿（此前这三处都因债券端
-    #     只有收益率曲线、无价格序列而做不了）。
-    #   ⚠ 一次取全历史 → 全量刷新、漏跑一天不丢数据（不同于 get_cn_index_dividend）。
-    ("中债指数", "get_bond_index_cbond.py",
-     {"hour": 19, "minute": 5, "day_of_week": "mon-fri"}, None, True, None, 300),
-    # 美债总回报**代理指数**（久期近似）：19:06。HK 侧债腿 —— §4.4.1 的 HK 相关性矩阵需要它。
-    #   ⚠ 真实指数在 FRED（ICE BofA），而 FRED 当前停机维护、yfinance 被限流 → 先用久期
-    #     近似顶上；**待 FRED 恢复后必须替换为真实指数**（备选序列已记在采集器 docstring）。
-    #   ⚠ 只可用于相关性口径，**不可用于波动率口径**（高估约 30%）→ 不接入任何 VOL 指标。
-    #   纯派生（只读 daily_benchmark 的 US.DGS10）→ 漏跑一天不丢数据。
-    ("美债总回报代理", "get_us_bond_tr_proxy.py",
-     {"hour": 19, "minute": 6, "day_of_week": "mon-fri"}, None, True, None, 300),
-    # 全A 市场级估值（乐咕乐股，月频序列但月内滚动更新）：19:10 刷新。
-    ("全A市场估值", "get_macro_valuation.py",
-     {"hour": 19, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 300),
-    # 中证全指股息率/估值（§4.1 股息利差的数据基础）：19:20。
-    # ⚠ 源只回最近 20 个交易日 → **须每个交易日采到**，漏采即永久缺失（同行业估值快照）。
-    # ⚠ 发布时点无法确证是 T 日盘后还是 T+1 日 → 采集器按「T+1」记 release_time（宁晚勿早）。
-    ("中证指数股息率", "get_cn_index_dividend.py",
-     {"hour": 19, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
-    # 乐咕乐股股息率（长历史口径，§4.1 股息利差的**指标层来源**）：19:20。
-    # 一次取全历史 → 全量刷新、漏跑一天不丢数据（区别于上面那条的 20 日窗口）。
-    ("乐咕股息率", "get_dividend_yield_lg.py",
-     {"hour": 19, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
-    # 沪深股票总市值（§4.1 巴菲特指标的分子）：19:20。两所统计盘后发布。
-    ("沪深总市值", "get_market_cap.py",
-     {"hour": 19, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
-    # 交易日历维护（A股 AKShare 预排 + 港股由成交额表派生）：交易日 08:45 盘前刷新。
-    ("交易日历维护", "init_trading_calendar.py",
-     {"hour": 8, "minute": 45, "day_of_week": "mon-fri"}, None, True, None, 300),
-
-    # 宏观月/季频包（PMI/CPI/PPI/社融/M1M2/GDP/LPR/用电量/市值…，日检幂等：发布即落库）。
-    # 排在 18:20 —— 必须早于 18:45 的「市场状态计算」（计算层按 PIT 取当日已发布值）。
-    ("宏观月频采集", "get_macro_monthly.py",
-     {"hour": 18, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 600),
-    # 宏观日频包（HIBOR/Shibor/商品 + 信用利差/期限利差派生）：18:30，同样早于计算层。
-    ("宏观日频采集", "get_macro_daily.py",
-     {"hour": 18, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 600),
-
-    # 分析师一致预期每日快照：18:40（早于计算层，供修正宽度当日可用）。
-    # ⚠ 逐日快照是「差分依赖」：漏采一天即永久断档（源不提供历史序列，无法补算）。
-    ("一致预期快照", "get_analyst_forecast.py",
-     {"hour": 18, "minute": 40, "day_of_week": "mon-fri"}, None, True, None, 600),
-
-    # 申万一级行业成分主数据（PIT 版本链）：18:05，早于 19:10 的行业配置计算层。
-    # ⚠ 必须**每交易日**跑：源只给当前成分 + 计入日期、无剔除记录，
-    #    eff_to 只能靠逐日快照对比累积（阶段 0 探测结论），漏采一天即永久断链。
-    #    31 次 AKShare 调用实测 ~10s；清单塌陷时脚本自带质量闸门拒绝写库。
-    ("行业成分主数据", "get_sector_constituent.py",
-     {"hour": 18, "minute": 5, "day_of_week": "mon-fri"}, None, True, None, 600),
-
-    # 申万一级行业指数增量更新：18:10（早于 18:45 计算层，行业层指标当日可用）。
-    # 注：调度器在进程内调 run(codes, ctx=...)，不传命令行参数 →
-    #     backfill_sw_industry.run 的 incremental 默认为 True（只 upsert 尾部，避免每日写 20 万行）。
-    ("申万行业指数", "backfill_sw_industry.py",
-     {"hour": 18, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 900),
-
-    # 行业估值快照（申万一级 PE/PB/股息率）：18:15，早于 18:45 计算层。
-    # ⚠ 源只给当前横截面、**无历史序列** → 每个交易日必须当日采到，漏采即永久缺失。
-    ("行业估值快照", "get_sector_valuation.py",
-     {"hour": 18, "minute": 15, "day_of_week": "mon-fri"}, None, True, None, 300),
-
-    # 行业映射月度复核：每月 1 日 08:20（行业分类会随指数公司调整而变）。
-    # confirmed=true 的行不会被覆盖（人工/规则判断优先于自动结果）。
+    # 行业映射月度复核：confirmed=true 的行不被自动结果覆盖。
     ("行业映射重算", "build_sector_mapping.py",
      {"day": 1, "hour": 8, "minute": 20}, None, True, None, 900),
 
-    # 行业资金流（同花顺源，东财 push2 已断连换源）：15:35 A 股收盘后。
-    # ⚠ 源只提供「当前快照」无历史 → 每个交易日的快照必须当日采到，漏采即永久缺失。
+    # 全市场清单刷新：唯一进 _CATCH_UP_NAMES 白名单的任务；清单塌陷会连累
+    # hk/a_daily_quote 采集范围（soft_delete_scope 已按市场门控）。
+    ("全市场清单刷新", "sync_quote_universe.py", {"hour": 8, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    ("交易日历维护", "init_trading_calendar.py", {"hour": 8, "minute": 45, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # 融资融券 → daily_margin_balance；09:20 昨日兜底 / 18:20 当日（后者属 P2）。
+    ("融资融券全量", "get_margin_balance.py",
+     {"hour": "9,18", "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
+
+    # ══ P1 盘中 09:30–16:10 ═══
+    ("全球指数采集(每小时)", "get_global_benchmarks.py", {"hour": "*", "minute": 0}, None, True, None, 180),
+    ("指数分钟-快源", "get_index_minute_fast.py",
+     {"minute": "*", "hour": "9-11,13-16", "day_of_week": "mon-fri"}, None, True, None, 120),
+    # 国际源东财反爬敏感，保持 5 分钟；失败一批无损（成功即补齐当天全部分钟）。
+    ("指数分钟-国际", "get_index_minute_intl.py",
+     {"minute": "*/5", "hour": "8-14", "day_of_week": "mon-fri"}, None, True, None, 120),
+    ("港股全市场成交额", "get_hk_market_turnover.py",
+     {"minute": "*/5", "second": 0}, None, False, "HK", 300),
+    ("A股全市场成交额", "get_a_market_turnover.py",
+     {"minute": "*/5", "second": 0}, None, False, "A", 120),
+    # 多空力量回合：每分钟只重算当天（days_back=1，单轮 20~25s），
+    # 历史补数用 `build_force_rounds.py --days N`；:05 秒位冻结。
+    ("多空力量回合", "build_force_rounds.py",
+     {"minute": "*", "second": 5, "hour": "9-16", "day_of_week": "mon-fri"}, None, True, None, 900),
+    # 行业资金流：源只给当前快照，漏采即永久缺失，必须 A 股收盘后当日采到。
     ("行业资金流", "get_sector_fund_flow.py",
      {"hour": 15, "minute": 35, "day_of_week": "mon-fri"}, None, True, None, 300),
 
-    # 市场情绪事件采集：19:30（IPO / 基金发行 / 解禁 / 董监高增减持，四类一次跑完）。
-    # 晚于计算层（18:45）不影响当日可用性：事件指标为「公告先行」或滞后一日口径，
-    # 次日计算即纳入；解禁排期前瞻 180 天，不缺一日。
-    ("市场事件采集", "get_market_events.py",
-     {"hour": 19, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 900),
+    # ══ P2 盘后采集 16:10–18:40 · 全部早于 18:45 计算闸门 ══════════════════
+    ("A股全市场成交额-盘后补采", "get_a_market_turnover.py",
+     {"hour": 16, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 120),
+    ("牛熊证街货分布", "get_cbbc.py",
+     {"hour": 16, "minute": 25, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("港股全市场成交额-盘后补采", "get_hk_market_turnover.py",
+     {"hour": 16, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 沽空 16:50 主采 + 17:40 / 18:30 补采；18:45 计算层依赖当日终值。
+    # 17:40 避开 compute-profile.timer（17:30，512M）。
+    ("全日沽空数据", "get_realtime_short_selling_fullday.py",
+     {"hour": 16, "minute": 50, "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 回合收口：清 ongoing 兜底，必须放在分钟轮（9-16 时）覆盖窗口之外。
+    ("多空力量回合-盘后收口", "build_force_rounds.py",
+     {"hour": 17, "minute": 5, "day_of_week": "mon-fri"}, None, True, None, 900),
+    ("全日沽空数据-补采1", "get_realtime_short_selling_fullday.py",
+     {"hour": 17, "minute": 40, "day_of_week": "mon-fri"}, None, True, None, 300),
 
-    # 市场状态计算层（读原始表算指标 → regime.indicator_value；
-    # L2 由 build_dimension_value.py 产出，L3 由 build_business_value.py 在 L2 之后产出）。
-    # 依赖当日终值：A股 16:10、港股 16:30 盘后补采 + 港股沽空 18:30 三采 → 18:45 跑。
-    # 增量窗口 45 天（自动重算并覆盖近段），首次/补历史用 --backfill（分块，可中断续跑）。
+    # 周二：成分归属 18:00 → 展示标签 18:35（须在其后取刚刷新的 INDUSTRY 清单）。
+    ("指数成分归属", "get_stock_sector.py", {"day_of_week": 2, "hour": 18, "minute": 0}, None, True, None, 180),
+    # PIT 版本链：逐日必跑，eff_to 靠快照对比累积，漏采一天即永久断链。
+    ("行业成分主数据", "get_sector_constituent.py",
+     {"hour": 18, "minute": 5, "day_of_week": "mon-fri"}, None, True, None, 600),
+    ("申万行业指数", "backfill_sw_industry.py",
+     {"hour": 18, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 900),
+    # 行业估值快照：源无历史，漏采即永久缺失。
+    ("行业估值快照", "get_sector_valuation.py",
+     {"hour": 18, "minute": 15, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("宏观月频采集", "get_macro_monthly.py",
+     {"hour": 18, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 600),
+
+    # ── T 日 18:00 PIT 的 5 条宏观序列：被 18:45 计算层当日消费，2026-11-15
+    ("中债收益率曲线", "get_cn_bond.py",
+     {"hour": 18, "minute": 22, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("中债指数", "get_bond_index_cbond.py",
+     {"hour": 18, "minute": 24, "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 美债代理：FRED 停机期间的久期近似，只可用于相关性口径，不接 VOL 指标。
+    ("美债总回报代理", "get_us_bond_tr_proxy.py",
+     {"hour": 18, "minute": 26, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("全A市场估值", "get_macro_valuation.py",
+     {"hour": 18, "minute": 28, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("宏观日频采集", "get_macro_daily.py",
+     {"hour": 18, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 600),
+    ("全日沽空数据-补采2", "get_realtime_short_selling_fullday.py",
+     {"hour": 18, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("沪深总市值", "get_market_cap.py",
+     {"hour": 18, "minute": 32, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("行业层级映射", "build_sector_hierarchy.py",
+     {"day_of_week": 2, "hour": 18, "minute": 35}, None, True, None, 180),
+    # 一致预期快照：逐日差分，漏采一天即永久断档。
+    ("一致预期快照", "get_analyst_forecast.py",
+     {"hour": 18, "minute": 40, "day_of_week": "mon-fri"}, None, True, None, 600),
+
+    # ══ P3 盘后计算 18:45–19:30 ═══════════════════════════════════════════
+    # 计算闸门：所有 T 日口径且被当日消费的采集必须排在 18:45 之前。
+    # 45 天增量窗口能补齐数据，但不能替代正确排序（顺序错时当日读数慢一天且任务仍记 ok）。
     ("市场状态计算", "market_state_daily.py",
      {"hour": 18, "minute": 45, "day_of_week": "mon-fri"}, None, True, None, 1800),
+    # 19:10 sector-layer.timer / 19:20 sector-layer-hk.timer：独立 systemd unit，
+    # 不在此列表；全量画像 compute-profile.timer 17:30 亦已迁出（资源规范 R4/R5）。
+
+    # ══ P4 夜间 T+1 19:30–20:30 · 不参与当日计算，供次日重算 ═══════════════
+    # 事件采集：滞后一日口径，晚于计算层无碍（豁免范本，注释须写明口径理由）。
+    ("市场事件采集", "get_market_events.py",
+     {"hour": 19, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 900),
+    # 两条股息率 release_time = T+1 18:00，后移不改 PIT 语义。
+    # ⚠ 中证源只回最近 20 个交易日 → 每日必采，漏采即永久缺失，不可降优先级。
+    ("中证指数股息率", "get_cn_index_dividend.py",
+     {"hour": 20, "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("乐咕股息率", "get_dividend_yield_lg.py",
+     {"hour": 20, "minute": 5, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("指数成分权重", "get_stock_sector_weight.py", {"day_of_week": 2, "hour": 20, "minute": 30}, None, True, None, 180),
+
+    # ══ P5 低频 · 凌晨 / 周末 ═════════════════════════════════════════════
+    # 全量任务超时后 daemon 线程会续跑至自然完成，数据照常入库。
+    ("财务指标全量", "get_financial.py",
+     {"hour": 2, "minute": 0, "day_of_week": "mon"}, None, True, None, 7200),
+    # 公司资料：富途限流 30 次/30s（脚本按 26 次节流），全市场 ≈2.7h。
+    ("公司资料全量", "get_company_profile.py",
+     {"hour": 3, "minute": 0, "day_of_week": "sun"}, None, True, None, 14400),
+    ("分红明细全量", "get_dividend_history.py",
+     {"hour": 9, "minute": 0, "day_of_week": "sat"}, None, True, None, 7200),
+
+    # ══ 已停用（保留备查）════════════════════════════════════════════════
+    #("数据清理", "cleanup_old_data.py", {"hour": 4, "minute": 0}, None, True, None, 180),
+    #("指数相关性分析", "benchmark_correlation_daily.py",
+    # {"hour": 17, "minute": 30, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS], True, None, 180),
+    #("宏观环境评分", "macro_environment_score.py",
+    # {"hour": 18, "minute": 0, "day_of_week": "mon-fri"}, [s["code"] for s in STOCKS], True, None, 180),
 
     # 注意：采集层故障监控已由独立服务 monitor_collector.py（常驻进程，
     # systemd: monitor-collector.service）负责，不再挂在调度器里，
