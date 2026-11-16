@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""申万一级行业成分主数据采集 —— 写入 regime.sector_constituent（PIT 版本链）。
+"""申万一级行业成分主数据采集 —— 写入 industry.constituent（PIT 版本链）。
 
 第④层「行业配置」阶段 2 的数据层，口径见 doc/industry_allocation_feasibility.md
 §2.2.1 / §4.2。
@@ -35,8 +35,8 @@ import pandas as pd
 
 from db import bulk_upsert, get_conn
 
-TABLE = "regime.sector_constituent"
-CHANGE_TABLE = "regime.sector_constituent_change"
+TABLE = "industry.constituent"
+CHANGE_TABLE = "industry.constituent_change"
 SOURCE = "akshare:index_component_sw"
 MARKET = "CN"
 CLASSIFICATION = "SW_L1"
@@ -134,7 +134,7 @@ def _load_active(conn) -> dict:
     """当前有效成分 {(sector_code, stock_code): (eff_from, weight)}。"""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT sector_code, stock_code, eff_from, weight FROM regime.sector_constituent "
+            "SELECT sector_code, stock_code, eff_from, weight FROM industry.constituent "
             "WHERE market=%s AND classification=%s AND eff_to IS NULL",
             (MARKET, CLASSIFICATION))
         return {(r[0], r[1]): (r[2], float(r[3]) if r[3] is not None else None)
@@ -186,7 +186,7 @@ def _apply(conn, diff: dict, dry_run: bool = False) -> dict:
     for r in diff["remove"]:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE regime.sector_constituent SET eff_to=%s "
+                "UPDATE industry.constituent SET eff_to=%s "
                 "WHERE market=%s AND classification=%s AND sector_code=%s "
                 "AND stock_code=%s AND eff_to IS NULL",
                 (snap, MARKET, CLASSIFICATION, r["sector_code"], r["stock_code"]))
@@ -195,7 +195,7 @@ def _apply(conn, diff: dict, dry_run: bool = False) -> dict:
     for r in diff["weight"]:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE regime.sector_constituent SET eff_to=%s "
+                "UPDATE industry.constituent SET eff_to=%s "
                 "WHERE market=%s AND classification=%s AND sector_code=%s "
                 "AND stock_code=%s AND eff_to IS NULL",
                 (snap, MARKET, CLASSIFICATION, r["sector_code"], r["stock_code"]))
@@ -206,7 +206,7 @@ def _apply(conn, diff: dict, dry_run: bool = False) -> dict:
     for (sec, stock), w in diff["tiny"]:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE regime.sector_constituent SET weight=%s "
+                "UPDATE industry.constituent SET weight=%s "
                 "WHERE market=%s AND classification=%s AND sector_code=%s "
                 "AND stock_code=%s AND eff_to IS NULL",
                 (w, MARKET, CLASSIFICATION, sec, stock))
@@ -279,7 +279,7 @@ def run(codes=None, ctx=None, snapshot_date: dt.date = None, dry_run: bool = Fal
 
         with conn.cursor() as cur:
             cur.execute("SELECT count(*), count(*) FILTER (WHERE eff_to IS NULL), "
-                        "min(eff_from), max(eff_from) FROM regime.sector_constituent "
+                        "min(eff_from), max(eff_from) FROM industry.constituent "
                         "WHERE market=%s AND classification=%s",
                         (MARKET, CLASSIFICATION))
             total, n_active, mn, mx = cur.fetchone()

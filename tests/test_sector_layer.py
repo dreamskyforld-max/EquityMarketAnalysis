@@ -165,7 +165,7 @@ class TestIndicatorDict(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertTrue(d["is_active"])
                 self.assertIn(d, sl.ACTIVE_DEFS)
-                self.assertIn("sector_constituent", d["source"])
+                self.assertIn("constituent", d["source"])
                 self.assertTrue(d["value_col"] or d["pct_x_col"])
         self.assertEqual(sl.CALIB_VERSION, "s2.1")   # 口径断点必须换指纹
         self.assertEqual(len(sl.ENABLED_DIMENSIONS), 6)
@@ -265,8 +265,11 @@ class TestComputeFrameContract(unittest.TestCase):
 
     def test_biz_rows_flags(self):
         rows = sl._biz_rows(self.wide, dt.date(2026, 1, 1), dt.date(2026, 12, 31))
-        self.assertTrue(all("PARTIAL_STATE" in r["gate_flags"] for r in rows))
-        self.assertTrue(all("rank_no" in r for r in rows))
+        entities = {(r["sector_code"], r["trade_date"]) for r in rows}
+        self.assertEqual({r["biz_code"] for r in rows}, set(sl._biz_hashes()))
+        self.assertEqual(len(rows), len(entities) * 5)   # 每个行业日 5 个 active biz_code
+        gates = [r for r in rows if r["biz_code"] == "SEC.BIZ.GATE"]
+        self.assertTrue(all("PARTIAL_STATE" in r["detail"]["gate_flags"] for r in gates))
 
 
 class TestEngineeringGuards(unittest.TestCase):
@@ -298,28 +301,31 @@ class TestEngineeringGuards(unittest.TestCase):
     def test_ddl_dual_source(self):
         schema = _read("sql/schema.sql")
         code = _read("regime_schema.py")
-        for tbl in ("regime.sector_indicator_dict", "regime.sector_indicator_value",
-                    "regime.sector_score_daily", "regime.sector_biz_daily"):
+        for tbl in ("industry.indicator_dict", "industry.indicator_value",
+                    "industry.dimension_value", "industry.business_dict",
+                    "industry.business_value"):
             with self.subTest(tbl=tbl):
                 self.assertIn("CREATE TABLE IF NOT EXISTS " + tbl, schema)
                 self.assertIn("CREATE TABLE IF NOT EXISTS " + tbl, code)
-        self.assertIn("rank_no", schema)
-        self.assertIn("rank_no", code)
+        self.assertIn("biz_code", schema)
+        self.assertIn("biz_code", code)
+        self.assertIn("CREATE SCHEMA IF NOT EXISTS industry", schema)
+        self.assertIn("CREATE SCHEMA IF NOT EXISTS industry", code)
         self.assertIn("def ensure_sector_schema", code)
 
     def test_ddl_primary_keys_include_market_and_classification(self):
         schema = _read("sql/schema.sql")
         self.assertIn("PRIMARY KEY (market, classification, sector_code, trade_date, indicator_code)", schema)
         self.assertIn("PRIMARY KEY (market, classification, sector_code, trade_date, dimension_code)", schema)
-        self.assertIn("PRIMARY KEY (market, classification, sector_code, trade_date)", schema)
+        self.assertIn("PRIMARY KEY (biz_code, market, classification, sector_code, trade_date)", schema)
 
     def test_monitor_registered(self):
         src = _read("monitor_collector.py")
         self.assertIn('("行业配置计算", 1440', src)
-        for tbl in ("sector_indicator_value", "sector_score_daily", "sector_biz_daily"):
+        for tbl in ("indicator_value", "dimension_value", "business_value", "business_dict"):
             with self.subTest(tbl=tbl):
-                self.assertIn('("regime", "' + tbl + '"', src)
-                self.assertIn('("regime", "' + tbl + '")', src)  # CN 日历集合
+                self.assertIn('("industry", "' + tbl + '"', src)
+                self.assertIn('("industry", "' + tbl + '")', src)  # CN 日历集合
 
     def test_write_batch_under_r6(self):
         self.assertLessEqual(sl.WRITE_BATCH, 50_000)

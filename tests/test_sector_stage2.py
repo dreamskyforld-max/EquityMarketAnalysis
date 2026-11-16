@@ -269,7 +269,10 @@ class TestStage2FrameWiring(unittest.TestCase):
 
     def test_no_partial_state_flag(self):
         rows = sl._biz_rows(self.wide, dt.date(2026, 1, 1), dt.date(2026, 12, 31))
-        self.assertTrue(all("PARTIAL_STATE" not in r["gate_flags"] for r in rows))
+        entities = {(r["sector_code"], r["trade_date"]) for r in rows}
+        self.assertEqual(len(rows), len(entities) * 5)
+        gates = [r for r in rows if r["biz_code"] == "SEC.BIZ.GATE"]
+        self.assertTrue(all("PARTIAL_STATE" not in r["detail"]["gate_flags"] for r in gates))
 
     def test_stage2_indicator_rows_emitted(self):
         rows = sl._indicator_rows(self.wide, dt.date(2026, 1, 1), dt.date(2026, 12, 31))
@@ -280,7 +283,7 @@ class TestStage2FrameWiring(unittest.TestCase):
 
     def test_pit_capable_flag_for_stage2(self):
         rows = sl._indicator_rows(self.wide, dt.date(2026, 1, 1), dt.date(2026, 12, 31))
-        stage2 = [r for r in rows if "sector_constituent" in
+        stage2 = [r for r in rows if "constituent" in
                   next(d["source"] for d in sl.ACTIVE_DEFS
                        if d["code"] == r["indicator_code"])]
         self.assertTrue(all(r["extra"]["pit_capable"] for r in stage2))
@@ -292,13 +295,13 @@ class TestEngineeringGuards(unittest.TestCase):
     def test_ddl_dual_source(self):
         schema = _read("sql/schema.sql")
         code = _read("regime_schema.py")
-        for tbl in ("regime.sector_constituent", "regime.sector_constituent_change"):
+        for tbl in ("industry.constituent", "industry.constituent_change"):
             with self.subTest(tbl=tbl):
                 self.assertIn("CREATE TABLE IF NOT EXISTS " + tbl, schema)
                 self.assertIn("CREATE TABLE IF NOT EXISTS " + tbl, code)
         self.assertIn("eff_from", schema)
         self.assertIn("_SECTOR_DDL_KEYS", code)
-        self.assertIn("sector_constituent", code)
+        self.assertIn("CREATE SCHEMA IF NOT EXISTS industry", code)
 
     def test_scheduler_registration(self):
         src = _read("market_scheduler.py")
@@ -309,10 +312,10 @@ class TestEngineeringGuards(unittest.TestCase):
 
     def test_monitor_registration(self):
         src = _read("monitor_collector.py")
-        for tbl in ("sector_constituent", "sector_constituent_change"):
+        for tbl in ("constituent", "constituent_change"):
             with self.subTest(tbl=tbl):
-                self.assertIn('("regime", "' + tbl + '"', src)
-                self.assertIn('("regime", "' + tbl + '")', src)
+                self.assertIn('("industry", "' + tbl + '"', src)
+                self.assertIn('("industry", "' + tbl + '")', src)
 
     def test_resource_guards(self):
         src = _read("sector_stage2_agg.py")

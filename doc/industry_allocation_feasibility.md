@@ -1,10 +1,12 @@
-# 行业配置（第四层）可行性分析与设计
+# 行业热点（第四层）可行性分析与设计
 
 > **文档性质**：设计稿（未实施）。目标与需求牵引 → 指标体系为主体 → 落地计划收尾。
 > **上位文档**：`doc/market_profile.md`（下称「主报告」，重点评估其 §6 第四层 / §6.10 / §7 / §8.5 / §9）。
 > **现状依据**：`sql/schema.sql`、`market_state_daily.py`、`doc/market_profile_collection_plan.md` §7.11/§7.13/§7.14/§7.8、`doc/market_state_data_architecture.md`、`doc/compute_task_resource_standard.md`。
 > **数据基准**：2026-11（本项目行业层采集自 2026-09-30 起陆续上线）。
 > **边界**：本文只做第 ④ 层指标与计算的设计，不覆盖前端页面契约（`market_profile_ui_handoff.md` 目前完全没有 ④ 层内容，需另行补齐）。
+
+> 🔴 **表名迁移说明（2026-11-16，阅读本文前必读）**：本文是设计稿与实施期历史记录，正文中的 `regime.sector_*` / `regime.hk_sector_index_daily` 均为**迁移前**表名，**保留原样以维持历史留痕**。现行规格见 `doc/industry_hotspot_data_architecture.md v1.3`：第④层 7 张专属表已迁入独立 `industry` 域并去掉 `sector_` 前缀（如 `industry.constituent`、`industry.hk_index_daily`）；L3 由宽表 `sector_biz_daily` 改为长表 `industry.business_value` + `industry.business_dict`（按 `biz_code` 分行）。**5 张共用输入表（`sector_daily` / `sector_valuation_snapshot` / `sector_fund_flow` / `sector_mapping` / `analyst_forecast_snapshot`）仍留在 `regime`**，由第③层读写。本文附录 A 的 SQL 如要复跑，须按现行规格替换表名。
 
 ---
 

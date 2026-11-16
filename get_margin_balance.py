@@ -215,13 +215,48 @@ def collect(trade_date: Optional[date] = None, dry: bool = False) -> int:
     return len(rows)
 
 
+def collect_recent(days: int = 7, dry: bool = False) -> int:
+    """回填最近 days 个自然日内所有缺失的交易日数据（默认 7 天）。
+
+    不依赖交易日历：查库得到该窗口内已有数据的日期，对其余每个日期直接调
+    collect()；周末（weekday>=5）由 collect 内部跳过，非交易日/当日未披露
+    （东财返回空）由 fetch_day 返回空 DataFrame 自然跳过。这样即使某次调度
+    misfire 漏采，后续任一轮（09:20/18:20）都能把窗口内的空洞补回。
+
+    只扫描自然日、不做交易日判断，是为了避免引入 trading_calendar 等多数据源
+    依赖。代价是每天多探查若干本就无数据的日期（东财空返回开销很小）。
+
+    返回窗口内新入库行数合计。
+    """
+    today = date.today()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT trade_date FROM daily_margin_balance "
+                "WHERE trade_date >= %s AND trade_date <= %s",
+                (today - timedelta(days=days - 1), today))
+            have = {r[0] for r in cur.fetchall()}
+
+    total = 0
+    for i in range(days):
+        d = today - timedelta(days=i)
+        if d in have:
+            continue
+        total += collect(trade_date=d, dry=dry)
+    return total
+
+
 def run(codes=None, ctx=None, **kwargs) -> int:
-    """常驻进程入口，供 collector_runtime.run_module 调用。"""
+    """常驻进程入口，供 collector_runtime.run_module 调用。
+
+    每轮回填最近 7 个自然日内的缺失交易日（防漏采）。kwargs 的 trade_date
+    由独立运行/手动补录使用，走原来的单日 collect 逻辑。
+    """
     cli_date = kwargs.get("trade_date")
-    td: Optional[date] = None
     if cli_date:
         td = datetime.strptime(cli_date, "%Y-%m-%d").date()
-    return collect(trade_date=td)
+        return collect(trade_date=td)
+    return collect_recent(days=7)
 
 
 def main():

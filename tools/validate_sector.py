@@ -81,13 +81,25 @@ def load_panel(conn, start: dt.date, end: dt.date) -> pd.DataFrame:
     用 (trade_date × sw_code) 宽表在**交易日网格**上 shift(-N)，避免某行业缺行时
     groupby.shift 按行数位移造成错位；mean(axis=1) 自动适配 rank_n 16→28→31 时变。
     """
+    # L3 已改为按 biz_code 分行的长表；这里用条件聚合 pivot 回一行业一日一行，
+    # 保持下游分组/IC/占比计算的输入形状不变。
     biz = read_sql(conn, """
-        SELECT trade_date, sector_code, state_side, risk_side, quadrant,
-               rank_no, rank_n, coverage, applicable, confidence, gate_flags,
-               params_hash, extra->>'pit_capable' AS pit_capable,
-               extra->>'calib_version' AS calib_version
-        FROM regime.sector_biz_daily
+        SELECT trade_date, sector_code,
+               max(score)  FILTER (WHERE biz_code='SEC.BIZ.STATE_SIDE') AS state_side,
+               max(score)  FILTER (WHERE biz_code='SEC.BIZ.RISK_SIDE')  AS risk_side,
+               max(state)  FILTER (WHERE biz_code='SEC.BIZ.QUADRANT')   AS quadrant,
+               max(level)  FILTER (WHERE biz_code='SEC.BIZ.RANK')       AS rank_no,
+               (max(detail->>'rank_n') FILTER (WHERE biz_code='SEC.BIZ.RANK'))::int AS rank_n,
+               max(coverage)   AS coverage,
+               bool_or(applicable) AS applicable,
+               max(confidence) AS confidence,
+               max(detail->>'gate_flags') FILTER (WHERE biz_code='SEC.BIZ.GATE') AS gate_flags,
+               max(params_hash) AS params_hash,
+               max(extra->>'pit_capable')   AS pit_capable,
+               max(extra->>'calib_version') AS calib_version
+        FROM industry.business_value
         WHERE market=%s AND classification=%s AND trade_date BETWEEN %s AND %s
+        GROUP BY trade_date, sector_code
         ORDER BY trade_date, sector_code
     """, params=[MARKET, CLASSIFICATION, start, end])
     px = read_sql(conn, """
@@ -120,13 +132,13 @@ def load_dimension_items(conn, start: dt.date, end: dt.date,
     """构念效度：**按维度分批**加载成员分位 + 该维度 score（R3：不一次性透视全维度）。"""
     iv = read_sql(conn, """
         SELECT trade_date, sector_code, indicator_code, percentile_xsec
-        FROM regime.sector_indicator_value
+        FROM industry.indicator_value
         WHERE market=%s AND classification=%s AND trade_date BETWEEN %s AND %s
           AND indicator_code = ANY(%s)
     """, params=[MARKET, CLASSIFICATION, start, end, sorted(codes)])
     sc = read_sql(conn, """
         SELECT trade_date, sector_code, dimension_code, score
-        FROM regime.sector_score_daily
+        FROM industry.dimension_value
         WHERE market=%s AND classification=%s AND trade_date BETWEEN %s AND %s
           AND dimension_code = %s
     """, params=[MARKET, CLASSIFICATION, start, end, dimension])
@@ -423,7 +435,7 @@ def check_shares(conn, panel: pd.DataFrame, start: dt.date, end: dt.date) -> dic
     # 拥挤档位用 SQL 聚合（只回 5 行），不把百万行 L1 明细拉进内存
     g = read_sql(conn, """
         SELECT extra->>'label' AS label, count(*) AS n
-        FROM regime.sector_indicator_value
+        FROM industry.indicator_value
         WHERE market=%s AND classification=%s AND trade_date BETWEEN %s AND %s
           AND indicator_code=%s
         GROUP BY 1
@@ -452,12 +464,15 @@ def check_pit_bias(conn, panel: pd.DataFrame) -> dict:
                              rank_coverage=_r(g["rank_no"].notna().mean(), 4),
                              applicable_ratio=_r(g["applicable"].mean(), 4),
                              coverage_mean=_r(g["coverage"].mean(), 4))
+    # 长表下每个行业日有多行，rows 用 DISTINCT 去重，各指标用 FILTER 分别取。
     hist = read_sql(conn, """
         SELECT extra->>'pit_capable' AS pit_capable,
                min(trade_date) AS date_min, max(trade_date) AS date_max,
-               count(*) AS rows, avg(state_side) AS state_mean,
-               count(rank_no) AS ranked_rows, avg(coverage) AS coverage_mean
-        FROM regime.sector_biz_daily
+               count(DISTINCT (trade_date, sector_code)) AS rows,
+               avg(score) FILTER (WHERE biz_code='SEC.BIZ.STATE_SIDE') AS state_mean,
+               count(level) FILTER (WHERE biz_code='SEC.BIZ.RANK') AS ranked_rows,
+               avg(coverage) FILTER (WHERE biz_code='SEC.BIZ.STATE_SIDE') AS coverage_mean
+        FROM industry.business_value
         WHERE market=%s AND classification=%s AND trade_date >= %s
         GROUP BY 1 ORDER BY 1
     """, params=[MARKET, CLASSIFICATION, dt.date(1999, 12, 30)])
@@ -494,7 +509,7 @@ def check_data_gates(conn, panel: pd.DataFrame, end: dt.date) -> dict:
     with conn.cursor() as cur:
         cur.execute("""
             SELECT count(*), min(trade_date), max(trade_date)
-            FROM regime.sector_indicator_value
+            FROM industry.indicator_value
             WHERE market=%s AND classification=%s AND indicator_code=%s
               AND extra->>'label' = %s
         """, (MARKET, CLASSIFICATION, "SEC.CROWD.GATE", "EXTREME"))
@@ -507,13 +522,13 @@ def check_data_gates(conn, panel: pd.DataFrame, end: dt.date) -> dict:
             c, mx = cur.fetchone()
             snapshots[name] = dict(observed_days=int(c), last=str(mx))
         cur.execute("SELECT count(*), min(trade_date), max(trade_date) "
-                    "FROM regime.sector_biz_daily WHERE market='HK'")
+                    "FROM industry.business_value WHERE market='HK'")
         hk_n, hk_d0, hk_d1 = cur.fetchone()
 
     # EXTREME 后 N 日可观测行数（用 L3 面板的 fwd 标签做保守上界）
     ext_rows = read_sql(conn, """
         SELECT trade_date, sector_code
-        FROM regime.sector_indicator_value
+        FROM industry.indicator_value
         WHERE market=%s AND classification=%s AND indicator_code=%s
           AND extra->>'label'=%s AND trade_date BETWEEN %s AND %s
     """, params=[MARKET, CLASSIFICATION, "SEC.CROWD.GATE", "EXTREME",
@@ -536,7 +551,7 @@ def check_data_gates(conn, panel: pd.DataFrame, end: dt.date) -> dict:
         "EXTREME 样本须覆盖 ≥60 个交易日之后的完整前瞻窗口，且行业×日样本足以做显著性检验",
         "45 行全部集中在最近约 30 个交易日，后 60 日收益完全不可观测；"
         "拿 20 日部分窗口出结论属选择性样本，按 §3.7 不通过处置降级为纯展示标记",
-        "监控 regime.sector_indicator_value 中 SEC.CROWD.GATE 的 EXTREME 行数与日期跨度；"
+        "监控 industry.indicator_value 中 SEC.CROWD.GATE 的 EXTREME 行数与日期跨度；"
         "待 EXTREME 最早日 +60 交易日之后再复跑本脚本"))
 
     for name, s in snapshots.items():
@@ -563,7 +578,7 @@ def check_hk_sensitivity(conn, start: dt.date, end: dt.date) -> dict:
     """阶段 3 待排查项：最小成分数门槛 / 截尾敏感性（描述性，不改生产口径）。"""
     d = read_sql(conn, """
         SELECT trade_date, sector_code, ret_eq, ret_cap, n_constituent
-        FROM regime.hk_sector_index_daily
+        FROM industry.hk_index_daily
         WHERE trade_date BETWEEN %s AND %s
           AND ret_eq IS NOT NULL AND ret_cap IS NOT NULL
     """, params=[start, end])
@@ -601,7 +616,7 @@ def run(start: dt.date, end: dt.date, n_iter: int = BOOTSTRAP_DEFAULT) -> dict:
     rng = np.random.default_rng(RANDOM_SEED)
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT max(trade_date) FROM regime.sector_biz_daily "
+            cur.execute("SELECT max(trade_date) FROM industry.business_value "
                         "WHERE market=%s AND classification=%s",
                         (MARKET, CLASSIFICATION))
             last = cur.fetchone()[0]

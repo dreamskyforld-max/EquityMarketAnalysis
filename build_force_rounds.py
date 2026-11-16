@@ -171,7 +171,7 @@ def load_panel(cur, code: str, day: dt.date, th: dict) -> list[dict]:
                SUM(price * volume) AS amt
         FROM tick_data
         WHERE stock_code=%(code)s AND tick_time >= %(day)s AND tick_time < %(day)s + interval '1 day'
-          AND ticker_direction IN ('BUY', 'SELL') AND volume > 0
+          AND ticker_direction <> 'NEUTRAL' AND ticker_direction <> 'NONE' AND volume > 0
         GROUP BY 1, 2, 3
         """, {"code": code, "day": day, "xl": th["xlarge"], "lg": th["large"], "md": th["medium"]})
 

@@ -5,7 +5,7 @@
 
 HK 没有官方行业指数序列（CN 侧是 31 个申万一级 `daily_benchmark` / `regime.sector_daily`），
 本模块从 `hk_daily_quote` × `stock_sector`（113 个恒生三级 `HK.LIST*` 行业）自下而上合成，
-输出 `regime.hk_sector_index_daily`（第 27 号表），供 `sector_layer_hk.py` 计算 L1/L2/L3。
+输出 `industry.hk_index_daily`（第 27 号表），供 `sector_layer_hk.py` 计算 L1/L2/L3。
 
 【2026-11-14 实测驱动的三条口径变更，均已写进字典 remark / 表注释】
   ① M8 原文「流通市值加权」不可得：`circular_market_val` 2000-2023 全 NULL、
@@ -278,7 +278,7 @@ def _refresh_index_points(conn, start: dt.date, end: dt.date, write: bool) -> in
 
     base = read_sql(conn, """
         SELECT DISTINCT ON (sector_code) sector_code, idx_eq, idx_cap
-        FROM regime.hk_sector_index_daily
+        FROM industry.hk_index_daily
         WHERE trade_date < %s AND idx_eq IS NOT NULL
         ORDER BY sector_code, trade_date DESC
     """, params=[start])
@@ -287,7 +287,7 @@ def _refresh_index_points(conn, start: dt.date, end: dt.date, write: bool) -> in
 
     rows_df = read_sql(conn, """
         SELECT trade_date, sector_code, ret_eq, ret_cap
-        FROM regime.hk_sector_index_daily
+        FROM industry.hk_index_daily
         WHERE trade_date BETWEEN %s AND %s
         ORDER BY sector_code, trade_date
     """, params=[start, end])
@@ -320,7 +320,7 @@ def _refresh_index_points(conn, start: dt.date, end: dt.date, write: bool) -> in
         return len(out)
     with conn.cursor() as cur:
         sql = """
-            UPDATE regime.hk_sector_index_daily AS t
+            UPDATE industry.hk_index_daily AS t
                SET idx_eq = v.idx_eq, idx_cap = v.idx_cap
               FROM (VALUES %s) AS v(trade_date, sector_code, idx_eq, idx_cap)
              WHERE t.trade_date = v.trade_date::date
@@ -333,7 +333,7 @@ def _refresh_index_points(conn, start: dt.date, end: dt.date, write: bool) -> in
 
 
 def build_index_daily(conn, start: dt.date, end: dt.date, write: bool = True) -> dict:
-    """按月 × 按股票分批聚合 → 写 regime.hk_sector_index_daily（表 27）。"""
+    """按月 × 按股票分批聚合 → 写 industry.hk_index_daily（表 27）。"""
     t0 = time.monotonic()
     cmap = load_constituents(conn)
     if cmap.empty:
@@ -375,7 +375,7 @@ def build_index_daily(conn, start: dt.date, end: dt.date, write: bool = True) ->
         rows = _clean_rows(monthly.to_dict("records"))
         if write:
             for i in range(0, len(rows), WRITE_BATCH):
-                bulk_upsert(conn, "regime.hk_sector_index_daily", rows[i:i + WRITE_BATCH],
+                bulk_upsert(conn, "industry.hk_index_daily", rows[i:i + WRITE_BATCH],
                             conflict_cols=["trade_date", "sector_code"])
                 conn.commit()
         stats["rows"] += len(rows)
@@ -415,7 +415,7 @@ def report_consistency(conn, start: dt.date, end: dt.date) -> dict:
         SELECT trade_date,
                count(*) FILTER (WHERE ret_eq > 0) * 100.0 / nullif(count(*), 0) AS up_new,
                count(*) AS rank_n
-        FROM regime.hk_sector_index_daily
+        FROM industry.hk_index_daily
         WHERE trade_date BETWEEN %s AND %s
         GROUP BY trade_date ORDER BY trade_date
     """, params=[start, end])
@@ -433,7 +433,7 @@ def report_consistency(conn, start: dt.date, end: dt.date) -> dict:
                corr(ret_eq, ret_cap) AS corr,
                count(*) FILTER (WHERE sign(ret_eq) <> sign(ret_cap)) AS sign_flips,
                min(n_constituent) FILTER (WHERE abs(ret_eq - ret_cap) > 20) AS min_n_large_gap
-        FROM regime.hk_sector_index_daily
+        FROM industry.hk_index_daily
         WHERE trade_date BETWEEN %s AND %s
           AND ret_eq IS NOT NULL AND ret_cap IS NOT NULL
     """, params=[start, end])
@@ -462,7 +462,7 @@ def _rnd(v, digits=4):
 def _default_window(conn) -> tuple[dt.date, dt.date]:
     end = dt.date.today()
     with conn.cursor() as cur:
-        cur.execute("SELECT max(trade_date) FROM regime.hk_sector_index_daily")
+        cur.execute("SELECT max(trade_date) FROM industry.hk_index_daily")
         last = cur.fetchone()[0]
     start = (last - dt.timedelta(days=REWIND_DAYS)) if last else \
             (end - dt.timedelta(days=INCREMENTAL_DAYS))

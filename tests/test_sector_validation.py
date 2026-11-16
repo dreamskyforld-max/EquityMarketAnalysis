@@ -230,7 +230,7 @@ class TestEngineeringGuards(unittest.TestCase):
         self.assertIn("by_min_constituents", src)
         self.assertIn("by_winsorize", src)
         self.assertIn("不改生产口径", src)
-        self.assertNotIn("ALTER TABLE regime.hk_sector_index_daily", src)
+        self.assertNotIn("ALTER TABLE industry.hk_index_daily", src)
 
     def test_data_gates_cover_three_items(self):
         src = _read("tools/validate_sector.py")

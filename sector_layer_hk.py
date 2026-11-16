@@ -44,8 +44,10 @@ import pandas as pd
 
 from db import bulk_upsert, get_conn, read_sql
 from log_utils import setup_logger
-from sector_layer import (CROWD_GATE_CODES, PK_COLS, RRG_LABELS, _clean_rows,
-                          _get, _reverse_percentile, _write_batched,
+from sector_layer import (BIZ_DEFS as _CN_BIZ_DEFS,
+                          BIZ_PK_COLS, CROWD_GATE_CODES, CROWD_PCT_HIGH, PK_COLS, RRG_LABELS,
+                          _atom_spec, _clean_rows, _get, _hash_spec,
+                          _reverse_percentile, _write_batched,
                           _xsec_percentile, confidence_of, crowd_gate, quadrant_of)
 
 log = setup_logger("sector_layer_hk")
@@ -69,6 +71,17 @@ WRITE_BATCH = 2000
 # 本期启用的维度（FLOW / FUNDAMENTAL 无可靠数据源，写 NULL 行并标 reason）
 ENABLED_DIMENSIONS = ("TREND", "VALUATION", "CROWDING", "BREADTH")
 
+# L3 业务读数阈值：抽成常量以便纳入口径指纹（数值与既有实现完全一致）。
+# ⚠ 改这些值会换掉 HK 的 L2/L3 params_hash，必须全量重算。
+COVERAGE_MIN = 0.6
+VALID_DAYS_20_MIN = 15
+VALID_DAYS_WINDOW = 20
+
+# 拥挤度规则判定所用因子（HK TURNOVER_PCT 登记为 inactive，但定义仍在
+# HK_INDICATOR_DEFS 中，纳入指纹可让「启用该因子」这一口径变更被感知）。
+_HK_CROWD_FACTORS = ("SEC.CROWD.AMT_SHARE_PCT", "SEC.CROWD.TURNOVER_PCT",
+                     "SEC.CROWD.VAL_PCT")
+
 
 # ── remark 三段式（与 regime.indicator_dict 的事实标准对齐）──────────────────
 # 单行 `定义：…　·　判读：…　·　数据：…`，可扩展 ⚠/口径：；无换行、无【】。
@@ -90,7 +103,7 @@ def D(code, name, domain, side, unit, direction, formula, model_key,
     return dict(code=code, indicator_name=name, domain=domain, side=side,
                 unit=unit, direction=direction, formula=formula, model_key=model_key,
                 value_col=value_col, pct_x_col=pct_x_col, pct_t_col=pct_t_col,
-                n_col=n_col, source="regime.hk_sector_index_daily", freq=freq,
+                n_col=n_col, source="industry.hk_index_daily", freq=freq,
                 remark=remark, is_active=active, extra_kind=extra_kind)
 
 HK_INDICATOR_DEFS = [
@@ -265,12 +278,107 @@ HK_DIMENSION_DEFS = {
                              ("SEC.BREADTH.RET_DISPERSION", -1)]),
 }
 
+# HK 业务指标集合：与 CN 共用同一组 biz_code（开放集合），但按市场覆盖
+# 输入清单与启用状态。⚠ SEC.BIZ.RANK 本期 is_active=False（阶段 3 用户决策
+# 「HK 不排名」）—— 字典仍登记该行，值表不产出，前端显示「本期不提供」。
+HK_BIZ_DEFS = {code: dict(cfg, inputs=list(cfg["inputs"]))
+               for code, cfg in _CN_BIZ_DEFS.items()}
+HK_BIZ_DEFS["SEC.BIZ.STATE_SIDE"]["inputs"] = [
+    {"kind": "dimension", "code": "SEC.DIM." + n}
+    for n, c in HK_DIMENSION_DEFS.items()
+    if c["side"] == "state" and c["structure"] in ("single_anchor", "equal")]
+HK_BIZ_DEFS["SEC.BIZ.RANK"]["is_active"] = False
+HK_BIZ_DEFS["SEC.BIZ.RANK"]["output_schema"] = dict(
+    _CN_BIZ_DEFS["SEC.BIZ.RANK"]["output_schema"],
+    level="恒 NULL：阶段 3 用户决策 HK 首期不产出跨行业排名")
+
 
 # ── 口径指纹（含市场，保证与 CN 同 code 指标的 hash 不同）─────────────────────
 def _hk_params_hash(d: dict) -> str:
+    """HK L1 原子口径指纹（payload 含市场与分类，保证与 CN 同 code 指标不同）。"""
     payload = "|".join([d["code"], MARKET, CLASSIFICATION, d["unit"],
                         d["direction"], d["formula"], d["model_key"], CALIB_VERSION])
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
+
+
+# ── HK L2 / L3 口径指纹（与 CN 独立版本线，spec 内已带 market/classification）──
+def _hk_dim_spec() -> dict:
+    """HK 六维口径规格：结构 + 锚/成员/sign + 上游 L1 定义 + hk1.0。"""
+    out = {}
+    for name, cfg in HK_DIMENSION_DEFS.items():
+        codes = ([cfg["anchor"]] if cfg["anchor"] else
+                 [c for c, _ in cfg.get("members", [])])
+        if name == "CROWDING":
+            codes = list(_HK_CROWD_FACTORS)
+        out[name] = {
+            "layer": "L2", "code": "SEC.DIM." + name,
+            "market": MARKET, "classification": CLASSIFICATION,
+            "version": CALIB_VERSION,
+            "structure": cfg["structure"], "side": cfg["side"],
+            "anchor": cfg["anchor"],
+            "members": [{"code": c, "sign": s}
+                        for c, s in cfg.get("members", [])],
+            "upstream": {c: _atom_spec(HK_INDICATOR_DEFS, c, _hk_params_hash)
+                         for c in codes},
+        }
+    return out
+
+
+def _hk_dim_hashes() -> dict:
+    """循环外预计算一次，避免每个行业日重复 json.dumps（热路径护栏）。"""
+    return {n: _hash_spec(s) for n, s in _hk_dim_spec().items()}
+
+
+def _hk_biz_spec(biz_code: str, dim_hashes: dict) -> dict:
+    """HK L3 单指标口径规格：自身定义 + 六维指纹 + 闸门阈值 + 不排名 + hk1.0。"""
+    cfg = HK_BIZ_DEFS[biz_code]
+    return {
+        "layer": "L3", "code": biz_code,
+        "market": MARKET, "classification": CLASSIFICATION,
+        "version": CALIB_VERSION,
+        "kind": cfg["kind"], "side": cfg["side"],
+        "inputs": cfg["inputs"], "output_schema": cfg["output_schema"],
+        "upstream_dims": dim_hashes,
+        "params": {
+            "enabled_dimensions": list(ENABLED_DIMENSIONS),
+            "coverage_min": COVERAGE_MIN,
+            "valid_days_20_min": VALID_DAYS_20_MIN,
+            "valid_days_window": VALID_DAYS_WINDOW,
+            "crowd_pct_high": CROWD_PCT_HIGH,
+            "short_sample": SHORT_SAMPLE,
+            "min_periods": MIN_PERIODS,
+            "cap_start": str(CAP_START),
+            "no_rank": True,
+        },
+    }
+
+
+def _hk_biz_hashes() -> dict:
+    """循环外预计算一次；只产出 is_active=True 的业务指标。"""
+    dh = _hk_dim_hashes()
+    return {c: _hash_spec(_hk_biz_spec(c, dh))
+            for c, cfg in HK_BIZ_DEFS.items() if cfg["is_active"]}
+
+
+def _hk_biz_params_hash(biz_code: str) -> str:
+    return _hash_spec(_hk_biz_spec(biz_code, _hk_dim_hashes()))
+
+
+def _hk_biz_dict_rows() -> list:
+    """HK business_dict 种子（含 is_active=False 的 RANK 行）。"""
+    now = dt.datetime.now().astimezone()
+    dh = _hk_dim_hashes()
+    return [dict(market_scope=MARKET, classification=CLASSIFICATION,
+                 biz_code=code, biz_name=cfg["biz_name"],
+                 question=cfg["question"], side=cfg["side"], kind=cfg["kind"],
+                 inputs=cfg["inputs"], params={"version": CALIB_VERSION},
+                 output_schema=cfg["output_schema"],
+                 params_hash=_hash_spec(_hk_biz_spec(code, dh)),
+                 is_active=cfg["is_active"],
+                 remark="定义：" + cfg["biz_name"] + "　·　判读：" +
+                        (cfg["question"] or "") + "　·　数据：HK 全期非 PIT / 置信度低",
+                 updated_at=now)
+            for code, cfg in HK_BIZ_DEFS.items()]
 
 
 # ── 数据加载（R1/R7：全部带时间下界）────────────────────────────────────────
@@ -286,7 +394,7 @@ def _load_index_daily(conn, start: dt.date, end: dt.date) -> pd.DataFrame:
         SELECT trade_date, sector_code, sector_name, ret_eq, ret_cap, amount,
                pe_agg, pb_agg, div_yield_agg, up_ratio, above_ma60,
                new_high_low, ret_dispersion, southbound_net, coverage, n_constituent
-        FROM regime.hk_sector_index_daily
+        FROM industry.hk_index_daily
         WHERE trade_date BETWEEN %s AND %s
         ORDER BY sector_code, trade_date
     """
@@ -298,7 +406,7 @@ def _precompute_amt_share(conn, end: dt.date) -> pd.DataFrame:
     from market_state_daily import _expanding_percentile
     sql = """
         SELECT trade_date, sector_code, amount
-        FROM regime.hk_sector_index_daily
+        FROM industry.hk_index_daily
         WHERE trade_date <= %s AND amount IS NOT NULL
         ORDER BY sector_code, trade_date
     """
@@ -399,7 +507,7 @@ def _compute_hk_frame(df: pd.DataFrame, amt: pd.DataFrame) -> pd.DataFrame:
 
     df["_valid"] = df["rs_20d"].notna().astype(int)
     df["valid_days_20"] = df.groupby("sector_code")["_valid"].transform(
-        lambda s: s.rolling(20, min_periods=1).sum())
+        lambda s: s.rolling(VALID_DAYS_WINDOW, min_periods=1).sum())
 
     # 维度分
     def _pct_col(code):
@@ -496,6 +604,7 @@ def _clean_int(v):
 
 def _score_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
     rows, now = [], dt.datetime.now().astimezone()
+    dim_hashes = _hk_dim_hashes()   # 循环外算一次；含锚/成员/sign/上游 L1 定义
     for rec in wide.to_dict("records"):
         d = rec["trade_date"]
         if isinstance(d, pd.Timestamp):
@@ -529,9 +638,7 @@ def _score_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
                 confidence=confidence_of(_dim_n_sample(rec, name), cov,
                                          pit_capable=False),
                 members_used=members,
-                params_hash=_hk_params_hash(dict(
-                    code="SEC.DIM." + name, unit="score_0_100", direction="high_good",
-                    formula=cfg["structure"], model_key=cfg["structure"])),
+                params_hash=dim_hashes[name],
                 extra=extra, updated_at=now))
     return rows
 
@@ -545,7 +652,12 @@ def _dim_n_sample(rec: dict, name: str):
 
 
 def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
+    """HK L3 长表：按 HK_BIZ_DEFS 中 is_active=True 的业务指标产出多行。
+
+    SEC.BIZ.RANK 本期不启用 → 该 biz_code 无值表行（business_dict 仍登记原因）。
+    """
     rows, now = [], dt.datetime.now().astimezone()
+    hashes = _hk_biz_hashes()   # 循环外算一次；每个 biz_code 一个独立指纹
     for rec in wide.to_dict("records"):
         d = rec["trade_date"]
         if isinstance(d, pd.Timestamp):
@@ -555,7 +667,7 @@ def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
         cov = float(_get(rec, "biz_coverage") or 0.0)
         c = rec.get("_crowd") or {}
         flags = []
-        if cov < 0.6:
+        if cov < COVERAGE_MIN:
             flags.append("DATA_COVERAGE")
         if d < CAP_START:
             flags.append("BREAK")       # 2002 前 total_market_val 覆盖率 <6%
@@ -564,8 +676,11 @@ def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
         state_n = int(_get(rec, "state_n") or 0)
         # HK 状态侧只有 TREND + BREADTH（FLOW/FUNDAMENTAL 无可靠源），
         # 相对完整体系的 4 组恒不齐 → PARTIAL_STATE 闸门恒开。
+        # SHORT_SAMPLE 不是闸门：短样本由 L1 quality + L2/L3 confidence 承载
+        # （与 CN 同源纪律，见 sector_layer._biz_rows 注释）。
         flags.append("PARTIAL_STATE")
-        applicable = (cov >= 0.6 and int(_get(rec, "valid_days_20") or 0) >= 15
+        applicable = (cov >= COVERAGE_MIN
+                      and int(_get(rec, "valid_days_20") or 0) >= VALID_DAYS_20_MIN
                       and "DATA_COVERAGE" not in flags and "BREAK" not in flags)
         extra = dict(state_members=rec["state_members"], state_n=state_n,
                      state_dims_full=4, partial=True,
@@ -579,22 +694,40 @@ def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
                      rank_n=_clean_int(rec.get("rank_n")),
                      break_notes="2002-01-01 前 total_market_val 覆盖率 <6%，加权版指数与估值不可用",
                      granularity="HK 113 恒生三级 vs CN 31 申万一级，不可混排")
-        rows.append(dict(
+        state_side = _get(rec, "state_side")
+        risk_side = _get(rec, "risk_side")
+        quadrant = rec.get("quadrant") or "NA"
+        rank_n = _clean_int(rec.get("rank_n"))
+        common = dict(
             market=MARKET, classification=CLASSIFICATION,
             sector_code=rec["sector_code"], trade_date=d,
-            state_side=_get(rec, "state_side"), risk_side=_get(rec, "risk_side"),
-            quadrant=rec.get("quadrant") or "NA",
-            rank_no=None,                 # 🔴 本期不排名（用户决策）
-            rank_n=_clean_int(rec.get("rank_n")),
-            coverage=cov, gate_flags=flags,
-            applicable=bool(applicable),
+            coverage=cov, applicable=bool(applicable),
             # HK 全期非 PIT（stock_sector 当前成分）→ 置信度不高于 low
             confidence=confidence_of(_get(rec, "pe_n_sample"), cov,
                                      pit_capable=False),
-            params_hash=_hk_params_hash(dict(
-                code="SEC.BIZ.DAILY", unit="score_0_100", direction="neutral",
-                formula="state/risk matrix (no rank)", model_key="L3")),
-            extra=extra, updated_at=now))
+            extra=extra, updated_at=now)
+        for biz_code, h in hashes.items():
+            score = state = level = None
+            detail = {}
+            if biz_code == "SEC.BIZ.STATE_SIDE":
+                score = state_side
+                detail = dict(state_members=rec["state_members"],
+                              state_n=state_n, partial=True,
+                              state_dims_full=4)
+            elif biz_code == "SEC.BIZ.RISK_SIDE":
+                score = risk_side
+            elif biz_code == "SEC.BIZ.QUADRANT":
+                state = quadrant
+                detail = dict(state_side=state_side, risk_side=risk_side)
+            elif biz_code == "SEC.BIZ.GATE":
+                detail = dict(gate_flags=flags, crowd_gate=c.get("gate"),
+                              crowd_k=c.get("k"), crowd_partial=c.get("partial"),
+                              no_rank=True, rank_n=rank_n,
+                              no_rank_reason="阶段3 HK 首期不产出跨行业排名（C 组仅南向短样本、E 组不可得）；"
+                                             "排序待阶段4 前瞻验证后再议")
+            rows.append(dict(common, biz_code=biz_code, score=score,
+                             state=state, level=level, detail=detail,
+                             params_hash=h))
     return rows
 
 
@@ -612,8 +745,11 @@ def sync_dict_hk(conn) -> int:
                  pit_capable=False, is_active=d["is_active"], remark=d["remark"],
                  updated_at=dt.datetime.now().astimezone())
             for d in HK_INDICATOR_DEFS]
-    bulk_upsert(conn, "regime.sector_indicator_dict", _clean_rows(rows),
+    bulk_upsert(conn, "industry.indicator_dict", _clean_rows(rows),
                 conflict_cols=["market_scope", "classification", "indicator_code"])
+    # L3 业务指标字典（HK 行，含 is_active=False 的 RANK）
+    bulk_upsert(conn, "industry.business_dict", _clean_rows(_hk_biz_dict_rows()),
+                conflict_cols=["market_scope", "classification", "biz_code"])
     conn.commit()
     return len(rows)
 
@@ -621,7 +757,7 @@ def sync_dict_hk(conn) -> int:
 def _default_window(conn) -> tuple[dt.date, dt.date]:
     end = dt.date.today()
     with conn.cursor() as cur:
-        cur.execute("SELECT max(trade_date) FROM regime.sector_biz_daily "
+        cur.execute("SELECT max(trade_date) FROM industry.business_value "
                     "WHERE market=%s AND classification=%s", (MARKET, CLASSIFICATION))
         last = cur.fetchone()[0]
     start = (last - dt.timedelta(days=REWIND_DAYS)) if last else \
@@ -688,10 +824,10 @@ def run(codes=None, ctx=None, start: dt.date = None, end: dt.date = None,
                 stats["index"] = build_index_daily(conn, start, end, write=write)
             # 输入新鲜度闸门：数据层未产出时不制造空洞读数
             with conn.cursor() as cur:
-                cur.execute("SELECT max(trade_date) FROM regime.hk_sector_index_daily")
+                cur.execute("SELECT max(trade_date) FROM industry.hk_index_daily")
                 upstream = cur.fetchone()[0]
             if upstream is None:
-                raise RuntimeError("regime.hk_sector_index_daily 为空 —— 数据层 D4 未产出，拒绝执行")
+                raise RuntimeError("industry.hk_index_daily 为空 —— 数据层 D4 未产出，拒绝执行")
             end = min(end, upstream)
             if start > end:
                 return {"skipped": "start > end（上游数据未就绪）"}
@@ -711,13 +847,13 @@ def run(codes=None, ctx=None, start: dt.date = None, end: dt.date = None,
                     bz = _biz_rows(sub, cs, ce)
                     if write:
                         stats["iv"] += _write_batched(
-                            conn, "regime.sector_indicator_value", iv,
+                            conn, "industry.indicator_value", iv,
                             PK_COLS + ["indicator_code"])
                         stats["score"] += _write_batched(
-                            conn, "regime.sector_score_daily", sc,
+                            conn, "industry.dimension_value", sc,
                             PK_COLS + ["dimension_code"])
                         stats["biz"] += _write_batched(
-                            conn, "regime.sector_biz_daily", bz, PK_COLS)
+                            conn, "industry.business_value", bz, BIZ_PK_COLS)
                     else:
                         stats["iv"] += len(iv)
                         stats["score"] += len(sc)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""第④层「行业配置」阶段 2：自下而上聚合（依赖 regime.sector_constituent）。
+"""第④层「行业配置」阶段 2：自下而上聚合（依赖 industry.constituent）。
 
 被 sector_layer.py 调用，产出「一行 = 一个行业日」的阶段 2 原子聚合表，
 再 merge 进 _compute_frame 的宽表。
@@ -63,7 +63,7 @@ def load_constituent_map(conn) -> pd.DataFrame:
     """全部版本链（含已关闭区间），约 5~8 千行，一次加载无内存压力。"""
     sql = """
         SELECT sector_code, stock_code, eff_from, eff_to, weight
-        FROM regime.sector_constituent
+        FROM industry.constituent
         WHERE market='CN' AND classification='SW_L1'
     """
     df = read_sql(conn, sql)

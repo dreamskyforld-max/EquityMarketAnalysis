@@ -222,23 +222,30 @@ class TestHKBusinessContract(unittest.TestCase):
 
     def test_no_rank_and_no_rank_reason(self):
         rows = slh._biz_rows(self._wide(), dt.date(2026, 1, 1), dt.date(2026, 12, 31))
-        self.assertEqual(len(rows), 1)
-        r = rows[0]
-        self.assertIsNone(r["rank_no"])
-        self.assertTrue(r["extra"]["no_rank"])
-        self.assertIn("不产出跨行业排名", r["extra"]["no_rank_reason"])
+        self.assertEqual(len(rows), 4)   # RANK 字典登记但本期不产出值表行
+        codes = {r["biz_code"] for r in rows}
+        self.assertNotIn("SEC.BIZ.RANK", codes)
+        gate = next(r for r in rows if r["biz_code"] == "SEC.BIZ.GATE")
+        self.assertTrue(gate["detail"]["no_rank"])
+        self.assertIn("不产出跨行业排名", gate["detail"]["no_rank_reason"])
+        # 不排名决策同时留在共有 extra 与 GATE 行 detail，前端两条路径都能取到
+        self.assertTrue(any(r["extra"].get("no_rank") for r in rows))
 
     def test_partial_state_and_break_gate(self):
-        r = slh._biz_rows(self._wide(), dt.date(2026, 1, 1), dt.date(2026, 12, 31))[0]
-        self.assertIn("PARTIAL_STATE", r["gate_flags"])
+        rows = slh._biz_rows(self._wide(), dt.date(2026, 1, 1), dt.date(2026, 12, 31))
+        r = rows[0]
+        gate = next(x for x in rows if x["biz_code"] == "SEC.BIZ.GATE")
+        self.assertIn("PARTIAL_STATE", gate["detail"]["gate_flags"])
         self.assertEqual(r["confidence"], "low")
         self.assertFalse(r["extra"]["pit_capable"])
         self.assertTrue(r["extra"]["survivorship_bias"])
-        self.assertEqual(r["extra"]["state_dims_full"], 4)
+        self.assertEqual(r["detail"].get("state_dims_full") or
+                         next(x for x in rows if x["biz_code"] == "SEC.BIZ.STATE_SIDE")["detail"]["state_dims_full"], 4)
         early = slh._biz_rows(self._wide(dt.date(2001, 6, 1)),
-                              dt.date(2000, 1, 1), dt.date(2001, 12, 31))[0]
-        self.assertIn("BREAK", early["gate_flags"])
-        self.assertFalse(early["applicable"])
+                              dt.date(2000, 1, 1), dt.date(2001, 12, 31))
+        early_gate = next(x for x in early if x["biz_code"] == "SEC.BIZ.GATE")
+        self.assertIn("BREAK", early_gate["detail"]["gate_flags"])
+        self.assertTrue(all(not x["applicable"] for x in early))
 
     def test_quadrant_names_contain_no_advice(self):
         for q in ("强势·未拥挤", "强势·偏贵拥挤", "冷门·未拥挤", "弱势·偏贵拥挤", "NA"):
@@ -305,7 +312,7 @@ class TestCrossSectionIsolation(unittest.TestCase):
         src = _read("sector_layer_hk.py")
         self.assertIn('MARKET = "HK"', src)
         self.assertIn('CLASSIFICATION = "HS_L3"', src)
-        self.assertIn("FROM regime.hk_sector_index_daily", src)
+        self.assertIn("FROM industry.hk_index_daily", src)
         self.assertNotIn("FROM regime.sector_daily", src)
         self.assertNotIn("FROM a_daily_quote", src)
         self.assertNotIn("FROM regime.sector_valuation_snapshot", src)
@@ -335,7 +342,7 @@ class TestEngineeringGuards(unittest.TestCase):
 
     def test_ddl_dual_source_and_pk_migration(self):
         schema, code = _read("sql/schema.sql"), _read("regime_schema.py")
-        for tbl in ("regime.hk_sector_index_daily", "regime.sector_indicator_dict"):
+        for tbl in ("industry.hk_index_daily", "industry.indicator_dict"):
             with self.subTest(tbl=tbl):
                 self.assertIn("CREATE TABLE IF NOT EXISTS " + tbl, schema)
                 self.assertIn("CREATE TABLE IF NOT EXISTS " + tbl, code)
@@ -386,7 +393,7 @@ class TestEngineeringGuards(unittest.TestCase):
     def test_monitor_registered(self):
         src = _read("monitor_collector.py")
         self.assertIn('("行业配置计算HK", 1440', src)
-        self.assertIn('("regime", "hk_sector_index_daily"', src)
+        self.assertIn('("industry", "hk_index_daily"', src)
         self.assertIn("已知残差", src)
 
     def test_batch_and_stream_bounds(self):

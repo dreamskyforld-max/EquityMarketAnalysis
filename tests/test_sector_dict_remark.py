@@ -1,4 +1,4 @@
-"""第④层 `regime.sector_indicator_dict.remark` 三段式规范测试（防回退）。
+"""第④层 `industry.indicator_dict.remark` 三段式规范测试（防回退）。
 
 参照 `regime.indicator_dict` 的事实标准（market_state_daily.py:211/215/707/255）：
 单行 `定义：…　·　判读：…　·　数据：…`，可扩展 口径：/⚠/已知限制：，无换行、
@@ -117,7 +117,7 @@ class TestDocAndDDLSync(unittest.TestCase):
         schema = _read("sql/schema.sql")
         code = _read("regime_schema.py")
         key = "规范化三段式（与 regime.indicator_dict 事实标准一致）"
-        self.assertIn("COMMENT ON COLUMN regime.sector_indicator_dict.remark IS '" + key, schema)
+        self.assertIn("COMMENT ON COLUMN industry.indicator_dict.remark IS '" + key, schema)
         self.assertIn(key, code)
         self.assertIn("库内手改会被幂等 upsert 覆盖", schema)
         self.assertIn("库内手改会被幂等 upsert 覆盖", code)

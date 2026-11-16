@@ -1633,6 +1633,12 @@ CREATE INDEX IF NOT EXISTS idx_company_rev_break_stock
 
 CREATE SCHEMA IF NOT EXISTS regime;
 
+-- 第④层「行业热点」独立域（2026-11-16）：只放行业指标层的 8 张专属表。
+-- ⚠ regime.sector_daily / sector_valuation_snapshot / sector_fund_flow /
+--   sector_mapping / analyst_forecast_snapshot 是采集层与第③层共用的输入表，
+--   **留在 regime 不动**（market_state_daily.py 直接读写），本层跨 schema 只读。
+CREATE SCHEMA IF NOT EXISTS industry;
+
 -- 1. 宏观与时序指标长表（月/季/日频统一承载；长表避免 30+ 张单指标表）
 -- 1a. 原始序列注册表（**维度表**）：series_code 的身份 / 口径 / 出处
 CREATE TABLE IF NOT EXISTS regime.macro_series_meta (
@@ -2251,7 +2257,7 @@ COMMENT ON COLUMN force_round_daily.applicable IS '适用性：近 20 个已落�
 --     ⚠ 实体键含 (market, classification)：CN 与 HK 物理分行，禁止混合排名/混合分位。
 --     ⚠ 输出只作状态度量与风险闸门，**不含超配/低配建议**（主报告 §0 判断 1）。
 -- ═══════════════════════════════════════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS regime.sector_indicator_dict (
+CREATE TABLE IF NOT EXISTS industry.indicator_dict (
     indicator_code  VARCHAR(64)     NOT NULL,
     indicator_name  VARCHAR(100)    NOT NULL,
     domain          VARCHAR(24)     NOT NULL,       -- TREND/VAL/FLOW/CROWD/FUND/BREADTH
@@ -2275,12 +2281,12 @@ CREATE TABLE IF NOT EXISTS regime.sector_indicator_dict (
     -- 阶段 3：CN / HK 共用同一套指标 code，字典按市场+分类隔离，避免 HK 覆盖 CN 行
     PRIMARY KEY (market_scope, classification, indicator_code)
 );
-COMMENT ON TABLE  regime.sector_indicator_dict IS '第④层行业指标字典（代码即字典：sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS 幂等 upsert）。⚠ 阶段3 起主键含 market_scope+classification：CN(SW_L1) 与 HK(HS_L3) 同名指标各占一行，冲突键必须带这两个字段';
-COMMENT ON COLUMN regime.sector_indicator_dict.direction IS 'high_good/high_risk/neutral；**方向只在此定义一次**，维度合成按 DIMENSION_DEFS.sign 翻转，消费端禁止二次翻转（§7.1）';
-COMMENT ON COLUMN regime.sector_indicator_dict.model_key IS '计算模型编号（设计文档 §3.2）：M1横截面分位 / M2时序分位 / M3相对强度 / M4归一滚动 / M5条件命中 / M6 PIT成分聚合 / M7快照差分 / M8自算指数';
-COMMENT ON COLUMN regime.sector_indicator_dict.remark IS '规范化三段式（与 regime.indicator_dict 事实标准一致）：单行 定义：…　·　判读：…　·　数据：…（全角空格包围中点分隔），可扩展 口径：/⚠/已知限制：；无换行、无方括号标题。定义写公式+单位+值域，判读写高低位业务含义与联读，数据写起点/覆盖门禁/口径断点/跨市场可比性。⚠ 只改 remark 不进 params_hash、不触发历史重算；但代码即字典，须改 sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS，库内手改会被幂等 upsert 覆盖';
+COMMENT ON TABLE  industry.indicator_dict IS '第④层行业指标字典（代码即字典：sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS 幂等 upsert）。⚠ 阶段3 起主键含 market_scope+classification：CN(SW_L1) 与 HK(HS_L3) 同名指标各占一行，冲突键必须带这两个字段';
+COMMENT ON COLUMN industry.indicator_dict.direction IS 'high_good/high_risk/neutral；**方向只在此定义一次**，维度合成按 DIMENSION_DEFS.sign 翻转，消费端禁止二次翻转（§7.1）';
+COMMENT ON COLUMN industry.indicator_dict.model_key IS '计算模型编号（设计文档 §3.2）：M1横截面分位 / M2时序分位 / M3相对强度 / M4归一滚动 / M5条件命中 / M6 PIT成分聚合 / M7快照差分 / M8自算指数';
+COMMENT ON COLUMN industry.indicator_dict.remark IS '规范化三段式（与 regime.indicator_dict 事实标准一致）：单行 定义：…　·　判读：…　·　数据：…（全角空格包围中点分隔），可扩展 口径：/⚠/已知限制：；无换行、无方括号标题。定义写公式+单位+值域，判读写高低位业务含义与联读，数据写起点/覆盖门禁/口径断点/跨市场可比性。⚠ 只改 remark 不进 params_hash、不触发历史重算；但代码即字典，须改 sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS，库内手改会被幂等 upsert 覆盖';
 
-CREATE TABLE IF NOT EXISTS regime.sector_indicator_value (
+CREATE TABLE IF NOT EXISTS industry.indicator_value (
     market          VARCHAR(8)      NOT NULL,       -- CN / HK（禁止混合分位）
     classification  VARCHAR(16)     NOT NULL,       -- SW_L1 / HS_L3
     sector_code     VARCHAR(20)     NOT NULL,
@@ -2298,13 +2304,13 @@ CREATE TABLE IF NOT EXISTS regime.sector_indicator_value (
     PRIMARY KEY (market, classification, sector_code, trade_date, indicator_code)
 );
 CREATE INDEX IF NOT EXISTS idx_sector_iv_code_date
-    ON regime.sector_indicator_value (indicator_code, trade_date DESC);
+    ON industry.indicator_value (indicator_code, trade_date DESC);
 CREATE INDEX IF NOT EXISTS idx_sector_iv_date
-    ON regime.sector_indicator_value (trade_date DESC);
-COMMENT ON TABLE  regime.sector_indicator_value IS '第④层 L1 原子指标（行业×日×指标）。横截面分位与时序分位分列存放：阶段1估值/资金流仅27个快照日 << min_periods=250，时序分位一律 NULL 并写 n_sample，禁止用短样本分位填充';
-COMMENT ON COLUMN regime.sector_indicator_value.extra IS 'rank_n=当日有效行业数（实测 16→28→31 时变）；pit_capable=false 的历史段含幸存者偏差；crowd k/partial 记录拥挤度实际参与因子数';
+    ON industry.indicator_value (trade_date DESC);
+COMMENT ON TABLE  industry.indicator_value IS '第④层 L1 原子指标（行业×日×指标）。横截面分位与时序分位分列存放：阶段1估值/资金流仅27个快照日 << min_periods=250，时序分位一律 NULL 并写 n_sample，禁止用短样本分位填充';
+COMMENT ON COLUMN industry.indicator_value.extra IS 'rank_n=当日有效行业数（实测 16→28→31 时变）；pit_capable=false 的历史段含幸存者偏差；crowd k/partial 记录拥挤度实际参与因子数';
 
-CREATE TABLE IF NOT EXISTS regime.sector_score_daily (
+CREATE TABLE IF NOT EXISTS industry.dimension_value (
     market          VARCHAR(8)      NOT NULL,
     classification  VARCHAR(16)     NOT NULL,
     sector_code     VARCHAR(20)     NOT NULL,
@@ -2322,34 +2328,65 @@ CREATE TABLE IF NOT EXISTS regime.sector_score_daily (
     PRIMARY KEY (market, classification, sector_code, trade_date, dimension_code)
 );
 CREATE INDEX IF NOT EXISTS idx_sector_score_date
-    ON regime.sector_score_daily (trade_date DESC);
-COMMENT ON TABLE  regime.sector_score_daily IS '第④层 L2 维度读数（六维）。成员 <4 时按 §7.2 走「单锚」而非扁平等权（等权会让单成员 33% 超过 25% 上限）；CROWDING 走规则判定 score 恒 NULL，档位在 extra.crowd_gate；FUNDAMENTAL/BREADTH 阶段1 未启用';
+    ON industry.dimension_value (trade_date DESC);
+COMMENT ON TABLE  industry.dimension_value IS '第④层 L2 维度读数（六维）。成员 <4 时按 §7.2 走「单锚」而非扁平等权（等权会让单成员 33% 超过 25% 上限）；CROWDING 走规则判定 score 恒 NULL，档位在 extra.crowd_gate；FUNDAMENTAL/BREADTH 阶段1 未启用';
 
-CREATE TABLE IF NOT EXISTS regime.sector_biz_daily (
+-- 24a. 第④层 L3 业务指标字典（代码即字典：sector_layer.BIZ_DEFS /
+--      sector_layer_hk.HK_BIZ_DEFS 幂等 upsert）。
+--      ⚠ 业务指标是**开放集合**：新增/下线只改字典行与值表行，不加表字段。
+--      ⚠ 主键含 market_scope+classification：同一 biz_code 在 CN / HK 可分别
+--        决定是否启用（如 HK 的 SEC.BIZ.RANK 本期 is_active=false）。
+CREATE TABLE IF NOT EXISTS industry.business_dict (
+    market_scope    VARCHAR(16)     NOT NULL DEFAULT 'CN',
+    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
+    biz_code        VARCHAR(32)     NOT NULL,
+    biz_name        VARCHAR(64)     NOT NULL,       -- 中文名称（前端展示）
+    question        TEXT,                           -- 面向用户的一句话问句
+    side            VARCHAR(12)     NOT NULL,       -- state / risk / neutral
+    kind            VARCHAR(16)     NOT NULL,       -- continuous / enum / rank / gate
+    inputs          JSONB,                          -- [{kind:dimension|atom, code}]
+    params          JSONB,
+    output_schema   JSONB,                          -- score/state/level/detail 语义 + 值域
+    params_hash     VARCHAR(16),                    -- 该 biz_code 独立口径指纹
+    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
+    remark          TEXT,
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (market_scope, classification, biz_code)
+);
+COMMENT ON TABLE  industry.business_dict IS '第④层 L3 业务指标字典：一行一个业务指标，登记中文名、面向用户的问句、输入清单、输出契约与独立口径指纹。新增/下线指标只增删字典行，不改表结构';
+COMMENT ON COLUMN industry.business_dict.output_schema IS '多态列语义说明。⚠ score/state/level 是多态列，各 biz_code 语义不同，消费方必须先按 biz_code 过滤并校验本字段，禁止跨 biz 比较或聚合';
+COMMENT ON COLUMN industry.business_dict.is_active IS 'false = 本期不产出值表行（如 HK 不排名）；不是漏采，前端应显示「本期不提供」并给出 reason';
+
+-- 24b. 第④层 L3 业务指标值（长表）。
+--      ⚠ 取代旧宽表 sector_biz_daily：旧设计把 5 类业务读数压成一行的多个列，
+--        没有指标编码、无法各自版本化/重算/增减。现按 biz_code 分行。
+CREATE TABLE IF NOT EXISTS industry.business_value (
+    biz_code        VARCHAR(32)     NOT NULL,
     market          VARCHAR(8)      NOT NULL,
     classification  VARCHAR(16)     NOT NULL,
     sector_code     VARCHAR(20)     NOT NULL,
     trade_date      DATE            NOT NULL,
-    state_side      NUMERIC(6,2),                   -- 状态侧（阶段1 = TREND + FLOW 均值）
-    risk_side       NUMERIC(6,2),                   -- 风险侧（阶段1 = VALUATION）
-    quadrant        VARCHAR(24),                   -- 2×2 状态矩阵；**名称只描述当前状态**
-    rank_no         INT,                            -- 当日同一 (market,classification) 内排名
-    rank_n          INT,
-    coverage        NUMERIC(5,4),                   -- 可用维度/当期已启用维度（阶段2 分母变化=口径断点）
-    gate_flags      JSONB,                          -- DATA_COVERAGE/SHORT_SAMPLE/BREAK/CROWDING/PARTIAL_STATE
-    applicable      BOOLEAN         NOT NULL DEFAULT FALSE,
-    confidence      VARCHAR(12),
-    params_hash     VARCHAR(16),
-    extra           JSONB,                          -- state_members / partial / crowd_k / rank_n
+    score           NUMERIC(6,2),                   -- 多态：连续型读数（0-100）
+    state           VARCHAR(24),                    -- 多态：中文状态 / 枚举标签
+    level           SMALLINT,                       -- 多态：档位序号或当日排名
+    detail          JSONB,                          -- 该 biz_code 特有输出（gate_flags/rank_n/state_members…）
+    coverage        NUMERIC(5,4),                   -- 共有质量元数据：可用维度/当期已启用维度
+    applicable      BOOLEAN         NOT NULL DEFAULT FALSE,  -- 共有质量元数据
+    confidence      VARCHAR(12),                    -- 共有质量元数据：normal / low
+    params_hash     VARCHAR(16),                    -- = business_dict 该行的 params_hash
+    extra           JSONB,                          -- 口径与明细（calib_version/pit_capable/no_rank…）
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (market, classification, sector_code, trade_date)
+    PRIMARY KEY (biz_code, market, classification, sector_code, trade_date)
 );
-CREATE INDEX IF NOT EXISTS idx_sector_biz_date
-    ON regime.sector_biz_daily (trade_date DESC);
-COMMENT ON TABLE  regime.sector_biz_daily IS '第④层 L3 业务读数：状态侧/风险侧分离，**不产出单一综合分**（§7.2 异质信息扁平平均只产生权重幻觉）；排序仅为当日横截面状态描述，未完成前瞻 IC 验证前不得升格为配置建议';
-COMMENT ON COLUMN regime.sector_biz_daily.quadrant IS '强势·未拥挤 / 强势·偏贵拥挤 / 冷门·未拥挤 / 弱势·偏贵拥挤 / NA。**只描述当前状态，不含超配/低配/买卖含义**';
-COMMENT ON COLUMN regime.sector_biz_daily.applicable IS '近20交易日有效读数≥15日 且 coverage≥0.6 且无 DATA_COVERAGE 闸门。false 时前端只提示数据不足，不显示排名与象限';
-COMMENT ON COLUMN regime.sector_biz_daily.rank_no IS 'applicable=true 才出排名；按 state_side 降序、method=min。⚠ 不同 market/classification 之间绝不合并排名';
+CREATE INDEX IF NOT EXISTS idx_industry_biz_date
+    ON industry.business_value (trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_industry_biz_code_date
+    ON industry.business_value (biz_code, trade_date DESC);
+COMMENT ON TABLE  industry.business_value IS '第④层 L3 业务读数（长表）：一行业一日一业务指标一行。状态侧/风险侧分离，**不产出单一综合分**；排序仅为当日横截面状态描述，前瞻 IC 未通过前不得升格为配置建议。⚠ 读任何字段前必须先按 biz_code 过滤并校验 business_dict.output_schema';
+COMMENT ON COLUMN industry.business_value.score IS '⚠ 多态列：SEC.BIZ.STATE_SIDE=状态侧热度(0-100)；SEC.BIZ.RISK_SIDE=风险侧水平(0-100，高=更贵)；其余 biz_code 恒 NULL。禁止跨 biz 比较';
+COMMENT ON COLUMN industry.business_value.state IS '⚠ 多态列：SEC.BIZ.QUADRANT=强势·未拥挤 / 强势·偏贵拥挤 / 冷门·未拥挤 / 弱势·偏贵拥挤 / NA。**只描述当前状态，不含超配/低配/买卖含义**；其余 biz_code 恒 NULL';
+COMMENT ON COLUMN industry.business_value.level IS '⚠ 多态列：SEC.BIZ.RANK=当日排名名次（1..rank_n）；其余恒 NULL。HK 本期不排名，该 biz_code 无行';
+COMMENT ON COLUMN industry.business_value.applicable IS '近20交易日有效读数≥15日 且 coverage≥0.6 且无 DATA_COVERAGE/BREAK 闸门。false 时前端只提示数据不足，不显示排名与象限';
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 25~26. 第④层 行业成分主数据（阶段 2，PIT 版本链）
@@ -2362,7 +2399,7 @@ COMMENT ON COLUMN regime.sector_biz_daily.rank_no IS 'applicable=true 才出排�
 --     ⚠ 决策 B：权重只落本表，**不回写 public.stock_sector**（后者是证监会/富途分类，
 --       口径不同且无生效日，混写会造成不同分类的权重同列）。
 -- ═══════════════════════════════════════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS regime.sector_constituent (
+CREATE TABLE IF NOT EXISTS industry.constituent (
     market          VARCHAR(8)      NOT NULL DEFAULT 'CN',
     classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
     sector_code     VARCHAR(20)     NOT NULL,       -- 申万一级代码，如 801010
@@ -2375,14 +2412,14 @@ CREATE TABLE IF NOT EXISTS regime.sector_constituent (
     PRIMARY KEY (market, classification, sector_code, stock_code, eff_from)
 );
 CREATE INDEX IF NOT EXISTS idx_sector_const_stock
-    ON regime.sector_constituent (stock_code, eff_from, eff_to);
+    ON industry.constituent (stock_code, eff_from, eff_to);
 CREATE INDEX IF NOT EXISTS idx_sector_const_active
-    ON regime.sector_constituent (sector_code, eff_to);
-COMMENT ON TABLE  regime.sector_constituent IS '第④层行业成分主数据 PIT 版本链（阶段2）。每交易日快照与 active 行对比生成 ADD/REMOVE/WEIGHT 变更；eff_from 最小 2021-12-13，eff_to 由后续快照关闭。⚠ 无历史剔除记录，2021-12-13 前的成分不可还原';
-COMMENT ON COLUMN regime.sector_constituent.eff_from IS '生效日 = max(源计入日期, 2021-12-13)；PIT 取用条件 trade_date >= eff_from AND (eff_to IS NULL OR trade_date < eff_to)';
-COMMENT ON COLUMN regime.sector_constituent.weight IS '申万指数成分权重，**百分数**（如 8.72 = 8.72%，单行业合计≈100，不是 0~1 小数）；权重变化 ≥0.01 个百分点才关旧开新，微小波动只更新当前行';
+    ON industry.constituent (sector_code, eff_to);
+COMMENT ON TABLE  industry.constituent IS '第④层行业成分主数据 PIT 版本链（阶段2）。每交易日快照与 active 行对比生成 ADD/REMOVE/WEIGHT 变更；eff_from 最小 2021-12-13，eff_to 由后续快照关闭。⚠ 无历史剔除记录，2021-12-13 前的成分不可还原';
+COMMENT ON COLUMN industry.constituent.eff_from IS '生效日 = max(源计入日期, 2021-12-13)；PIT 取用条件 trade_date >= eff_from AND (eff_to IS NULL OR trade_date < eff_to)';
+COMMENT ON COLUMN industry.constituent.weight IS '申万指数成分权重，**百分数**（如 8.72 = 8.72%，单行业合计≈100，不是 0~1 小数）；权重变化 ≥0.01 个百分点才关旧开新，微小波动只更新当前行';
 
-CREATE TABLE IF NOT EXISTS regime.sector_constituent_change (
+CREATE TABLE IF NOT EXISTS industry.constituent_change (
     id              BIGSERIAL       PRIMARY KEY,
     snapshot_date   DATE            NOT NULL,
     market          VARCHAR(8)      NOT NULL DEFAULT 'CN',
@@ -2397,8 +2434,8 @@ CREATE TABLE IF NOT EXISTS regime.sector_constituent_change (
     UNIQUE (snapshot_date, market, classification, sector_code, stock_code, change_type)
 );
 CREATE INDEX IF NOT EXISTS idx_sector_const_change_date
-    ON regime.sector_constituent_change (snapshot_date DESC);
-COMMENT ON TABLE regime.sector_constituent_change IS '行业成分变更日志（逐日快照审计）：ADD/REMOVE/WEIGHT 三类，可据此重建任意历史截面。⚠ 只在首次采到之后才逐步累积，不是历史回填产物';
+    ON industry.constituent_change (snapshot_date DESC);
+COMMENT ON TABLE industry.constituent_change IS '行业成分变更日志（逐日快照审计）：ADD/REMOVE/WEIGHT 三类，可据此重建任意历史截面。⚠ 只在首次采到之后才逐步累积，不是历史回填产物';
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 27. 第④层 港股行业层数据底座（阶段 3 / D4，hk_sector_index.py）
@@ -2415,7 +2452,7 @@ COMMENT ON TABLE regime.sector_constituent_change IS '行业成分变更日志�
 --     ⚠ 成分只有 stock_sector 当前快照（无 PIT / 无生效日）→ 所有自下而上
 --       聚合含幸存者偏差，消费端必须透出 pit_capable=false / confidence=low。
 -- ═══════════════════════════════════════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS regime.hk_sector_index_daily (
+CREATE TABLE IF NOT EXISTS industry.hk_index_daily (
     trade_date      DATE            NOT NULL,
     sector_code     VARCHAR(20)     NOT NULL,       -- HK.LIST1019 等恒生三级行业
     sector_name     VARCHAR(100),
@@ -2440,10 +2477,10 @@ CREATE TABLE IF NOT EXISTS regime.hk_sector_index_daily (
     PRIMARY KEY (trade_date, sector_code)
 );
 CREATE INDEX IF NOT EXISTS idx_hk_sector_index_code_date
-    ON regime.hk_sector_index_daily (sector_code, trade_date DESC);
+    ON industry.hk_index_daily (sector_code, trade_date DESC);
 CREATE INDEX IF NOT EXISTS idx_hk_sector_index_date
-    ON regime.hk_sector_index_daily (trade_date DESC);
-COMMENT ON TABLE  regime.hk_sector_index_daily IS '第④层 HK 行业日聚合与自算指数（M8 两版并列）。⚠ 成分取 stock_sector 当前快照，非 PIT，历史读数含幸存者偏差；⚠ 113 个恒生三级行业与 CN 31 个申万一级不同构，不得混合分位/排名';
-COMMENT ON COLUMN regime.hk_sector_index_daily.ret_cap IS 'M8 口径变更：文档原文「流通市值加权」，实测 circular_market_val 长期缺失（2024-05 起仅 65 日有值）→ 改用 total_market_val。权重取当日市值（非前收市值），与 market_state_daily 的 HK cap_ret 同源；与 CN 用 circular_market_val 的口径差异已登记';
-COMMENT ON COLUMN regime.hk_sector_index_daily.pe_agg IS '行业估值 = 成分股市值加权调和均值 Σw/Σ(w/pe)（等价「行业总市值 / 行业总盈利」），仅取 pe>0 的成分；不是官方行业指数 PE，与 CN sector_valuation_snapshot 不同构。覆盖成分 <60% 时置 NULL';
-COMMENT ON COLUMN regime.hk_sector_index_daily.southbound_net IS 'daily_ggt_hold.est_net_inflow 按行业求和（亿港元）。⚠ 源 2026-04-20 起仅 136 个交易日、est_ 为估算值、按当前成分回算 → survivorship_bias=true';
+    ON industry.hk_index_daily (trade_date DESC);
+COMMENT ON TABLE  industry.hk_index_daily IS '第④层 HK 行业日聚合与自算指数（M8 两版并列）。⚠ 成分取 stock_sector 当前快照，非 PIT，历史读数含幸存者偏差；⚠ 113 个恒生三级行业与 CN 31 个申万一级不同构，不得混合分位/排名';
+COMMENT ON COLUMN industry.hk_index_daily.ret_cap IS 'M8 口径变更：文档原文「流通市值加权」，实测 circular_market_val 长期缺失（2024-05 起仅 65 日有值）→ 改用 total_market_val。权重取当日市值（非前收市值），与 market_state_daily 的 HK cap_ret 同源；与 CN 用 circular_market_val 的口径差异已登记';
+COMMENT ON COLUMN industry.hk_index_daily.pe_agg IS '行业估值 = 成分股市值加权调和均值 Σw/Σ(w/pe)（等价「行业总市值 / 行业总盈利」），仅取 pe>0 的成分；不是官方行业指数 PE，与 CN sector_valuation_snapshot 不同构。覆盖成分 <60% 时置 NULL';
+COMMENT ON COLUMN industry.hk_index_daily.southbound_net IS 'daily_ggt_hold.est_net_inflow 按行业求和（亿港元）。⚠ 源 2026-04-20 起仅 136 个交易日、est_ 为估算值、按当前成分回算 → survivorship_bias=true';

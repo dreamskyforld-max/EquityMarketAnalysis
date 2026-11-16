@@ -7,6 +7,7 @@
 > .venv/bin/python3 tools/validate_sector.py --bootstrap 200 --out /tmp/sector_val
 > ```
 > ⚠ `doc/*.md` 不随 `deploy.sh` 同步到服务器（rsync 排除 `*.md`），本报告是开发侧载体。
+> 🔴 **表名迁移说明（2026-11-16）**：本文数字与结论仍有效，但正文提到的 `regime.hk_sector_index_daily` 已迁为 `industry.hk_index_daily`；L3 由宽表改为 `industry.business_value` 长表（按 `biz_code` 分行）。工作台 `tools/validate_sector.py` 已用条件聚合 pivot 回一行业一日一行，下游计算口径不变。
 
 ---
 

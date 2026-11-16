@@ -333,25 +333,27 @@ _REGIME_TABLE_CONFIG = [
      "market_state_daily（逐行业横截面，18:45 计算层写入）", True),
     ("regime", "sector_valuation_snapshot", "updated_at", "day", 1, 0,
      "get_sector_valuation（行业估值快照，18:15；源无历史，漏采即永久缺失）", True),
-    # 第④层行业配置计算层（sector_layer.py，sector-layer.timer 工作日 19:10）
-    ("regime", "sector_indicator_dict", "updated_at", "lowfreq", 30, 0,
-     "sector_layer（行业指标字典，每次运行幂等 upsert）", True),
-    ("regime", "sector_indicator_value", "trade_date", "day", 1, 0,
+    # 第④层行业热点计算层（industry 域；sector_layer.py，sector-layer.timer 19:10）
+    ("industry", "indicator_dict", "updated_at", "lowfreq", 30, 0,
+     "sector_layer（L1 指标字典，每次运行幂等 upsert）", True),
+    ("industry", "business_dict", "updated_at", "lowfreq", 30, 0,
+     "sector_layer（L3 业务指标字典，开放集合，每次运行幂等 upsert）", True),
+    ("industry", "indicator_value", "trade_date", "day", 1, 0,
      "sector_layer（第④层 L1 原子指标，19:10；按 trade_date 判新鲜度）", True),
-    ("regime", "sector_score_daily", "trade_date", "day", 1, 0,
+    ("industry", "dimension_value", "trade_date", "day", 1, 0,
      "sector_layer（第④层 L2 维度读数，19:10）", True),
-    ("regime", "sector_biz_daily", "trade_date", "day", 1, 0,
-     "sector_layer（第④层 L3 业务读数，19:10；增量默认回退 3 天自愈）", True),
+    ("industry", "business_value", "trade_date", "day", 1, 0,
+     "sector_layer（第④层 L3 业务读数长表，19:10；增量默认回退 3 天自愈）", True),
     # 第④层阶段 2 行业成分主数据（get_sector_constituent.py，交易日 18:05）。
     # ⚠ 两表都是**事件驱动**：成分无变更的日子不写新行，用 day/1 会天天误报。
     #    表级用 lowfreq/7 兜底；采集是否停摆由调度器的 collection_task_log 判。
-    ("regime", "sector_constituent", "created_at", "lowfreq", 7, 0,
+    ("industry", "constituent", "created_at", "lowfreq", 7, 0,
      "get_sector_constituent（PIT 版本链，18:05；事件驱动，无变更日不写）", True),
-    ("regime", "sector_constituent_change", "created_at", "lowfreq", 7, 0,
+    ("industry", "constituent_change", "created_at", "lowfreq", 7, 0,
      "get_sector_constituent（成分变更日志，18:05；事件驱动）", True),
     # 第④层阶段 3 / D4：HK 行业日聚合与自算指数（sector-layer-hk.timer 工作日 19:20）。
-    # ⚠ 按 trade_date 判新鲜度；CN/HK 输出共用 4 张表，表级监控按 CN 日历（见下方已知残差）。
-    ("regime", "hk_sector_index_daily", "trade_date", "day", 1, 0,
+    # ⚠ 按 trade_date 判新鲜度；CN/HK 输出共用表，表级监控按 CN 日历（见下方已知残差）。
+    ("industry", "hk_index_daily", "trade_date", "day", 1, 0,
      "hk_sector_index（阶段3 自算行业指数，19:20；按 trade_date 判新鲜度）", True),
     ("public", "trading_calendar", "updated_at", "lowfreq", 7, 0,
      "init_trading_calendar（年度追加 + 日增量）", True),
@@ -429,12 +431,13 @@ _CN_MONITOR_TABLES = {
     #   同一张表，表级 MAX(trade_date) 仍按 CN 日历。港股独家交易日可能晚一日，
     #   最多产生 1 天 lag 的边界告警；任务是否真停摆以 collection_task_log 的
     #   「行业配置计算HK」埋点为准。不新建 HK 专用表即可避免重复告警配置。
-    ("regime", "sector_indicator_dict"),
-    ("regime", "sector_indicator_value"),
-    ("regime", "sector_score_daily"),
-    ("regime", "sector_biz_daily"),
-    ("regime", "sector_constituent"),
-    ("regime", "sector_constituent_change"),
+    ("industry", "indicator_dict"),
+    ("industry", "business_dict"),
+    ("industry", "indicator_value"),
+    ("industry", "dimension_value"),
+    ("industry", "business_value"),
+    ("industry", "constituent"),
+    ("industry", "constituent_change"),
 }
 
 

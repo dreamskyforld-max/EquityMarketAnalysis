@@ -121,21 +121,21 @@ QUERIES = [
      "count(DISTINCT classification) AS classifications, "
      "min(indicator_code) AS min_code, max(indicator_code) AS max_code, "
      "count(DISTINCT params_hash) AS hashes "
-     "FROM regime.sector_indicator_dict"),
+     "FROM industry.indicator_dict"),
 
     ("⑥ sector_constituent 现状",
      "SELECT market, classification, count(*) AS rows, "
      "count(DISTINCT sector_code) AS sectors, count(DISTINCT stock_code) AS stocks, "
      "min(eff_from) AS min_eff, max(eff_from) AS max_eff, "
      "count(*) FILTER (WHERE eff_to IS NOT NULL) AS closed "
-     "FROM regime.sector_constituent GROUP BY 1, 2 ORDER BY 1, 2"),
+     "FROM industry.constituent GROUP BY 1, 2 ORDER BY 1, 2"),
 
-    ("⑥ 输出表现有 market / classification 分布",
-     "SELECT 'sector_indicator_value' AS tbl, market, classification, count(*) AS rows "
-     "FROM regime.sector_indicator_value GROUP BY 1, 2, 3 "
+    ("⑥ 输出表现有 market / classification / biz_code 分布",
+     "SELECT 'indicator_value' AS tbl, market, classification, '' AS biz_code, count(*) AS rows "
+     "FROM industry.indicator_value GROUP BY 1, 2, 3 "
      "UNION ALL "
-     "SELECT 'sector_biz_daily', market, classification, count(*) "
-     "FROM regime.sector_biz_daily GROUP BY 1, 2, 3 ORDER BY 1, 2, 3"),
+     "SELECT 'business_value', market, classification, biz_code, count(*) "
+     "FROM industry.business_value GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4"),
 ]
 
 

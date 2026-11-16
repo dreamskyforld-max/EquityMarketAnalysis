@@ -67,6 +67,12 @@ BACKFILL_START = dt.date(1999, 12, 30)
 ENABLED_DIMENSIONS = ("TREND", "FLOW", "VALUATION", "CROWDING",
                       "FUNDAMENTAL", "BREADTH")
 
+# L3 业务读数阈值：抽成常量以便纳入口径指纹（数值与既有实现完全一致）。
+# ⚠ 改这些值会换掉 L2/L3 的 params_hash，必须全量重算，不得只写新日期。
+COVERAGE_MIN = 0.6              # applicable / DATA_COVERAGE / confidence_of
+VALID_DAYS_20_MIN = 15          # 近 20 交易日有效读数门槛
+VALID_DAYS_WINDOW = 20          # valid_days_20 的滚动窗口
+
 
 # ── 指标字典（代码即字典；新增指标须先在此登记）──────────────────────────────
 # value_col / pct_x_col / pct_t_col / n_col 指向 _compute_frame() 产出的宽表列。
@@ -98,7 +104,7 @@ _D_SNAP = ("数据：regime.sector_valuation_snapshot 只给当前横截面、�
            "2026-09-30 起逐日累积（实测 27 个快照日），漏采一天即永久缺失")
 _D_FLOW = ("数据：同花顺约 90 个细分行业资金流经 regime.sector_mapping 映射到申万，"
            "只纳入 confirmed=true 或 corr≥0.6；源只给即时快照、2026-09-30 起")
-_D_PIT = ("数据：成分按 regime.sector_constituent 的 [eff_from, eff_to) 取用，"
+_D_PIT = ("数据：成分按 industry.constituent 的 [eff_from, eff_to) 取用，"
           "有效起点 2021-12-13（决策 A：申万 2021 版分类启用日），更早不得用当前成分回算；"
           "按月 × 按股票分批聚合，pit_capable=false 段须降置信")
 _D_FC = ("数据：regime.analyst_forecast_snapshot 2026-09-30 起、仅 A 股、实测 25 个快照日；"
@@ -278,12 +284,12 @@ INDICATOR_DEFS = [
              "数据：raw_value 存 0–4 编码，label/k/partial/members 在 extra" + _SEP +
              "⚠ 阶段 1(k=2) 与阶段 2(k=3) 分母不同，两期闸门不可跨期比较；阶段 4 因 EXTREME 仅 45 行判 NOT_EVALUABLE，验证完成前只作纯展示标记",
       extra_kind="crowd"),
-    # ── 阶段 2：依赖 regime.sector_constituent 的自下而上指标 ──────────────
+    # ── 阶段 2：依赖 industry.constituent 的自下而上指标 ──────────────
     # 有效起点 2021-12-13（决策 A）；全部由 sector_stage2_agg 按月 × 按股票分批聚合。
     D("SEC.CROWD.TURNOVER_PCT", "行业换手率横截面分位", "CROWD", "risk", "score_0_100", "high_risk",
       "成分股 turnover_rate 按流通市值加权 → 当日横截面分位(M1)", "M6",
       value_col="turnover_w", pct_x_col="turnover_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + regime.sector_constituent",
+      source="a_daily_quote + industry.constituent",
       remark="定义：成分股 turnover_rate 按流通市值加权的行业换手率，再取当日横截面分位（M1，0–100）" + _SEP +
              "判读：高 = 该行业交投相对同侪更热，是拥挤三因子的第三票；阶段 1 该因子恒缺，闸门按 k=2 部分模式" + _SEP +
              _D_PIT + _SEP +
@@ -291,28 +297,28 @@ INDICATOR_DEFS = [
     D("SEC.VAL.INTRA_DISPERSION", "行业内个股PE离散度", "VAL", "risk", "score_0_100", "high_risk",
       "成分股 pe_ttm_ratio 横截面 std → 当日横截面分位(M1)", "M6",
       value_col="pe_dispersion", pct_x_col="pe_disp_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + regime.sector_constituent",
+      source="a_daily_quote + industry.constituent",
       remark="定义：行业内成分股 PE-TTM 的横截面标准差，再取当日横截面分位（M1，0–100）" + _SEP +
              "判读：高 = 行业内估值分化大（龙头与尾部定价撕裂）；与 PE_XSEC_PCT 高冗余，**仅作校验不进维度分**" + _SEP +
              _D_PIT + _SEP + "⚠ 个股 pe_ttm_ratio 2018 起才有，早期为 NULL"),
     D("SEC.BREADTH.UP_RATIO", "行业内上涨占比", "BREADTH", "state", "pct", "high_good",
       "M6：成分股 change_pct>0 占比", "M6",
       value_col="up_ratio", pct_x_col="up_ratio_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + regime.sector_constituent",
+      source="a_daily_quote + industry.constituent",
       remark="定义：行业内当日收涨成分股占有行情成分数比例（%，M6 count-if/n）" + _SEP +
              "判读：**高 = 行业内部参与广度健康**；与市场级 SECTOR.UP_RATIO 区分——后者是「多少个行业在涨」，本项是「行业内多少股票在涨」" + _SEP +
              _D_PIT),
     D("SEC.BREADTH.ABOVE_MA60", "行业内站上MA60占比", "BREADTH", "state", "pct", "high_good",
       "M6：成分股 close > MA60 占比（rolling 60，min_periods=60）", "M6",
       value_col="above_ma60", pct_x_col="above_ma60_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + regime.sector_constituent",
+      source="a_daily_quote + industry.constituent",
       remark="定义：行业内 close > MA60 的成分股占比（%，rolling 60 / min_periods=60）" + _SEP +
              "判读：>50 多数成分站上中期均线 = 中期广度健康；极高位偏过热，须与趋势方向同用" + _SEP +
              _D_PIT + _SEP + "⚠ 需 60 交易日暖机，起点后首 60 日为 NULL"),
     D("SEC.BREADTH.NEW_HIGH_LOW", "行业内新高−新低归一净占比", "BREADTH", "state", "pct", "high_good",
       "100×(n_high−n_low)/(n_high+n_low)，60日窗口；计数类必须归一（§5.7）", "M6",
       value_col="new_high_low", pct_x_col="nhl_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + regime.sector_constituent",
+      source="a_daily_quote + industry.constituent",
       remark="定义：60 日新高−新低**归一净占比** = 100×(n_high−n_low)/(n_high+n_low)（%，−100~100）" + _SEP +
              "判读：>0 创新高者占优 = 中期动能健康；持续为负而行业指数走高 = 内在动能衰竭" + _SEP +
              _D_PIT + _SEP +
@@ -320,14 +326,14 @@ INDICATOR_DEFS = [
     D("SEC.BREADTH.RET_DISPERSION", "行业内收益离散度", "BREADTH", "state", "pct", "high_risk",
       "成分股 20 日收益横截面 std → 横截面分位(M1)", "M6",
       value_col="ret_dispersion", pct_x_col="ret_disp_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + regime.sector_constituent",
+      source="a_daily_quote + industry.constituent",
       remark="定义：行业内成分股 20 日收益的横截面标准差（M6 + std）" + _SEP +
              "判读：direction=high_risk（**高 = 分化大**）；BREADTH 维度内 sign=-1 翻转，高分位代表更集中" + _SEP +
              _D_PIT + _SEP +
              "⚠ 阶段 4 构念效度实测与维度分相关仅 0.160 <0.3，已登记为待移出成员（见 sector_validation_report.md §3）"),
     D("SEC.FLOW.MARGIN_NET", "行业两融净买入", "FLOW", "state", "yi_yuan", "high_good",
       "M6：成分股 rz_net 求和 / 1e8", "M6",
-      value_col="margin_net", source="daily_margin_balance + regime.sector_constituent",
+      value_col="margin_net", source="daily_margin_balance + industry.constituent",
       remark="定义：行业成分股两融净买入额求和 / 1e8（亿元，M6）" + _SEP +
              "判读：>0 杠杆资金净流入该行业；只作描述性读数，不作预测信号" + _SEP +
              "⚠ 源 daily_margin_balance.rz_net（元→亿元），按 PIT 成分映射" + _SEP +
@@ -335,7 +341,7 @@ INDICATOR_DEFS = [
     D("SEC.FUND.ROE_MEDIAN", "行业ROE中位数", "FUND", "state", "pct", "high_good",
       "M6：按 announce_date ≤ t 取最新报告期（PIT），行业内取中位数", "M6",
       value_col="roe_median", pct_x_col="roe_xsec_pct", n_col="constituent_n",
-      source="financial_indicator + regime.sector_constituent",
+      source="financial_indicator + industry.constituent",
       remark="定义：行业成分股 ROE 的 PIT 中位数（%，按 announce_date ≤ t 取最新报告期）" + _SEP +
              "判读：高 = 行业盈利能力相对强；FUNDAMENTAL 维度 4 成员之一（每成员 25% 权重）" + _SEP +
              _D_PIT + _SEP +
@@ -343,7 +349,7 @@ INDICATOR_DEFS = [
     D("SEC.FUND.NP_YOY_MEDIAN", "行业净利同比中位数", "FUND", "state", "pct", "high_good",
       "PIT 最新报告期 net_profit_yoy 中位数", "M6",
       value_col="np_yoy_median", pct_x_col="npyoy_xsec_pct", n_col="constituent_n",
-      source="financial_indicator + regime.sector_constituent",
+      source="financial_indicator + industry.constituent",
       remark="定义：行业成分股净利同比的 PIT 中位数（%）" + _SEP +
              "判读：>0 行业盈利整体扩张；与 REV_YOY_MEDIAN 联读区分「增收不增利」" + _SEP +
              _D_PIT + _SEP +
@@ -351,20 +357,20 @@ INDICATOR_DEFS = [
     D("SEC.FUND.REV_YOY_MEDIAN", "行业营收同比中位数", "FUND", "state", "pct", "high_good",
       "PIT 最新报告期 revenue_yoy 中位数", "M6",
       value_col="rev_yoy_median", pct_x_col="revyoy_xsec_pct", n_col="constituent_n",
-      source="financial_indicator + regime.sector_constituent",
+      source="financial_indicator + industry.constituent",
       remark="定义：行业成分股营收同比的 PIT 中位数（%）" + _SEP +
              "判读：>0 行业需求端扩张；与 NP_YOY_MEDIAN 背离时提示利润率变化" + _SEP +
              _D_PIT),
     D("SEC.FUND.IMPROVEMENT_BREADTH", "行业盈利改善宽度", "FUND", "state", "pct", "high_good",
       "PIT 最新报告期 net_profit_yoy>0 的成分占比", "M6",
       value_col="improvement_breadth", pct_x_col="improve_xsec_pct", n_col="constituent_n",
-      source="financial_indicator + regime.sector_constituent",
+      source="financial_indicator + industry.constituent",
       remark="定义：行业内净利同比为正的成分占比（0–100%，M6 count-if/n）" + _SEP +
              "判读：高 = 盈利改善是**普遍性**而非少数龙头拉动；与 NP_YOY_MEDIAN 联读区分「中位数被拉高」与「多数改善」" + _SEP +
              _D_PIT + _SEP + "⚠ 归一比率天然平稳（§5.7 L2-a ③），不随股票池扩缩漂移"),
     D("SEC.FUND.COVERAGE", "财务覆盖度", "FUND", "state", "ratio", "high_good",
       "有 ROE 的成分数 / 成分数", "M6",
-      value_col="fund_coverage", source="financial_indicator + regime.sector_constituent",
+      value_col="fund_coverage", source="financial_indicator + industry.constituent",
       remark="定义：有 ROE 的成分数 / PIT 有效成分数（0–1）" + _SEP +
              "判读：**门禁**——<0.6 时 FUNDAMENTAL 组全部读数作废并清库，不得用稀疏样本出中位数" + _SEP +
              _D_PIT + _SEP +
@@ -372,7 +378,7 @@ INDICATOR_DEFS = [
     D("SEC.FUND.REVISION_BREADTH", "行业盈利修正宽度", "FUND", "state", "pct", "high_good",
       "M7：同财年 FY1 EPS 相邻快照差分（±0.5% 噪声），30快照滚动，按成分下沉到行业", "M7",
       value_col="revision_breadth", pct_x_col="revision_xsec_pct", n_col="revision_n",
-      source="regime.analyst_forecast_snapshot + regime.sector_constituent",
+      source="regime.analyst_forecast_snapshot + industry.constituent",
       remark="定义：行业盈利修正宽度 = (Σ上调−Σ下调)/Σ可比样本×100（M7，同财年 FY1 EPS 相邻快照差分 ±0.5% 噪声，30 快照滚动）" + _SEP +
              "判读：>0 分析师预期在上修；FUNDAMENTAL 维度 4 成员之一" + _SEP +
              _D_FC + _SEP +
@@ -380,13 +386,13 @@ INDICATOR_DEFS = [
              "⚠ 阶段 4 构念效度实测载荷 0.156 <0.3，已登记为待移出成员（见 sector_validation_report.md §3）"),
     D("SEC.FUND.RATING_BULL_PCT", "行业评级乐观度", "FUND", "state", "pct", "high_good",
       "(rating_buy+rating_overweight)/五档合计，按成分汇总", "M0",
-      value_col="rating_bull_pct", source="regime.analyst_forecast_snapshot + regime.sector_constituent",
+      value_col="rating_bull_pct", source="regime.analyst_forecast_snapshot + industry.constituent",
       remark="定义：(买入+增持)/评级五档合计，按 PIT 成分汇总（%）" + _SEP +
              "判读：🔴 判别力弱——§7.8 实测 99.3% 结构性集中在买入/增持，**仅作极端背离提示，不进维度分**" + _SEP +
              _D_FC),
     D("SEC.FUND.FORECAST_COVERAGE", "预期覆盖度", "FUND", "state", "ratio", "high_good",
       "有预期数据的成分数 / PIT 有效成分数", "M6",
-      value_col="forecast_coverage", source="regime.analyst_forecast_snapshot + regime.sector_constituent",
+      value_col="forecast_coverage", source="regime.analyst_forecast_snapshot + industry.constituent",
       remark="定义：有预期数据的成分数 / PIT 有效成分数（0–1）" + _SEP +
              "判读：**门禁**——<0.3 时 REVISION_BREADTH 不出值，避免用少数覆盖样本冒充行业一致预期" + _SEP +
              _D_FC),
@@ -419,6 +425,63 @@ DIMENSION_DEFS = {
 
 RRG_LABELS = {1: "领先", 2: "走强", 3: "走弱", 4: "落后"}
 CROWD_GATE_CODES = {"NORMAL": 0, "WATCH": 1, "HIGH": 2, "EXTREME": 3, "NA": 4}
+
+# ── L3 业务指标字典（代码即字典；**开放集合**）────────────────────────────────
+# 取代旧宽表：旧设计把 5 类业务读数压成一行的多个列，没有指标编码，无法各自
+# 版本化 / 重算 / 增减。现按 biz_code 分行写 industry.business_value，定义同步
+# 落 industry.business_dict。**新增或下线业务指标只改本字典，不加表字段。**
+# ⚠ question / biz_name 是面向前端的展示文案，与 remark 一样不进 params_hash 之外
+#   的口径计算（但 inputs / output_schema / kind / side 进口径指纹）。
+BIZ_DEFS = {
+    "SEC.BIZ.STATE_SIDE": dict(
+        biz_name="状态侧热度",
+        question="这个行业当前整体状态在同日所有行业中偏强还是偏弱？",
+        side="state", kind="continuous",
+        inputs=[{"kind": "dimension", "code": "SEC.DIM." + n}
+                for n, c in DIMENSION_DEFS.items()
+                if c["side"] == "state"
+                and c["structure"] in ("single_anchor", "equal")],
+        output_schema={"score": "0-100 状态侧热度 = 当期有分的状态侧维度等权均值；有效维度<2 为 NULL",
+                       "state": "恒 NULL", "level": "恒 NULL",
+                       "detail": "state_members / state_n / partial"},
+        is_active=True),
+    "SEC.BIZ.RISK_SIDE": dict(
+        biz_name="风险侧水平",
+        question="这个行业当前估值风险高不高？",
+        side="risk", kind="continuous",
+        inputs=[{"kind": "dimension", "code": "SEC.DIM.VALUATION"}],
+        output_schema={"score": "0-100 风险侧水平 = VALUATION.score；高分 = 更贵",
+                       "state": "恒 NULL", "level": "恒 NULL", "detail": "{}"},
+        is_active=True),
+    "SEC.BIZ.QUADRANT": dict(
+        biz_name="状态象限",
+        question="把状态与风险组合起来，当前属于哪一类局面？",
+        side="neutral", kind="enum",
+        inputs=[{"kind": "biz", "code": "SEC.BIZ.STATE_SIDE"},
+                {"kind": "biz", "code": "SEC.BIZ.RISK_SIDE"}],
+        output_schema={"score": "恒 NULL",
+                       "state": "强势·未拥挤 / 强势·偏贵拥挤 / 冷门·未拥挤 / 弱势·偏贵拥挤 / NA；只描述当前状态，不含超配/低配/买卖含义",
+                       "level": "恒 NULL", "detail": "state_side / risk_side"},
+        is_active=True),
+    "SEC.BIZ.RANK": dict(
+        biz_name="当日状态排名",
+        question="今天所有行业按状态排序，它排第几？共几个可比行业？",
+        side="state", kind="rank",
+        inputs=[{"kind": "biz", "code": "SEC.BIZ.STATE_SIDE"}],
+        output_schema={"score": "恒 NULL", "state": "恒 NULL",
+                       "level": "当日排名名次 1..rank_n（仅 applicable=true 有值）",
+                       "detail": "rank_no / rank_n"},
+        is_active=True),
+    "SEC.BIZ.GATE": dict(
+        biz_name="风险与可用性闸门",
+        question="哪些原因让今天的结论需要打折看？",
+        side="risk", kind="gate",
+        inputs=[{"kind": "atom", "code": "SEC.CROWD.GATE"},
+                {"kind": "dimension", "code": "SEC.DIM.CROWDING"}],
+        output_schema={"score": "恒 NULL", "state": "恒 NULL", "level": "恒 NULL",
+                       "detail": "gate_flags[] / crowd_gate / crowd_k / crowd_partial"},
+        is_active=True),
+}
 
 # 阶段 2 聚合输出的列（sector_stage2_agg.build_stage2_agg）
 _STAGE2_AGG_COLS = [
@@ -462,10 +525,121 @@ def _reverse_percentile(s: pd.Series) -> pd.Series:
 
 
 def _params_hash(d: dict) -> str:
-    """口径指纹：公式/单位/极性/模型/参数/版本任一变化都会换指纹（§7.2 PIT 铁律）。"""
+    """L1 原子口径指纹：公式/单位/极性/模型/版本任一变化都会换指纹（§7.2 PIT 铁律）。
+
+    ⚠ 本函数只用于 L1 原子。L2 / L3 用下面的 _dim_spec / _biz_spec，
+      因为它们的口径还依赖「锚、成员、sign、L1 定义、闸门阈值」，旧实现把这些
+      漏在 payload 之外，改了不换指纹会让历史行混存两套口径却显示同一版本号。
+    """
     payload = "|".join([d["code"], d["unit"], d["direction"], d["formula"],
                         d["model_key"], CALIB_VERSION])
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
+
+
+# ── L2 / L3 口径指纹（结构 + 上游 L1 定义 + 闸门阈值，全量纳入）────────────────
+# 只纳入「影响数值」的字段。indicator_name / remark / is_active 属文案或启用开关，
+# 不进指纹（与 remark 不触发重算的既有纪律一致）；成员启用状态变化时必然伴随
+# formula / source / model_key 调整，会经 upstream 自动传导。
+_NUMERIC_DEF_KEYS = ("code", "unit", "direction", "formula", "model_key",
+                     "source", "freq", "value_col", "pct_x_col", "pct_t_col",
+                     "n_col", "extra_kind")
+_CROWD_FACTORS = ("SEC.CROWD.AMT_SHARE_PCT", "SEC.CROWD.TURNOVER_PCT",
+                  "SEC.CROWD.VAL_PCT")
+
+
+def _hash_spec(spec: dict) -> str:
+    """规范化序列化后取 md5 前 16 位。纯函数，HK 侧复用。"""
+    return hashlib.md5(json.dumps(spec, sort_keys=True, ensure_ascii=False,
+                                  default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def _atom_spec(defs: list, code: str, hash_fn) -> dict:
+    """某 L1 原子的口径规格：自身指纹 + 影响数值的定义字段。纯函数，HK 侧复用。"""
+    d = next(x for x in defs if x["code"] == code)
+    return {"l1_hash": hash_fn(d),
+            "def": {k: d.get(k) for k in _NUMERIC_DEF_KEYS}}
+
+
+def _dim_spec() -> dict:
+    """CN 六维口径规格（纯函数，供单测验证「改锚 / 改成员 / 改 sign」的敏感性）。"""
+    out = {}
+    for name, cfg in DIMENSION_DEFS.items():
+        codes = ([cfg["anchor"]] if cfg["anchor"] else
+                 [c for c, _ in cfg.get("members", [])])
+        if name == "CROWDING":
+            codes = list(_CROWD_FACTORS)     # 规则判定维度无 anchor/members
+        out[name] = {
+            "layer": "L2", "code": "SEC.DIM." + name,
+            "market": MARKET, "classification": CLASSIFICATION,
+            "version": CALIB_VERSION,
+            "structure": cfg["structure"], "side": cfg["side"],
+            "anchor": cfg["anchor"],
+            "members": [{"code": c, "sign": s}
+                        for c, s in cfg.get("members", [])],
+            "upstream": {c: _atom_spec(INDICATOR_DEFS, c, _params_hash)
+                         for c in codes},
+        }
+    return out
+
+
+def _dim_hashes() -> dict:
+    """循环外预计算一次，避免每个行业日重复 json.dumps（热路径护栏）。"""
+    return {n: _hash_spec(s) for n, s in _dim_spec().items()}
+
+
+def _biz_spec(biz_code: str, dim_hashes: dict) -> dict:
+    """CN L3 单指标口径规格：自身定义 + 六维指纹 + 闸门阈值 + 版本。
+
+    ⚠ 每个 biz_code 独立出指纹 —— 改某一个业务指标的输入 / 输出契约 / 阈值，
+      只换它自己的 params_hash，不牵连其它业务指标的历史行。
+    """
+    cfg = BIZ_DEFS[biz_code]
+    return {
+        "layer": "L3", "code": biz_code,
+        "market": MARKET, "classification": CLASSIFICATION,
+        "version": CALIB_VERSION,
+        "kind": cfg["kind"], "side": cfg["side"],
+        "inputs": cfg["inputs"], "output_schema": cfg["output_schema"],
+        "upstream_dims": dim_hashes,
+        "params": {
+            "enabled_dimensions": list(ENABLED_DIMENSIONS),
+            "coverage_min": COVERAGE_MIN,
+            "valid_days_20_min": VALID_DAYS_20_MIN,
+            "valid_days_window": VALID_DAYS_WINDOW,
+            "crowd_pct_high": CROWD_PCT_HIGH,
+            "short_sample": SHORT_SAMPLE,
+            "min_periods": MIN_PERIODS,
+            "pit_start": str(PIT_START),
+        },
+    }
+
+
+def _biz_hashes() -> dict:
+    """循环外预计算一次：每个 active biz_code 一个独立指纹。"""
+    dh = _dim_hashes()
+    return {c: _hash_spec(_biz_spec(c, dh))
+            for c, cfg in BIZ_DEFS.items() if cfg["is_active"]}
+
+
+def _biz_params_hash(biz_code: str) -> str:
+    return _hash_spec(_biz_spec(biz_code, _dim_hashes()))
+
+
+def _biz_dict_rows() -> list:
+    """business_dict 种子（代码即字典，幂等 upsert）。"""
+    now = dt.datetime.now().astimezone()
+    dh = _dim_hashes()
+    return [dict(market_scope=MARKET, classification=CLASSIFICATION,
+                 biz_code=code, biz_name=cfg["biz_name"],
+                 question=cfg["question"], side=cfg["side"], kind=cfg["kind"],
+                 inputs=cfg["inputs"], params={"version": CALIB_VERSION},
+                 output_schema=cfg["output_schema"],
+                 params_hash=_hash_spec(_biz_spec(code, dh)),
+                 is_active=cfg["is_active"],
+                 remark="定义：" + cfg["biz_name"] + "　·　判读：" +
+                        (cfg["question"] or "") + "　·　数据：见 industry_hotspot_data_architecture.md §6",
+                 updated_at=now)
+            for code, cfg in BIZ_DEFS.items()]
 
 
 def _clean_value(v):
@@ -530,7 +704,7 @@ def quadrant_of(state: float, risk: float, state_med: float, risk_med: float) ->
 
 def confidence_of(n_sample: int | None, coverage: float, pit_capable: bool = True) -> str:
     """置信度：短样本 / 低覆盖 / 非 PIT 段一律降级。"""
-    if coverage < 0.6 or not pit_capable:
+    if coverage < COVERAGE_MIN or not pit_capable:
         return "low"
     if n_sample is not None and n_sample < SHORT_SAMPLE:
         return "low"
@@ -693,7 +867,7 @@ def _compute_frame(df: pd.DataFrame, val: pd.DataFrame, amt: pd.DataFrame,
     # applicable：近 20 交易日有效读数 ≥15 日（直接从输入算，不依赖输出表）
     df["_valid"] = df["rs_20d"].notna().astype(int)
     df["valid_days_20"] = df.groupby("sw_code")["_valid"].transform(
-        lambda s: s.rolling(20, min_periods=1).sum())
+        lambda s: s.rolling(VALID_DAYS_WINDOW, min_periods=1).sum())
 
     # 维度分：单锚 / 分块等权 / 规则判定（§7.2 三种标准结构）
     def _anchor_pct(code):
@@ -783,7 +957,7 @@ def _indicator_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
                     extra["label"] = {v: k for k, v in CROWD_GATE_CODES.items()}.get(int(raw))
             extra["rank_n"] = _clean_value(rec.get("rank_n"))
             # 依赖成分主数据的指标，在 PIT_START 之前无有效成分 → 标注非 PIT。
-            extra["pit_capable"] = (d >= PIT_START) if "sector_constituent" in meta["source"] else True
+            extra["pit_capable"] = (d >= PIT_START) if "constituent" in meta["source"] else True
             rows.append(dict(
                 market=MARKET, classification=CLASSIFICATION,
                 sector_code=rec["sw_code"], trade_date=d,
@@ -814,6 +988,7 @@ def _dim_n_sample(rec: dict, name: str):
 
 def _score_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
     rows, now = [], dt.datetime.now().astimezone()
+    dim_hashes = _dim_hashes()      # 循环外算一次；含锚/成员/sign/上游 L1 定义
     for rec in wide.to_dict("records"):
         d = rec["trade_date"]
         if isinstance(d, pd.Timestamp):
@@ -843,15 +1018,19 @@ def _score_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
                 side=cfg["side"], score=score, coverage=cov, dispersion=0.0,
                 confidence=confidence_of(_dim_n_sample(rec, name), cov),
                 members_used=members,
-                params_hash=_params_hash(dict(code="SEC.DIM." + name, unit="score_0_100",
-                                              direction="high_good", formula=cfg["structure"],
-                                              model_key=cfg["structure"])),
+                params_hash=dim_hashes[name],
                 extra=extra, updated_at=now))
     return rows
 
 
 def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
+    """L3 长表：一个行业日按 BIZ_DEFS 产出多行，每行一个 biz_code。
+
+    公共质量元数据（coverage / applicable / confidence / extra）每行都带；
+    多态列 score / state / level / detail 按 biz_code 各填各的，其余恒 NULL。
+    """
     rows, now = [], dt.datetime.now().astimezone()
+    hashes = _biz_hashes()      # 循环外算一次；每个 biz_code 一个独立指纹
     for rec in wide.to_dict("records"):
         d = rec["trade_date"]
         if isinstance(d, pd.Timestamp):
@@ -861,10 +1040,12 @@ def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
         cov = float(_get(rec, "coverage") or 0.0)
         c = rec.get("_crowd") or {}
         flags = []
-        if cov < 0.6:
+        if cov < COVERAGE_MIN:
             flags.append("DATA_COVERAGE")
-        # SHORT_SAMPLE 只在「参与维度分的锚指标」短样本时触发；阶段1 锚均为横截面
-        # 分位（不依赖时序样本），故不触发 —— 否则 applicable 会恒为 false。
+        # SHORT_SAMPLE 不是闸门：按设计稿 §3.6 实施期细化 ①，短样本只按
+        # 「参与维度分的锚指标」判定；当前锚全部是横截面分位（不依赖时序样本），
+        # 故不触发。短样本信息由 L1 quality='short_sample' 与 L2/L3
+        # confidence='low' 承载，若写成闸门会让 applicable 恒为 false。
         if c.get("gate") in ("HIGH", "EXTREME"):
             flags.append("CROWDING")
         state_dims_n = sum(1 for cfg in DIMENSION_DEFS.values()
@@ -873,33 +1054,54 @@ def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
         state_n = int(_get(rec, "state_n") or 0)
         if state_n < state_dims_n:
             flags.append("PARTIAL_STATE")   # 阶段 2 之前 / 成分数据缺失时状态侧不齐
-        applicable = (cov >= 0.6 and int(_get(rec, "valid_days_20") or 0) >= 15
+        applicable = (cov >= COVERAGE_MIN
+                      and int(_get(rec, "valid_days_20") or 0) >= VALID_DAYS_20_MIN
                       and "DATA_COVERAGE" not in flags)
         partial = "PARTIAL_STATE" in flags
-        extra = dict(state_members=rec["state_members"], state_n=state_n,
-                     partial=partial, enabled_dimensions=list(ENABLED_DIMENSIONS),
-                     calib_version=CALIB_VERSION, pit_capable=(d >= PIT_START),
-                     crowd_k=c.get("k"), crowd_partial=c.get("partial"),
-                     rank_n=_clean_value(rec.get("rank_n")))
-        rows.append(dict(
+        state_side = _get(rec, "state_side")
+        risk_side = _get(rec, "risk_side")
+        quadrant = rec.get("quadrant") or "NA"
+        rank_no = _get(rec, "rank") if applicable else None
+        rank_n = _clean_value(rec.get("rank_n"))
+        common = dict(
             market=MARKET, classification=CLASSIFICATION,
             sector_code=rec["sw_code"], trade_date=d,
-            state_side=_get(rec, "state_side"), risk_side=_get(rec, "risk_side"),
-            quadrant=rec.get("quadrant") or "NA",
-            rank_no=_get(rec, "rank") if applicable else None,
-            rank_n=_clean_value(rec.get("rank_n")),
-            coverage=cov, gate_flags=flags,
-            applicable=bool(applicable),
+            coverage=cov, applicable=bool(applicable),
             confidence=confidence_of(_get(rec, "pe_n_sample"), cov),
-            params_hash=_params_hash(dict(code="SEC.BIZ.DAILY", unit="score_0_100",
-                                          direction="neutral", formula="state/risk matrix",
-                                          model_key="L3")),
-            extra=extra, updated_at=now))
+            extra=dict(enabled_dimensions=list(ENABLED_DIMENSIONS),
+                       calib_version=CALIB_VERSION,
+                       pit_capable=(d >= PIT_START),
+                       rank_n=rank_n),
+            updated_at=now)
+        for biz_code, h in hashes.items():
+            score = state = level = None
+            detail = {}
+            if biz_code == "SEC.BIZ.STATE_SIDE":
+                score = state_side
+                detail = dict(state_members=rec["state_members"],
+                              state_n=state_n, partial=partial)
+            elif biz_code == "SEC.BIZ.RISK_SIDE":
+                score = risk_side
+            elif biz_code == "SEC.BIZ.QUADRANT":
+                state = quadrant
+                detail = dict(state_side=state_side, risk_side=risk_side)
+            elif biz_code == "SEC.BIZ.RANK":
+                level = int(rank_no) if rank_no is not None else None
+                detail = dict(rank_no=level, rank_n=rank_n)
+            elif biz_code == "SEC.BIZ.GATE":
+                detail = dict(gate_flags=flags, crowd_gate=c.get("gate"),
+                              crowd_k=c.get("k"), crowd_partial=c.get("partial"))
+            rows.append(dict(common, biz_code=biz_code, score=score,
+                             state=state, level=level, detail=detail,
+                             params_hash=h))
     return rows
 
 
 # ── 写库 / 字典同步 ────────────────────────────────────────────────────────
+# L1/L2 的实体主键（不含 biz_code）；L3 长表主键另加 biz_code。
+# ⚠ 不要混用：给 L1/L2 的 conflict_cols 加 biz_code 会因列不存在直接报错。
 PK_COLS = ["market", "classification", "sector_code", "trade_date"]
+BIZ_PK_COLS = ["biz_code"] + PK_COLS
 
 
 def _write_batched(conn, table: str, rows: list, conflict_cols: list) -> int:
@@ -926,8 +1128,11 @@ def sync_dict(conn) -> int:
     # 阶段 3：字典主键扩为 (market_scope, classification, indicator_code)，
     # 冲突键必须同步带上市场与分类，否则 ON CONFLICT 匹配不到唯一约束直接报错。
     # 只改冲突键，不改任何指标口径 → CN 读数与 params_hash 逐值不变。
-    bulk_upsert(conn, "regime.sector_indicator_dict", _clean_rows(rows),
+    bulk_upsert(conn, "industry.indicator_dict", _clean_rows(rows),
                 conflict_cols=["market_scope", "classification", "indicator_code"])
+    # L3 业务指标字典（开放集合）：与 L1 字典同轮幂等 upsert。
+    bulk_upsert(conn, "industry.business_dict", _clean_rows(_biz_dict_rows()),
+                conflict_cols=["market_scope", "classification", "biz_code"])
     conn.commit()
     return len(rows)
 
@@ -936,7 +1141,7 @@ def _default_window(conn) -> tuple[dt.date, dt.date]:
     """增量窗口：取输出表最新日 -3 天（迟到/修订自愈）；无输出则最近 45 天。"""
     end = dt.date.today()
     with conn.cursor() as cur:
-        cur.execute("SELECT max(trade_date) FROM regime.sector_biz_daily WHERE market=%s",
+        cur.execute("SELECT max(trade_date) FROM industry.business_value WHERE market=%s",
                     (MARKET,))
         last = cur.fetchone()[0]
     start = (last - dt.timedelta(days=REWIND_DAYS)) if last else \
@@ -1012,13 +1217,13 @@ def run(codes=None, ctx=None, start: dt.date = None, end: dt.date = None,
                     bz = _biz_rows(sub, cs, ce)
                     if write:
                         n_iv += _write_batched(
-                            conn, "regime.sector_indicator_value", iv,
+                            conn, "industry.indicator_value", iv,
                             PK_COLS + ["indicator_code"])
                         n_sc += _write_batched(
-                            conn, "regime.sector_score_daily", sc,
+                            conn, "industry.dimension_value", sc,
                             PK_COLS + ["dimension_code"])
                         n_bz += _write_batched(
-                            conn, "regime.sector_biz_daily", bz, PK_COLS)
+                            conn, "industry.business_value", bz, BIZ_PK_COLS)
                     else:
                         n_iv += len(iv)
                         n_sc += len(sc)
