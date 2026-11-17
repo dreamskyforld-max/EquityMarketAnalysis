@@ -57,7 +57,6 @@ log = setup_logger("hk_sector_index")
 
 # 口径标识（消费端按此组合过滤，禁止与 CN / SW_L1 混排）
 MARKET = "HK"
-CLASSIFICATION = "HS_L3"
 EQ_START = dt.date(2000, 1, 3)          # hk_daily_quote 实测起点
 CAP_START = dt.date(2002, 1, 1)         # total_market_val 2002 起覆盖率 97.5%+
 BACKFILL_START = EQ_START

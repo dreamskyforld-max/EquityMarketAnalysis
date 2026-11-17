@@ -60,7 +60,7 @@ industry 域数据底座   constituent (CN PIT 版本链) + constituent_change
         │
         ▼
 L1 原子指标  industry.indicator_value   一行业×一日×一指标：raw + 横截面分位 + 时序分位
-        │  只交 (market, classification, sector_code, trade_date, indicator_code, ...)
+        │  只交 (market, sector_code, trade_date, indicator_code, ...)
         ▼
 L2 维度指标  industry.dimension_value   六维各自 0–100 分 + 结构 / 置信 / 成员说明
         │  只交 (dimension_code, score, coverage, confidence, members_used, extra)
@@ -73,24 +73,24 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 1. **方向只定义一次**：原子层 `raw_value` 不翻向；极性在 `indicator_dict.direction` 声明，维度层按 `DIMENSION_DEFS.sign` 唯一翻转（`sign=-1` 取 `100−p`），消费端不得二次翻转。
 2. **判定型读原子、连续型读维度**：拥挤度闸门（`SEC.CROWD.GATE`）走原子规则判定，不经维度分平均稀释；`state_side` / `risk_side` 走维度分。
-3. **分位是 as-of 水平读数**：横截面分位只在同一 `(market, classification, trade_date)` 的有效行业集内计算；时序分位只用截至当日的历史样本。分位不是「变化量」，RRG 纵轴由两次分位之差单独构造。
+3. **分位是 as-of 水平读数**：横截面分位只在同一 `(market, trade_date)` 的有效行业集内计算；时序分位只用截至当日的历史样本。分位不是「变化量」，RRG 纵轴由两次分位之差单独构造。
 
 ### 1.2 对象清单（表级）
 
 | 表 | 层 | 粒度 / 主键 | 生产者与调度 | 使用方常读它做什么 |
 |---|---|---|---|---|
-| `industry.indicator_dict` | 字典 | `(market_scope, classification, indicator_code)` | 代码即字典：`sector_layer.INDICATOR_DEFS` / `sector_layer_hk.HK_INDICATOR_DEFS` 幂等 upsert | 查中文名、单位、方向、公式、模型、起点、`params_hash`、`remark` 三段式 |
-| `industry.indicator_value` | L1 | `(market, classification, sector_code, trade_date, indicator_code)` | `sector_layer.py` 19:10 / `sector_layer_hk.py` 19:20（独立 systemd unit） | 取原始读数、两种分位、`n_sample` / `coverage` / `quality` |
-| `industry.dimension_value` | L2 | `(market, classification, sector_code, trade_date, dimension_code)` | 同上 | 取六维 score 与结构 / 置信 / 成员；`CROWDING` 读 `extra.crowd_gate` |
-| `industry.business_dict` | 字典 | `(market_scope, classification, biz_code)` | 代码即字典：`sector_layer.BIZ_DEFS` / `sector_layer_hk.HK_BIZ_DEFS` 幂等 upsert | 查业务指标中文名、一句话问句、输入清单、输出契约、`is_active`、独立 `params_hash`；新增/下线指标只改这里 |
-| `industry.business_value` | L3 | `(biz_code, market, classification, sector_code, trade_date)` | 同上 | 按 `biz_code` 取状态侧 / 风险侧 / 象限 / 排名 / 闸门读数与共有 `applicable` / `confidence`；每行业日 5 行（CN）/ 4 行（HK） |
-| `industry.constituent` | 底座 | `(market, classification, sector_code, stock_code, eff_from)` | `get_constituent.py`，交易日 18:05（调度器进程内） | 按 `[eff_from, eff_to)` 取当时成分；查权重（百分数） |
-| `industry.constituent_change` | 底座 | `id` / `UNIQUE(snapshot_date, market, classification, sector_code, stock_code, change_type)` | 同上 | 审计 ADD / REMOVE / WEIGHT 变更，重建任意历史截面 |
+| `industry.indicator_dict` | 字典 | `indicator_code` | 代码即字典：`sector_layer.sync_dict` 一次性幂等 upsert（一行一概念，两市场差异落 `params.per_market`） | 查中文名、单位、方向、公式、模型、起点、`params_hash`、`remark` 三段式 |
+| `industry.indicator_value` | L1 | `(market, sector_code, trade_date, indicator_code)` | `sector_layer.py` 19:10 / `sector_layer_hk.py` 19:20（独立 systemd unit） | 取原始读数、两种分位、`n_sample` / `coverage` / `quality` |
+| `industry.dimension_value` | L2 | `(market, sector_code, trade_date, dimension_code)` | 同上 | 取六维 score 与结构 / 置信 / 成员；`CROWDING` 读 `extra.crowd_gate` |
+| `industry.business_dict` | 字典 | `biz_code` | 代码即字典：`sector_layer.sync_dict` 一次性幂等 upsert（一行一概念） | 查业务指标中文名、一句话问句、输入清单、输出契约、`is_active`、独立 `params_hash`；新增/下线指标只改这里 |
+| `industry.business_value` | L3 | `(biz_code, market, sector_code, trade_date)` | 同上 | 按 `biz_code` 取状态侧 / 风险侧 / 象限 / 排名 / 闸门读数与共有 `applicable` / `confidence`；每行业日 5 行（CN）/ 4 行（HK） |
+| `industry.constituent` | 底座 | `(market, sector_code, stock_code, eff_from)` | `get_constituent.py`，交易日 18:05（调度器进程内） | 按 `[eff_from, eff_to)` 取当时成分；查权重（百分数） |
+| `industry.constituent_change` | 底座 | `id` / `UNIQUE(snapshot_date, market, sector_code, stock_code, change_type)` | 同上 | 审计 ADD / REMOVE / WEIGHT 变更，重建任意历史截面 |
 | `industry.hk_index_daily` | 底座 | `(trade_date, sector_code)` | `hk_sector_index.py`（由 `sector_layer_hk.py` 调用） | HK 两版指数点位 / 日收益、行业聚合、南向净流入 |
 | `regime.sector_daily` | 外部输入 | 交易日 × 申万一级 | `market_state_daily.calc_sector_daily`（18:45） | 价格类与资金类 L1 的直接上游 |
 | `regime.sector_valuation_snapshot` / `sector_fund_flow` / `analyst_forecast_snapshot` | 外部输入 | 快照日 × 行业 / 股票 | 采集层（15:35 / 18:15 / 18:40） | 估值、资金、一致预期原始快照 |
 
-> ⚠ `market` 是**市场键**（该行由哪个市场的计算产出），取值 `CN` / `HK`；`classification` 取值 `SW_L1` / `HS_L3`。二者共同进入所有输出表主键，**任何查询不得跨这两个键合并排名或合并分位**。
+> ⚠ `market` 是**市场键**（该行由哪个市场的计算产出），取值 `CN` / `HK`，进入所有输出表主键；字典表不设市场键，**任何查询不得跨 `market` 合并排名或合并分位**。行业集合差异（CN 31 申万一级 / HK 113 恒生三级）由 `market` 隔离，不再单列 `classification`。
 > ⚠ 全量历史回填写库尚未执行（各阶段只跑过小窗口真实写库 + dry-run）；timer 默认增量 45 天，不依赖历史回填即可工作。使用方按实际可查日期范围读取，不要假设长历史已铺满。
 
 ---
@@ -143,9 +143,9 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 | 口径指纹 | **实际 payload（代码）** | 变更后的重算范围 |
 |---|---|---|
-| `indicator_dict.params_hash`（L1） | CN：`code｜unit｜direction｜formula｜model_key｜CALIB_VERSION`；HK 另含 `market` + `classification`。**v1.2 未改动** | 该指标全部历史 L1 原子 |
-| L2 `params_hash` | `_hash_spec(_dim_spec()[name])`；spec = `layer / code / market / classification / version / structure / side / anchor / members[{code,sign}] / upstream{原子code: {l1_hash, def}}`。`def` 取「影响数值」的 L1 定义字段（`code/unit/direction/formula/model_key/source/freq/value_col/pct_x_col/pct_t_col/n_col/extra_kind`） | 仅 `dimension_value` 该维度历史；**因 L3 纳入六维指纹，会自动连带 L3** |
-| L3 `params_hash` | `_hash_spec(_biz_spec(biz_code, dim_hashes))`；**每个 `biz_code` 独立指纹**。spec = `layer / code / market / classification / version / kind / side / inputs / output_schema / upstream_dims{六维指纹} / params{闸门阈值}`；阈值含 `enabled_dimensions / coverage_min / valid_days_20_min / valid_days_window / crowd_pct_high / short_sample / min_periods / pit_start`（HK 另含 `cap_start / no_rank`） | 仅该 `biz_code` 的 `business_value` 历史；改单个业务指标不牵连其它 |
+| `indicator_dict.params_hash`（L1） | 统一：`layer / code / DICT_VERSION / concept / per_market.{CN,HK}`（两市场实现差异全纳入） | 该指标全部历史 L1 原子 |
+| L2 `params_hash` | `_hash_spec(_dim_spec()[name])`；spec = `layer / code / version / structure / side / anchor / members[{code,sign}] / upstream{原子code: {l1_hash, def}}`。`def` 取「影响数值」的 L1 定义字段（`code/unit/direction/formula/model_key/source/freq/value_col/pct_x_col/pct_t_col/n_col/extra_kind`） | 仅 `dimension_value` 该维度历史；**因 L3 纳入六维指纹，会自动连带 L3** |
+| L3 `params_hash` | `_hash_spec(_biz_spec(biz_code, dim_hashes))`；**每个 `biz_code` 独立指纹**。spec = `layer / code / version / kind / side / inputs / output_schema / upstream_dims{六维指纹} / params{闸门阈值}`；阈值含 `enabled_dimensions / coverage_min / valid_days_20_min / valid_days_window / crowd_pct_high / short_sample / min_periods / pit_start`（HK 另含 `cap_start / no_rank`） | 仅该 `biz_code` 的 `business_value` 历史；改单个业务指标不牵连其它 |
 | `hk_index_daily.model_version` | 数据层 D4 口径（M8 两版指数、聚合列） | 表 27 全量 + HK L1/L2/L3 |
 
 > ✅ **v1.2 机制修复**：旧实现把 L2/L3 指纹只绑在 `structure` 字面量上，改锚 / 改成员 / 翻 `sign` / 改 L1 定义 / 改闸门阈值都不换指纹，历史行会混存两套口径却显示同一版本号。现按下列规则全量纳入，**传导链自动生效**：
@@ -159,7 +159,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 | CN | `s2.1` | 阶段 1 `s1.1` → 阶段 2 `s2.1` | 六维启用、coverage 分母 3→6、拥挤 k=2→k=3、`PARTIAL_STATE` 消失（六维齐备时）。**两期 L2/L3 读数不可直接比较**，须按 `params_hash` / `extra.calib_version` 分段 |
 | HK | `hk1.0` | 独立版本线 | payload 含市场，保证与 CN 同 code 指标的 `params_hash` 不同；HK 不改动 CN 的 `s2.1` |
 
-> ⚠ **读到任何一行先做两件事**：① `model_version`（L1）/ `params_hash`（L2/L3）与对应字典不等 → 旧口径数据；② 检查 `market` + `classification` 是否属于同一市场段。
+> ⚠ **读到任何一行先做两件事**：① `model_version`（L1）/ `params_hash`（L2/L3）与对应字典不等 → 旧口径数据；② 值表 `market` 是否属于目标市场。
 > ⚠ `remark` **不进** `params_hash`：只改文案不换指纹、不触发历史重算；但「代码即字典」，库内手改会被 `sync_dict` / `sync_dict_hk` 每轮幂等 upsert 覆盖，必须改代码中的定义表。
 > ⚠ 除 `params_hash` 变更外，**参考样本集变化也是重算触发**：如快照类数据回补、成分起点护栏调整会改变所有后续日的排位；此类变更须换 `CALIB_VERSION` 并全量重算。
 
@@ -169,11 +169,11 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 #### 2.3.1 `industry.indicator_value`（L1 原子读数）
 
-一行业一日一指标一行。主键 `(market, classification, sector_code, trade_date, indicator_code)`。
+一行业一日一指标一行。主键 `(market, sector_code, trade_date, indicator_code)`。
 
 | 列 | 类型 | 我读到的是什么 | 用来做什么 / 什么时候为空 |
 |---|---|---|---|
-| `market` / `classification` / `sector_code` / `trade_date` / `indicator_code` | `VARCHAR(8)/(16)/(20)/DATE/VARCHAR(64)` | 一行的身份 | 点查；中文名称联 `indicator_dict.indicator_name`（§7.1）；`market`/`classification` 决定分位分母，禁止跨市场拼接 |
+| `market` / `sector_code` / `trade_date` / `indicator_code` | `VARCHAR(8)/(20)/DATE/VARCHAR(64)` | 一行的身份 | 点查；中文名称联 `indicator_dict.indicator_name`（§7.1）；`market` 决定分位分母，禁止跨市场拼接 |
 | `raw_value` | `NUMERIC(20,6)` | 指标原始值，单位见 `indicator_dict.unit` | 展示绝对值、画原始曲线；**量纲各异，不跨指标比较**；枚举类指标存编码（RRG 1–4、GATE 0–4），中文 label 在 `extra.label` |
 | `percentile_xsec` | `NUMERIC(6,2)` | 0–100 的**当日横截面中位秩分位**（M1） | 短历史期主用口径；`NULL` = 当日有效行业 `<10`、无源或该指标不取横截面分位 |
 | `percentile_ts` | `NUMERIC(6,2)` | 0–100 的 **as-of 时序分位**（M2） | 跨期比较自身水位；`NULL` = `n_sample < 250` 或指标不取时序分位。**CN 估值 / 资金快照仅 27 日，恒为 NULL** |
@@ -191,7 +191,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 | `rank_n` | ✅ | ✅ | ⚠ **两市场口径不同**：CN = 当日有 `state_side` 的行业数（业务层 `count`），HK = 当日有效行业数（`n_valid`，实测 109~112）。均随分母时变，早期段不与后期直接比 |
 | `pit_capable` | ✅ | ✅ | CN：**仅 `source` 含 `constituent` 的指标**按 `d >= 2021-12-13` 判定；其余价格类指标**全期恒 `true`**。HK：全期 `false` |
 | `survivorship_bias` | — | ✅ | HK 全期 `true`（成分只有当前快照） |
-| `classification` / `granularity` | — | ✅ | HK 的分类与「113 vs 31 不可混排」声明 |
+| `granularity` | — | ✅ | HK 的「113 vs 31 不可混排」声明 |
 | `label` | ✅ | ✅ | 枚举指标中文标签（RRG 象限 1–4 / 拥挤档位） |
 | `k` / `partial` / `members` | ✅ | ✅ | 拥挤度实际参与因子数、是否部分模式、命中因子名列表。⚠ **没有 `hit` 键**（命中数在 `raw_value`） |
 
@@ -200,7 +200,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 #### 2.3.2 `industry.dimension_value`（L2 维度读数）
 
-一行业一日一维度一行。主键 `(market, classification, sector_code, trade_date, dimension_code)`。
+一行业一日一维度一行。主键 `(market, sector_code, trade_date, dimension_code)`。
 
 | 列 | 类型 | 我读到的是什么 | 用来做什么 / 什么时候为空 |
 |---|---|---|---|
@@ -215,19 +215,19 @@ L3 业务指标  industry.business_value + industry.business_dict
 | `extra` | `JSONB` | 结构、锚、成员、门禁说明 | 形状见下 |
 | `updated_at` | `TIMESTAMPTZ` | 写入时间 | 排查重算 / 补数 |
 
-`extra` 常用键：`structure`（`single_anchor` / `equal` / `rule` / `unavailable`）、`anchor`、`members`、`weight`（`equal` 时 0.25）、`calib_break`、`crowd_gate`（`NORMAL/WATCH/HIGH/EXTREME/NA`）、`k`、`partial`、`reason`（`unavailable` 的原因）；HK 另有 `pit_capable=false` / `classification`。
+`extra` 常用键：`structure`（`single_anchor` / `equal` / `rule` / `unavailable`）、`anchor`、`members`、`weight`（`equal` 时 0.25）、`calib_break`、`crowd_gate`（`NORMAL/WATCH/HIGH/EXTREME/NA`）、`k`、`partial`、`reason`（`unavailable` 的原因）；HK 另有 `pit_capable=false`。
 
 > ⚠ 本表没有 `quality` / `state` 列；可用性一律用 `confidence` + `extra` 承载。
 > ⚠ **不产出单一综合分**：状态侧 4 组与风险侧 2 组是异质信息，加权求和会产生「低估值抵消高拥挤」的无意义读数。
 
 #### 2.3.3 `industry.business_value`（L3 业务读数，长表）
 
-**一行业 × 一日 × 一业务指标一行**。主键 `(biz_code, market, classification, sector_code, trade_date)`；每个行业日按 `business_dict.is_active` 产出 5 行（CN）/ 4 行（HK，RANK 不启用）。
+**一行业 × 一日 × 一业务指标一行**。主键 `(biz_code, market, sector_code, trade_date)`；每个行业日按 `business_dict.is_active` 产出 5 行（CN）/ 4 行（HK，RANK 不启用）。
 
 | 列 | 类型 | 我读到的是什么 | 用来做什么 / 什么时候为空 |
 |---|---|---|---|
 | `biz_code` | `VARCHAR(32)` | 业务指标编码（主键列） | **读任何字段前必须按此过滤并校验 `business_dict.output_schema`**；5 个值见 §6.0；禁止跨 biz 比较或聚合 |
-| `market` / `classification` / `sector_code` / `trade_date` | 同 L1 | 一行的身份 | 点查；HK/CN 不混排 |
+| `market` / `sector_code` / `trade_date` | 同 L1 | 一行的身份 | 点查；HK/CN 不混排 |
 | `score` | `NUMERIC(6,2)` | ⚠ **多态**：`STATE_SIDE`=状态侧热度、`RISK_SIDE`=风险侧水平（高=更贵）；其余 biz_code 恒 NULL | 不是跨 biz 可比的「程度分」 |
 | `state` | `VARCHAR(24)` | ⚠ **多态**：`QUADRANT`=强势·未拥挤 / 强势·偏贵拥挤 / 冷门·未拥挤 / 弱势·偏贵拥挤 / NA；其余恒 NULL | 只描述当前状态，不含配置建议 |
 | `level` | `SMALLINT` | ⚠ **多态**：`RANK`=当日排名名次（1..`rank_n`）；其余恒 NULL | `applicable=false` 时 NULL；HK 无 RANK 行 |
@@ -249,11 +249,11 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 #### 2.3.5 `industry.indicator_dict`（指标字典表字段说明）
 
-**什么时候读它**：想知道某原子指标的**中文名称、单位、方向（极性）、频率、来源、公式、计算模型、市场归属、起点护栏、口径指纹、是否启用**。一行一个指标，主键 `(market_scope, classification, indicator_code)` —— CN 的 `SW_L1` 与 HK 的 `HS_L3` 同名 `SEC.*` 编码各占一行，**不得按 `indicator_code` 单列点查**。
+**什么时候读它**：想知道某原子指标的**中文名称、单位、方向（极性）、频率、来源、公式、计算模型、市场归属、起点护栏、口径指纹、是否启用**。一行一个领域概念，主键 `indicator_code`；两市场的公式 / 来源 / 模型 / 启用状态差异登记在 `params.per_market.{CN,HK}`，**按 `indicator_code` 单列点查即可**。
 
 | 列 | 类型 | 我读到的是什么 | 用来做什么 / 注意什么 |
 |---|---|---|---|
-| `market_scope` / `classification` / `indicator_code` | `VARCHAR(16)/(16)/(64)` | 一行的身份（复合主键） | 点查必须带全三列；缺省 `CN` / `SW_L1`。HK 行由 `sync_dict_hk` 用三列 `ON CONFLICT` 写入，避免覆盖 CN 同名指标 |
+| `market_scope` / `indicator_code` | `VARCHAR(16)/(64)` | 概念身份 + 适用范围声明 | 主键仅 `indicator_code`；`market_scope` 是声明列（`CN` / `HK` / `CN+HK`），`sync_dict` 一次写入 |
 | `indicator_name` | `VARCHAR(100)` | **指标中文名称** | 前端展示名的来源（§4 各表已逐条列出）；以代码定义表为准 |
 | `domain` | `VARCHAR(24)` | 原子族：`TREND` / `VAL` / `FLOW` / `CROWD` / `FUND` / `BREADTH` | 分组筛选；与 A–F 组一一对应（§4） |
 | `side` | `VARCHAR(12)` | `state`（状态侧）/ `risk`（风险侧） | 决定极性解释：状态侧高分 = 更强 / 更健康；风险侧高分 = 更贵 / 更拥挤 |
@@ -263,7 +263,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 | `source` | `VARCHAR(160)` | 上游表 / 接口 | 追溯数据出处；快照类断档即永久缺失 |
 | `formula` | `TEXT` | 核心公式（人读版） | **前端「算法详情」可直接展示此列**（§7.2）；与 `model_key` 联读 |
 | `model_key` | `VARCHAR(8)` | 计算模型编号 `M0`–`M8` | 对应 §2.4 的模型与护栏 |
-| `params` | `JSONB` | 口径参数物化形态 | CN `{"version": "s2.1"}`；HK `{"version": "hk1.0", "market": "HK", "classification": "HS_L3"}`；**字典种子不是参数定义** |
+| `params` | `JSONB` | 口径参数物化形态 | `{"version": "v2.0", "per_market": {"CN": {...}, "HK": {...}}}`；**字典种子不是参数定义** |
 | `params_hash` | `VARCHAR(16)` | 口径指纹 | payload 见 §2.2；与值表 `model_version` 比对判新旧 |
 | `min_periods` | `INT` | 分位最小有效观测数 | 写库规则：**仅 `model_key='M2'` 写 250，其余一律 0**；未达标不出分位 |
 | `pit_capable` | `BOOLEAN` | 字典层静态声明 | CN 行恒 `true`、HK 行恒 `false`。⚠ **逐日实际 PIT 状态看值表 `extra.pit_capable`**（§2.3.1） |
@@ -278,7 +278,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 ```json
 {
-  "market_scope": "CN", "classification": "SW_L1",
+  "market_scope": "CN+HK",
   "indicator_code": "SEC.VAL.PE_XSEC_PCT", "indicator_name": "PE横截面分位",
   "domain": "VAL", "side": "risk", "unit": "score_0_100",
   "direction": "high_risk", "freq": "day",
@@ -292,11 +292,11 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 ```json
 {
-  "market_scope": "HK", "classification": "HS_L3",
+  "market_scope": "CN+HK",
   "indicator_code": "SEC.CROWD.TURNOVER_PCT", "indicator_name": "换手率分位(本期不可用)",
   "domain": "CROWD", "side": "risk", "unit": "score_0_100",
   "direction": "high_risk", "freq": "day", "formula": "M6+M2", "model_key": "M2",
-  "params": {"version": "hk1.0", "market": "HK", "classification": "HS_L3"}, "params_hash": "…",
+  "params": {"version": "v2.0", "per_market": {"CN": {...}, "HK": {...}}}, "params_hash": "…",
   "min_periods": 250, "pit_capable": false, "is_active": false,
   "remark": "定义：…　·　判读：…　·　数据：…"
 }
@@ -307,7 +307,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 | 模型 | 名称 | 公式 / 步骤 | 边界与护栏 |
 |---|---|---|---|
 | **M0** | 原值直取 | 直接取上游列（`sector_daily.ret_20d`、`sector_valuation_snapshot.pe_ttm` 等） | 量纲以字典 `unit` 为准；不跨指标比大小 |
-| **M1** | 横截面分位 | `p_xsec = 100 × (n_less + 0.5·n_equal) / n_valid`，同一 `(market, classification, trade_date)` 内取中位秩 | `n_valid < 10` 不给分位；并列值取中位秩；分母写入 `extra.rank_n` |
+| **M1** | 横截面分位 | `p_xsec = 100 × (n_less + 0.5·n_equal) / n_valid`，同一 `(market, trade_date)` 内取中位秩 | `n_valid < 10` 不给分位；并列值取中位秩；分母写入 `extra.rank_n` |
 | **M2** | 时序分位 | `p_ts = 100 × (历史样本中 ≤ 当前值的比例)`，as-of；`ROLL_WINDOW=2520`（10 年）滚动 | `MIN_PERIODS = 250` 未达标置 NULL；`SHORT_SAMPLE = 750` 降置信；不得用短样本分位填充 |
 | **M3** | 相对强度 RS | `rs_N(t) = ret_N(sector,t) − mean_{s∈S_t} ret_N(s,t)`，`S_t` 为当日有效行业集 | **基准是当日有效行业等权均值，不是大盘指数**；横截面均值恒 0 |
 | **M4** | 归一与滚动 | `net_norm = net_1d / 行业成交额`；`rolling_sum(N, min_periods=N)` | 窗口不足不给值（防部分窗口当完整窗口）；资金净额必须先归一才能取时序分位 |
@@ -319,7 +319,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 **五条数据可用性铁律**（使用方必须遵守）：
 
 1. **PIT**：任何成分聚合按 `[eff_from, eff_to)` 取用；财务按公告可见日；分位 as-of 计算，禁止事后刷写。CN 自下而上指标起点 **2021-12-13**，HK 全期 `pit_capable=false`。
-2. **A/H 分离**：`market` / `classification` 是主键列；不得在同一查询里对 CN/HK 混合排名、混合分位、混合校准。
+2. **A/H 分离**：`market` 是值表主键列；不得在同一查询里对 CN/HK 混合排名、混合分位、混合校准。
 3. **历史深度分级**：长历史（价格类，1999 起 / HK 2000 起）可出时序分位；快照类（估值 / 资金流 / 一致预期，2026-09-30 起仅 27 / 27 / 25 日）首期**只出横截面分位**，时序分位置 NULL 并写 `n_sample`。
 4. **分母时变**：CN `rank_n` 16→28→31（早期有效行业数）、HK 109~112；同源占比分母取「当日有效行业合计」，早期段不与后期直接比排名或成交额占比。
 5. **短样本不伪装**：短样本以 L1 `quality='short_sample'` + L2/L3 `confidence='low'` 承载，**不产出 `gate_flags`**（§6.3）。这是有意设计：闸门是屏蔽结论的硬开关，短样本是降置信的软标记；若按全局 `n_sample<750` 触发闸门，快照期所有行业会 `applicable=false`、系统不产出任何排名。
@@ -358,7 +358,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 ```json
 {
-  "market": "CN", "classification": "SW_L1", "sector_code": "801780",
+  "market": "CN", "sector_code": "801780",
   "trade_date": "2026-11-11", "indicator_code": "SEC.VAL.PE_XSEC_PCT",
   "raw_value": 31.24, "percentile_xsec": 63.40, "percentile_ts": null,
   "n_sample": 31, "coverage": null, "quality": "ok",
@@ -366,7 +366,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 }
 ```
 
-下游接口：L2 只读 `(indicator_code, market, classification, sector_code, trade_date, percentile_xsec/percentile_ts)`；`extra` 用于下钻与质量判断。**前端展示**：展示名取字典 `indicator_name`，读数与单位取 `raw_value` + `unit`，算法详情取字典 `formula` / `model_key` / `remark`（§7.2）。
+下游接口：L2 只读 `(indicator_code, market, sector_code, trade_date, percentile_xsec/percentile_ts)`；`extra` 用于下钻与质量判断。**前端展示**：展示名取字典 `indicator_name`，读数与单位取 `raw_value` + `unit`，算法详情取字典 `formula` / `model_key` / `remark`（§7.2）。
 
 ### 4.1 A 组 · 相对强弱与趋势 `SEC.TREND.*`（状态侧）
 
@@ -487,7 +487,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 | 块 | 内容 |
 |---|---|
-| **定义** | 中文名称：行业趋势与相对强弱；编码 `TREND`；状态侧；**问句：这个行业最近相对其他行业是强还是弱？位置在改善还是转差？**；`score` 0–100，高分 = 相对更强；粒度 `(market, classification, sector_code, trade_date, TREND)`；CN / HK 均产出。**不回答**：未来涨跌、绝对涨跌幅度（那是 `RET_20D` 原子）、大盘相对强弱 |
+| **定义** | 中文名称：行业趋势与相对强弱；编码 `TREND`；状态侧；**问句：这个行业最近相对其他行业是强还是弱？位置在改善还是转差？**；`score` 0–100，高分 = 相对更强；粒度 `(market, sector_code, trade_date, TREND)`；CN / HK 均产出。**不回答**：未来涨跌、绝对涨跌幅度（那是 `RET_20D` 原子）、大盘相对强弱 |
 | **输入** | `industry.indicator_value` 的 `SEC.TREND.RS_XSEC_PCT`（相对强度横截面分位，`percentile_xsec`）；校验项 `RS_MOM_20D` / `RRG_QUADRANT` / `MOM_RANK` 仍落 L1，**不进 score** |
 | **计算模型** | **原理**：相对强弱是横截面概念，用「行业 20 日收益 − 当日有效行业等权均值」（M3）作原始量，再取当日横截面中位秩分位（M1）。选单锚而非多成员平均，是因为 RS 的水平 / 变化 / 排名是同一现象的不同读法，平均会把权重退化成「写了几个指标」。<br>**公式**：`score = p_xsec(RS_20D)`（M1：`100×(n_less + 0.5·n_equal)/n_valid`）；`sign=+1` 不翻向。<br>**参数**：`XSEC_MIN_N=10`（有效行业不足不给分位）；`ROLL_WINDOW=2520` / `MIN_PERIODS=250`（仅对 M2 类原子生效）；锚 code 登记在 `DIMENSION_DEFS["TREND"].anchor`。<br>**落地形态**：`df["dim_TREND"] = _anchor_pct("SEC.TREND.RS_XSEC_PCT")`。<br>**门禁**：锚为 NULL → `score=NULL`、`coverage=0`、`confidence=low` |
 | **输出** | `industry.dimension_value`：`score`（0–100，可空）、`side='state'`、`coverage`（0 或 1）、`dispersion=0.0`、`confidence`、`members_used=["SEC.TREND.RS_XSEC_PCT"]`、`params_hash`、`extra={"structure":"single_anchor","anchor":"SEC.TREND.RS_XSEC_PCT","members":[...] }`。下游接口：参与 L3 `state_side` 均值 |
@@ -547,18 +547,18 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 ```json
 {
-  "market": "HK", "classification": "HS_L3", "sector_code": "HK.LIST1019",
+  "market": "HK", "sector_code": "HK.LIST1019",
   "trade_date": "2026-11-13", "dimension_code": "CROWDING", "side": "risk",
   "score": null, "coverage": 1.0, "dispersion": 0.0, "confidence": "low",
   "members_used": [],
   "params_hash": "…",
   "extra": {"structure": "rule", "anchor": null, "members": [],
             "crowd_gate": "HIGH", "k": 2, "partial": true,
-            "pit_capable": false, "classification": "HS_L3"}
+            "pit_capable": false}
 }
 ```
 
-下游接口：L3 按 `(market, classification, sector_code, trade_date, dimension_code)` 点查；`CROWDING` 读 `extra.crowd_gate`，不读 `score`。
+下游接口：L3 按 `(market, sector_code, trade_date, dimension_code)` 点查；`CROWDING` 读 `extra.crowd_gate`，不读 `score`。
 
 > ⚠ **六维分不可横向比较或求均值**：分位基数、聚合结构、语义都不同。唯一合法的数值使用是各自按 `side` 参与 L3 的 `state_side` / `risk_side` 均值（且仅同侧、同 `market`）。
 
@@ -578,7 +578,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 | `SEC.BIZ.RANK` | 当日状态排名 | 今天所有行业按状态排序，它排第几？共几个可比行业？ | `rank` | `level` | ✅ / ⛔ HK 字典登记但 `is_active=false` |
 | `SEC.BIZ.GATE` | 风险与可用性闸门 | 哪些原因让今天的结论需要打折看？ | `gate` | `detail` | ✅ / ✅ |
 
-字典主键 `(market_scope, classification, biz_code)`；每行带 `inputs` / `params` / `output_schema`（多态列语义）/ 独立 `params_hash` / `is_active` / `remark`。**新增指标 = 加一行字典 + 计算层加一个分支；下线 = 改 `is_active=false`**。
+字典主键 `biz_code`，一行一概念，市场差异落 `params.per_market`；每行带 `inputs` / `params` / `output_schema`（多态列语义）/ 独立 `params_hash` / `is_active` / `remark`。**新增指标 = 加一行字典 + 计算层加一个分支；下线 = 改 `is_active=false`**。
 
 ### 6.1 逐指标规格（前端展示的直接依据）
 
@@ -601,7 +601,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 state_side = mean(当期有分的状态侧维度 score)       # 有效维度 <2 → NULL
 risk_side  = VALUATION.score
 quadrant   = quadrant_of(state_side, risk_side, median_t(state_side), median_t(risk_side))
-rank_no    = rank(ascending=False, method='min')     # 同 (market, classification, trade_date)
+rank_no    = rank(ascending=False, method='min')     # 同 (market, trade_date)
 coverage   = 可用维度数 / len(ENABLED_DIMENSIONS)   # CN 6 / HK 4
 applicable = coverage >= 0.6
              AND valid_days_20 >= 15
@@ -637,7 +637,7 @@ confidence = confidence_of(pe_n_sample, coverage, pit_capable)
 
 ```json
 // 行 1/5：状态侧热度
-{"biz_code":"SEC.BIZ.STATE_SIDE","market":"CN","classification":"SW_L1",
+{"biz_code":"SEC.BIZ.STATE_SIDE","market":"CN",
  "sector_code":"801780","trade_date":"2026-11-11","score":58.32,
  "state":null,"level":null,"detail":{"state_members":["dim_BREADTH","dim_FLOW","dim_FUNDAMENTAL","dim_TREND"],"state_n":4,"partial":false},
  "coverage":1.0,"applicable":true,"confidence":"low","params_hash":"…",
@@ -646,7 +646,7 @@ confidence = confidence_of(pe_n_sample, coverage, pit_capable)
 ```
 ```json
 // 行 5/5：闸门
-{"biz_code":"SEC.BIZ.GATE","market":"CN","classification":"SW_L1",
+{"biz_code":"SEC.BIZ.GATE","market":"CN",
  "sector_code":"801780","trade_date":"2026-11-11","score":null,"state":null,"level":null,
  "detail":{"gate_flags":["CROWDING"],"crowd_gate":"HIGH","crowd_k":3,"crowd_partial":false},
  "coverage":1.0,"applicable":true,"confidence":"low","params_hash":"…",
@@ -715,7 +715,7 @@ confidence = confidence_of(pe_n_sample, coverage, pit_capable)
 
 ## 8 数据使用方查询手册
 
-> 所有示例为只读 SQL；`market` / `classification` 必须成对指定。`%` 字面在 Python 参数化执行（`cur.execute(sql, params)`）时须双写成 `%%`，否则 psycopg2 会误判为格式符。
+> 所有示例为只读 SQL；值表查询必须带 `market`，字典按 `indicator_code` / `biz_code` 单列点查。`%` 字面在 Python 参数化执行（`cur.execute(sql, params)`）时须双写成 `%%`，否则 psycopg2 会误判为格式符。
 
 | 我要… | 读哪张表 | 要点 |
 |---|---|---|
@@ -734,9 +734,8 @@ SELECT v.sector_code, v.level AS rank_no,
        d.biz_name, d.question
 FROM industry.business_value v
 JOIN industry.business_dict d
-  ON d.market_scope = v.market AND d.classification = v.classification
- AND d.biz_code = v.biz_code
-WHERE v.market = 'CN' AND v.classification = 'SW_L1'
+  ON d.biz_code = v.biz_code
+WHERE v.market = 'CN'
   AND v.biz_code = 'SEC.BIZ.RANK' AND v.trade_date = DATE '2026-11-11'
   AND v.applicable AND v.level IS NOT NULL
 ORDER BY v.level;
@@ -746,9 +745,8 @@ SELECT v.biz_code, d.biz_name, d.question, v.score, v.state, v.level,
        v.detail, v.coverage, v.applicable, v.confidence
 FROM industry.business_value v
 JOIN industry.business_dict d
-  ON d.market_scope = v.market AND d.classification = v.classification
- AND d.biz_code = v.biz_code
-WHERE v.market = 'CN' AND v.classification = 'SW_L1'
+  ON d.biz_code = v.biz_code
+WHERE v.market = 'CN'
   AND v.sector_code = '801780' AND v.trade_date = DATE '2026-11-11'
 ORDER BY v.biz_code;
 
@@ -758,7 +756,7 @@ SELECT dimension_code, side, score, coverage, confidence, members_used,
        extra->>'crowd_gate' AS crowd_gate,
        extra->>'reason' AS unavailable_reason
 FROM industry.dimension_value
-WHERE market = 'CN' AND classification = 'SW_L1'
+WHERE market = 'CN'
   AND sector_code = '801780' AND trade_date = DATE '2026-11-11'
 ORDER BY dimension_code;
 
@@ -768,16 +766,15 @@ SELECT v.indicator_code, d.indicator_name, d.unit, v.raw_value,
        d.formula, d.model_key, d.remark
 FROM industry.indicator_value v
 JOIN industry.indicator_dict d
-  ON d.market_scope = v.market AND d.classification = v.classification
- AND d.indicator_code = v.indicator_code
-WHERE v.market = 'CN' AND v.classification = 'SW_L1'
+  ON d.indicator_code = v.indicator_code
+WHERE v.market = 'CN'
   AND v.sector_code = '801780' AND v.trade_date = DATE '2026-11-11'
 ORDER BY v.indicator_code;
 
 -- 4) PIT 成分取用（CN，2021-12-13 起）
 SELECT stock_code, weight, eff_from, eff_to
 FROM industry.constituent
-WHERE market = 'CN' AND classification = 'SW_L1' AND sector_code = '801010'
+WHERE market = 'CN' AND sector_code = '801010'
   AND DATE '2026-11-11' >= eff_from
   AND (eff_to IS NULL OR DATE '2026-11-11' < eff_to)
 ORDER BY weight DESC;
@@ -801,7 +798,7 @@ ORDER BY weight DESC;
 | 8 | HK `FLOW` / `FUNDAMENTAL` | 读 L2 | 各有一行 `score=NULL` + `extra.reason`，不是缺行 |
 | 9 | `coverage = 0.50` | 读 L3 | `gate_flags` 含 `DATA_COVERAGE`、`applicable=false`、`rank_no IS NULL`（CN） |
 | 10 | `quadrant ≠ 'NA'` | 读 L3 | 象限名不得被解释为超配 / 低配 / 买卖含义 |
-| 11 | 同一 `(market, classification, trade_date)` 连续跑两次 | 重算 L3 | 除 `updated_at` 外逐字段相等（幂等） |
+| 11 | 同一 `(market, trade_date)` 连续跑两次 | 重算 L3 | 除 `updated_at` 外逐字段相等（幂等） |
 | 12 | **改 L2 的 `anchor` / `members` / `sign` 但不动 `structure`** | 重算 | `params_hash` **必须变化**，且因 L3 纳入六维指纹，L3 `params_hash` 同步变化（§2.2）；指纹变化后须全量重算 L2+L3 并按版本分段展示。**改 `remark` / `indicator_name` 时两处指纹均不得变化** |
 | 13 | `CALIB_VERSION s1.1 → s2.1` | 对比两期 L2/L3 | `params_hash` 全变、`extra.calib_break` 登记断点；两期读数不可直接比 |
 | 14 | CN 成分表 `eff_from` 最小 2021-12-13 | 取 2021-12-12 的自下而上指标 | 无读数；不得用当前成分回算后声称 PIT |

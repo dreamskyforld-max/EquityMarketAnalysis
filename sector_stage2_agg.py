@@ -64,7 +64,7 @@ def load_constituent_map(conn) -> pd.DataFrame:
     sql = """
         SELECT sector_code, stock_code, eff_from, eff_to, weight
         FROM industry.constituent
-        WHERE market='CN' AND classification='SW_L1'
+        WHERE market='CN'
     """
     df = read_sql(conn, sql)
     if df.empty:

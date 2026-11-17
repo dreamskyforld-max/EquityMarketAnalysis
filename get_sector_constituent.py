@@ -39,7 +39,6 @@ TABLE = "industry.constituent"
 CHANGE_TABLE = "industry.constituent_change"
 SOURCE = "akshare:index_component_sw"
 MARKET = "CN"
-CLASSIFICATION = "SW_L1"
 PIT_START = dt.date(2021, 12, 13)      # 决策 A：2021 版申万分类启用日
 WEIGHT_EPS = 0.01                      # 权重变化 < 0.01 个百分点视为噪声
 MIN_SECTORS = 25                       # 31 个行业至少成功 25 个
@@ -135,8 +134,8 @@ def _load_active(conn) -> dict:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT sector_code, stock_code, eff_from, weight FROM industry.constituent "
-            "WHERE market=%s AND classification=%s AND eff_to IS NULL",
-            (MARKET, CLASSIFICATION))
+            "WHERE market=%s AND eff_to IS NULL",
+            (MARKET,))
         return {(r[0], r[1]): (r[2], float(r[3]) if r[3] is not None else None)
                 for r in cur.fetchall()}
 
@@ -187,18 +186,18 @@ def _apply(conn, diff: dict, dry_run: bool = False) -> dict:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE industry.constituent SET eff_to=%s "
-                "WHERE market=%s AND classification=%s AND sector_code=%s "
+                "WHERE market=%s AND sector_code=%s "
                 "AND stock_code=%s AND eff_to IS NULL",
-                (snap, MARKET, CLASSIFICATION, r["sector_code"], r["stock_code"]))
+                (snap, MARKET, r["sector_code"], r["stock_code"]))
 
     # ② WEIGHT（显著）：关旧行 + 开新行，生效日 = 快照日
     for r in diff["weight"]:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE industry.constituent SET eff_to=%s "
-                "WHERE market=%s AND classification=%s AND sector_code=%s "
+                "WHERE market=%s AND sector_code=%s "
                 "AND stock_code=%s AND eff_to IS NULL",
-                (snap, MARKET, CLASSIFICATION, r["sector_code"], r["stock_code"]))
+                (snap, MARKET, r["sector_code"], r["stock_code"]))
     new_rows = diff["add"] + [
         dict(r, eff_from=snap) for r in diff["weight"]]
 
@@ -207,17 +206,17 @@ def _apply(conn, diff: dict, dry_run: bool = False) -> dict:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE industry.constituent SET weight=%s "
-                "WHERE market=%s AND classification=%s AND sector_code=%s "
+                "WHERE market=%s AND sector_code=%s "
                 "AND stock_code=%s AND eff_to IS NULL",
-                (w, MARKET, CLASSIFICATION, sec, stock))
+                (w, MARKET, sec, stock))
 
     if new_rows:
-        rows = [dict(market=MARKET, classification=CLASSIFICATION,
+        rows = [dict(market=MARKET,
                      sector_code=r["sector_code"], stock_code=r["stock_code"],
                      eff_from=r["eff_from"], eff_to=None, weight=r["weight"],
                      source=SOURCE) for r in new_rows]
         bulk_upsert(conn, TABLE, rows,
-                    conflict_cols=["market", "classification", "sector_code",
+                    conflict_cols=["market", "sector_code",
                                    "stock_code", "eff_from"],
                     skip_null_updates=True)
 
@@ -226,13 +225,13 @@ def _apply(conn, diff: dict, dry_run: bool = False) -> dict:
     for kind in ("add", "remove", "weight"):
         for r in diff[kind]:
             log_rows.append(dict(
-                snapshot_date=snap, market=MARKET, classification=CLASSIFICATION,
+                snapshot_date=snap, market=MARKET,
                 sector_code=r["sector_code"], stock_code=r["stock_code"],
                 change_type=r["change_type"], old_weight=r["old_weight"],
                 new_weight=r["new_weight"], eff_from=r["eff_from"]))
     if log_rows:
         bulk_upsert(conn, CHANGE_TABLE, log_rows,
-                    conflict_cols=["snapshot_date", "market", "classification",
+                    conflict_cols=["snapshot_date", "market",
                                    "sector_code", "stock_code", "change_type"])
     conn.commit()
     return counts
@@ -280,8 +279,8 @@ def run(codes=None, ctx=None, snapshot_date: dt.date = None, dry_run: bool = Fal
         with conn.cursor() as cur:
             cur.execute("SELECT count(*), count(*) FILTER (WHERE eff_to IS NULL), "
                         "min(eff_from), max(eff_from) FROM industry.constituent "
-                        "WHERE market=%s AND classification=%s",
-                        (MARKET, CLASSIFICATION))
+                        "WHERE market=%s",
+                        (MARKET,))
             total, n_active, mn, mx = cur.fetchone()
         print(f"  {'--dry-run：未写库' if dry_run else '✅ 写入完成'}；"
               f"库内版本链 {total:,} 行 / active {n_active:,} 行（{mn} ~ {mx}）")

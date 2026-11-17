@@ -4,7 +4,7 @@
 背景：doc/industry_allocation_feasibility.md §2.2 D4 / §3.2 M8 / §4.2 阶段 3。
 
 三项用户决策（2026-11-14）在测试里钉住，防静默回退：
-  ① 沿用现有 4 张输出表，字典主键扩为 (market_scope, classification, indicator_code)；
+  ① 沿用现有 4 张输出表，字典回归一行一概念（主键仅 code）；
   ② M8 加权版用 total_market_val（2002 起），等权版 2000 起；
   ③ HK 本期 A/B/D/F + 南向，L3 不排名。
 """
@@ -258,7 +258,7 @@ class TestHKBusinessContract(unittest.TestCase):
         self.assertGreater(len(rows), 0)
         for r in rows:
             self.assertEqual(r["market"], "HK")
-            self.assertEqual(r["classification"], "HS_L3")
+            self.assertNotIn("classification", r)
             self.assertFalse(r["extra"]["pit_capable"])
             self.assertTrue(r["extra"]["survivorship_bias"])
         # 不可用指标不产出行
@@ -311,19 +311,17 @@ class TestCrossSectionIsolation(unittest.TestCase):
     def test_hk_sources_never_touch_cn_tables(self):
         src = _read("sector_layer_hk.py")
         self.assertIn('MARKET = "HK"', src)
-        self.assertIn('CLASSIFICATION = "HS_L3"', src)
         self.assertIn("FROM industry.hk_index_daily", src)
         self.assertNotIn("FROM regime.sector_daily", src)
         self.assertNotIn("FROM a_daily_quote", src)
         self.assertNotIn("FROM regime.sector_valuation_snapshot", src)
 
-    def test_dict_upsert_includes_market_and_classification(self):
+    def test_dict_upsert_is_single_code(self):
         src = _read("sector_layer_hk.py")
-        self.assertIn('conflict_cols=["market_scope", "classification", "indicator_code"]', src)
+        self.assertIn("def sync_dict_hk", src)
+        self.assertIn("from sector_layer import sync_dict", src)
         cn = _read("sector_layer.py")
-        self.assertIn('conflict_cols=["market_scope", "classification", "indicator_code"]', cn)
-        self.assertIn("PRIMARY KEY (market_scope, classification, indicator_code)",
-                      _read("sql/schema.sql"))
+        self.assertIn('conflict_cols=["indicator_code"]', cn)
 
 
 class TestEngineeringGuards(unittest.TestCase):
@@ -332,7 +330,6 @@ class TestEngineeringGuards(unittest.TestCase):
     def test_cn_side_unchanged(self):
         """阶段 3 只允许改 CN 的字典冲突键，口径版本与指纹算法一律不动。"""
         self.assertEqual(sl.MARKET, "CN")
-        self.assertEqual(sl.CLASSIFICATION, "SW_L1")
         self.assertEqual(sl.CALIB_VERSION, "s2.1")
         self.assertEqual(len(sl.INDICATOR_DEFS), 41)
         self.assertNotEqual(slh.CALIB_VERSION, sl.CALIB_VERSION)
@@ -348,9 +345,9 @@ class TestEngineeringGuards(unittest.TestCase):
                 self.assertIn("CREATE TABLE IF NOT EXISTS " + tbl, code)
         for text in (schema, code):
             self.assertIn("PRIMARY KEY (trade_date, sector_code)", text)
-            self.assertIn("PRIMARY KEY (market_scope, classification, indicator_code)", text)
-        self.assertIn("def _migrate_sector_dict_pk", code)
-        self.assertIn("_migrate_sector_dict_pk(conn", code)
+            self.assertIn("indicator_code  VARCHAR(64)     PRIMARY KEY", text)
+        self.assertIn("def _migrate_sector_schema_v2", code)
+        self.assertIn("_migrate_sector_schema_v2(conn", code)
         self.assertIn('"hk_sector_index_daily", "hk_sector_index_daily_idx"', code)
         self.assertIn("ret_cap", schema)
         self.assertIn("southbound_net", schema)

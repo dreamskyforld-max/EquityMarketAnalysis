@@ -16,8 +16,8 @@
      本期只出「状态读数 + 2×2 状态矩阵 + 闸门」，排序待阶段 4 前瞻验证后再议。
 
 【纪律】
-   · 主键含 (market, classification) = ('HK','HS_L3')，横截面一律按
-     (market, classification, trade_date) 分组 —— 本模块只加载 HK 数据，物理上
+   · 主键含 market（'HK'），横截面按 (market, trade_date) 分组 —— 本模块只加载
+     HK 数据，物理上
      不可能混入 CN；测试另有静态断言钉住。
    · 全部读数 `pit_capable=false` / `confidence=low`（成分是 stock_sector 当前快照）。
    · 113 个恒生三级行业 vs CN 31 个申万一级，字典 remark 与 extra 双处标注粒度差异。
@@ -46,14 +46,13 @@ from db import bulk_upsert, get_conn, read_sql
 from log_utils import setup_logger
 from sector_layer import (BIZ_DEFS as _CN_BIZ_DEFS,
                           BIZ_PK_COLS, CROWD_GATE_CODES, CROWD_PCT_HIGH, PK_COLS, RRG_LABELS,
-                          _atom_spec, _clean_rows, _get, _hash_spec,
+                          _atom_spec, _clean_rows, _dict_hash, _get, _hash_spec,
                           _reverse_percentile, _write_batched,
                           _xsec_percentile, confidence_of, crowd_gate, quadrant_of)
 
 log = setup_logger("sector_layer_hk")
 
 MARKET = "HK"
-CLASSIFICATION = "HS_L3"
 CALIB_VERSION = "hk1.0"             # 独立于 CN 的 s2.1；换版本会换掉 HK 全部 params_hash
 EQ_START = dt.date(2000, 1, 3)
 CAP_START = dt.date(2002, 1, 1)     # 总市值加权版起点（口径断点：BREAK 闸门）
@@ -296,12 +295,12 @@ HK_BIZ_DEFS["SEC.BIZ.RANK"]["output_schema"] = dict(
 # ── 口径指纹（含市场，保证与 CN 同 code 指标的 hash 不同）─────────────────────
 def _hk_params_hash(d: dict) -> str:
     """HK L1 原子口径指纹（payload 含市场与分类，保证与 CN 同 code 指标不同）。"""
-    payload = "|".join([d["code"], MARKET, CLASSIFICATION, d["unit"],
+    payload = "|".join([d["code"], d["unit"],
                         d["direction"], d["formula"], d["model_key"], CALIB_VERSION])
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
 
 
-# ── HK L2 / L3 口径指纹（与 CN 独立版本线，spec 内已带 market/classification）──
+# ── HK L2 / L3 口径指纹（统一线，spec 纳入两市场实现差异）──
 def _hk_dim_spec() -> dict:
     """HK 六维口径规格：结构 + 锚/成员/sign + 上游 L1 定义 + hk1.0。"""
     out = {}
@@ -312,8 +311,7 @@ def _hk_dim_spec() -> dict:
             codes = list(_HK_CROWD_FACTORS)
         out[name] = {
             "layer": "L2", "code": "SEC.DIM." + name,
-            "market": MARKET, "classification": CLASSIFICATION,
-            "version": CALIB_VERSION,
+                        "version": CALIB_VERSION,
             "structure": cfg["structure"], "side": cfg["side"],
             "anchor": cfg["anchor"],
             "members": [{"code": c, "sign": s}
@@ -334,8 +332,7 @@ def _hk_biz_spec(biz_code: str, dim_hashes: dict) -> dict:
     cfg = HK_BIZ_DEFS[biz_code]
     return {
         "layer": "L3", "code": biz_code,
-        "market": MARKET, "classification": CLASSIFICATION,
-        "version": CALIB_VERSION,
+                "version": CALIB_VERSION,
         "kind": cfg["kind"], "side": cfg["side"],
         "inputs": cfg["inputs"], "output_schema": cfg["output_schema"],
         "upstream_dims": dim_hashes,
@@ -365,10 +362,10 @@ def _hk_biz_params_hash(biz_code: str) -> str:
 
 
 def _hk_biz_dict_rows() -> list:
-    """HK business_dict 种子（含 is_active=False 的 RANK 行）。"""
+    """兼容保留：字典已统一由 sector_layer.sync_dict 生成。"""
     now = dt.datetime.now().astimezone()
     dh = _hk_dim_hashes()
-    return [dict(market_scope=MARKET, classification=CLASSIFICATION,
+    return [dict(market_scope=MARKET,
                  biz_code=code, biz_name=cfg["biz_name"],
                  question=cfg["question"], side=cfg["side"], kind=cfg["kind"],
                  inputs=cfg["inputs"], params={"version": CALIB_VERSION},
@@ -571,7 +568,6 @@ def _indicator_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
                 continue
             extra = dict(rank_n=_clean_int(rec.get("n_valid")),
                          pit_capable=False, survivorship_bias=True,
-                         classification=CLASSIFICATION,
                          granularity="HK 113 恒生三级 vs CN 31 申万一级，不可混排")
             if meta["extra_kind"] == "rrg" and raw is not None:
                 extra["label"] = RRG_LABELS.get(int(raw))
@@ -582,14 +578,14 @@ def _indicator_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
                 if meta["code"] == "SEC.CROWD.GATE" and raw is not None:
                     extra["label"] = {v: k for k, v in CROWD_GATE_CODES.items()}.get(int(raw))
             rows.append(dict(
-                market=MARKET, classification=CLASSIFICATION,
+                market=MARKET,
                 sector_code=rec["sector_code"], trade_date=d,
                 indicator_code=meta["code"], raw_value=raw,
                 percentile_xsec=px, percentile_ts=pt, n_sample=ns,
                 coverage=_get(rec, "coverage"),
                 quality=("short_sample" if ns is not None and
                          meta["model_key"] == "M2" and ns < SHORT_SAMPLE else "ok"),
-                model_version=_hk_params_hash(meta), extra=extra, updated_at=now))
+                model_version=_dict_hash("L1", meta["code"]), extra=extra, updated_at=now))
     return rows
 
 
@@ -604,7 +600,7 @@ def _clean_int(v):
 
 def _score_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
     rows, now = [], dt.datetime.now().astimezone()
-    dim_hashes = _hk_dim_hashes()   # 循环外算一次；含锚/成员/sign/上游 L1 定义
+    dim_hashes = {n: _dict_hash("L2", n) for n in HK_DIMENSION_DEFS}  # 统一口径指纹
     for rec in wide.to_dict("records"):
         d = rec["trade_date"]
         if isinstance(d, pd.Timestamp):
@@ -621,8 +617,8 @@ def _score_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
             members = ([cfg["anchor"]] if cfg["anchor"] else
                        [code for code, _ in cfg.get("members", [])])
             extra = dict(structure=cfg["structure"], anchor=cfg["anchor"],
-                         members=members, pit_capable=False,
-                         classification=CLASSIFICATION)
+                         members=members, pit_capable=False)
+
             if cfg["structure"] == "unavailable":
                 extra["reason"] = cfg["reason"]
             if cfg["structure"] == "equal":
@@ -631,7 +627,7 @@ def _score_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
                 extra.update(crowd_gate=c.get("gate"), k=c.get("k"),
                              partial=c.get("partial"))
             rows.append(dict(
-                market=MARKET, classification=CLASSIFICATION,
+                market=MARKET,
                 sector_code=rec["sector_code"], trade_date=d, dimension_code=name,
                 side=cfg["side"], score=score, coverage=cov, dispersion=0.0,
                 # HK 全期非 PIT → 置信度一律 low
@@ -657,7 +653,8 @@ def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
     SEC.BIZ.RANK 本期不启用 → 该 biz_code 无值表行（business_dict 仍登记原因）。
     """
     rows, now = [], dt.datetime.now().astimezone()
-    hashes = _hk_biz_hashes()   # 循环外算一次；每个 biz_code 一个独立指纹
+    hashes = {c: _dict_hash("L3", c)
+              for c, cfg in HK_BIZ_DEFS.items() if cfg["is_active"]}  # 统一口径指纹；RANK 不产出
     for rec in wide.to_dict("records"):
         d = rec["trade_date"]
         if isinstance(d, pd.Timestamp):
@@ -699,7 +696,7 @@ def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
         quadrant = rec.get("quadrant") or "NA"
         rank_n = _clean_int(rec.get("rank_n"))
         common = dict(
-            market=MARKET, classification=CLASSIFICATION,
+            market=MARKET,
             sector_code=rec["sector_code"], trade_date=d,
             coverage=cov, applicable=bool(applicable),
             # HK 全期非 PIT（stock_sector 当前成分）→ 置信度不高于 low
@@ -733,32 +730,16 @@ def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
 
 # ── 字典同步 ────────────────────────────────────────────────────────────────
 def sync_dict_hk(conn) -> int:
-    rows = [dict(indicator_code=d["code"], indicator_name=d["indicator_name"],
-                 domain=d["domain"], side=d["side"], market_scope=MARKET,
-                 classification=CLASSIFICATION, unit=d["unit"],
-                 direction=d["direction"], freq=d["freq"], source=d["source"],
-                 formula=d["formula"], model_key=d["model_key"],
-                 params={"version": CALIB_VERSION, "market": MARKET,
-                         "classification": CLASSIFICATION},
-                 params_hash=_hk_params_hash(d),
-                 min_periods=MIN_PERIODS if d["model_key"] == "M2" else 0,
-                 pit_capable=False, is_active=d["is_active"], remark=d["remark"],
-                 updated_at=dt.datetime.now().astimezone())
-            for d in HK_INDICATOR_DEFS]
-    bulk_upsert(conn, "industry.indicator_dict", _clean_rows(rows),
-                conflict_cols=["market_scope", "classification", "indicator_code"])
-    # L3 业务指标字典（HK 行，含 is_active=False 的 RANK）
-    bulk_upsert(conn, "industry.business_dict", _clean_rows(_hk_biz_dict_rows()),
-                conflict_cols=["market_scope", "classification", "biz_code"])
-    conn.commit()
-    return len(rows)
+    """兼容入口：字典表已统一，转交 sector_layer.sync_dict 写同一批行。"""
+    from sector_layer import sync_dict
+    return sync_dict(conn)
 
 
 def _default_window(conn) -> tuple[dt.date, dt.date]:
     end = dt.date.today()
     with conn.cursor() as cur:
         cur.execute("SELECT max(trade_date) FROM industry.business_value "
-                    "WHERE market=%s AND classification=%s", (MARKET, CLASSIFICATION))
+                    "WHERE market=%s", (MARKET,))
         last = cur.fetchone()[0]
     start = (last - dt.timedelta(days=REWIND_DAYS)) if last else \
             (end - dt.timedelta(days=INCREMENTAL_DAYS))
@@ -817,7 +798,7 @@ def run(codes=None, ctx=None, start: dt.date = None, end: dt.date = None,
                 end = end or dt.date.today()
 
             stats = dict(start=str(start), end=str(end), market=MARKET,
-                         classification=CLASSIFICATION, calib_version=CALIB_VERSION)
+                         calib_version=CALIB_VERSION)
             # ① 数据层 D4：自算指数 + 行业日聚合（内部按月×按股票分批）
             if not skip_index:
                 from hk_sector_index import build_index_daily

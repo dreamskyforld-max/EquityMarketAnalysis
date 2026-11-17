@@ -2254,41 +2254,40 @@ COMMENT ON COLUMN force_round_daily.applicable IS '适用性：近 20 个已落�
 --           ⚠ 不得挂进 market_scheduler —— 资源规范 R4/R5）
 --     输入：regime.sector_daily / sector_valuation_snapshot / sector_fund_flow
 --     口径：doc/industry_allocation_feasibility.md（§3 指标体系 / §4.2 阶段 1）
---     ⚠ 实体键含 (market, classification)：CN 与 HK 物理分行，禁止混合排名/混合分位。
+--     ⚠ 实体键含 market：CN 与 HK 物理分行，禁止混合排名/混合分位。
+--     ⚠ 字典表与 regime 同构：**一行一个领域概念**，市场适用范围由 market_scope
+--        声明，两市场的实现差异（源/公式/模型/起点/可用性）落 params.per_market；
+--        值表按 market 分行，CN / HK 共用同一套输出表。
 --     ⚠ 输出只作状态度量与风险闸门，**不含超配/低配建议**（主报告 §0 判断 1）。
 -- ═══════════════════════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS industry.indicator_dict (
-    indicator_code  VARCHAR(64)     NOT NULL,
+    indicator_code  VARCHAR(64)     PRIMARY KEY,
     indicator_name  VARCHAR(100)    NOT NULL,
     domain          VARCHAR(24)     NOT NULL,       -- TREND/VAL/FLOW/CROWD/FUND/BREADTH
     side            VARCHAR(12)     NOT NULL,       -- state=状态侧 / risk=风险侧
-    market_scope    VARCHAR(16)     NOT NULL DEFAULT 'CN',
-    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
+    market_scope    VARCHAR(16)     NOT NULL DEFAULT 'CN+HK',  -- 声明列：CN / HK / CN+HK
     unit            VARCHAR(16),
     direction       VARCHAR(12)     NOT NULL,       -- 方向唯一真源，消费端不得二次翻转
     freq            VARCHAR(8)      NOT NULL DEFAULT 'day',
-    source          VARCHAR(160),
-    formula         TEXT,
+    source          VARCHAR(160),                   -- 概念级来源；两市场实现见 params.per_market
+    formula         TEXT,                            -- 同名 code 并列两市场公式「CN：…；HK：…」，照 regime.SECTOR.UP_RATIO
     model_key       VARCHAR(8),                    -- M0~M8，见设计文档 §3.2
-    params          JSONB,
-    params_hash     VARCHAR(16),                   -- 口径变更触发历史重算
+    params          JSONB,                          -- per_market.{CN,HK} 实现差异 + 概念级参数
+    params_hash     VARCHAR(16),                   -- 口径变更触发历史重算（全市场统一）
     min_periods     INT             NOT NULL DEFAULT 0,
     pit_capable     BOOLEAN         NOT NULL DEFAULT TRUE,
-    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
-    remark          TEXT,                               -- 规范化三段式：【定义】是什么 /【判读】怎么看 /【数据】样本与断点（与 indicator_dict 同款）
+    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,  -- 概念级总开关；市场级禁产见 params.per_market
+    remark          TEXT,                               -- 规范化三段式：【定义】是什么 /【判读】怎么看 /【数据】样本与断点
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-    -- 阶段 3：CN / HK 共用同一套指标 code，字典按市场+分类隔离，避免 HK 覆盖 CN 行
-    PRIMARY KEY (market_scope, classification, indicator_code)
+    updated_at      TIMESTAMPTZ     DEFAULT NOW()
 );
-COMMENT ON TABLE  industry.indicator_dict IS '第④层行业指标字典（代码即字典：sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS 幂等 upsert）。⚠ 阶段3 起主键含 market_scope+classification：CN(SW_L1) 与 HK(HS_L3) 同名指标各占一行，冲突键必须带这两个字段';
+COMMENT ON TABLE  industry.indicator_dict IS '第④层行业指标字典（代码即字典：sector_layer.sync_dict 一次性幂等 upsert）。与 regime 同构：主键仅 indicator_code，一行一个领域概念，market_scope 只声明适用范围，两市场实现差异落 params.per_market.{CN,HK}；同名 code 在 CN/HK 概念相同，计算方法与数据源不同不改变概念';
 COMMENT ON COLUMN industry.indicator_dict.direction IS 'high_good/high_risk/neutral；**方向只在此定义一次**，维度合成按 DIMENSION_DEFS.sign 翻转，消费端禁止二次翻转（§7.1）';
 COMMENT ON COLUMN industry.indicator_dict.model_key IS '计算模型编号（设计文档 §3.2）：M1横截面分位 / M2时序分位 / M3相对强度 / M4归一滚动 / M5条件命中 / M6 PIT成分聚合 / M7快照差分 / M8自算指数';
-COMMENT ON COLUMN industry.indicator_dict.remark IS '规范化三段式（与 regime.indicator_dict 事实标准一致）：单行 定义：…　·　判读：…　·　数据：…（全角空格包围中点分隔），可扩展 口径：/⚠/已知限制：；无换行、无方括号标题。定义写公式+单位+值域，判读写高低位业务含义与联读，数据写起点/覆盖门禁/口径断点/跨市场可比性。⚠ 只改 remark 不进 params_hash、不触发历史重算；但代码即字典，须改 sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS，库内手改会被幂等 upsert 覆盖';
+COMMENT ON COLUMN industry.indicator_dict.remark IS '规范化三段式（与 regime.indicator_dict 事实标准一致）：单行 定义：…　·　判读：…　·　数据：…（全角空格包围中点分隔），可扩展 口径：/⚠/已知限制：；无换行、无方括号标题。定义写公式+单位+值域，判读写高低位业务含义与联读，数据写起点/覆盖门禁/口径断点/跨市场可比性。⚠ 只改 remark 不进 params_hash、不触发历史重算；但代码即字典，须改 sector_layer.INDICATOR_DEFS，库内手改会被幂等 upsert 覆盖';
 
 CREATE TABLE IF NOT EXISTS industry.indicator_value (
     market          VARCHAR(8)      NOT NULL,       -- CN / HK（禁止混合分位）
-    classification  VARCHAR(16)     NOT NULL,       -- SW_L1 / HS_L3
     sector_code     VARCHAR(20)     NOT NULL,
     trade_date      DATE            NOT NULL,
     indicator_code  VARCHAR(64)     NOT NULL,
@@ -2298,10 +2297,10 @@ CREATE TABLE IF NOT EXISTS industry.indicator_value (
     n_sample        INT,
     coverage        NUMERIC(5,4),
     quality         VARCHAR(16),                    -- ok / short_sample / unavailable
-    model_version   VARCHAR(16),                    -- = sector_indicator_dict.params_hash
+    model_version   VARCHAR(16),                    -- = industry.indicator_dict.params_hash（全市场统一）
     extra           JSONB,                          -- rank_n / pit_capable / label / crowd k
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (market, classification, sector_code, trade_date, indicator_code)
+    PRIMARY KEY (market, sector_code, trade_date, indicator_code)
 );
 CREATE INDEX IF NOT EXISTS idx_sector_iv_code_date
     ON industry.indicator_value (indicator_code, trade_date DESC);
@@ -2312,7 +2311,6 @@ COMMENT ON COLUMN industry.indicator_value.extra IS 'rank_n=当日有效行业�
 
 CREATE TABLE IF NOT EXISTS industry.dimension_value (
     market          VARCHAR(8)      NOT NULL,
-    classification  VARCHAR(16)     NOT NULL,
     sector_code     VARCHAR(20)     NOT NULL,
     trade_date      DATE            NOT NULL,
     dimension_code  VARCHAR(24)     NOT NULL,
@@ -2325,45 +2323,41 @@ CREATE TABLE IF NOT EXISTS industry.dimension_value (
     params_hash     VARCHAR(16),
     extra           JSONB,                          -- structure / anchor / crowd_gate / k
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (market, classification, sector_code, trade_date, dimension_code)
+    PRIMARY KEY (market, sector_code, trade_date, dimension_code)
 );
 CREATE INDEX IF NOT EXISTS idx_sector_score_date
     ON industry.dimension_value (trade_date DESC);
 COMMENT ON TABLE  industry.dimension_value IS '第④层 L2 维度读数（六维）。成员 <4 时按 §7.2 走「单锚」而非扁平等权（等权会让单成员 33% 超过 25% 上限）；CROWDING 走规则判定 score 恒 NULL，档位在 extra.crowd_gate；FUNDAMENTAL/BREADTH 阶段1 未启用';
 
--- 24a. 第④层 L3 业务指标字典（代码即字典：sector_layer.BIZ_DEFS /
---      sector_layer_hk.HK_BIZ_DEFS 幂等 upsert）。
+-- 24a. 第④层 L3 业务指标字典（代码即字典：sector_layer.sync_dict 幂等 upsert）。
 --      ⚠ 业务指标是**开放集合**：新增/下线只改字典行与值表行，不加表字段。
---      ⚠ 主键含 market_scope+classification：同一 biz_code 在 CN / HK 可分别
---        决定是否启用（如 HK 的 SEC.BIZ.RANK 本期 is_active=false）。
+--      ⚠ 与 regime.business_dict 同构：主键仅 biz_code，**一行一个领域概念**。
+--        两市场的输入成员可用性、启停与口径参数落 params.per_market.{CN,HK}。
 CREATE TABLE IF NOT EXISTS industry.business_dict (
-    market_scope    VARCHAR(16)     NOT NULL DEFAULT 'CN',
-    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
-    biz_code        VARCHAR(32)     NOT NULL,
+    biz_code        VARCHAR(32)     PRIMARY KEY,
     biz_name        VARCHAR(64)     NOT NULL,       -- 中文名称（前端展示）
     question        TEXT,                           -- 面向用户的一句话问句
     side            VARCHAR(12)     NOT NULL,       -- state / risk / neutral
     kind            VARCHAR(16)     NOT NULL,       -- continuous / enum / rank / gate
-    inputs          JSONB,                          -- [{kind:dimension|atom, code}]
-    params          JSONB,
+    market_scope    VARCHAR(16)     NOT NULL DEFAULT 'CN+HK',  -- 声明列：CN / HK / CN+HK
+    inputs          JSONB,                          -- 两市场成员并集 [{kind, code, market}]
+    params          JSONB,                          -- per_market.{CN,HK} 实现差异 + 概念级参数
     output_schema   JSONB,                          -- score/state/level/detail 语义 + 值域
-    params_hash     VARCHAR(16),                    -- 该 biz_code 独立口径指纹
-    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
+    params_hash     VARCHAR(16),                    -- 该 biz_code 独立口径指纹（全市场统一）
+    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,  -- 概念级总开关；市场级禁产见 params.per_market
     remark          TEXT,
-    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (market_scope, classification, biz_code)
+    updated_at      TIMESTAMPTZ     DEFAULT NOW()
 );
-COMMENT ON TABLE  industry.business_dict IS '第④层 L3 业务指标字典：一行一个业务指标，登记中文名、面向用户的问句、输入清单、输出契约与独立口径指纹。新增/下线指标只增删字典行，不改表结构';
+COMMENT ON TABLE  industry.business_dict IS '第④层 L3 业务指标字典：一行一个业务指标，登记中文名、面向用户的问句、输入清单、输出契约与独立口径指纹。新增/下线指标只增删字典行，不改表结构。market_scope 只声明适用范围，市场差异落 params.per_market';
 COMMENT ON COLUMN industry.business_dict.output_schema IS '多态列语义说明。⚠ score/state/level 是多态列，各 biz_code 语义不同，消费方必须先按 biz_code 过滤并校验本字段，禁止跨 biz 比较或聚合';
-COMMENT ON COLUMN industry.business_dict.is_active IS 'false = 本期不产出值表行（如 HK 不排名）；不是漏采，前端应显示「本期不提供」并给出 reason';
+COMMENT ON COLUMN industry.business_dict.is_active IS 'false = 该概念全局下线；某市场本期不产出（如 HK 不排名）属实现层禁产，记在 params.per_market.HK，前端应显示「本期不提供」并给出 reason';
 
 -- 24b. 第④层 L3 业务指标值（长表）。
 --      ⚠ 取代旧宽表 sector_biz_daily：旧设计把 5 类业务读数压成一行的多个列，
 --        没有指标编码、无法各自版本化/重算/增减。现按 biz_code 分行。
 CREATE TABLE IF NOT EXISTS industry.business_value (
     biz_code        VARCHAR(32)     NOT NULL,
-    market          VARCHAR(8)      NOT NULL,
-    classification  VARCHAR(16)     NOT NULL,
+    market          VARCHAR(8)      NOT NULL,       -- CN / HK，物理分行
     sector_code     VARCHAR(20)     NOT NULL,
     trade_date      DATE            NOT NULL,
     score           NUMERIC(6,2),                   -- 多态：连续型读数（0-100）
@@ -2373,10 +2367,10 @@ CREATE TABLE IF NOT EXISTS industry.business_value (
     coverage        NUMERIC(5,4),                   -- 共有质量元数据：可用维度/当期已启用维度
     applicable      BOOLEAN         NOT NULL DEFAULT FALSE,  -- 共有质量元数据
     confidence      VARCHAR(12),                    -- 共有质量元数据：normal / low
-    params_hash     VARCHAR(16),                    -- = business_dict 该行的 params_hash
+    params_hash     VARCHAR(16),                    -- = industry.business_dict 该行的 params_hash（全市场统一）
     extra           JSONB,                          -- 口径与明细（calib_version/pit_capable/no_rank…）
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (biz_code, market, classification, sector_code, trade_date)
+    PRIMARY KEY (biz_code, market, sector_code, trade_date)
 );
 CREATE INDEX IF NOT EXISTS idx_industry_biz_date
     ON industry.business_value (trade_date DESC);
@@ -2401,7 +2395,6 @@ COMMENT ON COLUMN industry.business_value.applicable IS '近20交易日有效读
 -- ═══════════════════════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS industry.constituent (
     market          VARCHAR(8)      NOT NULL DEFAULT 'CN',
-    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
     sector_code     VARCHAR(20)     NOT NULL,       -- 申万一级代码，如 801010
     stock_code      VARCHAR(20)     NOT NULL,       -- 项目格式 SH./SZ./BJ. + 6 位
     eff_from        DATE            NOT NULL,       -- = max(计入日期, 2021-12-13)
@@ -2409,7 +2402,7 @@ CREATE TABLE IF NOT EXISTS industry.constituent (
     weight          NUMERIC(8,4),                   -- 百分数（源原值，单行业合计≈100）
     source          VARCHAR(64)     NOT NULL DEFAULT 'akshare:index_component_sw',
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (market, classification, sector_code, stock_code, eff_from)
+    PRIMARY KEY (market, sector_code, stock_code, eff_from)
 );
 CREATE INDEX IF NOT EXISTS idx_sector_const_stock
     ON industry.constituent (stock_code, eff_from, eff_to);
@@ -2423,7 +2416,6 @@ CREATE TABLE IF NOT EXISTS industry.constituent_change (
     id              BIGSERIAL       PRIMARY KEY,
     snapshot_date   DATE            NOT NULL,
     market          VARCHAR(8)      NOT NULL DEFAULT 'CN',
-    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
     sector_code     VARCHAR(20)     NOT NULL,
     stock_code      VARCHAR(20)     NOT NULL,
     change_type     VARCHAR(12)     NOT NULL,       -- ADD / REMOVE / WEIGHT
@@ -2431,7 +2423,7 @@ CREATE TABLE IF NOT EXISTS industry.constituent_change (
     new_weight      NUMERIC(8,4),
     eff_from        DATE,
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    UNIQUE (snapshot_date, market, classification, sector_code, stock_code, change_type)
+    UNIQUE (snapshot_date, market, sector_code, stock_code, change_type)
 );
 CREATE INDEX IF NOT EXISTS idx_sector_const_change_date
     ON industry.constituent_change (snapshot_date DESC);

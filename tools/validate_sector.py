@@ -53,7 +53,6 @@ from db import get_conn, read_sql  # noqa: E402
 from sector_layer import DIMENSION_DEFS  # noqa: E402
 
 MARKET = "CN"
-CLASSIFICATION = "SW_L1"
 PIT_START = dt.date(2021, 12, 13)
 HORIZONS = (20, 60, 120)
 MIN_XSEC_N = 10           # 与 XSEC_MIN_N 一致：横截面样本不足不给 IC
@@ -98,10 +97,10 @@ def load_panel(conn, start: dt.date, end: dt.date) -> pd.DataFrame:
                max(extra->>'pit_capable')   AS pit_capable,
                max(extra->>'calib_version') AS calib_version
         FROM industry.business_value
-        WHERE market=%s AND classification=%s AND trade_date BETWEEN %s AND %s
+        WHERE market=%s AND trade_date BETWEEN %s AND %s
         GROUP BY trade_date, sector_code
         ORDER BY trade_date, sector_code
-    """, params=[MARKET, CLASSIFICATION, start, end])
+    """, params=[MARKET, start, end])
     px = read_sql(conn, """
         SELECT trade_date, sw_code, close
         FROM regime.sector_daily
@@ -133,15 +132,15 @@ def load_dimension_items(conn, start: dt.date, end: dt.date,
     iv = read_sql(conn, """
         SELECT trade_date, sector_code, indicator_code, percentile_xsec
         FROM industry.indicator_value
-        WHERE market=%s AND classification=%s AND trade_date BETWEEN %s AND %s
+        WHERE market=%s AND trade_date BETWEEN %s AND %s
           AND indicator_code = ANY(%s)
-    """, params=[MARKET, CLASSIFICATION, start, end, sorted(codes)])
+    """, params=[MARKET, start, end, sorted(codes)])
     sc = read_sql(conn, """
         SELECT trade_date, sector_code, dimension_code, score
         FROM industry.dimension_value
-        WHERE market=%s AND classification=%s AND trade_date BETWEEN %s AND %s
+        WHERE market=%s AND trade_date BETWEEN %s AND %s
           AND dimension_code = %s
-    """, params=[MARKET, CLASSIFICATION, start, end, dimension])
+    """, params=[MARKET, start, end, dimension])
     for d in (iv, sc):
         if not d.empty:
             d["trade_date"] = pd.to_datetime(d["trade_date"]).dt.date
@@ -436,10 +435,10 @@ def check_shares(conn, panel: pd.DataFrame, start: dt.date, end: dt.date) -> dic
     g = read_sql(conn, """
         SELECT extra->>'label' AS label, count(*) AS n
         FROM industry.indicator_value
-        WHERE market=%s AND classification=%s AND trade_date BETWEEN %s AND %s
+        WHERE market=%s AND trade_date BETWEEN %s AND %s
           AND indicator_code=%s
         GROUP BY 1
-    """, params=[MARKET, CLASSIFICATION, start, end, "SEC.CROWD.GATE"])
+    """, params=[MARKET, start, end, "SEC.CROWD.GATE"])
     total = float(g["n"].sum()) if not g.empty else 0.0
     gate = {str(r["label"]): round(float(r["n"]) / total, 4)
             for _, r in g.iterrows() if r["label"]} if total else {}
@@ -473,9 +472,9 @@ def check_pit_bias(conn, panel: pd.DataFrame) -> dict:
                count(level) FILTER (WHERE biz_code='SEC.BIZ.RANK') AS ranked_rows,
                avg(coverage) FILTER (WHERE biz_code='SEC.BIZ.STATE_SIDE') AS coverage_mean
         FROM industry.business_value
-        WHERE market=%s AND classification=%s AND trade_date >= %s
+        WHERE market=%s AND trade_date >= %s
         GROUP BY 1 ORDER BY 1
-    """, params=[MARKET, CLASSIFICATION, dt.date(1999, 12, 30)])
+    """, params=[MARKET, dt.date(1999, 12, 30)])
     full = [dict(pit_capable=str(r["pit_capable"]), rows=int(r["rows"]),
                  date_min=str(r["date_min"]), date_max=str(r["date_max"]),
                  state_side_mean=_r(r["state_mean"], 4),
@@ -510,9 +509,9 @@ def check_data_gates(conn, panel: pd.DataFrame, end: dt.date) -> dict:
         cur.execute("""
             SELECT count(*), min(trade_date), max(trade_date)
             FROM industry.indicator_value
-            WHERE market=%s AND classification=%s AND indicator_code=%s
+            WHERE market=%s AND indicator_code=%s
               AND extra->>'label' = %s
-        """, (MARKET, CLASSIFICATION, "SEC.CROWD.GATE", "EXTREME"))
+        """, (MARKET, "SEC.CROWD.GATE", "EXTREME"))
         n_ext, d0, d1 = cur.fetchone()
         cur.execute("SELECT max(trade_date) FROM regime.sector_daily")
         px_max = cur.fetchone()[0]
@@ -529,9 +528,9 @@ def check_data_gates(conn, panel: pd.DataFrame, end: dt.date) -> dict:
     ext_rows = read_sql(conn, """
         SELECT trade_date, sector_code
         FROM industry.indicator_value
-        WHERE market=%s AND classification=%s AND indicator_code=%s
+        WHERE market=%s AND indicator_code=%s
           AND extra->>'label'=%s AND trade_date BETWEEN %s AND %s
-    """, params=[MARKET, CLASSIFICATION, "SEC.CROWD.GATE", "EXTREME",
+    """, params=[MARKET, "SEC.CROWD.GATE", "EXTREME",
                  dt.date(1999, 12, 30), end])
     if not ext_rows.empty:
         ext_rows["trade_date"] = pd.to_datetime(ext_rows["trade_date"]).dt.date
@@ -617,14 +616,14 @@ def run(start: dt.date, end: dt.date, n_iter: int = BOOTSTRAP_DEFAULT) -> dict:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT max(trade_date) FROM industry.business_value "
-                        "WHERE market=%s AND classification=%s",
-                        (MARKET, CLASSIFICATION))
+                        "WHERE market=%s",
+                        (MARKET,))
             last = cur.fetchone()[0]
         end = min(end, last or end)
         panel = load_panel(conn, start, end)
         result = dict(
             generated_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-            scope=dict(market=MARKET, classification=CLASSIFICATION,
+            scope=dict(market=MARKET,
                        start=str(start), end=str(end), bootstrap=n_iter,
                        split_fraction=SPLIT_FRACTION, horizons=list(HORIZONS)),
             sample=dict(rows=int(len(panel)),

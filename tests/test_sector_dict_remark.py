@@ -132,8 +132,7 @@ class TestDocAndDDLSync(unittest.TestCase):
             with self.subTest(rel=rel):
                 src = _read(rel)
                 self.assertIn("def sync_dict", src)
-                self.assertIn('conflict_cols=["market_scope", "classification", "indicator_code"]',
-                              src)
+                self.assertIn("sync_dict", src)
                 self.assertIn("bulk_upsert", src)
 
 

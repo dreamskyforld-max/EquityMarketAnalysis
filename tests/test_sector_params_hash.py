@@ -9,7 +9,7 @@
   ① 影响数值的变更必须换指纹；
   ② 文案类变更（indicator_name / remark）不得换指纹；
   ③ L1 原子指纹保持不变（避免误触发 L1 全量重算）；
-  ④ CN / HK 两条版本线互相隔离；
+  ④ CN / HK 值表统一写字典的同一个 hash（跨市场可比对）；
   ⑤ 真实产出行的 params_hash 与预计算一致（防调用点漏改）。
 """
 from __future__ import annotations
@@ -207,28 +207,31 @@ class TestL1Unchanged(unittest.TestCase):
 
 
 class TestHKIsolation(unittest.TestCase):
-    """HK 独立口径线：spec 带市场 / 分类 / hk1.0 / no_rank。"""
+    """HK 实现细节留在 spec 内，字典与值表 hash 跨市场统一。"""
 
     def test_20_spec_metadata(self):
         spec = slh._hk_dim_spec()
         self.assertEqual(len(spec), 6)
         for s in spec.values():
-            self.assertEqual(s["market"], "HK")
-            self.assertEqual(s["classification"], "HS_L3")
+            self.assertNotIn("market", s)
+            self.assertNotIn("classification", s)
             self.assertEqual(s["version"], "hk1.0")
         biz = slh._hk_biz_spec(BIZ_SAMPLE, slh._hk_dim_hashes())
         self.assertTrue(biz["params"]["no_rank"])
         self.assertEqual(biz["params"]["cap_start"], "2002-01-01")
-        self.assertEqual(biz["market"], "HK")
+        self.assertNotIn("market", biz)
         # HK 本期不排名：字典登记 RANK 但值表不产出
         self.assertFalse(slh.HK_BIZ_DEFS["SEC.BIZ.RANK"]["is_active"])
         self.assertNotIn("SEC.BIZ.RANK", slh._hk_biz_hashes())
 
-    def test_21_differs_from_cn(self):
-        cn, hk = sl._dim_hashes(), slh._hk_dim_hashes()
-        self.assertTrue(all(cn[k] != hk[k] for k in cn))
-        self.assertNotEqual(sl._biz_params_hash(BIZ_SAMPLE),
-                            slh._hk_biz_params_hash(BIZ_SAMPLE))
+    def test_21_unified_across_markets(self):
+        # 统一字典指纹：同一 code 的 CN/HK 值表必须写同一个 hash（与 regime 同构）
+        for n in sl.DIMENSION_DEFS:
+            self.assertEqual(sl._dict_hash("L2", n), slh._dict_hash("L2", n))
+        for code in sl.BIZ_DEFS:
+            self.assertEqual(sl._dict_hash("L3", code), slh._dict_hash("L3", code))
+        for code in ("SEC.TREND.RET_20D", "SEC.VAL.PE_XSEC_PCT", "SEC.BREADTH.UP_RATIO"):
+            self.assertEqual(sl._dict_hash("L1", code), slh._dict_hash("L1", code))
 
     def test_22_hk_sensitivity(self):
         base_dim = slh._hk_dim_hashes()
@@ -273,7 +276,7 @@ class TestProducedRows(unittest.TestCase):
 
     def test_24_score_rows_use_new_hashes(self):
         rows = sl._score_rows(_cn_wide(), DAY, DAY)
-        expected = sl._dim_hashes()
+        expected = {n: sl._dict_hash("L2", n) for n in sl.DIMENSION_DEFS}
         self.assertEqual(len(rows), 6)
         for r in rows:
             self.assertEqual(r["params_hash"], expected[r["dimension_code"]])
@@ -284,7 +287,7 @@ class TestProducedRows(unittest.TestCase):
 
     def test_25_biz_rows_are_long_table_with_independent_hashes(self):
         rows = sl._biz_rows(_cn_biz_wide(), DAY, DAY)
-        expected = sl._biz_hashes()
+        expected = {c: sl._dict_hash("L3", c) for c in sl.BIZ_DEFS}
         self.assertEqual(len(rows), 5)              # CN 5 个 active 业务指标
         self.assertEqual({r["biz_code"] for r in rows}, set(expected))
         by_code = {r["biz_code"]: r for r in rows}
@@ -308,7 +311,7 @@ class TestProducedRows(unittest.TestCase):
             "_crowd": {"gate": "NORMAL", "k": 2, "partial": True},
         }])
         rows = slh._score_rows(wide, DAY, DAY)
-        expected = slh._hk_dim_hashes()
+        expected = {n: slh._dict_hash("L2", n) for n in slh.HK_DIMENSION_DEFS}
         for r in rows:
             self.assertEqual(r["params_hash"], expected[r["dimension_code"]])
 
@@ -327,7 +330,7 @@ class TestProducedRows(unittest.TestCase):
         self.assertNotIn("SEC.BIZ.RANK", {r["biz_code"] for r in rows})
         by_code = {r["biz_code"]: r for r in rows}
         for code, r in by_code.items():
-            self.assertEqual(r["params_hash"], slh._hk_biz_hashes()[code])
+            self.assertEqual(r["params_hash"], slh._dict_hash("L3", code))
         gate = by_code["SEC.BIZ.GATE"]["detail"]["gate_flags"]
         self.assertIn("BREAK", gate)
         self.assertIn("PARTIAL_STATE", gate)

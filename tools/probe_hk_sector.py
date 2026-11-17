@@ -118,23 +118,22 @@ QUERIES = [
 
     ("⑥ sector_indicator_dict 现状（PK 只有 indicator_code → 双市场会冲突）",
      "SELECT count(*) AS rows, count(DISTINCT market_scope) AS markets, "
-     "count(DISTINCT classification) AS classifications, "
      "min(indicator_code) AS min_code, max(indicator_code) AS max_code, "
      "count(DISTINCT params_hash) AS hashes "
      "FROM industry.indicator_dict"),
 
     ("⑥ sector_constituent 现状",
-     "SELECT market, classification, count(*) AS rows, "
+     "SELECT market, count(*) AS rows, "
      "count(DISTINCT sector_code) AS sectors, count(DISTINCT stock_code) AS stocks, "
      "min(eff_from) AS min_eff, max(eff_from) AS max_eff, "
      "count(*) FILTER (WHERE eff_to IS NOT NULL) AS closed "
      "FROM industry.constituent GROUP BY 1, 2 ORDER BY 1, 2"),
 
-    ("⑥ 输出表现有 market / classification / biz_code 分布",
-     "SELECT 'indicator_value' AS tbl, market, classification, '' AS biz_code, count(*) AS rows "
+    ("⑥ 输出表现有 market / biz_code 分布",
+     "SELECT 'indicator_value' AS tbl, market, '' AS biz_code, count(*) AS rows "
      "FROM industry.indicator_value GROUP BY 1, 2, 3 "
      "UNION ALL "
-     "SELECT 'business_value', market, classification, biz_code, count(*) "
+     "SELECT 'business_value', market, biz_code, count(*) "
      "FROM industry.business_value GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4"),
 ]
 

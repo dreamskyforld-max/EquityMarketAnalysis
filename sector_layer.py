@@ -32,6 +32,7 @@ import argparse
 import datetime as dt
 import gc
 import hashlib
+import importlib
 import json
 import math
 import sys
@@ -46,7 +47,8 @@ from log_utils import setup_logger
 log = setup_logger("sector_layer")
 
 MARKET = "CN"
-CLASSIFICATION = "SW_L1"
+MARKETS = ("CN", "HK")
+DICT_VERSION = "v2.0"           # 统一字典版本：一行一概念，口径变更触发全市场重算
 CALIB_VERSION = "s2.1"          # 口径版本；阶段1→2 变更（六维启用/分母变化）触发历史重算
 PIT_START = dt.date(2021, 12, 13)   # 决策A：自下而上指标有效起点（sector_stage2_agg.PIT_START）
 
@@ -570,7 +572,7 @@ def _dim_spec() -> dict:
             codes = list(_CROWD_FACTORS)     # 规则判定维度无 anchor/members
         out[name] = {
             "layer": "L2", "code": "SEC.DIM." + name,
-            "market": MARKET, "classification": CLASSIFICATION,
+            "market": MARKET,
             "version": CALIB_VERSION,
             "structure": cfg["structure"], "side": cfg["side"],
             "anchor": cfg["anchor"],
@@ -596,8 +598,7 @@ def _biz_spec(biz_code: str, dim_hashes: dict) -> dict:
     cfg = BIZ_DEFS[biz_code]
     return {
         "layer": "L3", "code": biz_code,
-        "market": MARKET, "classification": CLASSIFICATION,
-        "version": CALIB_VERSION,
+        "version": DICT_VERSION,
         "kind": cfg["kind"], "side": cfg["side"],
         "inputs": cfg["inputs"], "output_schema": cfg["output_schema"],
         "upstream_dims": dim_hashes,
@@ -625,19 +626,193 @@ def _biz_params_hash(biz_code: str) -> str:
     return _hash_spec(_biz_spec(biz_code, _dim_hashes()))
 
 
-def _biz_dict_rows() -> list:
-    """business_dict 种子（代码即字典，幂等 upsert）。"""
+def _hk_impl() -> dict:
+    """HK 侧实现定义（延迟导入，避免与 sector_layer_hk 顶层 import 形成循环）。
+
+    字典表只登记领域概念；两市场的公式 / 数据源 / 模型 / 启用状态 / 版本等
+    实现差异全部落 params.per_market，由本函数提供 HK 部分。
+    """
+    import importlib
+    hk = importlib.import_module("sector_layer_hk")
+    return {
+        "version": hk.CALIB_VERSION,
+        "enabled_dimensions": list(hk.ENABLED_DIMENSIONS),
+        "no_rank": True,
+        "cap_start": str(hk.CAP_START),
+        "pit_capable": False,
+        "coverage_min": hk.COVERAGE_MIN,
+        "valid_days_20_min": hk.VALID_DAYS_20_MIN,
+        "valid_days_window": hk.VALID_DAYS_WINDOW,
+        "crowd_pct_high": hk.CROWD_PCT_HIGH,
+        "short_sample": hk.SHORT_SAMPLE,
+        "min_periods": hk.MIN_PERIODS,
+        "dimension_defs": {
+            n: {k: c.get(k) for k in ("side", "structure", "anchor", "reason")}
+               | {"members": [{"code": a, "sign": s} for a, s in c.get("members", [])]}
+            for n, c in hk.HK_DIMENSION_DEFS.items()
+        },
+        "indicator_defs": {
+            d["code"]: {k: d.get(k) for k in _NUMERIC_DEF_KEYS}
+            for d in hk.HK_INDICATOR_DEFS
+        },
+        "biz_defs": {
+            code: {"inputs": cfg["inputs"], "output_schema": cfg["output_schema"],
+                   "is_active": cfg["is_active"]}
+            for code, cfg in hk.HK_BIZ_DEFS.items()
+        },
+    }
+
+
+def _cn_impl() -> dict:
+    return {
+        "version": CALIB_VERSION,
+        "enabled_dimensions": list(ENABLED_DIMENSIONS),
+        "no_rank": False,
+        "pit_start": str(PIT_START),
+        "pit_capable": True,
+        "coverage_min": COVERAGE_MIN,
+        "valid_days_20_min": VALID_DAYS_20_MIN,
+        "valid_days_window": VALID_DAYS_WINDOW,
+        "crowd_pct_high": CROWD_PCT_HIGH,
+        "short_sample": SHORT_SAMPLE,
+        "min_periods": MIN_PERIODS,
+        "dimension_defs": {
+            n: {k: c.get(k) for k in ("side", "structure", "anchor", "sign")}
+               | {"members": [{"code": a, "sign": s} for a, s in c.get("members", [])]}
+            for n, c in DIMENSION_DEFS.items()
+        },
+        "indicator_defs": {
+            d["code"]: {k: d.get(k) for k in _NUMERIC_DEF_KEYS}
+            for d in INDICATOR_DEFS
+        },
+        "biz_defs": {
+            code: {"inputs": cfg["inputs"], "output_schema": cfg["output_schema"],
+                   "is_active": cfg["is_active"]}
+            for code, cfg in BIZ_DEFS.items()
+        },
+    }
+
+
+def _per_market() -> dict:
+    """一行一概念字典的 params.per_market：两市场实现差异的唯一登记处。"""
+    return {"CN": _cn_impl(), "HK": _hk_impl()}
+
+
+def _dict_spec(layer: str, code: str) -> dict:
+    """统一口径指纹：概念定义 + 两市场实现差异，全市场共用一个 hash。
+
+    L2 维度没有字典表（industry 层六维只存在于代码），但仍需统一指纹供
+    `dimension_value.params_hash` 使用：concept 取 CN 侧维度定义，
+    HK 侧结构差异由 per_market.HK.dimension_defs 纳入。
+    """
+    pm = _per_market()
+    if layer == "L1":
+        concept = next((d for d in INDICATOR_DEFS if d["code"] == code), None)
+    elif layer == "L2":
+        concept = DIMENSION_DEFS.get(code)
+    else:
+        concept = BIZ_DEFS.get(code)
+    return {"layer": layer, "code": code, "version": DICT_VERSION,
+            "concept": concept, "per_market": pm}
+
+
+def _dict_hash(layer: str, code: str) -> str:
+    return _hash_spec(_dict_spec(layer, code))
+
+
+def _split_remark(remark: str) -> dict:
+    """按 `_SEP` 拆三段式：定义 / 判读 / 其余（数据 / ⚠ / 口径）。"""
+    out = {"定义": "", "判读": "", "其余": []}
+    for part in (remark or "").split(_SEP):
+        if part.startswith("定义："):
+            out["定义"] = part[len("定义："):]
+        elif part.startswith("判读："):
+            out["判读"] = part[len("判读："):]
+        elif part:
+            out["其余"].append(part.removeprefix("数据："))
+    return out
+
+
+def _merged_indicator_remark(cn: dict | None, hk: dict | None) -> str:
+    """同名 code 的 remark：定义 / 数据 / ⚠ 段并列两市场原文，判读段保留一份。
+
+    措辞全部来自两市场现有字符串；`⚠ **两市场构造不同、数值不可直接比**`
+    与 `**CN** = …；**HK** = …` 沿用 regime.SECTOR.UP_RATIO 的先例，不新造词。
+    """
+    if not cn:
+        return hk["remark"]
+    if not hk:
+        return cn["remark"]
+    c, h = _split_remark(cn["remark"]), _split_remark(hk["remark"])
+    seg = ["⚠ **两市场构造不同、数值不可直接比**：**CN** = " + c["定义"] +
+           "；**HK** = " + h["定义"]]
+    if c["判读"] == h["判读"]:
+        seg.append("判读：" + c["判读"])
+    else:
+        seg.append("判读：**CN** = " + c["判读"] + "；**HK** = " + h["判读"])
+    seg.append("数据：**CN** = " + "；".join(c["其余"]) +
+               "；**HK** = " + "；".join(h["其余"]))
+    return _SEP.join(seg)
+
+
+def _merged_formula(cn: dict | None, hk: dict | None) -> str:
+    """同名 code 的 formula：`CN：…；HK：…`，照 regime.SECTOR.UP_RATIO 格式。"""
+    if not cn:
+        return hk["formula"]
+    if not hk:
+        return cn["formula"]
+    return "CN：" + cn["formula"] + "；HK：" + hk["formula"]
+
+
+def _indicator_dict_rows() -> list:
+    """L1 字典：一行一个领域概念（CN 全集 ∪ HK 独有）。"""
     now = dt.datetime.now().astimezone()
-    dh = _dim_hashes()
-    return [dict(market_scope=MARKET, classification=CLASSIFICATION,
+    pm = _per_market()
+    hk_defs = {d["code"]: d for d in
+               importlib.import_module("sector_layer_hk").HK_INDICATOR_DEFS}
+    codes = [d["code"] for d in INDICATOR_DEFS] + \
+            [c for c in hk_defs if c not in {d["code"] for d in INDICATOR_DEFS}]
+    rows = []
+    for code in codes:
+        cn = next((d for d in INDICATOR_DEFS if d["code"] == code), None)
+        hk = hk_defs.get(code)
+        base = cn or hk
+        scope = "CN+HK" if cn and hk else ("CN" if cn else "HK")
+        rows.append(dict(
+            indicator_code=code, indicator_name=base["indicator_name"],
+            domain=base["domain"], side=base["side"], market_scope=scope,
+            unit=base["unit"], direction=base["direction"], freq=base["freq"],
+            source=base["source"], formula=_merged_formula(cn, hk),
+            model_key=base["model_key"],
+            params={"version": DICT_VERSION, "per_market": {
+                "CN": pm["CN"]["indicator_defs"].get(code),
+                "HK": pm["HK"]["indicator_defs"].get(code)}},
+            params_hash=_dict_hash("L1", code),
+            min_periods=MIN_PERIODS if base["model_key"] == "M2" else 0,
+            pit_capable=bool(cn), is_active=bool(cn and cn["is_active"]) or bool(hk and hk["is_active"]),
+            remark=_merged_indicator_remark(cn, hk), updated_at=now))
+    return rows
+
+
+def _biz_dict_rows() -> list:
+    """business_dict 种子：一行一个业务指标，市场差异落 params.per_market。"""
+    now = dt.datetime.now().astimezone()
+    pm = _per_market()
+    return [dict(market_scope="CN+HK",
                  biz_code=code, biz_name=cfg["biz_name"],
                  question=cfg["question"], side=cfg["side"], kind=cfg["kind"],
-                 inputs=cfg["inputs"], params={"version": CALIB_VERSION},
+                 inputs=cfg["inputs"],
+                 params={"version": DICT_VERSION, "per_market": {
+                     "CN": pm["CN"]["biz_defs"].get(code),
+                     "HK": pm["HK"]["biz_defs"].get(code)}},
                  output_schema=cfg["output_schema"],
-                 params_hash=_hash_spec(_biz_spec(code, dh)),
-                 is_active=cfg["is_active"],
+                 params_hash=_dict_hash("L3", code),
+                 is_active=True,
                  remark="定义：" + cfg["biz_name"] + "　·　判读：" +
-                        (cfg["question"] or "") + "　·　数据：见 industry_hotspot_data_architecture.md §6",
+                        (cfg["question"] or "") +
+                        "　·　⚠ **两市场构造不同、数值不可直接比**："
+                        "**CN** = 见 industry_hotspot_data_architecture.md §6；"
+                        "**HK** = HK 全期非 PIT / 置信度低",
                  updated_at=now)
             for code, cfg in BIZ_DEFS.items()]
 
@@ -959,14 +1134,14 @@ def _indicator_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
             # 依赖成分主数据的指标，在 PIT_START 之前无有效成分 → 标注非 PIT。
             extra["pit_capable"] = (d >= PIT_START) if "constituent" in meta["source"] else True
             rows.append(dict(
-                market=MARKET, classification=CLASSIFICATION,
+                market=MARKET,
                 sector_code=rec["sw_code"], trade_date=d,
                 indicator_code=meta["code"], raw_value=raw,
                 percentile_xsec=px, percentile_ts=pt, n_sample=ns,
                 coverage=None, quality=("short_sample" if ns is not None and
                                         meta["model_key"] == "M2" and ns < SHORT_SAMPLE
                                         else "ok"),
-                model_version=_params_hash(meta), extra=extra,
+                model_version=_dict_hash("L1", meta["code"]), extra=extra,
                 updated_at=now))
     return rows
 
@@ -988,7 +1163,7 @@ def _dim_n_sample(rec: dict, name: str):
 
 def _score_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
     rows, now = [], dt.datetime.now().astimezone()
-    dim_hashes = _dim_hashes()      # 循环外算一次；含锚/成员/sign/上游 L1 定义
+    dim_hashes = {n: _dict_hash("L2", n) for n in DIMENSION_DEFS}  # 统一口径指纹
     for rec in wide.to_dict("records"):
         d = rec["trade_date"]
         if isinstance(d, pd.Timestamp):
@@ -1013,7 +1188,7 @@ def _score_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
                 extra.update(crowd_gate=c.get("gate"), k=c.get("k"),
                              partial=c.get("partial"))
             rows.append(dict(
-                market=MARKET, classification=CLASSIFICATION,
+                market=MARKET,
                 sector_code=rec["sw_code"], trade_date=d, dimension_code=name,
                 side=cfg["side"], score=score, coverage=cov, dispersion=0.0,
                 confidence=confidence_of(_dim_n_sample(rec, name), cov),
@@ -1030,7 +1205,7 @@ def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
     多态列 score / state / level / detail 按 biz_code 各填各的，其余恒 NULL。
     """
     rows, now = [], dt.datetime.now().astimezone()
-    hashes = _biz_hashes()      # 循环外算一次；每个 biz_code 一个独立指纹
+    hashes = {c: _dict_hash("L3", c) for c in BIZ_DEFS}  # 统一口径指纹
     for rec in wide.to_dict("records"):
         d = rec["trade_date"]
         if isinstance(d, pd.Timestamp):
@@ -1064,7 +1239,7 @@ def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
         rank_no = _get(rec, "rank") if applicable else None
         rank_n = _clean_value(rec.get("rank_n"))
         common = dict(
-            market=MARKET, classification=CLASSIFICATION,
+            market=MARKET,
             sector_code=rec["sw_code"], trade_date=d,
             coverage=cov, applicable=bool(applicable),
             confidence=confidence_of(_get(rec, "pe_n_sample"), cov),
@@ -1100,7 +1275,7 @@ def _biz_rows(wide: pd.DataFrame, start: dt.date, end: dt.date) -> list:
 # ── 写库 / 字典同步 ────────────────────────────────────────────────────────
 # L1/L2 的实体主键（不含 biz_code）；L3 长表主键另加 biz_code。
 # ⚠ 不要混用：给 L1/L2 的 conflict_cols 加 biz_code 会因列不存在直接报错。
-PK_COLS = ["market", "classification", "sector_code", "trade_date"]
+PK_COLS = ["market", "sector_code", "trade_date"]
 BIZ_PK_COLS = ["biz_code"] + PK_COLS
 
 
@@ -1114,25 +1289,17 @@ def _write_batched(conn, table: str, rows: list, conflict_cols: list) -> int:
 
 
 def sync_dict(conn) -> int:
-    """指标字典幂等 upsert（口径唯一真源在 INDICATOR_DEFS）。"""
-    rows = [dict(indicator_code=d["code"], indicator_name=d["indicator_name"],
-                 domain=d["domain"], side=d["side"], market_scope=MARKET,
-                 classification=CLASSIFICATION, unit=d["unit"], direction=d["direction"],
-                 freq=d["freq"], source=d["source"], formula=d["formula"],
-                 model_key=d["model_key"],
-                 params={"version": CALIB_VERSION},
-                 params_hash=_params_hash(d),
-                 min_periods=MIN_PERIODS if d["model_key"] == "M2" else 0,
-                 pit_capable=True, is_active=d["is_active"], remark=d["remark"],
-                 updated_at=dt.datetime.now().astimezone()) for d in INDICATOR_DEFS]
-    # 阶段 3：字典主键扩为 (market_scope, classification, indicator_code)，
-    # 冲突键必须同步带上市场与分类，否则 ON CONFLICT 匹配不到唯一约束直接报错。
-    # 只改冲突键，不改任何指标口径 → CN 读数与 params_hash 逐值不变。
+    """两张字典表幂等 upsert：一行一个领域概念，不区分 CN / HK。
+
+    口径唯一真源在 INDICATOR_DEFS / BIZ_DEFS；两市场实现差异由
+    `_per_market()` 落 params.per_market，由 `_dict_hash()` 统一指纹。
+    CN / HK 两侧 run() 调本函数写成同一批行（幂等，不互相覆盖）。
+    """
+    rows = _indicator_dict_rows()
     bulk_upsert(conn, "industry.indicator_dict", _clean_rows(rows),
-                conflict_cols=["market_scope", "classification", "indicator_code"])
-    # L3 业务指标字典（开放集合）：与 L1 字典同轮幂等 upsert。
+                conflict_cols=["indicator_code"])
     bulk_upsert(conn, "industry.business_dict", _clean_rows(_biz_dict_rows()),
-                conflict_cols=["market_scope", "classification", "biz_code"])
+                conflict_cols=["biz_code"])
     conn.commit()
     return len(rows)
 

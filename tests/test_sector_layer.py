@@ -313,11 +313,11 @@ class TestEngineeringGuards(unittest.TestCase):
         self.assertIn("CREATE SCHEMA IF NOT EXISTS industry", code)
         self.assertIn("def ensure_sector_schema", code)
 
-    def test_ddl_primary_keys_include_market_and_classification(self):
+    def test_ddl_primary_keys_market_only(self):
         schema = _read("sql/schema.sql")
-        self.assertIn("PRIMARY KEY (market, classification, sector_code, trade_date, indicator_code)", schema)
-        self.assertIn("PRIMARY KEY (market, classification, sector_code, trade_date, dimension_code)", schema)
-        self.assertIn("PRIMARY KEY (biz_code, market, classification, sector_code, trade_date)", schema)
+        self.assertIn("PRIMARY KEY (market, sector_code, trade_date, indicator_code)", schema)
+        self.assertIn("PRIMARY KEY (market, sector_code, trade_date, dimension_code)", schema)
+        self.assertIn("PRIMARY KEY (biz_code, market, sector_code, trade_date)", schema)
 
     def test_monitor_registered(self):
         src = _read("monitor_collector.py")

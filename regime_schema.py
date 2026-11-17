@@ -566,36 +566,34 @@ ALTER TABLE regime.indicator_value ADD COLUMN IF NOT EXISTS model_version VARCHA
     # ── 第④层 行业配置（阶段 1；与 sql/schema.sql 第 21~24 号表**逐字一致**）──
     #     生产：sector_layer.py（独立 systemd timer，工作日 19:10）
     #     口径：doc/industry_allocation_feasibility.md §3
+    #     ⚠ 字典表与 regime 同构：一行一个领域概念，市场差异落 params.per_market；
+    #       值表按 market 分行，CN / HK 共用同一套输出表。
     "sector_indicator_dict": """
 CREATE TABLE IF NOT EXISTS industry.indicator_dict (
-    indicator_code  VARCHAR(64)     NOT NULL,
+    indicator_code  VARCHAR(64)     PRIMARY KEY,
     indicator_name  VARCHAR(100)    NOT NULL,
     domain          VARCHAR(24)     NOT NULL,       -- TREND/VAL/FLOW/CROWD/FUND/BREADTH
     side            VARCHAR(12)     NOT NULL,       -- state=状态侧 / risk=风险侧
-    market_scope    VARCHAR(16)     NOT NULL DEFAULT 'CN',
-    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
+    market_scope    VARCHAR(16)     NOT NULL DEFAULT 'CN+HK',
     unit            VARCHAR(16),
     direction       VARCHAR(12)     NOT NULL,       -- 方向唯一真源，消费端不得二次翻转
     freq            VARCHAR(8)      NOT NULL DEFAULT 'day',
     source          VARCHAR(160),
     formula         TEXT,
     model_key       VARCHAR(8),                    -- M0~M8，见设计文档 §3.2
-    params          JSONB,
-    params_hash     VARCHAR(16),                   -- 口径变更触发历史重算
+    params          JSONB,                          -- per_market.{CN,HK} 实现差异 + 概念级参数
+    params_hash     VARCHAR(16),                   -- 口径变更触发历史重算（全市场统一）
     min_periods     INT             NOT NULL DEFAULT 0,
     pit_capable     BOOLEAN         NOT NULL DEFAULT TRUE,
     is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
-    remark          TEXT,                               -- 规范化三段式：【定义】是什么 /【判读】怎么看 /【数据】样本与断点（与 indicator_dict 同款）
+    remark          TEXT,
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-    -- 阶段 3：CN / HK 共用同一套指标 code，字典按市场+分类隔离，避免 HK 覆盖 CN 行
-    PRIMARY KEY (market_scope, classification, indicator_code)
+    updated_at      TIMESTAMPTZ     DEFAULT NOW()
 )
 """,
     "sector_indicator_value": """
 CREATE TABLE IF NOT EXISTS industry.indicator_value (
     market          VARCHAR(8)      NOT NULL,       -- CN / HK（禁止混合分位）
-    classification  VARCHAR(16)     NOT NULL,       -- SW_L1 / HS_L3
     sector_code     VARCHAR(20)     NOT NULL,
     trade_date      DATE            NOT NULL,
     indicator_code  VARCHAR(64)     NOT NULL,
@@ -608,7 +606,7 @@ CREATE TABLE IF NOT EXISTS industry.indicator_value (
     model_version   VARCHAR(16),                    -- = sector_indicator_dict.params_hash
     extra           JSONB,                          -- rank_n / pit_capable / label / crowd k
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (market, classification, sector_code, trade_date, indicator_code)
+    PRIMARY KEY (market, sector_code, trade_date, indicator_code)
 )
 """,
     "sector_indicator_value_idx": """
@@ -620,7 +618,6 @@ CREATE INDEX IF NOT EXISTS idx_sector_iv_date
     "sector_score_daily": """
 CREATE TABLE IF NOT EXISTS industry.dimension_value (
     market          VARCHAR(8)      NOT NULL,
-    classification  VARCHAR(16)     NOT NULL,
     sector_code     VARCHAR(20)     NOT NULL,
     trade_date      DATE            NOT NULL,
     dimension_code  VARCHAR(24)     NOT NULL,
@@ -633,7 +630,7 @@ CREATE TABLE IF NOT EXISTS industry.dimension_value (
     params_hash     VARCHAR(16),
     extra           JSONB,                          -- structure / anchor / crowd_gate / k
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (market, classification, sector_code, trade_date, dimension_code)
+    PRIMARY KEY (market, sector_code, trade_date, dimension_code)
 )
 """,
     "sector_score_daily_idx": """
@@ -645,28 +642,25 @@ CREATE INDEX IF NOT EXISTS idx_sector_score_date
     #   重名会让字典字面量的后者覆盖前者，导致新库 bootstrap 漏建第③层表。
     "industry_business_dict": """
 CREATE TABLE IF NOT EXISTS industry.business_dict (
-    market_scope    VARCHAR(16)     NOT NULL DEFAULT 'CN',
-    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
-    biz_code        VARCHAR(32)     NOT NULL,
+    biz_code        VARCHAR(32)     PRIMARY KEY,
     biz_name        VARCHAR(64)     NOT NULL,
     question        TEXT,
     side            VARCHAR(12)     NOT NULL,
     kind            VARCHAR(16)     NOT NULL,
+    market_scope    VARCHAR(16)     NOT NULL DEFAULT 'CN+HK',
     inputs          JSONB,
     params          JSONB,
     output_schema   JSONB,
     params_hash     VARCHAR(16),
     is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
     remark          TEXT,
-    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (market_scope, classification, biz_code)
+    updated_at      TIMESTAMPTZ     DEFAULT NOW()
 )
 """,
     "sector_biz_daily": """
 CREATE TABLE IF NOT EXISTS industry.business_value (
     biz_code        VARCHAR(32)     NOT NULL,
     market          VARCHAR(8)      NOT NULL,
-    classification  VARCHAR(16)     NOT NULL,
     sector_code     VARCHAR(20)     NOT NULL,
     trade_date      DATE            NOT NULL,
     score           NUMERIC(6,2),
@@ -679,7 +673,7 @@ CREATE TABLE IF NOT EXISTS industry.business_value (
     params_hash     VARCHAR(16),
     extra           JSONB,
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (biz_code, market, classification, sector_code, trade_date)
+    PRIMARY KEY (biz_code, market, sector_code, trade_date)
 )
 """,
     "sector_biz_daily_idx": """
@@ -693,7 +687,6 @@ CREATE INDEX IF NOT EXISTS idx_industry_biz_code_date
     "sector_constituent": """
 CREATE TABLE IF NOT EXISTS industry.constituent (
     market          VARCHAR(8)      NOT NULL DEFAULT 'CN',
-    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
     sector_code     VARCHAR(20)     NOT NULL,       -- 申万一级代码，如 801010
     stock_code      VARCHAR(20)     NOT NULL,       -- 项目格式 SH./SZ./BJ. + 6 位
     eff_from        DATE            NOT NULL,       -- = max(计入日期, 2021-12-13)
@@ -701,7 +694,7 @@ CREATE TABLE IF NOT EXISTS industry.constituent (
     weight          NUMERIC(8,4),                   -- 百分数（源原值，单行业合计≈100）
     source          VARCHAR(64)     NOT NULL DEFAULT 'akshare:index_component_sw',
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (market, classification, sector_code, stock_code, eff_from)
+    PRIMARY KEY (market, sector_code, stock_code, eff_from)
 )
 """,
     "sector_constituent_idx": """
@@ -715,7 +708,6 @@ CREATE TABLE IF NOT EXISTS industry.constituent_change (
     id              BIGSERIAL       PRIMARY KEY,
     snapshot_date   DATE            NOT NULL,
     market          VARCHAR(8)      NOT NULL DEFAULT 'CN',
-    classification  VARCHAR(16)     NOT NULL DEFAULT 'SW_L1',
     sector_code     VARCHAR(20)     NOT NULL,
     stock_code      VARCHAR(20)     NOT NULL,
     change_type     VARCHAR(12)     NOT NULL,       -- ADD / REMOVE / WEIGHT
@@ -723,7 +715,7 @@ CREATE TABLE IF NOT EXISTS industry.constituent_change (
     new_weight      NUMERIC(8,4),
     eff_from        DATE,
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    UNIQUE (snapshot_date, market, classification, sector_code, stock_code, change_type)
+    UNIQUE (snapshot_date, market, sector_code, stock_code, change_type)
 )
 """,
     "sector_constituent_change_idx": """
@@ -1154,13 +1146,13 @@ def apply_series_defs(rows: list, defs: dict) -> list:
 # 第④层表的 COMMENT（与 sql/schema.sql 第 21~24 号表逐字一致）
 _SECTOR_COMMENTS = [
     ("TABLE", "industry.indicator_dict",
-     "第④层行业指标字典（代码即字典：sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS 幂等 upsert）。⚠ 阶段3 起主键含 market_scope+classification：CN(SW_L1) 与 HK(HS_L3) 同名指标各占一行，冲突键必须带这两个字段"),
+     "第④层行业指标字典（代码即字典：sector_layer.sync_dict 一次性幂等 upsert）。与 regime 同构：主键仅 indicator_code，一行一个领域概念，market_scope 只声明适用范围，两市场实现差异落 params.per_market.{CN,HK}；同名 code 在 CN/HK 概念相同，计算方法与数据源不同不改变概念"),
     ("COLUMN", "industry.indicator_dict.direction",
      "high_good/high_risk/neutral；**方向只在此定义一次**，维度合成按 DIMENSION_DEFS.sign 翻转，消费端禁止二次翻转（§7.1）"),
     ("COLUMN", "industry.indicator_dict.model_key",
      "计算模型编号（设计文档 §3.2）：M1横截面分位 / M2时序分位 / M3相对强度 / M4归一滚动 / M5条件命中 / M6 PIT成分聚合 / M7快照差分 / M8自算指数"),
     ("COLUMN", "industry.indicator_dict.remark",
-     "规范化三段式（与 regime.indicator_dict 事实标准一致）：单行 定义：…　·　判读：…　·　数据：…（全角空格包围中点分隔），可扩展 口径：/⚠/已知限制：；无换行、无方括号标题。定义写公式+单位+值域，判读写高低位业务含义与联读，数据写起点/覆盖门禁/口径断点/跨市场可比性。⚠ 只改 remark 不进 params_hash、不触发历史重算；但代码即字典，须改 sector_layer.INDICATOR_DEFS / sector_layer_hk.HK_INDICATOR_DEFS，库内手改会被幂等 upsert 覆盖"),
+     "规范化三段式（与 regime.indicator_dict 事实标准一致）：单行 定义：…　·　判读：…　·　数据：…（全角空格包围中点分隔），可扩展 口径：/⚠/已知限制：；无换行、无方括号标题。定义写公式+单位+值域，判读写高低位业务含义与联读，数据写起点/覆盖门禁/口径断点/跨市场可比性。⚠ 只改 remark 不进 params_hash、不触发历史重算；但代码即字典，须改 sector_layer.INDICATOR_DEFS，库内手改会被幂等 upsert 覆盖"),
     ("TABLE", "industry.indicator_value",
      "第④层 L1 原子指标（行业×日×指标）。横截面分位与时序分位分列存放：阶段1估值/资金流仅27个快照日 << min_periods=250，时序分位一律 NULL 并写 n_sample，禁止用短样本分位填充"),
     ("COLUMN", "industry.indicator_value.extra",
@@ -1168,11 +1160,11 @@ _SECTOR_COMMENTS = [
     ("TABLE", "industry.dimension_value",
      "第④层 L2 维度读数（六维）。成员 <4 时按 §7.2 走「单锚」而非扁平等权（等权会让单成员 33% 超过 25% 上限）；CROWDING 走规则判定 score 恒 NULL，档位在 extra.crowd_gate；FUNDAMENTAL/BREADTH 阶段1 未启用"),
     ("TABLE", "industry.business_dict",
-     "第④层 L3 业务指标字典：一行一个业务指标，登记中文名、面向用户的问句、输入清单、输出契约与独立口径指纹。新增/下线指标只增删字典行，不改表结构"),
+     "第④层 L3 业务指标字典：一行一个业务指标，登记中文名、面向用户的问句、输入清单、输出契约与独立口径指纹。新增/下线指标只增删字典行，不改表结构。market_scope 只声明适用范围，市场差异落 params.per_market"),
     ("COLUMN", "industry.business_dict.output_schema",
      "多态列语义说明。⚠ score/state/level 是多态列，各 biz_code 语义不同，消费方必须先按 biz_code 过滤并校验本字段，禁止跨 biz 比较或聚合"),
     ("COLUMN", "industry.business_dict.is_active",
-     "false = 本期不产出值表行（如 HK 不排名）；不是漏采，前端应显示「本期不提供」并给出 reason"),
+     "false = 该概念全局下线；某市场本期不产出（如 HK 不排名）属实现层禁产，记在 params.per_market.HK，前端应显示「本期不提供」并给出 reason"),
     ("TABLE", "industry.business_value",
      "第④层 L3 业务读数（长表）：一行业一日一业务指标一行。状态侧/风险侧分离，**不产出单一综合分**；排序仅为当日横截面状态描述，前瞻 IC 未通过前不得升格为配置建议。⚠ 读任何字段前必须先按 biz_code 过滤并校验 business_dict.output_schema"),
     ("COLUMN", "industry.business_value.score",
@@ -1203,40 +1195,68 @@ _SECTOR_COMMENTS = [
 ]
 
 
-def _migrate_sector_dict_pk(conn, verbose: bool = False) -> bool:
-    """阶段 3：把 sector_indicator_dict 的 PK 幂等扩成 (market_scope, classification, indicator_code)。
+# 第④层 7 张表的新主键 / 唯一约束（去掉 classification 后的形态）
+_SECTOR_V2_KEYS = (
+    ("industry.indicator_dict", "PRIMARY KEY", "indicator_code"),
+    ("industry.indicator_value", "PRIMARY KEY", "market, sector_code, trade_date, indicator_code"),
+    ("industry.dimension_value", "PRIMARY KEY", "market, sector_code, trade_date, dimension_code"),
+    ("industry.business_dict", "PRIMARY KEY", "biz_code"),
+    ("industry.business_value", "PRIMARY KEY", "biz_code, market, sector_code, trade_date"),
+    ("industry.constituent", "PRIMARY KEY", "market, sector_code, stock_code, eff_from"),
+    ("industry.constituent_change", "UNIQUE", "snapshot_date, market, sector_code, stock_code, change_type"),
+)
 
-    存量库（阶段 1/2 建的）PK 只有 indicator_code；HK 侧复用同名 SEC.* 指标 code
-    会覆盖 CN 字典行。`CREATE TABLE IF NOT EXISTS` 不会改已有表 → 必须显式迁移。
-    幂等：已是复合主键则直接返回 False；表不存在（随后由 DDL 创建）也返回 False。
+
+def _migrate_sector_schema_v2(conn, verbose: bool = False) -> bool:
+    """存量库自愈：删 classification 列 + 按新形态重建主键/唯一约束（幂等）。
+
+    `CREATE TABLE IF NOT EXISTS` 不会改已有表结构，故迁移必须显式执行：
+      · 字典表（indicator_dict / business_dict）：旧库 CN/HK 各一行同 code，
+        直接清空后由 `sector_layer.sync_dict` 按「一行一概念」重写（字典是代码投影）。
+      · 值表：classification 恒等于 f(market)，删列后新键不会撞行，数据保留。
+      · constituent / constituent_change：PIT 版本链不可重建，只改结构、保留数据。
+
+    ⚠ 逐表独立事务（每表 ALTER 后 commit）：旧实现用 information_schema.columns
+      在一个大事务里锁住全部 7 张表再逐表升级 AccessExclusiveLock，与并发的
+      ensure_sector_schema 按不同顺序锁表会交叉死锁（实测稳定复现）。改为按
+      _SECTOR_V2_KEYS 固定顺序、每张表单独提交，把锁窗口缩到单表单事务。
+    幂等：目标表已无 classification 列则跳过。
     """
-    with conn.cursor() as cur:
-        cur.execute("SELECT to_regclass('industry.indicator_dict')")
-        if cur.fetchone()[0] is None:
-            return False
-        cur.execute("""
-            SELECT c.conname, array_agg(a.attname ORDER BY k.ord)
-            FROM pg_constraint c
-            CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
-            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
-            WHERE c.conrelid = 'industry.indicator_dict'::regclass
-              AND c.contype = 'p'
-            GROUP BY c.conname
-        """)
-        row = cur.fetchone()
-        if row and list(row[1] or []) == ["market_scope", "classification", "indicator_code"]:
-            return False
-        if not row:
-            return False        # 无主键的异常表不在这里强行改，交给 _schema_diff 报告
-        name = row[0]
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-            raise RuntimeError(f"sector_indicator_dict 主键约束名异常：{name!r}")
-        cur.execute(f"ALTER TABLE industry.indicator_dict DROP CONSTRAINT {name}")
-        cur.execute("ALTER TABLE industry.indicator_dict "
-                    "ADD PRIMARY KEY (market_scope, classification, indicator_code)")
-    if verbose:
-        print("  ✅ sector_indicator_dict 主键已扩为 (market_scope, classification, indicator_code)")
-    return True
+    dict_tables = {"indicator_dict", "business_dict"}
+    changed = False
+    for table, kind, cols in _SECTOR_V2_KEYS:
+        short = table.split(".", 1)[1]
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM pg_attribute a
+                JOIN pg_class c ON c.oid=a.attrelid
+                JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname='industry' AND c.relname=%s
+                  AND a.attname='classification' AND NOT a.attisdropped
+            """, (short,))
+            if not cur.fetchone():
+                continue
+            cur.execute("""
+                SELECT c.conname FROM pg_constraint c
+                WHERE c.conrelid = %s::regclass AND c.contype IN ('p','u')
+            """, (table,))
+            names = [r[0] for r in cur.fetchall()]
+        for name in names:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise RuntimeError(f"{table} 约束名异常：{name!r}")
+            with conn.cursor() as cur:
+                cur.execute(f'ALTER TABLE {table} DROP CONSTRAINT "{name}"')
+            conn.commit()               # 单表约束删除后立即提交，释放锁
+        with conn.cursor() as cur:
+            if short in dict_tables:
+                cur.execute(f"DELETE FROM {table}")
+            cur.execute(f"ALTER TABLE {table} DROP COLUMN classification")
+            cur.execute(f"ALTER TABLE {table} ADD {kind} ({cols})")
+        conn.commit()                   # 单表改完立即提交
+        changed = True
+        if verbose:
+            print(f"  ✅ {table} 已迁移为 {kind} ({cols})")
+    return changed
 
 
 def ensure_sector_schema(conn=None, verbose: bool = False) -> None:
@@ -1244,7 +1264,8 @@ def ensure_sector_schema(conn=None, verbose: bool = False) -> None:
 
     不调 ensure_schema：后者会执行 _DDL 全部 60+ 项并重刷全库注释，
     而日频计算只需要本层新表存在即可。
-    ⚠ 阶段 3 新增：建表后跑字典复合主键迁移（存量库自愈），CN / HK 共用一张字典表。
+    ⚠ 建表后跑 `_migrate_sector_schema_v2`（存量库结构自愈）：字典回归一行一概念、
+      值表按 market 分行。字典行由 `sync_dict` 重写，值表数据保留待全量重算。
     """
     from db import get_conn
 
@@ -1258,10 +1279,10 @@ def ensure_sector_schema(conn=None, verbose: bool = False) -> None:
             cur.execute(_DDL[name])
             if verbose:
                 print(f"  ✅ {name}")
-        _migrate_sector_dict_pk(conn, verbose=verbose)
         for kind, target, text in _SECTOR_COMMENTS:
             cur.execute(f"COMMENT ON {kind} {target} IS %s", (text,))
-    conn.commit()
+    conn.commit()                       # 建表/注释先提交，不与迁移大事务叠锁
+    _migrate_sector_schema_v2(conn, verbose=verbose)
 
 
 def ensure_schema(conn=None, verbose: bool = False) -> None:
