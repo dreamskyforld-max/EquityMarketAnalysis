@@ -21,7 +21,8 @@
      不可能混入 CN；测试另有静态断言钉住。
    · 全部读数 `pit_capable=false` / `confidence=low`（成分是 stock_sector 当前快照）。
    · 113 个恒生三级行业 vs CN 31 个申万一级，字典 remark 与 extra 双处标注粒度差异。
-   · 独立 systemd `sector-layer-hk.timer`（工作日 19:20），不挂 market_scheduler（R4/R5）。
+   · 与 CN 共用 `sector-layer.service`（工作日 19:10），CN 算完再串行算 HK；
+     不挂 market_scheduler（R4/R5）。
 
 CLI:
     python3 sector_layer_hk.py --dry-run
@@ -292,9 +293,14 @@ HK_BIZ_DEFS["SEC.BIZ.RANK"]["output_schema"] = dict(
     level="恒 NULL：阶段 3 用户决策 HK 首期不产出跨行业排名")
 
 
-# ── 口径指纹（含市场，保证与 CN 同 code 指标的 hash 不同）─────────────────────
+# ── 旧 L1 原子口径指纹（仅供旧版 _hk_dim_spec / 回归测试使用）─────────────────
 def _hk_params_hash(d: dict) -> str:
-    """HK L1 原子口径指纹（payload 含市场与分类，保证与 CN 同 code 指标不同）。"""
+    """HK L1 原子口径指纹（旧版 payload，不含市场/分类）。
+
+    值表 model_version 与字典 params_hash 已统一走 sector_layer._dict_hash；
+    本函数只供 _hk_dim_spec 的 upstream 摘要与 test_sector_params_hash 的
+    L1 payload 敏感性断言使用，不再参与任何写库。
+    """
     payload = "|".join([d["code"], d["unit"],
                         d["direction"], d["formula"], d["model_key"], CALIB_VERSION])
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
@@ -398,27 +404,70 @@ def _load_index_daily(conn, start: dt.date, end: dt.date) -> pd.DataFrame:
     return read_sql(conn, sql, params=[w, end])
 
 
-def _precompute_amt_share(conn, end: dt.date) -> pd.DataFrame:
-    """轻量 3 列全史 → 成交额占比 + 10 年 as-of 时序分位（与 CN 同款，独立数据源）。"""
-    from market_state_daily import _expanding_percentile
-    sql = """
-        SELECT trade_date, sector_code, amount
-        FROM industry.hk_index_daily
-        WHERE trade_date <= %s AND amount IS NOT NULL
-        ORDER BY sector_code, trade_date
+def _precompute_amt_share(conn, start: dt.date, end: dt.date) -> pd.DataFrame:
+    """3 列全史 → 成交额占比 + 10 年 as-of 时序分位（与 CN 同款，独立数据源）。
+
+    ⚠ R3（2026-11-17）：原实现一次读 69 万行 × 3 列再 groupby.transform，
+      `expanding` 的有序 buf 副本把峰值推到 368MB（服务上限 512M、目标 200M）。
+      分位与占比都可按行业独立计算（分母是「当日全部行业」需一次全局和），
+      改为：① 一次读当日分母映射（轻量）；② 按行业分批读 + 批内算 + **只保留
+      trade_date >= start 的结果行**（历史仅用于计算分位，不需返回给增量窗口）。
+      逐值语义不变（每行业的分位只依赖本行业历史），峰值与总行数脱钩。
+
+      `start` 由调用方传增量窗口起点；全量回填时 start=2000-01-03 会保留全史。
     """
-    df = read_sql(conn, sql, params=[end])
+    from market_state_daily import _expanding_percentile
+
     cols = ["trade_date", "sector_code", "amt_share", "amt_share_pct", "amt_share_n"]
-    if df.empty:
+    # ① 全史当日分母：只取两列（69 万行 × 2），聚合成 ~6,500 行字典后释放
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT trade_date, sum(amount) AS total
+            FROM industry.hk_index_daily
+            WHERE trade_date <= %s AND amount IS NOT NULL
+            GROUP BY trade_date
+        """, (end,))
+        denom = {r[0]: float(r[1]) for r in cur.fetchall() if r[1]}
+    if not denom:
         return pd.DataFrame(columns=cols)
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-    df["amt_share"] = df["amount"] / df.groupby("trade_date")["amount"].transform("sum")
-    g = df.groupby("sector_code")["amt_share"]
-    df["amt_share_pct"] = g.transform(
-        lambda s: _expanding_percentile(s, window=ROLL_WINDOW, min_periods=MIN_PERIODS))
-    df["amt_share_n"] = g.transform(
-        lambda s: s.rolling(ROLL_WINDOW, min_periods=1).count())
-    return df[cols]
+
+    # ② 按行业分批：每批只持有 10 个行业的全史（约 6 万行），算完即释放
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT sector_code FROM industry.hk_index_daily
+            WHERE trade_date <= %s AND amount IS NOT NULL
+            ORDER BY sector_code
+        """, (end,))
+        sectors = [r[0] for r in cur.fetchall()]
+
+    parts = []
+    for i in range(0, len(sectors), 10):
+        batch = sectors[i:i + 10]
+        sql = """
+            SELECT trade_date, sector_code, amount
+            FROM industry.hk_index_daily
+            WHERE trade_date <= %s AND amount IS NOT NULL
+              AND sector_code = ANY(%s)
+            ORDER BY sector_code, trade_date
+        """
+        df = read_sql(conn, sql, params=[end, batch])
+        if df.empty:
+            continue
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+        df["amt_share"] = df["amount"].astype(float) / df["trade_date"].map(denom)
+        # ⚠ 必须按行业分组算：批内 10 个行业混在一起传会让滚动窗口跨行业串样本
+        # （实测分位差 21.8，口径错误）。原实现的 groupby.transform 天然按行业隔离。
+        g = df.groupby("sector_code", sort=False)["amt_share"]
+        df["amt_share_pct"] = g.transform(
+            lambda s: _expanding_percentile(s, window=ROLL_WINDOW, min_periods=MIN_PERIODS))
+        df["amt_share_n"] = g.transform(
+            lambda s: s.rolling(ROLL_WINDOW, min_periods=1).count())
+        # 只保留窗口内结果；历史行只参与本行业分位计算，不再驻留
+        parts.append(df.loc[df["trade_date"] >= start, cols])
+        del df
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    return pd.concat(parts, ignore_index=True)
 
 
 # ── 计算主体 ────────────────────────────────────────────────────────────────
@@ -814,7 +863,7 @@ def run(codes=None, ctx=None, start: dt.date = None, end: dt.date = None,
                 return {"skipped": "start > end（上游数据未就绪）"}
 
             stats["dict_rows"] = sync_dict_hk(conn)
-            amt = _precompute_amt_share(conn, end)
+            amt = _precompute_amt_share(conn, start, end)
             stats.update(iv=0, score=0, biz=0, chunks=0)
             for cs, ce in _chunks(start, end):
                 raw = _load_index_daily(conn, cs, ce)

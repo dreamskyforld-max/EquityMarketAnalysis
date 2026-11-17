@@ -363,24 +363,19 @@ class TestEngineeringGuards(unittest.TestCase):
         self.assertIn('"build_sector_hierarchy.py"', _read("market_scheduler.py"))
         self.assertIn("18, \"minute\": 30", _read("market_scheduler.py"))
 
-    def test_hk_oneshot_unit_has_six_limits(self):
-        src = _read("system/sector-layer-hk.service")
-        for key in ("MemoryMax=512M", "MemorySwapMax=0", "RuntimeMaxSec=",
-                    "Nice=", "IOSchedulingPriority=", "OOMScoreAdjust="):
-            with self.subTest(key=key):
-                self.assertIn(key, src)
-        self.assertIn("Type=oneshot", src)
-        self.assertIn("sector_layer_hk.py", src)
-        self.assertNotIn("\n[Install]", src)
+    def test_hk_runs_after_cn_in_same_unit(self):
+        src = _read("system/sector-layer.service")
+        cn = src.index("sector_layer.py")
+        hk = src.index("sector_layer_hk.py")
+        self.assertLess(cn, hk)          # CN 先、HK 后，systemd oneshot 严格串行
+        self.assertEqual(src.count("ExecStart="), 2)
+        self.assertNotIn("ExecStart=-", src)   # 不做失败特殊处理
+        for f in ("system/sector-layer-hk.service", "system/sector-layer-hk.timer"):
+            self.assertFalse(os.path.exists(f))
 
-    def test_timer_wired_and_staggered_from_cn(self):
-        t = _read("system/sector-layer-hk.timer")
-        self.assertIn("OnCalendar=Mon-Fri 19:20:00", t)
-        self.assertIn("Unit=sector-layer-hk.service", t)
-        self.assertIn("sector-layer-hk.timer", _read("deploy.sh"))
-        b = _read("bootstrap.sh")
-        self.assertIn("sector-layer-hk.service sector-layer-hk.timer", b)
-        self.assertIn("systemctl enable --now sector-layer-hk.timer", b)
+    def test_no_hk_timer_deploy(self):
+        self.assertNotIn("sector-layer-hk.timer", _read("deploy.sh"))
+        self.assertNotIn("sector-layer-hk", _read("bootstrap.sh"))
 
     def test_not_in_scheduler(self):
         src = _read("market_scheduler.py")

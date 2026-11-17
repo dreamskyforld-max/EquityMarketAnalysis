@@ -132,7 +132,7 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
      {"hour": "7,17", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
 
     # 南向资金 → daily_ggt_hold；08:00 昨日兜底 / 19:00 盘后终值（后者属 P4，
-    # 是 sector-layer-hk.timer 19:20 的直接上游，不可后移）。
+    # 是 sector-layer.service 中 HK 计算的直接上游，不可后移）。
     ("南向资金", "get_south_flow.py",
      {"hour": "8,19", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
 
@@ -226,7 +226,7 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     # 45 天增量窗口能补齐数据，但不能替代正确排序（顺序错时当日读数慢一天且任务仍记 ok）。
     ("市场状态计算", "market_state_daily.py",
      {"hour": 18, "minute": 45, "day_of_week": "mon-fri"}, None, True, None, 1800),
-    # 19:10 sector-layer.timer / 19:20 sector-layer-hk.timer：独立 systemd unit，
+    # 19:10 sector-layer.service（CN + HK 串行，单一 systemd unit）：
     # 不在此列表；全量画像 compute-profile.timer 17:30 亦已迁出（资源规范 R4/R5）。
 
     # ══ P4 夜间 T+1 19:30–20:30 · 不参与当日计算，供次日重算 ═══════════════

@@ -256,8 +256,8 @@ _SEED_TABLE_CONFIG = [
 # 只有连续 ≥1.5 天没跑（如任务被 OOM 杀掉、timer 失效）才告警。
 _SEED_TASK_CONFIG = [
     ("全量画像计算", 1440, "compute-profile.timer 每日 17:30（独立 systemd 单元）"),
-    ("行业配置计算", 1440, "sector-layer.timer 工作日 19:10（独立 systemd 单元，第④层）"),
-    ("行业配置计算HK", 1440, "sector-layer-hk.timer 工作日 19:20（独立 systemd 单元，第④层阶段3）"),
+    ("行业配置计算", 1440, "sector-layer.timer 工作日 19:10（单一 systemd 单元，第④层 CN + HK 串行）"),
+    ("行业配置计算HK", 1440, "同一 sector-layer.service 的第二个 ExecStart，CN 完成后执行"),
 ]
 
 
@@ -333,7 +333,7 @@ _REGIME_TABLE_CONFIG = [
      "market_state_daily（逐行业横截面，18:45 计算层写入）", True),
     ("regime", "sector_valuation_snapshot", "updated_at", "day", 1, 0,
      "get_sector_valuation（行业估值快照，18:15；源无历史，漏采即永久缺失）", True),
-    # 第④层行业热点计算层（industry 域；sector_layer.py，sector-layer.timer 19:10）
+    # 第④层行业热点计算层（industry 域；sector_layer.py，sector-layer.service 19:10 第一个 ExecStart）
     ("industry", "indicator_dict", "updated_at", "lowfreq", 30, 0,
      "sector_layer（L1 指标字典，每次运行幂等 upsert）", True),
     ("industry", "business_dict", "updated_at", "lowfreq", 30, 0,
@@ -351,7 +351,7 @@ _REGIME_TABLE_CONFIG = [
      "get_sector_constituent（PIT 版本链，18:05；事件驱动，无变更日不写）", True),
     ("industry", "constituent_change", "created_at", "lowfreq", 7, 0,
      "get_sector_constituent（成分变更日志，18:05；事件驱动）", True),
-    # 第④层阶段 3 / D4：HK 行业日聚合与自算指数（sector-layer-hk.timer 工作日 19:20）。
+    # 第④层阶段 3 / D4：HK 行业日聚合与自算指数（同一 sector-layer.service 的第二个 ExecStart）。
     # ⚠ 按 trade_date 判新鲜度；CN/HK 输出共用表，表级监控按 CN 日历（见下方已知残差）。
     ("industry", "hk_index_daily", "trade_date", "day", 1, 0,
      "hk_sector_index（阶段3 自算行业指数，19:20；按 trade_date 判新鲜度）", True),

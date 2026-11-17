@@ -1,4 +1,4 @@
-# 行业热点（第④层）· 数据架构设计文档
+# 行业热点· 数据架构设计文档
 
 | 项 | 内容 |
 |---|---|
@@ -11,12 +11,6 @@
 | 适用范围 | 第④层「行业热点」数据底座与三层指标体系（L1 原子 / L2 维度 / L3 业务） |
 | 实现载体 | `sector_layer.py`（CN）、`sector_layer_hk.py`（HK）、`sector_stage2_agg.py`、`hk_sector_index.py`、`get_constituent.py` |
 
-> ⚠ **规格审查声明（v1.2）**：v1.0 曾把上位设计稿的**规划口径**当作生效规格，已逐项对照代码修正：闸门按市场分类、`applicable` 判定式、L1 的 `coverage` / `quality` / `n_sample` / `extra.pit_capable` 实际取值、`rank_n` 口径、L2/L3 `params_hash` 的实际 payload。**凡本文与代码冲突，以代码为准**。
-> v1.1 曾把两件事并列登记为「工程缺口」，复核后性质不同，v1.2 分别处置：
-> ① **L2/L3 改锚不换 `params_hash` 是真实机制缺陷** → 已修复，指纹改为纳入结构参数 + 上游 L1 定义 + 闸门阈值（§2.2）；
-> ② **`SHORT_SAMPLE` 不产出闸门是有意设计**，不是遗漏 → 撤回缺陷定性，改按设计意图说明（§6.3）。短样本信息由 L1 `quality` 与 L2/L3 `confidence` 完整承载，未丢失。
->
-> 🔴 **v1.3 结构变更（本次）**：① 新建独立 `industry` 域，第④层 7 张专属表迁入并去前缀，另新建 `business_dict`，域内共 8 张（`indicator_dict` / `indicator_value` / `dimension_value` / `business_dict` / `business_value` / `constituent` / `constituent_change` / `hk_index_daily`）；② **5 张共用输入表仍留 `regime`**（`sector_daily` / `sector_valuation_snapshot` / `sector_fund_flow` / `sector_mapping` / `analyst_forecast_snapshot`），由第③层读写，本层跨 schema 只读；③ L3 旧宽表 `business_value` → 长表 `industry.business_value` + 字典 `industry.business_dict`，`biz_code` 进主键，业务指标成为**开放集合**（增减只改字典行，不加列）。
 
 ---
 
@@ -118,9 +112,9 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 | `dimension_code` | 中文名称（建议） | 面向用户的一句话问句（建议） |
 |---|---|---|
-| `TREND` | 行业趋势与相对强弱 | 这个行业最近相对其他行业是强还是弱？位置在改善还是转差？ |
+| `TREND` | 行业趋势与相对强弱 | 这个行业最近相对其他行业是强还是弱？ |
 | `FLOW` | 行业资金流向 | 钱是在往这个行业流，还是在往外撤？ |
-| `VALUATION` | 行业估值水位 | 这个行业现在比别的行业贵还是便宜？ |
+| `VALUATION` | 行业估值水位 | 这个行业在同日行业估值光谱上处在什么位置？ |
 | `CROWDING` | 行业拥挤度 | 这个行业是不是已经被资金挤得太拥挤？ |
 | `FUNDAMENTAL` | 行业基本面与盈利预期 | 行业内公司盈利在变好还是变差？分析师预期在上调还是下调？ |
 | `BREADTH` | 行业内部参与广度 | 上涨是全行业一起涨，还是只靠少数几只股票撑着？ |
@@ -157,7 +151,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 | 市场 | `CALIB_VERSION` | 口径段 | 说明 |
 |---|---|---|---|
 | CN | `s2.1` | 阶段 1 `s1.1` → 阶段 2 `s2.1` | 六维启用、coverage 分母 3→6、拥挤 k=2→k=3、`PARTIAL_STATE` 消失（六维齐备时）。**两期 L2/L3 读数不可直接比较**，须按 `params_hash` / `extra.calib_version` 分段 |
-| HK | `hk1.0` | 独立版本线 | payload 含市场，保证与 CN 同 code 指标的 `params_hash` 不同；HK 不改动 CN 的 `s2.1` |
+| HK | `hk1.0` | 独立口径实现 | 两市场实现差异统一纳入字典 `params.per_market.{CN,HK}` 与单一 `params_hash`；`hk1.0` 只作值表 `extra.calib_version` 标注，不再产生独立 hash 线 |
 
 > ⚠ **读到任何一行先做两件事**：① `model_version`（L1）/ `params_hash`（L2/L3）与对应字典不等 → 旧口径数据；② 值表 `market` 是否属于目标市场。
 > ⚠ `remark` **不进** `params_hash`：只改文案不换指纹、不触发历史重算；但「代码即字典」，库内手改会被 `sync_dict` / `sync_dict_hk` 每轮幂等 upsert 覆盖，必须改代码中的定义表。
@@ -322,7 +316,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 2. **A/H 分离**：`market` 是值表主键列；不得在同一查询里对 CN/HK 混合排名、混合分位、混合校准。
 3. **历史深度分级**：长历史（价格类，1999 起 / HK 2000 起）可出时序分位；快照类（估值 / 资金流 / 一致预期，2026-09-30 起仅 27 / 27 / 25 日）首期**只出横截面分位**，时序分位置 NULL 并写 `n_sample`。
 4. **分母时变**：CN `rank_n` 16→28→31（早期有效行业数）、HK 109~112；同源占比分母取「当日有效行业合计」，早期段不与后期直接比排名或成交额占比。
-5. **短样本不伪装**：短样本以 L1 `quality='short_sample'` + L2/L3 `confidence='low'` 承载，**不产出 `gate_flags`**（§6.3）。这是有意设计：闸门是屏蔽结论的硬开关，短样本是降置信的软标记；若按全局 `n_sample<750` 触发闸门，快照期所有行业会 `applicable=false`、系统不产出任何排名。
+5. **短样本不伪装**：短样本以 L1 `quality='short_sample'` + L2/L3 `confidence='low'` 承载，**不产出 `gate_flags`**（§6.8）。这是有意设计：闸门是屏蔽结论的硬开关，短样本是降置信的软标记；若按全局 `n_sample<750` 触发闸门，快照期所有行业会 `applicable=false`、系统不产出任何排名。
 
 ---
 
@@ -465,9 +459,9 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 | 中文名称（建议） | `dimension_code` | 侧 | 面向用户的一句话问句（建议） | 极性（高分=） | 聚合结构 | CN 锚 / 成员 | HK 锚 / 成员 | 可用性 |
 |---|---|---|---|---|---|---|---|---|
-| 行业趋势与相对强弱 | `TREND` | 状态 | 这个行业最近相对其他行业是强还是弱？位置在改善还是转差？ | 相对更强 | 单锚 | `SEC.TREND.RS_XSEC_PCT` | 同 | CN/HK 均可用 |
+| 行业趋势与相对强弱 | `TREND` | 状态 | 这个行业最近相对其他行业是强还是弱？ | 相对更强 | 单锚 | `SEC.TREND.RS_XSEC_PCT` | 同 | CN/HK 均可用 |
 | 行业资金流向 | `FLOW` | 状态 | 钱是在往这个行业流，还是在往外撤？ | 资金更强 | 单锚 | `SEC.FLOW.XSEC_PCT` | ⛔ `unavailable` | HK 仅有 136 日南向，单锚不成立 |
-| 行业估值水位 | `VALUATION` | 风险 | 这个行业现在比别的行业贵还是便宜？ | 更贵 | 单锚 | `SEC.VAL.PE_XSEC_PCT` | 同（自算调和 PE） | HK 2002 起；CN 快照仅 27 日 |
+| 行业估值水位 | `VALUATION` | 风险 | 这个行业在同日行业估值光谱上处在什么位置？ | 更贵 | 单锚 | `SEC.VAL.PE_XSEC_PCT` | 同（自算调和 PE） | HK 2002 起；CN 快照仅 27 日 |
 | 行业拥挤度 | `CROWDING` | 风险 | 这个行业是不是已经被资金挤得太拥挤？ | 更拥挤 | **规则判定** | `HIT_CNT` + `GATE` | 同（k=2） | `score` 恒 NULL，档位在 `extra.crowd_gate` |
 | 行业基本面与盈利预期 | `FUNDAMENTAL` | 状态 | 行业内公司盈利在变好还是变差？分析师预期在上调还是下调？ | 更改善 | 4 成员等权 | ROE / 净利同比 / 改善宽度 / 修正宽度 | ⛔ `unavailable` | CN 起点 2021-12-13；HK 财务无公告日期 |
 | 行业内部参与广度 | `BREADTH` | 状态 | 上涨是全行业一起涨，还是只靠少数几只股票撑着？ | 更健康 | 4 成员等权 | 4 个 F 组原子 | 同 | 需 60 日暖机 |
@@ -487,7 +481,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 | 块 | 内容 |
 |---|---|
-| **定义** | 中文名称：行业趋势与相对强弱；编码 `TREND`；状态侧；**问句：这个行业最近相对其他行业是强还是弱？位置在改善还是转差？**；`score` 0–100，高分 = 相对更强；粒度 `(market, sector_code, trade_date, TREND)`；CN / HK 均产出。**不回答**：未来涨跌、绝对涨跌幅度（那是 `RET_20D` 原子）、大盘相对强弱 |
+| **定义** | 中文名称：行业趋势与相对强弱；编码 `TREND`；状态侧；**问句：这个行业最近相对其他行业是强还是弱？**；`score` 0–100，高分 = 相对更强；粒度 `(market, sector_code, trade_date, TREND)`；CN / HK 均产出。**不回答**：未来涨跌、绝对涨跌幅度（那是 `RET_20D` 原子）、大盘相对强弱 |
 | **输入** | `industry.indicator_value` 的 `SEC.TREND.RS_XSEC_PCT`（相对强度横截面分位，`percentile_xsec`）；校验项 `RS_MOM_20D` / `RRG_QUADRANT` / `MOM_RANK` 仍落 L1，**不进 score** |
 | **计算模型** | **原理**：相对强弱是横截面概念，用「行业 20 日收益 − 当日有效行业等权均值」（M3）作原始量，再取当日横截面中位秩分位（M1）。选单锚而非多成员平均，是因为 RS 的水平 / 变化 / 排名是同一现象的不同读法，平均会把权重退化成「写了几个指标」。<br>**公式**：`score = p_xsec(RS_20D)`（M1：`100×(n_less + 0.5·n_equal)/n_valid`）；`sign=+1` 不翻向。<br>**参数**：`XSEC_MIN_N=10`（有效行业不足不给分位）；`ROLL_WINDOW=2520` / `MIN_PERIODS=250`（仅对 M2 类原子生效）；锚 code 登记在 `DIMENSION_DEFS["TREND"].anchor`。<br>**落地形态**：`df["dim_TREND"] = _anchor_pct("SEC.TREND.RS_XSEC_PCT")`。<br>**门禁**：锚为 NULL → `score=NULL`、`coverage=0`、`confidence=low` |
 | **输出** | `industry.dimension_value`：`score`（0–100，可空）、`side='state'`、`coverage`（0 或 1）、`dispersion=0.0`、`confidence`、`members_used=["SEC.TREND.RS_XSEC_PCT"]`、`params_hash`、`extra={"structure":"single_anchor","anchor":"SEC.TREND.RS_XSEC_PCT","members":[...] }`。下游接口：参与 L3 `state_side` 均值 |
@@ -507,7 +501,7 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 | 块 | 内容 |
 |---|---|
-| **定义** | 中文名称：行业估值水位；编码 `VALUATION`；**风险侧**；**问句：这个行业现在比别的行业贵还是便宜？**；`score` 0–100，**高分 = 更贵（风险更高）**；CN / HK 均产出。**不回答**：便宜是否值得买、能否用低估值抵消拥挤 |
+| **定义** | 中文名称：行业估值水位；编码 `VALUATION`；**风险侧**；**问句：这个行业在同日行业估值光谱上处在什么位置？**；`score` 0–100，**高分 = 更贵（风险更高）**；CN / HK 均产出。**不回答**：便宜是否值得买、能否用低估值抵消拥挤 |
 | **输入** | CN：`SEC.VAL.PE_XSEC_PCT`（PE横截面分位），上游 `regime.sector_valuation_snapshot.pe_ttm`（2026-09-30 起 27 个快照日）；HK：`SEC.VAL.PE_XSEC_PCT`，上游 `hk_index_daily.pe_agg`（市值加权调和 PE，2002 起）。校验项 `PB_XSEC_PCT` / `REL_TO_MARKET` / `PE_TS_PCT` / `INTRA_DISPERSION` 不进 score |
 | **计算模型** | **原理**：官方快照只有当前横截面、无历史序列，故首期只做「同日同市场内比贵贱」的横截面分位（M1），不做「比自己历史」的时序分位（M2 需 250 观测）。用 PE 单锚避免与 PB / 相对市场比值重复计权。<br>**公式**：`score = p_xsec(pe)`，`direction='high_risk'`，`sign=+1`（PE 越高分位越高，天然对齐「高分=更贵」）。<br>**参数**：`XSEC_MIN_N=10`；`MIN_PERIODS=250`（`PE_TS_PCT` 未达标恒 NULL）；HK `CAP_START=2002-01-01`（之前覆盖率 <6% → `BREAK` 闸门）。<br>**落地形态**：`_anchor_pct("SEC.VAL.PE_XSEC_PCT")`。<br>**门禁**：锚 NULL → `score=NULL`；CN 快照短样本 → `confidence=low` |
 | **输出** | `side='risk'`、`score`、`coverage`、`confidence`、`members_used=["SEC.VAL.PE_XSEC_PCT"]`、`extra.structure='single_anchor'`。**这是 L3 `risk_side` 的唯一来源** |
@@ -568,34 +562,90 @@ L3 业务指标  industry.business_value + industry.business_dict
 
 > 🔴 **v1.3 结构变更**：L3 由宽表（`business_value`，一行业一日一行多列）改为**长表** `industry.business_value`（一行业一日一业务指标一行），并新增 `industry.business_dict` 字典。旧设计把设计稿 §1.3 的 5 类业务交付物压成一行多列，没有 `biz_code`、无法各自版本化 / 重算 / 增减；现按业务指标编码分行，**新增或下线业务指标只增删字典行与值表行，不加表字段**。代码真源为 `sector_layer.BIZ_DEFS` / `sector_layer_hk.HK_BIZ_DEFS`。
 
-### 6.0 业务指标字典（`industry.business_dict`）
+### 6.0 五项业务指标总览（章首索引）
 
-| `biz_code` | 中文名称（本文补写建议） | 面向用户的一句话问句（本文补写建议） | `kind` | 主输出列 | CN / HK |
-|---|---|---|---|---|---|
-| `SEC.BIZ.STATE_SIDE` | 状态侧热度 | 这个行业当前整体状态在同日所有行业中偏强还是偏弱？ | `continuous` | `score` | ✅ / ✅ |
-| `SEC.BIZ.RISK_SIDE` | 风险侧水平 | 这个行业当前估值风险高不高？ | `continuous` | `score` | ✅ / ✅ |
-| `SEC.BIZ.QUADRANT` | 状态象限 | 状态与风险组合起来，当前属于哪一类局面？ | `enum` | `state` | ✅ / ✅ |
-| `SEC.BIZ.RANK` | 当日状态排名 | 今天所有行业按状态排序，它排第几？共几个可比行业？ | `rank` | `level` | ✅ / ⛔ HK 字典登记但 `is_active=false` |
-| `SEC.BIZ.GATE` | 风险与可用性闸门 | 哪些原因让今天的结论需要打折看？ | `gate` | `detail` | ✅ / ✅ |
+| 中文名称（建议） | `biz_code` | 侧 | 面向用户的一句话问句（建议） | `kind` | 主输出列 | CN / HK |
+|---|---|---|---|---|---|---|
+| 状态侧热度 | `SEC.BIZ.STATE_SIDE` | 状态 | 这个行业当前整体状态在同日所有行业中偏强还是偏弱？ | `continuous` | `score` | ✅ / ✅ |
+| 风险侧水平 | `SEC.BIZ.RISK_SIDE` | 风险 | 这个行业当前估值风险高不高？ | `continuous` | `score` | ✅ / ✅ |
+| 状态象限 | `SEC.BIZ.QUADRANT` | 中性 | 状态与风险组合起来，当前属于哪一类局面？ | `enum` | `state` | ✅ / ✅ |
+| 当日状态排名 | `SEC.BIZ.RANK` | 状态 | 今天所有行业按状态排序，它排第几？共几个可比行业？ | `rank` | `level` | ✅ / ⛔ HK 本期不产出 |
+| 风险与可用性闸门 | `SEC.BIZ.GATE` | 风险 | 哪些原因让今天的结论需要打折看？ | `gate` | `detail` | ✅ / ✅ |
 
-字典主键 `biz_code`，一行一概念，市场差异落 `params.per_market`；每行带 `inputs` / `params` / `output_schema`（多态列语义）/ 独立 `params_hash` / `is_active` / `remark`。**新增指标 = 加一行字典 + 计算层加一个分支；下线 = 改 `is_active=false`**。
+**四种输出形态**（`kind`，与 L2 的 `structure` 对应但语义不同）：
 
-### 6.1 逐指标规格（前端展示的直接依据）
+| `kind` | 含义 | 主输出列 | 其余多态列 | CN / HK 差异 |
+|---|---|---|---|---|
+| `continuous` | 连续量读数 | `score` 0–100 | `state`/`level` 恒 NULL | 两市场均出，但输入维度数不同（CN 4 / HK 2） |
+| `enum` | 枚举分类 | `state`（5 个中文字符串含 `NA`） | `score`/`level` 恒 NULL | 同一判据、各自市场内取中位数 |
+| `rank` | 当日横截面名次 | `level` 1..`rank_n` | 仅 `applicable=true` 时有值 | HK 字典仍登记，本期不产出 |
+| `gate` | 规则判定标记 | `detail.gate_flags[]` | `score`/`state`/`level` 恒 NULL | `BREAK` 仅 HK；`PARTIAL_STATE` HK 恒开 |
 
-| `biz_code` | 解决什么问题 | 输入 | 计算模型 | 输出形式 / 值域 | 为空时 |
-|---|---|---|---|---|---|
-| `SEC.BIZ.STATE_SIDE` | 行业当前整体状态偏强还是偏弱？ | 当期**有分的**状态侧维度 `score`（CN 4 组 / HK 2 组） | 等权均值 `mean(skipna=True)`；有效维度 `<2 → NULL`；`detail.state_members/state_n/partial` | `score` 0–100；`state`/`level` 恒 NULL | 状态维度 <2 组有分 |
-| `SEC.BIZ.RISK_SIDE` | 行业当前估值风险高不高？ | `VALUATION.score` | 直取，不重算 | `score` 0–100，**高分 = 更贵** | 估值锚无分 |
-| `SEC.BIZ.QUADRANT` | 状态与风险组合起来是哪类局面？ | `state_side` / `risk_side` + 当日同市场横截面中位数 | `hi_s = state >= median(state)`；`hi_r = risk >= median(risk)` → 四象限 | `state` 为 5 个枚举中文字符串（含 `NA`）；`score`/`level` 恒 NULL | 任一侧 NULL → `NA` |
-| `SEC.BIZ.RANK` | 今天它排第几？共几个可比行业？ | 同日同市场 `state_side` | `rank(ascending=False, method='min')`；`rank_n = count(state_side)` | `level` 1..`rank_n`；`detail.rank_no/rank_n` | `applicable=false` 时 NULL；**HK 无此行** |
-| `SEC.BIZ.GATE` | 哪些原因让结论需要打折看？ | `coverage`、`crowd_gate`、日期、状态维度数 | 规则见 §6.3；`detail.gate_flags[]` | `state`/`score`/`level` 恒 NULL；全量在 `detail` | 不为空（无闸门时 `[]`） |
-
-**共有质量元数据列**（每行都带，不随 `biz_code` 变化）：`coverage`（可用维度 / 已启用维度，CN 分母 6 / HK 分母 4）、`applicable`、`confidence`、`params_hash`（该 `biz_code` 独立指纹）、`extra`（`enabled_dimensions` / `calib_version` / `pit_capable` / `rank_n`；HK 另有 `no_rank` / `no_rank_reason` / `survivorship_bias` / `granularity`）。
-
-> ⚠ 五个业务指标**只描述当日横截面状态**，不得展示为「看好 / 看空」「建议买入」；阶段 4 前瞻 IC 检验未通过（§9 第 16 条）。
+> ⚠ 字典主键 `biz_code`，一行一个领域概念，市场差异落 `params.per_market.{CN,HK}`；**HK 不排名是市场级实现禁产**（`params.per_market.HK.no_rank`），不是概念下线，`is_active` 保持 true。新增指标 = 加一行字典 + 计算层加一个分支；下线 = 改 `is_active=false`。
+> ⚠ 五项业务指标**只描述当日横截面状态**，不得展示为「看好 / 看空」「建议买入」；阶段 4 前瞻 IC 检验未通过（§9 第 16 条）。
 > ⚠ `STATE_SIDE` 与 `RISK_SIDE` **不相加、不求均值**：一个「越贵越危险」、一个「越强越健康」，合成会产生伪精确。
 
-### 6.2 计算模型与参数
+### 6.1 状态侧热度 · `SEC.BIZ.STATE_SIDE`
+
+| 块 | 内容 |
+|---|---|
+| **定义** | 中文名称：状态侧热度；编码 `SEC.BIZ.STATE_SIDE`；状态侧、`kind='continuous'`；**问句：这个行业当前整体状态在同日所有行业中偏强还是偏弱？**；`score` 0–100，高分 = 状态更强；粒度 `(market, sector_code, trade_date, SEC.BIZ.STATE_SIDE)`；CN / HK 均产出。**不回答**：未来涨跌、是否值得配置 |
+| **输入** | 当期**有分的**状态侧 L2 维度 `score`：CN 为 `TREND` / `FLOW` / `FUNDAMENTAL` / `BREADTH` 4 组，HK 为 `TREND` / `BREADTH` 2 组（`FLOW` / `FUNDAMENTAL` 本期 `unavailable`）。只读 `dimension_value.score`，不读 `CROWDING`（规则判定维度无 score） |
+| **计算模型** | **原理**：状态侧各维度分位基数相近（同为 0–100），等权平均得到一个"整体状态"读数；不可用维度不进分子也不进分母，避免用 0 分冒充。<br>**公式**：`score = mean(s_i for s_i notna)`；有效维度 `<2 → NULL`。<br>**参数**：`ENABLED_DIMENSIONS`（CN 6 / HK 4）决定 coverage 分母；`PARTIAL_STATE` 在有效状态维度不足时置位（HK 恒开）。<br>**落地形态**：`df["state_side"] = df[state_cols].mean(axis=1, skipna=True)`，再按 `<2` 置 NaN。<br>**门禁**：状态侧有分维度 <2 → `score=NULL` |
+| **输出** | `industry.business_value`：`score`（0–100，可空）、`side='state'`、`state`/`level` 恒 NULL、`detail={"state_members":[...],"state_n":N,"partial":bool}`；共有列 `coverage` / `applicable` / `confidence` / `params_hash` / `extra` 随行携带 |
+| **前端展示** | 显示 0–100 分 + 「由 N 项状态维度等权合成」，展开见 `detail.state_members`；`detail.partial=true` 时标注「状态维度不齐」；`score=NULL` 显示「数据不足」而非 0 分 |
+
+### 6.2 风险侧水平 · `SEC.BIZ.RISK_SIDE`
+
+| 块 | 内容 |
+|---|---|
+| **定义** | 中文名称：风险侧水平；编码 `SEC.BIZ.RISK_SIDE`；**风险侧**、`kind='continuous'`；**问句：这个行业当前估值风险高不高？**；`score` 0–100，**高分 = 更贵（风险更高）**；CN / HK 均产出。**不回答**：便宜是否值得买、能否用低估值抵消拥挤 |
+| **输入** | **仅** `VALUATION.score`（`SEC.DIM.VALUATION`）一个输入，**直取不重算**（`BIZ_DEFS` 的 `inputs` 只有这一项）。CROWDING 虽同属风险侧，但走 `GATE` 独立通路，**不并入本指标** |
+| **计算模型** | **原理**：风险侧当前只有估值水位一个连续量读数，故不做均值；拥挤度是分类档位，无法与连续分位相加。<br>**公式**：`score = dim_VALUATION`（直接赋值）。<br>**参数**：估值锚 CN 为 `PE_TS_PCT` 快照横截面分位（28 个快照日）、HK 为 `pe_agg` 横截面分位（2002 起）；`CAP_START`（HK）之前无读数。<br>**落地形态**：`df["risk_side"] = df["dim_VALUATION"]`。<br>**门禁**：估值锚 NULL → `score=NULL`；CN 快照短样本 → `confidence=low` |
+| **输出** | `score`（0–100，可空）、`side='risk'`、`state`/`level` 恒 NULL、`detail={}`；**这是 L3 象限判定的风险侧唯一来源** |
+| **前端展示** | **必须标注极性**「分数越高 = 越贵」，避免按状态侧习惯误读为「越好」；算法详情注明 CN 官方快照 / HK 个股调和聚合不同构、不可拼接；显示「仅 28 个快照日，暂无历史分位」 |
+
+### 6.3 状态象限 · `SEC.BIZ.QUADRANT`
+
+| 块 | 内容 |
+|---|---|
+| **定义** | 中文名称：状态象限；编码 `SEC.BIZ.QUADRANT`；中性侧、`kind='enum'`；**问句：状态与风险组合起来，当前属于哪一局面？**；输出为 5 个中文枚举（含 `NA`）；CN / HK 均产出。**不回答**：超配/低配、买入/卖出建议（只描述当前状态） |
+| **输入** | `STATE_SIDE.score` / `RISK_SIDE.score` + **当日同市场**两者的横截面中位数 |
+| **计算模型** | **原理**：用各市场自身当日中位数切 2×2，避免跨市场绝对水平不可比；相对判据对估值整体漂移不敏感（§5 的横截面语义在此延续）。<br>**公式**：`hi_s = state >= median_t(state)`、`hi_r = risk >= median_t(risk)`；`hi_s ∧ ¬hi_r → 强势·未拥挤`；`hi_s ∧ hi_r → 强势·偏贵拥挤`；`¬hi_s ∧ ¬hi_r → 冷门·未拥挤`；否则 `弱势·偏贵拥挤`。<br>**参数**：中位数按 `(market, trade_date)` 分组计算。<br>**落地形态**：`quadrant_of(state, risk, state_med, risk_med)`。<br>**门禁**：任一侧 NULL → `state='NA'` |
+| **输出** | `state`（5 个枚举字符串之一）、`side='neutral'`、`score`/`level` 恒 NULL、`detail={"state_side":…,"risk_side":…}` |
+| **前端展示** | 直接展示中文枚举（编码 1–4 不得上屏）；必须声明「只描述当前状态；阶段 4 前瞻检验未通过，不构成配置建议」；`state='NA'` 显示「数据不足」，不得隐含归类 |
+
+### 6.4 当日状态排名 · `SEC.BIZ.RANK`
+
+| 块 | 内容 |
+|---|---|
+| **定义** | 中文名称：当日状态排名；编码 `SEC.BIZ.RANK`；状态侧、`kind='rank'`；**问句：今天所有行业按状态排序，它排第几？共几个可比行业？**；CN 产出、**HK 本期不产出**（字典登记但值表无行）。**不回答**：未来收益排名、跨市场排名 |
+| **输入** | 同日同市场 `STATE_SIDE.score` |
+| **计算模型** | **原理**：只在 `applicable=true` 的行业间排名，避免用不可用读数凑分母。<br>**公式**：`level = rank(ascending=False, method='min')`；`rank_n = count(state_side)`。<br>**参数**：`COVERAGE_MIN=0.6` / `VALID_DAYS_20_MIN=15` 通过 `applicable` 间接控制参与排名。<br>**落地形态**：`df["rank"] = ...transform(lambda s: s.rank(ascending=False, method='min'))`，写行时 `level = rank_no if applicable else None`。<br>**门禁**：`applicable=false` → `level=NULL`；HK 恒不产出 |
+| **输出** | `level`（1..`rank_n`）、`side='state'`、`score`/`state` 恒 NULL、`detail={"rank_no":…,"rank_n":…}`；HK 值表无该 `biz_code` 行，原因在 `GATE.detail.no_rank_reason` 与 `extra.no_rank` |
+| **前端展示** | 必须标注「当日横截面状态排序，非投资建议、非未来收益预测」；HK 显示「本期不排名 + reason」，**不得用 `applicable` 推断 HK 是否有排名** |
+
+### 6.5 风险与可用性闸门 · `SEC.BIZ.GATE`
+
+| 块 | 内容 |
+|---|---|
+| **定义** | 中文名称：风险与可用性闸门；编码 `SEC.BIZ.GATE`；风险侧、`kind='gate'`；**问句：哪些原因让今天的结论需要打折看？**；**输出是标记列表而非数值**：`detail.gate_flags[]`；CN / HK 均产出。**不回答**：闸门是否意味着减仓（阶段 4 拥挤闸门验证 `NOT_EVALUABLE`） |
+| **输入** | `coverage`、`crowd_gate`（来自 `SEC.DIM.CROWDING` 的 `extra.crowd_gate`）、`state_n`、日期（HK `BREAK`） |
+| **计算模型** | **原理**：闸门只标注"结论该打多少折"，不改任何 score；`SHORT_SAMPLE` 有意不产出（否则快照期全部 `applicable=false`）。<br>**公式**：`DATA_COVERAGE ← coverage<0.6`；`CROWDING ← crowd_gate∈{HIGH,EXTREME}`；`PARTIAL_STATE ← state_n<状态维度数`（HK 恒开）；`BREAK ← trade_date<2002-01-01`（仅 HK）。<br>**参数/门禁**：详见 §6.9 闸门表。<br>**落地形态**：见 `_biz_rows` 的 `flags` 构造。<br>**注意**：`CROWDING` 闸门**仅提示，不屏蔽排名**；`applicable` 只看 `DATA_COVERAGE` 与 `valid_days_20` |
+| **输出** | `score`/`state`/`level` 恒 NULL；`detail={"gate_flags":[...],"crowd_gate":…,"crowd_k":…,"crowd_partial":…}`；HK 另有 `detail.no_rank`/`no_rank_reason` |
+| **前端展示** | 按 §6.9 映射中文标签；`CROWDING` 必须带 `crowd_k` / `partial`，`partial=true` 显示「2/3 因子，不判定极高」；`gate_flags=[]` 显示「无闸门」；不得写成「风险提示」或「减仓信号」 |
+
+### 6.6 共有质量元数据（每行都带，不随 `biz_code` 变化）
+
+| 列 | 含义 | CN | HK |
+|---|---|---|---|
+| `coverage` | 可用维度数 / 已启用维度数 | 分母 6 | 分母 4 |
+| `applicable` | 读数是否可用于排名/象限 | `coverage≥0.6 ∧ valid_days_20≥15 ∧ 无 DATA_COVERAGE` | 同左（另有 `BREAK` 闸门但不进 `applicable` 判定） |
+| `confidence` | `confidence_of(pe_n_sample, coverage, pit_capable)` | 快照短样本 → `low` | 恒 `low`（非 PIT） |
+| `params_hash` | 该 `biz_code` 独立口径指纹，取字典同一行 | 全市场统一 | 全市场统一 |
+| `extra` | `enabled_dimensions` / `calib_version` / `pit_capable` / `rank_n` | — | 另有 `no_rank` / `no_rank_reason` / `survivorship_bias` / `granularity` |
+
+### 6.7 计算模型速查与参数
 
 ```
 state_side = mean(当期有分的状态侧维度 score)       # 有效维度 <2 → NULL
@@ -619,7 +669,7 @@ confidence = confidence_of(pe_n_sample, coverage, pit_capable)
 | `SHORT_SAMPLE` | 750 | `confidence_of` | **只降置信**，不进闸门、不改 `score` | 口径变更 |
 | `CALIB_VERSION` | CN `s2.1` / HK `hk1.0` | 各 `biz_code` 的 `params_hash` | 区分口径段 | 换版本即全量重算 |
 
-### 6.3 闸门（`SEC.BIZ.GATE.detail.gate_flags`）
+### 6.8 闸门（`SEC.BIZ.GATE.detail.gate_flags`）
 
 > ✅ **`SHORT_SAMPLE` 不产出闸门是有意设计**：设计稿 §3.6 实施期细化 ① 与 `_biz_rows` 代码注释一致 —— 若按全局 `n_sample<750` 触发，快照期所有行业 `applicable=false`、不产出任何排名。信息由 L1 `quality='short_sample'` 与 L2/L3 `confidence='low'` 承载。⚠ `BREAK` **仅 HK 写入**（2002 前 `total_market_val` 覆盖率 <6%）；CN 早期段已由 `DATA_COVERAGE` 挡住，效果等价。
 
@@ -633,7 +683,7 @@ confidence = confidence_of(pe_n_sample, coverage, pit_capable)
 
 > ⚠ HK 不排名是独立决策：字典登记 `SEC.BIZ.RANK` 但 `is_active=false`、值表无该行；`SEC.BIZ.GATE.detail.no_rank / no_rank_reason` 与共有 `extra` 双处说明。**前端不得用 `applicable` 推断 HK 是否有排名**。
 
-### 6.4 输出样例（长表，每行业日 5 行）
+### 6.9 输出样例（长表，每行业日 5 行）
 
 ```json
 // 行 1/5：状态侧热度
@@ -665,7 +715,7 @@ confidence = confidence_of(pe_n_sample, coverage, pit_capable)
 
 | 段 | 作用 | L1 原子指标的数据来源 | L2 维度 / L3 字段的数据来源 |
 |---|---|---|---|
-| ① **展示名** | 让用户知道看的是什么 | `indicator_dict.indicator_name`（**已落库**，§4 各表已列出） | ⚠ **本文 §2.1 / §5.0 / §6.1 补写的建议名，代码未落库**，前端采用前需确认措辞 |
+| ① **展示名** | 让用户知道看的是什么 | `indicator_dict.indicator_name`（**已落库**，§4 各表已列出） | ⚠ **本文 §2.1 / §5.0 / §6.0 补写的建议名，代码未落库**，前端采用前需确认措辞 |
 | ② **一句话问句** | 让用户知道这个指标解决什么问题 | 字典 `remark` 的「定义」段 + 本文 §4 的「定义」列 | ⚠ 本文 §5.0 / §6.0 补写的建议问句，**非落库字段** |
 | ③ **读数 + 单位 + 位置** | 让用户看到今天的数与它在什么刻度上 | `raw_value` + `unit`，配 `percentile_xsec`（同日同侪位置）/ `percentile_ts`（自身历史水位） | `score` 0–100（L2）/ `state_side`·`risk_side`·`rank_no`（L3）；枚举值取 `extra.label` 或 `quadrant` |
 
@@ -679,9 +729,9 @@ confidence = confidence_of(pe_n_sample, coverage, pit_capable)
 |---|---|---|
 | 指标定义 / 单位 / 值域 | 字典 `indicator_name` / `unit` / `remark`「定义」段（L2/L3 用本文 §5 / §6） | 一句话说清算的是什么 |
 | **输入** | 字典 `source` / `formula`；L2 用 `members_used` 联字典取各成员中文名；L3 用 `extra.state_members` | 列出上游表·列 + 原子指标中文名 |
-| **计算模型 / 公式** | 字典 `formula` + `model_key`（M0–M8 说明见 §2.4）；L2 用 `extra.structure` / `extra.anchor` / `extra.weight`；L3 用 §6.2 | 把公式文字与参数一起展示，不要只给数字 |
+| **计算模型 / 公式** | 字典 `formula` + `model_key`（M0–M8 说明见 §2.4）；L2 用 `extra.structure` / `extra.anchor` / `extra.weight`；L3 用 §6.7 | 把公式文字与参数一起展示，不要只给数字 |
 | **参数与门禁** | 字典 `min_periods` / `params`；§2.4 通用规则；L2 `extra.reason`；L3 `gate_flags` | 例如「时序分位需 250 个有效观测，当前 27 个，故为空」 |
-| **输出形式** | `raw_value` / `percentile_xsec` / `percentile_ts`（L1）；`score` / `extra.crowd_gate`（L2）；§6.1 各列（L3） | 标明单位、值域、是否可空 |
+| **输出形式** | `raw_value` / `percentile_xsec` / `percentile_ts`（L1）；`score` / `extra.crowd_gate`（L2）；§6.1~§6.5 各节（L3） | 标明单位、值域、是否可空 |
 | **口径版本与可追溯** | `model_version`（L1）/ `params_hash`（L2/L3）/ `extra.calib_version` / `extra.pit_capable` | 让用户 / 客服能判断「这行数属于哪套口径」 |
 
 ### 7.3 上屏纪律
@@ -690,7 +740,7 @@ confidence = confidence_of(pe_n_sample, coverage, pit_capable)
 |---|---|
 | **可直接上屏** | L1 中文名 + `raw_value`（带 `unit`）、L1 两种分位（须标明「同日同侪」/「自身历史」）、L2 `score`（须带 `side` 极性说明）、L3 `state_side` / `risk_side` / `rank_no` / `quadrant`、`confidence`、`gate_flags` 中文标签 |
 | **必须带限定语** | `rank_no`：必须标注「当日横截面状态排序，非投资建议、非未来收益预测」；`risk_side`：必须标注「分数越高 = 越贵」；`CROWDING` 档位：必须标注 `extra.k` / `partial`，`partial=true` 时显示「2/3 因子，不判定极高」；HK 任何读数：必须标注「非 PIT / 含幸存者偏差 / 置信度低」 |
-| **必须先解码再上屏** | `raw_value` 为枚举编码时（`RRG_QUADRANT` 1–4、`CROWD.GATE` 0–4）取 `extra.label`；`dimension_code` / 闸门 / `structure` 等英文枚举按 §2.1 / §5.0 / §6.3 映射中文 |
+| **必须先解码再上屏** | `raw_value` 为枚举编码时（`RRG_QUADRANT` 1–4、`CROWD.GATE` 0–4）取 `extra.label`；`dimension_code` / 闸门 / `structure` 等英文枚举按 §2.1 / §5.0 / §6.8 映射中文 |
 | **禁止展示** | 单一综合分（本层不产出）；「超配 / 低配 / 买入 / 卖出」字样；把 `quadrant` 解释为建议；把 HK 排名留空却暗示「暂无数据」（应说明「本期不排名」）；把负 IC 反向解读为做空信号；跨 CN/HK 混排或同图比较 |
 
 ### 7.4 空值、低置信与闸门的呈现
@@ -780,7 +830,7 @@ WHERE market = 'CN' AND sector_code = '801010'
 ORDER BY weight DESC;
 ```
 
-> ⚠ `SELECT *` 禁止用于生产消费：维度 / 业务列可能增删，必须按白名单取列（§6.4）。
+> ⚠ `SELECT *` 禁止用于生产消费：维度 / 业务列可能增删，必须按白名单取列（§6.9）。
 
 ---
 
@@ -804,7 +854,7 @@ ORDER BY weight DESC;
 | 14 | CN 成分表 `eff_from` 最小 2021-12-13 | 取 2021-12-12 的自下而上指标 | 无读数；不得用当前成分回算后声称 PIT |
 | 15 | HK 两版指数同一行业日 | 对比 `ret_eq` / `ret_cap` | 差异与 `n_constituent` 随行可查；不静默截尾、不改值 |
 | 16 | 阶段 4 前瞻 IC 样本外区间跨 0 | 决策闸门 | 排序维持「当前状态描述」、权重维持等权、不得宣称有效；负 IC 不得反向解读为做空信号 |
-| 17 | 任一交易日的 L3 行 | 检查 `gate_flags` 与 `confidence` | **不得出现 `SHORT_SAMPLE`**（设计上归 `confidence`，见 §6.3），但短样本日 `confidence` 必须为 `low`；CN **不得出现 `BREAK`**；HK 2002 前必须出现 `BREAK` |
+| 17 | 任一交易日的 L3 行 | 检查 `gate_flags` 与 `confidence` | **不得出现 `SHORT_SAMPLE`**（设计上归 `confidence`，见 §6.8），但短样本日 `confidence` 必须为 `low`；CN **不得出现 `BREAK`**；HK 2002 前必须出现 `BREAK` |
 | 18 | 任一 L1 行 | 检查 `coverage` | CN 恒 NULL、HK 为成分覆盖度；不得把 CN 的 NULL 当作「覆盖度为 0」 |
 | 19 | 前端展示某指标 | 取三段信息 | ① 展示名（L1 取字典 `indicator_name`；L2/L3 取本文建议名）② 一句话问句 ③ 读数 + 单位 + 算法详情（§7.2 六项）齐备 |
 

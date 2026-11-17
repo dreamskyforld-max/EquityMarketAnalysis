@@ -2250,7 +2250,7 @@ COMMENT ON COLUMN force_round_daily.applicable IS '适用性：近 20 个已落�
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 21~24. 第④层 行业配置（阶段 1，sector_layer.py）
---     生产：sector_layer.py（独立 systemd oneshot + sector-layer.timer，工作日 19:10；
+--     生产：sector_layer.py（sector-layer.service 第一个 ExecStart，工作日 19:10；
 --           ⚠ 不得挂进 market_scheduler —— 资源规范 R4/R5）
 --     输入：regime.sector_daily / sector_valuation_snapshot / sector_fund_flow
 --     口径：doc/industry_allocation_feasibility.md（§3 指标体系 / §4.2 阶段 1）
@@ -2432,7 +2432,7 @@ COMMENT ON TABLE industry.constituent_change IS '行业成分变更日志（逐�
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 27. 第④层 港股行业层数据底座（阶段 3 / D4，hk_sector_index.py）
 --     生产：sector_layer_hk.py → hk_sector_index.build_index_daily()
---           （独立 systemd sector-layer-hk.timer，工作日 19:20；不挂 market_scheduler）
+--           （同一 sector-layer.service 第二个 ExecStart，CN 完成后串行执行；不挂 market_scheduler）
 --     源  ：hk_daily_quote × stock_sector(INDUSTRY, HK.LIST*, 113 个恒生三级行业)
 --           + daily_ggt_hold（南向 est_net_inflow，2026-04-20 起仅 136 个交易日）
 --     口径：doc/industry_allocation_feasibility.md §2.2 D4 / §3.2 M8 / §4.2 阶段 3

@@ -15,7 +15,8 @@
   · R1/R7：所有大表查询带时间下界；输入按 4 年分块，另用「轻量 3 列」序列算
     10 年时序分位，避免把 15 万行 × 15 列一次性拉进进程。
   · R3：独立单元 MemoryMax=512M，实测峰值须 ≤256MB。
-  · R4/R5：本模块由 system/sector-layer.timer 触发，**不得**挂进 market_scheduler。
+  · R4/R5：本模块由 system/sector-layer.service 的第一个 ExecStart 触发（19:10），
+    HK 由同一单元的第二个 ExecStart 串行执行；**不得**挂进 market_scheduler。
   · R6：单事务 upsert ≤2000 行，逐批 commit。
   · 监控：任务级 collection_task_log 埋点 + 表级 monitor_table_config 登记。
 
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import functools
 import gc
 import hashlib
 import importlib
@@ -693,8 +695,15 @@ def _cn_impl() -> dict:
     }
 
 
+@functools.lru_cache(maxsize=1)
 def _per_market() -> dict:
-    """一行一概念字典的 params.per_market：两市场实现差异的唯一登记处。"""
+    """一行一概念字典的 params.per_market：两市场实现差异的唯一登记处。
+
+    ⚠ 缓存是刚需：`_dict_hash()` 被每行值表调用，payload 需两市场全量 DEFS
+    摘要（41+25 指标 × 11 字段 + 6 维定义 + 5 业务），不缓存会让 HK 增量
+    4,879 行反复构造字典，实测峰值 468MB（R3 回退）。常量都在模块加载时
+    确定，进程内不会变；测试若 mock 常量须先 `_per_market.cache_clear()`。
+    """
     return {"CN": _cn_impl(), "HK": _hk_impl()}
 
 

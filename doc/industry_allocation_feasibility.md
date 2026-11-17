@@ -258,7 +258,7 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 > **阶段 3 落地调整（2026-11-14 用户决策，与本文初稿的「物理分表」表述不同）**：
 > ① **不新建 HK 专用 4 表**，CN / HK 沿用同一套 21–24 号表，靠主键里的 `(market, classification)` 区分 —— 即 `sql/schema.sql:2249` 注释所写的「物理分行」，不是物理分表。理由：消费端统一、避免双份写库逻辑；代价是 L1 表从 211 万行 CN 读数增至约 900 万行（HK 全量回填后），表级监控按 CN 日历（已知 1 天 lag 残差，已在 `monitor_collector.py` 注释登记）。
 > ② 因为两市场共用 `SEC.*` 指标 code，**字典 PK 从 `indicator_code` 扩为 `(market_scope, classification, indicator_code)`**；`sector_layer.sync_dict` / `sector_layer_hk.sync_dict_hk` 的 `ON CONFLICT` 键同步带上市场与分类。存量库由 `regime_schema._migrate_sector_dict_pk()` 幂等自愈（`CREATE TABLE IF NOT EXISTS` 不会改已有主键）。
-> ③ HK 侧另建独立计算模块 `sector_layer_hk.py`（口径版本 `hk1.0`，`params_hash` payload 含市场），**不改动 `sector_layer.py` 的计算主流程**（CN 侧只改字典冲突键）。已用 `git worktree` 取改动前代码逐值对比：41 条字典 / 41 个 `params_hash` / 6 个维度 / `CALIB_VERSION=s2.1` 全部一致。
+> ③ HK 侧另建独立计算模块 `sector_layer_hk.py`（口径版本 `hk1.0` 仅作值表标注；字典与值表 `params_hash` 已统一走 `sector_layer._dict_hash`），**不改动 `sector_layer.py` 的计算主流程**（CN 侧只改字典冲突键）。已用 `git worktree` 取改动前代码逐值对比：41 条字典 / 41 个 `params_hash` / 6 个维度 / `CALIB_VERSION=s2.1` 全部一致。
 > ④ 新增第 27 号表 `regime.hk_sector_index_daily`；25/26 号表为阶段 2 的成分主数据。
 
 **`remark` 三段式落地（2026-11-15）**：§3.1 表格只写了「三段式：定义/判读/数据」的要求，但阶段 1~3 的 66 条字典 remark 实际是「阶段1」「阶段2」这类开发期碎片（CN 平均 28 字、最短 3 字）。本次按 `regime.indicator_dict` 的事实标准全量重写：
@@ -497,7 +497,7 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 
 - **依赖数据**：S1 / S2 / S3（仅横截面）/ S4；**不依赖 D1**。
 - **交付指标**：A 组全部、B 组横截面项、C 组（除 `SOUTHBOUND_NET` / `MARGIN_NET`）、**D 组两因子部分模式**（`AMT_SHARE_PCT` + `VAL_PCT`，`k=2`、`partial=true`、最高档 `HIGH`）、L2 六组、L3 状态矩阵 / 排名 / 闸门。D2 已在阶段 0 关闭，本阶段无数据前置。
-- **工程**：`sector_layer.py`（计算）+ 4 张表 + `regime.sector_indicator_dict` 字典；独立 systemd `sector-layer.service` + `sector-layer.timer`（工作日 **19:10**，晚于 18:45 市场状态计算）；`collection_task_log` 任务级埋点（现有 `market_state_daily` 缺这一环，本层不继承该欠账）+ `monitor_table_config` 表级监控。
+- **工程**：`sector_layer.py`（计算）+ 4 张表 + `regime.sector_indicator_dict` 字典；systemd `sector-layer.service` + `sector-layer.timer`（工作日 **19:10**，CN 与 HK 由同一单元串行执行）；`collection_task_log` 任务级埋点（现有 `market_state_daily` 缺这一环，本层不继承该欠账）+ `monitor_table_config` 表级监控。
 
 #### 阶段 1 实施记录（2026-11-14）
 
@@ -508,7 +508,7 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 | `sector_layer.py` | **新增**计算层：29 条指标字典、六维定义、M1/M2/M3/M4/M5 实现、按月切片写入、任务埋点、CLI（`--backfill` / `--dry-run` / `--init-schema`） |
 | `sql/schema.sql` | 追加第 **21–24** 号表（字典 / L1 / L2 / L3）+ 索引 + COMMENT |
 | `regime_schema.py` | 同步 7 条 DDL + 10 条 COMMENT，新增 `ensure_sector_schema()`（只建本层表，供运行时幂等自举） |
-| `system/sector-layer.service` / `.timer` | **新增** oneshot + 六项资源上限 / 工作日 19:10 |
+| `system/sector-layer.service` / `.timer` | **新增** oneshot + 六项资源上限 / 工作日 19:10（CN → HK 串行） |
 | `deploy.sh` / `bootstrap.sh` | `TIMERS` / `units` / `enable_services` 接线 |
 | `monitor_collector.py` | `_SEED_TASK_CONFIG` 任务埋点、`_REGIME_TABLE_CONFIG` 4 表登记、`_CN_MONITOR_TABLES` 4 表 CN 日历 |
 | `tests/test_sector_layer.py` | **新增** 38 测试 / 92 subtests（口径纯函数 + 工程红线载体） |
@@ -609,13 +609,13 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 |---|---|
 | `tools/probe_hk_sector.py` | **新增**只读探测（14 条聚合 SQL，可复跑）：§2.1 港股实测盘点的数字来源 |
 | `hk_sector_index.py` | **新增**数据层 D4：按月 × 按股票(1000 只/批)双层分批、充分统计量跨批无损合并、M8 两版指数、增量接续 `idx_eq/idx_cap`、南向聚合、`--verify` 一致性 + 两版差异报告、CLI |
-| `sector_layer_hk.py` | **新增**指标层：25 条字典（24 active）、六维定义（4 启用）、L1/L2/L3、`hk1.0` 独立口径（payload 含市场）、2 年分块 + 10 天切片、任务埋点、CLI |
+| `sector_layer_hk.py` | **新增**指标层：25 条定义（24 active）、六维定义（4 启用）、L1/L2/L3、`hk1.0` 仅作口径标注（hash 已统一）、2 年分块 + 10 天切片、任务埋点、CLI |
 | `sql/schema.sql` / `regime_schema.py` | 追加第 **27** 号表 + 索引 + COMMENT，**逐字双同步**；字典 PK 扩为 `(market_scope, classification, indicator_code)`；新增 `_migrate_sector_dict_pk()` 幂等迁移、`_SECTOR_DDL_KEYS` / `_SECTOR_COMMENTS` 登记 |
 | `build_sector_hierarchy.py` | 补 `as_of` 列 / 注释 / 幂等 `ALTER`；`run(codes=None, ctx=None)` 兼容调度器进程内调用 |
 | `sector_layer.py` | **CN 侧唯一改动**：`sync_dict` 冲突键扩为三列（口径与 `params_hash` 完全不变） |
 | `market_scheduler.py` | 注册「行业层级映射」周二 **18:30**（紧跟 `get_stock_sector.py` 18:00） |
 | `monitor_collector.py` | `_SEED_TASK_CONFIG` 加「行业配置计算HK」；`_REGIME_TABLE_CONFIG` 登记表 27；CN 日历共表残差注释 |
-| `system/sector-layer-hk.service` / `.timer` | **新增** oneshot 六项资源上限 / 工作日 **19:20**（与 CN 19:10 错峰，避免两个 512M cgroup 同时抢 1.9GB 小机） |
+| `system/sector-layer.service` 第二个 `ExecStart` | CN 完成后串行跑 HK；与 CN 共用单一 512M cgroup，取消原 19:20 错峰单元 |
 | `deploy.sh` / `bootstrap.sh` | `TIMERS` / `units` / `enable --now` 接线 |
 | `tests/test_sector_stage3.py` | **新增** 35 测试 / 208 subtests（M8 口径、覆盖门禁、分批无损合并、业务契约、不混排、工程红线） |
 | 本文 | §0 / §2.1 / §2.2 / §3.1 / §3.2 / §3.6 / §4.2 / §4.4 同步 |
@@ -637,6 +637,14 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 | 数据层 12 个月（dry-run） | **210.7 MB** | 86.8 s |
 | 指标层端到端 44 日（dry-run） | **107.3 MB** | 1.9 s |
 | 指标层 44 日真实写库（80,246 行） | — | 13.8 s |
+| **合并单元 CN 增量真实写库**（2026-11-17） | **199.5 MiB** | 29 s |
+| **合并单元 HK 增量真实写库**（2026-11-17） | **184.8 MiB** | 34 s |
+
+> 🔴 **R3 三次修复（2026-11-17，合并单元后）**：`_precompute_amt_share` 一次读表 27 全史 69 万行 +
+> `groupby.transform` + 10 年 as-of 分位，实测 HK 增量峰值 **468MB**（超 512M 上限的 90%，
+> 且远高于文档 210.7MB）。改为「按行业分批（10 行业/批）+ 只保留增量窗口结果行」，
+> 分位逐值一致（max_abs_diff=0.0），峰值降到 **184.8 MiB**；同期 CN 增量 199.5 MiB。
+> `MemoryMax` 从 512M 收紧到 **256M**（留 56M 波动余量）。测试钉住 `MemoryMax=256M`。
 
 > 🔴 **R3 分批有效性验证**：3 个月 208.3MB → 12 个月 210.7MB，峰值几乎不变，证明**与 844 万行总规模脱钩**，满足「独立单元实测 ≤ 上限 512M 的一半（256MB）」。全量回填（2000 起约 26 年）按 87s/年估算约 35~40 分钟，**超过 timer 的 `RuntimeMaxSec=1800`** → 属手工运维动作，须低峰期单独执行；timer 默认增量 45 天不依赖回填即可工作。
 
@@ -661,7 +669,7 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 **未执行 / 待决定**
 
 - **全量回填写库未跑**（只跑 3 个月小窗口写库 + 12 个月 dry-run）：数据层全量约 35~40 分钟，指标层另需按 2 年块跑；属批量运维动作，建议低峰期单独执行 `python3 sector_layer_hk.py --backfill`。timer 默认增量 45 天，不依赖回填即可工作。
-- **服务器部署未执行**：需 `./deploy.sh up`（增量同步 `sql/schema.sql` + 渲染两个新 unit + enable `sector-layer-hk.timer`）+ **重启 `market-scheduler`** 使周二 18:30 的「行业层级映射」生效；监控配置由 `monitor_collector` 启动时幂等迁移。本机未重启任何服务。
+- **服务器部署未执行**：需 `./deploy.sh up`（增量同步 `sql/schema.sql` + 渲染单一新 unit + enable `sector-layer.timer`）+ **重启 `market-scheduler`** 使周二 18:30 的「行业层级映射」生效；监控配置由 `monitor_collector` 启动时幂等迁移。本机未重启任何服务。
 - ⚠ **字典 PK 迁移部署注意**：`sql/_schema_diff.py` 生成的低风险修复 SQL 里的 `ADD CONSTRAINT ... PRIMARY KEY (...)` **不要直接执行** —— 存量库的旧单列 PK 还在（脚本把 `DROP INDEX` 列进了高风险注释段），直接 ADD 会失败。运行时自愈由 `regime_schema._migrate_sector_dict_pk()` 完成（先 DROP 再 ADD，幂等），首次跑 `sector_layer_hk.py --init-schema` 即生效；本机已验证。
 - ⚠ 本机验证产生了 `sql/schema_fix_20261114_*.sql` 两个本地产物，均**未执行**；`deploy.sh` 的 rsync 排除清单已含 `sql/schema_fix_*.sql`，不会推到服务器。勿与 2026-10-05 那份服务器待执行 SQL 混淆。
 - **表级监控日历残差**：CN/HK 共表后，4 张输出表仍按 CN 日历判停滞，港股独家交易日最多产生 1 天 lag 的边界告警；任务真停摆以 `collection_task_log` 的「行业配置计算HK」埋点为准。

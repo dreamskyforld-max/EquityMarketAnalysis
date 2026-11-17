@@ -719,7 +719,7 @@ COMMENT ON COLUMN stock_info.delist_date IS '退市日期（NULL=未退市）；
 
 前移的 5 条均为一次取全历史 / 日检幂等，源当晚才出 T 日值时次日重跑照样补齐，前移零风险。两条股息率 `release_time` 本就是 T+1 18:00，后移不改变 PIT 语义，但中证源只回 20 日窗口、漏采即永久缺失，仍须每日必采。
 
-「市场事件采集」19:30 保持不动（原设计已写明滞后一日口径的豁免，见 `market_scheduler.py` 该条注释）。**P1 盘中任务全部冻结**（前端分钟级窗口内部聚合依赖每分钟 0 秒起采，禁止秒位分层）。两个独立 unit `sector-layer.timer` 19:10 / `sector-layer-hk.timer` 19:20 本轮不动。完整分段与三条铁律见 `market_scheduler.py` 的 `GLOBAL_TASKS` 上方「调度时段地图」。
+「市场事件采集」19:30 保持不动（原设计已写明滞后一日口径的豁免，见 `market_scheduler.py` 该条注释）。**P1 盘中任务全部冻结**（前端分钟级窗口内部聚合依赖每分钟 0 秒起采，禁止秒位分层）。第④层 CN + HK 已合并为单一 unit `sector-layer.timer` 19:10（CN 完成后串行跑 HK），本轮不动。完整分段与三条铁律见 `market_scheduler.py` 的 `GLOBAL_TASKS` 上方「调度时段地图」。
 
 ### 6.3 新脚本命名与实现约定
 

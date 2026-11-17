@@ -281,7 +281,7 @@ class TestEngineeringGuards(unittest.TestCase):
 
     def test_oneshot_unit_has_six_resource_limits(self):
         src = _read("system/sector-layer.service")
-        for key in ("MemoryMax=512M", "MemorySwapMax=0", "RuntimeMaxSec=",
+        for key in ("MemoryMax=256M", "MemorySwapMax=0", "RuntimeMaxSec=",
                     "Nice=", "IOSchedulingPriority=", "OOMScoreAdjust="):
             with self.subTest(key=key):
                 self.assertIn(key, src)
@@ -294,9 +294,12 @@ class TestEngineeringGuards(unittest.TestCase):
         self.assertIn("OnCalendar=Mon-Fri 19:10:00", t)
         self.assertIn("Unit=sector-layer.service", t)
         self.assertIn("sector-layer.timer", _read("deploy.sh"))
+        self.assertNotIn("sector-layer-hk.timer", _read("deploy.sh"))
         b = _read("bootstrap.sh")
         self.assertIn("sector-layer.service sector-layer.timer", b)
+        self.assertNotIn("sector-layer-hk", b)
         self.assertIn("systemctl enable --now sector-layer.timer", b)
+        self.assertEqual(_read("system/sector-layer.service").count("ExecStart="), 2)
 
     def test_ddl_dual_source(self):
         schema = _read("sql/schema.sql")
