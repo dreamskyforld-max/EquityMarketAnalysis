@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""个股画像 L2/L3 结论标签元数据（doc/stock_profile_l2_l3.md v1.0）。
+"""个股画像 L2/L3 结论标签元数据（doc/stock_profile_l2_l3.md v1.1）。
 
 本模块**只注册元数据，不实现计算**：6 个结论标签 source_type='derived'，
 由 profiling.conclusions.producer 统一生产，不走 engine.compute_tag()。
 compute_profile.py / profiling/run.py 的逐标签循环必须按 source_type 跳过它们。
 
-值域（35 个 code / label / short_label）以文档附录 D 为唯一真相源；
+值域（39 个 code / label / short_label）以文档附录 D 为唯一真相源；
 规则契约（inputs/derived_fields/params/rules/output_schema）以
 profiling.conclusions.rules.RULES 为唯一可执行真源。
 
@@ -27,6 +27,10 @@ VALUATION_ENUM = {
     "rel_expensive": ("相对偏贵", "相对偏高"),
     "hist_cheap_ind_expensive": ("相对自身历史偏低、相对同行偏高", "历史低同行高"),
     "hist_expensive_ind_cheap": ("相对自身历史偏高、相对同行偏低", "历史高同行低"),
+    "hist_cheap_ind_neutral": ("相对自身历史偏低、相对同行中性", "历史低同行中"),
+    "hist_expensive_ind_neutral": ("相对自身历史偏高、相对同行中性", "历史高同行中"),
+    "hist_neutral_ind_cheap": ("相对自身历史中性、相对同行偏低", "历史中同行低"),
+    "hist_neutral_ind_expensive": ("相对自身历史中性、相对同行偏高", "历史中同行高"),
     "loss": ("亏损（无 PE 估值锚）", "亏损无锚"),
     "negative": ("净资产为负（无 PB 估值锚）", "净资产为负"),
 }
@@ -87,9 +91,13 @@ def _no_direct_compute(name: str):
     value_type=ENUM, enum_type="valuation_conclusion", enum_values=VALUATION_ENUM,
     source_type="derived", update_freq="daily",
     data_sources=["val_pe_hist_pct", "val_pe_ind_pct", "val_pe_ttm_tier", "val_pb_tier"],
-    compute_logic="双分位同向且同档 → 相对档；分位背离 → 单列背离码；LOSS/NEGATIVE 业务码豁免 G1 直接发布。"
-                  "横截面分位不等于绝对贵贱。" + _DISCLAIMER,
-    parent_tag="val_pe_hist_pct", version="v1", pit_capable=True,
+    compute_logic="双分位各自按 20/80 切偏低、中性、偏高三档：同向且同档判相对档；"
+                  "历史分位≤20 且行业分位≥80、或历史分位≥80 且行业分位≤20 时单列背离码，"
+                  "背离码仅描述两个参照系分歧，不构成贵贱判断；"
+                  "单侧四格按各自位置单列中性码，双中性格判相对中性。"
+                  "LOSS/NEGATIVE 业务码豁免 G1 直接发布。横截面分位不等于绝对贵贱。"
+                  + _DISCLAIMER,
+    parent_tag="val_pe_hist_pct", version="v2", pit_capable=True,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def dim_valuation_conclusion(as_of: date):

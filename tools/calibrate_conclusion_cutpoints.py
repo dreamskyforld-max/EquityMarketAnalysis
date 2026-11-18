@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """个股画像 L2/L3 结论切点标定（只读，不写库）。
 
-用途：doc/stock_profile_l2_l3.md §12.2 第 2 项「params 实测标定」。按 v1.0 规则表
-在本机当前有效 L1 标签快照上模拟 6 个结论，输出各 enum 占比 / 出档率，检查
+用途：doc/stock_profile_l2_l3.md §12.2 第 2 项「params 实测标定」。按 v2 规则表
+（估值结论为 3×3 双分位交叉，不再有点差门槛）在本机当前有效 L1 标签快照上
+模拟 6 个结论，输出各 enum 占比 / 出档率，检查
 §10.1 的「无 0% 档、单档 ≤80%」约束，为冻结切点提供依据。
 
 资源约定（AGENTS.md 计算任务资源约定）：
@@ -28,6 +29,8 @@ from db import get_conn
 DOMAIN_CODES = {
     "dim_valuation_conclusion": ["rel_cheap", "rel_fair", "rel_expensive",
                                  "hist_cheap_ind_expensive", "hist_expensive_ind_cheap",
+                                 "hist_cheap_ind_neutral", "hist_expensive_ind_neutral",
+                                 "hist_neutral_ind_cheap", "hist_neutral_ind_expensive",
                                  "loss", "negative"],
     "dim_quality_conclusion": ["solid", "high_but_volatile", "paper_profit",
                                "leveraged", "weak", "deteriorating"],
@@ -50,10 +53,10 @@ TAGS = [
     "tst_price_position_52w", "trd_momentum_12_1", "att_volume_surge",
 ]
 
-# v1.0 拟定切点（§12.2 第 2 项）
+# v2 切点（§5.1；20/80 沿用 L1 等频五分档档界，不是按估值意义标定的阈值）
 P = {
     "coverage_min": 0.6,
-    "cheap_pctl": 20, "expensive_pctl": 80, "divergence_gap_pctl": 30,
+    "cheap_pctl": 20, "expensive_pctl": 80,
     "stable_max": 2, "volatile_min": 4, "quality_weak_max": 2,
     "leverage_high": 4, "roe_high": 4,
     "divergence_gap_tier": 2, "high_growth_min": 4, "persistence_min": 2,
@@ -162,6 +165,7 @@ def values(snap, spec):
 
 
 def judge_valuation(v):
+    """v2：历史分位 × 行业分位 3×3 全展开（与 RULES 的 VAL-02..VAL-10 一致）。"""
     if v["loss_flag"] is True:
         return "loss"
     if v["negative_flag"] is True:
@@ -169,13 +173,20 @@ def judge_valuation(v):
     a, b = v["pe_hist_pct"], v["pe_ind_pct"]
     if a is None or b is None:
         return None
-    if abs(a - b) >= P["divergence_gap_pctl"]:
-        return "hist_cheap_ind_expensive" if a < b else "hist_expensive_ind_cheap"
-    if a <= P["cheap_pctl"] and b <= P["cheap_pctl"]:
-        return "rel_cheap"
-    if a >= P["expensive_pctl"] and b >= P["expensive_pctl"]:
-        return "rel_expensive"
-    return "rel_fair"
+    lo, hi = P["cheap_pctl"], P["expensive_pctl"]
+    hb = "low" if a <= lo else ("high" if a >= hi else "mid")
+    ib = "low" if b <= lo else ("high" if b >= hi else "mid")
+    return {
+        ("low", "high"): "hist_cheap_ind_expensive",
+        ("high", "low"): "hist_expensive_ind_cheap",
+        ("low", "low"): "rel_cheap",
+        ("high", "high"): "rel_expensive",
+        ("low", "mid"): "hist_cheap_ind_neutral",
+        ("high", "mid"): "hist_expensive_ind_neutral",
+        ("mid", "low"): "hist_neutral_ind_cheap",
+        ("mid", "high"): "hist_neutral_ind_expensive",
+        ("mid", "mid"): "rel_fair",
+    }[(hb, ib)]
 
 
 def judge_quality(v):
@@ -239,6 +250,8 @@ JUDGES = {
 
 VAL_CLASS = {"rel_cheap": "cheap", "hist_cheap_ind_expensive": "cheap",
              "rel_fair": "neutral", "hist_expensive_ind_cheap": "neutral",
+             "hist_cheap_ind_neutral": "neutral", "hist_expensive_ind_neutral": "neutral",
+             "hist_neutral_ind_cheap": "neutral", "hist_neutral_ind_expensive": "neutral",
              "rel_expensive": "expensive", "loss": "no_anchor", "negative": "no_anchor"}
 QAL_CLASS = {"solid": "solid", "high_but_volatile": "volatile",
              "paper_profit": "weak", "leveraged": "weak",

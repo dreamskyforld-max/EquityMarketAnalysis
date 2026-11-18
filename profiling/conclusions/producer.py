@@ -163,17 +163,13 @@ def _build_values(spec: dict, stock: str, snap: dict, extras: dict, l2: dict):
 
 
 def _derive(spec: dict, values: dict) -> dict:
-    """derived_fields[].expr 仅文档说明，这里显式计算（引擎不解析表达式）。"""
+    """derived_fields[].expr 仅文档说明，这里显式计算（引擎不解析表达式）。
+
+    v2 起估值结论不再有派生字段：两个百分位是序数排名，相减无经济含义。
+    """
     for item in spec["derived_fields"]:
         field = item["field"]
-        if field == "pe_gap":
-            a, b = values.get("pe_hist_pct"), values.get("pe_ind_pct")
-            values[field] = abs(a - b) if a is not None and b is not None else None
-        elif field == "pe_gap_dir":
-            a, b = values.get("pe_hist_pct"), values.get("pe_ind_pct")
-            values[field] = ("hist_lower" if a < b else "hist_higher") \
-                if a is not None and b is not None else None
-        elif field == "growth_gap":
+        if field == "growth_gap":
             a, b = values.get("rev_tier"), values.get("np_tier")
             values[field] = abs(a - b) if a is not None and b is not None else None
     return values

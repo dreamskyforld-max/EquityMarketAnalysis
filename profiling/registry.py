@@ -209,7 +209,7 @@ def validate_enum_uniqueness() -> None:
             nkey = (et, name)
             owner = name_owner.get(nkey)
             # 同一个 code 的全称与简称允许相同（如「低位缩量」既是 label 又是 short_label）；
-            # 只有「不同 code 共用同一名称」才是概念冲突。结论层 35 个 enum 全部填了
+            # 只有「不同 code 共用同一名称」才是概念冲突。结论层 39 个 enum 全部填了
             # short_label（doc/stock_profile_l2_l3.md 附录 D），需排除自比较。
             if owner and owner != code:
                 raise ValueError(

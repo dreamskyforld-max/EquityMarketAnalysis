@@ -64,7 +64,6 @@ class TestRulesSchema(unittest.TestCase):
         self.assertEqual((rid, result), ("VAL-00", "loss"))
         rid, result = R.first_match(spec, {
             "loss_flag": False, "negative_flag": False,
-            "pe_gap": 2.0, "pe_gap_dir": "hist_lower",
             "pe_hist_pct": 18.0, "pe_ind_pct": 19.0,
         })
         self.assertEqual((rid, result), ("VAL-04", "rel_cheap"))
@@ -79,16 +78,50 @@ class TestRulesSchema(unittest.TestCase):
     def test_g4_exempt_declared(self):
         self.assertTrue(R.RULES["dim_valuation_conclusion"].get("g4_exempt"))
 
+    def test_valuation_3x3_matrix_first_match(self):
+        """§5.1 v2：双分位 3×3 全展开，每格都落到自己那一码，不被点差门槛抢走。"""
+        spec = R.RULES["dim_valuation_conclusion"]
+        cases = [
+            # (历史分位, 行业分位, 期望 rule_id, 期望结果码)
+            (1.19, 34.13, "VAL-07", "hist_cheap_ind_neutral"),   # HK.06181 第一轮反例
+            (10.0, 85.0, "VAL-02", "hist_cheap_ind_expensive"),
+            (85.0, 10.0, "VAL-03", "hist_expensive_ind_cheap"),
+            (10.0, 10.0, "VAL-04", "rel_cheap"),
+            (85.0, 85.0, "VAL-05", "rel_expensive"),
+            (85.0, 50.0, "VAL-08", "hist_expensive_ind_neutral"),
+            (50.0, 10.0, "VAL-09", "hist_neutral_ind_cheap"),
+            (50.0, 85.0, "VAL-10", "hist_neutral_ind_expensive"),
+            (50.0, 50.0, "VAL-06", "rel_fair"),
+        ]
+        for hist, ind, rule_id, result in cases:
+            with self.subTest(hist=hist, ind=ind):
+                self.assertEqual(
+                    R.first_match(spec, {"loss_flag": False, "negative_flag": False,
+                                        "pe_hist_pct": hist, "pe_ind_pct": ind}),
+                    (rule_id, result),
+                )
+
+    def test_valuation_has_no_gap_derived_fields(self):
+        """两个百分位是序数排名，相减无经济含义：v2 不得再有点差派生字段。"""
+        spec = R.RULES["dim_valuation_conclusion"]
+        self.assertEqual(spec["derived_fields"], [])
+        self.assertNotIn("divergence_gap_pctl", spec["params"])
+        self.assertEqual(spec["params"]["cheap_pctl"], 20)
+        self.assertEqual(spec["params"]["expensive_pctl"], 80)
+        values = {"pe_hist_pct": 1.19, "pe_ind_pct": 34.13}
+        producer._derive(spec, values)
+        self.assertEqual(values, {"pe_hist_pct": 1.19, "pe_ind_pct": 34.13})
+
 
 class TestEnumContract(unittest.TestCase):
-    def test_35_codes_exactly_cover_all_results(self):
+    def test_39_codes_exactly_cover_all_results(self):
         codes = set()
         for m in registry.all_tags():
             if m.source_type == "derived":
                 codes |= set(m.enum_values)
         results = {r["result"] for spec in R.RULES.values()
                    for r in spec["rules"] if r["result"] is not None}
-        self.assertEqual(len(codes), 35)
+        self.assertEqual(len(codes), 39)
         self.assertEqual(codes, results)  # 无越界码、无孤儿码
 
     def test_all_short_labels_nonempty(self):
@@ -106,7 +139,9 @@ class TestEnumContract(unittest.TestCase):
             self.assertTrue(m.value_ref and m.value_ref.startswith("enum:"))
             self.assertIsNone(m.value_range)   # §3.4 R4：不污染 _tag_pct
             self.assertIsNone(m.num_unit)
-            self.assertEqual(m.version, "v1")
+            # 规则升级只 bump 变更的那一个标签（§4.4.2）：估值结论 v2，其余仍 v1
+            expected = "v2" if m.code == "dim_valuation_conclusion" else "v1"
+            self.assertEqual(m.version, expected, m.code)
             self.assertEqual(m.status, "active")
             self.assertFalse(m.is_exclusive)
             self.assertFalse(m.confidence_req)
@@ -131,11 +166,6 @@ class TestProducerPureFunctions(unittest.TestCase):
         self.assertEqual(producer._cast("18.4", {"dtype": "float"}), 18.4)
 
     def test_derive_fields(self):
-        spec = R.RULES["dim_valuation_conclusion"]
-        values = {"pe_hist_pct": 10.0, "pe_ind_pct": 60.0}
-        producer._derive(spec, values)
-        self.assertEqual(values["pe_gap"], 50.0)
-        self.assertEqual(values["pe_gap_dir"], "hist_lower")
         spec = R.RULES["dim_growth_conclusion"]
         values = {"rev_tier": 1, "np_tier": 4}
         producer._derive(spec, values)

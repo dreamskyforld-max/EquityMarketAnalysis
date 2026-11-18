@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""个股画像 L2/L3 结论的**唯一可执行规则真源**（doc/stock_profile_l2_l3.md v1.0）。
+"""个股画像 L2/L3 结论的**唯一可执行规则真源**（doc/stock_profile_l2_l3.md v1.1）。
 
 本模块是纯数据 + 纯函数，零 IO（除 sync_conclusion_dict 的写字典动作）。
 - RULES：6 个结论的 inputs / derived_fields / params / rules / output_schema，
@@ -8,7 +8,8 @@
   profile.tag_registry.conclusion_dict，并校验 version 一致。
 - 判定只读内存 RULES，绝不读 JSONB，避免双真相源。
 
-切点数值见 doc §12.3.2（2026-11-12 本机实测标定后冻结，无需调整）。
+切点数值见 doc §5.1（20/80 沿用 L1 等频五分档档界）。v2 起估值结论
+改为「双分位各自切三档 → 3×3 交叉」，废弃点差门槛。
 """
 from __future__ import annotations
 
@@ -22,6 +23,12 @@ _QUARTERLY = "quarterly"
 VAL_CLASS = {
     "rel_cheap": "cheap", "hist_cheap_ind_expensive": "cheap",
     "rel_fair": "neutral", "hist_expensive_ind_cheap": "neutral",
+    # 3×3 矩阵的 4 个单侧格统一归中性类：单侧信号不足以支撑 L3 的贵贱判断，
+    # 且 §6.1 中「中性类 × 质量偏弱」整行不发布，避免误产出价值陷阱嫌疑
+    "hist_cheap_ind_neutral": "neutral",
+    "hist_expensive_ind_neutral": "neutral",
+    "hist_neutral_ind_cheap": "neutral",
+    "hist_neutral_ind_expensive": "neutral",
     "rel_expensive": "expensive",
     "loss": "no_anchor", "negative": "no_anchor",
 }
@@ -46,7 +53,7 @@ def _all(*items) -> dict:
 RULES: dict[str, dict] = {
     # ── §5.1 估值 ────────────────────────────────────────────────
     "dim_valuation_conclusion": {
-        "version": "v1",
+        "version": "v2",
         "update_freq": _DAILY,
         "inputs": [
             {"field": "pe_hist_pct", "tag_code": "val_pe_hist_pct",
@@ -58,33 +65,53 @@ RULES: dict[str, dict] = {
             {"field": "negative_flag", "tag_code": "val_pb_tier",
              "source_col": "key_value", "dtype": "bool", "match": "NEGATIVE", "role": "flag"},
         ],
-        "derived_fields": [
-            {"field": "pe_gap", "expr": "abs(pe_hist_pct - pe_ind_pct)", "dtype": "float"},
-            {"field": "pe_gap_dir", "expr": "hist_lower if pe_hist_pct < pe_ind_pct else hist_higher",
-             "dtype": "enum", "codes": ["hist_lower", "hist_higher"]},
-        ],
-        "params": {**_COMMON, "cheap_pctl": 20, "expensive_pctl": 80,
-                   "divergence_gap_pctl": 30},
+        # v2：两个百分位是序数排名，相减无经济含义，故删除点差派生字段，
+        # 改为「历史分位 × 行业分位」各自按 20/80 切三档后 3×3 全展开。
+        "derived_fields": [],
+        "params": {**_COMMON, "cheap_pctl": 20, "expensive_pctl": 80},
         "g4_exempt": True,  # loss_flag / negative_flag 命中即发布，豁免 G1/G2
         "rules": [
             {"rule_id": "VAL-00", "priority": 0,
              "conditions": _all(_cond("loss_flag", "==", True)), "result": "loss"},
             {"rule_id": "VAL-01", "priority": 1,
              "conditions": _all(_cond("negative_flag", "==", True)), "result": "negative"},
+            # 对角两格：两个参照系方向相反
             {"rule_id": "VAL-02", "priority": 10,
-             "conditions": _all(_cond("pe_gap", ">=", 30),
-                                _cond("pe_gap_dir", "==", "hist_lower")),
+             "conditions": _all(_cond("pe_hist_pct", "<=", 20),
+                                _cond("pe_ind_pct", ">=", 80)),
              "result": "hist_cheap_ind_expensive"},
             {"rule_id": "VAL-03", "priority": 11,
-             "conditions": _all(_cond("pe_gap", ">=", 30),
-                                _cond("pe_gap_dir", "==", "hist_higher")),
+             "conditions": _all(_cond("pe_hist_pct", ">=", 80),
+                                _cond("pe_ind_pct", "<=", 20)),
              "result": "hist_expensive_ind_cheap"},
+            # 同向两格：双分位共振
             {"rule_id": "VAL-04", "priority": 20,
              "conditions": _all(_cond("pe_hist_pct", "<=", 20),
                                 _cond("pe_ind_pct", "<=", 20)), "result": "rel_cheap"},
             {"rule_id": "VAL-05", "priority": 21,
              "conditions": _all(_cond("pe_hist_pct", ">=", 80),
                                 _cond("pe_ind_pct", ">=", 80)), "result": "rel_expensive"},
+            # 单侧四格：一侧有明确信号、另一侧中性，各自单列，不压成「相对中性」
+            {"rule_id": "VAL-07", "priority": 30,
+             "conditions": _all(_cond("pe_hist_pct", "<=", 20),
+                                _cond("pe_ind_pct", ">", 20),
+                                _cond("pe_ind_pct", "<", 80)),
+             "result": "hist_cheap_ind_neutral"},
+            {"rule_id": "VAL-08", "priority": 31,
+             "conditions": _all(_cond("pe_hist_pct", ">=", 80),
+                                _cond("pe_ind_pct", ">", 20),
+                                _cond("pe_ind_pct", "<", 80)),
+             "result": "hist_expensive_ind_neutral"},
+            {"rule_id": "VAL-09", "priority": 32,
+             "conditions": _all(_cond("pe_hist_pct", ">", 20),
+                                _cond("pe_hist_pct", "<", 80),
+                                _cond("pe_ind_pct", "<=", 20)),
+             "result": "hist_neutral_ind_cheap"},
+            {"rule_id": "VAL-10", "priority": 33,
+             "conditions": _all(_cond("pe_hist_pct", ">", 20),
+                                _cond("pe_hist_pct", "<", 80),
+                                _cond("pe_ind_pct", ">=", 80)),
+             "result": "hist_neutral_ind_expensive"},
             {"rule_id": "VAL-06", "priority": 99, "conditions": _all(), "result": "rel_fair"},
         ],
         "output_schema": {

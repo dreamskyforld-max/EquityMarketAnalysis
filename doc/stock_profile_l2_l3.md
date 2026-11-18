@@ -1,8 +1,8 @@
-# 个股画像 L2/L3 结论指标 · 数据契约设计文档
+# 个股综合研判 · 数据契约设计文档
 
 | 项目 | 内容 |
 | --- | --- |
-| 文档版本 | **v1.0**（进度与生产状态见 §12.2） |
+| 文档版本 | **v1.1**（2026-11-18 估值结论口径升级 v2，进度与生产状态见 §12.2） |
 | 编制日期 | 2026-11-12 |
 | 适用范围 | 个股画像现有 L1 标签（③④⑤⑥⑦⑩ 等）之上的结论层 |
 | 文档性质 | **数据架构 / 数据契约 + 口径规格**；不含实现代码、不建表 |
@@ -144,7 +144,7 @@ L3 业务指标   profile.tag_value        biz_* 2 个 enum：好公司×好价�
 | R2 | **版本列前进** | 每个结论标签每轮写一条 `tag_run_log`（`status='ok'`、`version` 同 `RULES`），作为 `DATA_SOURCES["profile_tag_value"].version_fn` 的唯一刷新信号。漏写 = 数据已更新但前端不重绘 |
 | R3 | **as_of 一致** | 消费端 `as_of` 回放读到的是「当前规则回算的历史值」（§4.4.4），结论生产者全量重建历史时须保证每个 `as_of` 都有可回放行（§4.6） |
 | R4 | **不进域内分位** | `db.py:8805-8826 _tag_pct()` 对 `num_unit='percentile_0_100'` 或数字档位 `tier` 才算分位，`enum` 返回 `None`。结论标签必须 `num_unit=NULL` **且 `value_range=NULL`**（`:8814` 未检查 `value_type=='tier'`，误带数字型 `value_range` 会被误算进域均值） |
-| R5 | **short_label 必填** | 6 组共 35 个 enum code 的 `short_label` 全部非空（附录 D）。否则 `COALESCE` 回退长句，筛选下拉显示失控 |
+| R5 | **short_label 必填** | 6 组共 39 个 enum code 的 `short_label` 全部非空（附录 D）。否则 `COALESCE` 回退长句，筛选下拉显示失控 |
 
 ---
 
@@ -287,25 +287,27 @@ L3 业务指标   profile.tag_value        biz_* 2 个 enum：好公司×好价�
     {"field": "negative_flag", "tag_code": "val_pb_tier", "source_col": "key_value",
      "dtype": "bool", "match": "NEGATIVE", "role": "flag"}
   ],
-  "derived_fields": [
-    {"field": "pe_gap", "expr": "abs(pe_hist_pct - pe_ind_pct)", "dtype": "float"},
-    {"field": "pe_gap_dir", "expr": "hist_lower if pe_hist_pct < pe_ind_pct else hist_higher",
-     "dtype": "enum", "codes": ["hist_lower", "hist_higher"]}
-  ],
-  "params": {"coverage_min": 0.6, "cheap_pctl": 20, "expensive_pctl": 80,
-             "divergence_gap_pctl": 30},
+  "derived_fields": [],
+  "params": {"coverage_min": 0.6, "cheap_pctl": 20, "expensive_pctl": 80},
   "rules": [
     {"rule_id": "VAL-00", "priority": 0,
      "conditions": {"all": [{"field": "loss_flag", "op": "==", "value": true}]},
      "result": "loss"},
     {"rule_id": "VAL-02", "priority": 10,
-     "conditions": {"all": [{"field": "pe_gap", "op": ">=", "value": 30},
-                            {"field": "pe_gap_dir", "op": "==", "value": "hist_lower"}]},
+     "conditions": {"all": [{"field": "pe_hist_pct", "op": "<=", "value": 20},
+                            {"field": "pe_ind_pct", "op": ">=", "value": 80}]},
      "result": "hist_cheap_ind_expensive"},
     {"rule_id": "VAL-04", "priority": 20,
      "conditions": {"all": [{"field": "pe_hist_pct", "op": "<=", "value": 20},
                             {"field": "pe_ind_pct", "op": "<=", "value": 20}]},
-     "result": "rel_cheap"}
+     "result": "rel_cheap"},
+    {"rule_id": "VAL-07", "priority": 30,
+     "conditions": {"all": [{"field": "pe_hist_pct", "op": "<=", "value": 20},
+                            {"field": "pe_ind_pct", "op": ">", "value": 20},
+                            {"field": "pe_ind_pct", "op": "<", "value": 80}]},
+     "result": "hist_cheap_ind_neutral"},
+    {"rule_id": "VAL-06", "priority": 99,
+     "conditions": {"all": []}, "result": "rel_fair"}
   ],
   "output_schema": {
     "key_value_semantics": "相对估值位置的枚举类型；不是绝对贵贱、不是预测",
@@ -325,7 +327,9 @@ L3 业务指标   profile.tag_value        biz_* 2 个 enum：好公司×好价�
 | 版本号 | **不放 `version`、不放 `history[]`**；当前期望版本的唯一真相源是 `tag_registry.version`（由 `RULES[code].version` 校验） |
 | 载体 | 一个 JSONB 列，**不新建独立字典表**；规则历史由 git 提交 + `tag_run_log.version` 时间线追溯 |
 
-> `params` 中的切点数值已标定**冻结**（`coverage_min=0.6` / `cheap_pctl=20` / `expensive_pctl=80` / `divergence_gap_pctl=30`）；§5/§6 各表 `params` 同属冻结值；schema 形状、算子集合、`inputs[]` 声明格式同为冻结项。
+> `params` 中的切点数值已标定**冻结**（`coverage_min=0.6` / `cheap_pctl=20` / `expensive_pctl=80`）；§5/§6 各表 `params` 同属冻结值；schema 形状、算子集合、`inputs[]` 声明格式同为冻结项。
+>
+> **v2 口径说明**：20/80 是 `quantile.assign_tier` 等频五分档的**档界借用**，不是按估值意义单独标定的阈值；`tools/calibrate_conclusion_cutpoints.py` 只校验分布（无 0% 档 / 单档 ≤80%）。实测把切点换成 25/75、30/70，单侧四格占比从 45.4% 仅降到 42.7%，**调切点不改变「单侧信号如何表达」**，故保留 20/80 以与 L1 显示档保持单一真相源。已废弃 `divergence_gap_pctl`：两个百分位是序数排名，相减无经济含义，不得再作为判定门槛。
 
 **§5/§6 规则表 → `RULES` 的投影约定**：六张规格表是 `RULES` 的人类可读投影，发布时按下列规则**机械展开**，`sync_conclusion_dict()` 逐条校验：
 
@@ -350,8 +354,7 @@ L3 业务指标   profile.tag_value        biz_* 2 个 enum：好公司×好价�
   "coverage": 0.83,
   "missing_inputs": ["val_fcf_yield_tier"],
   "evidence": {"pe_hist_pct": 18.4, "pe_ind_pct": 21.2, "tier_pe": "1", "tier_pb": "2",
-               "loss_flag": false, "negative_flag": false, "pe_gap": 2.8,
-               "pe_gap_dir": "hist_lower"},
+               "loss_flag": false, "negative_flag": false},
   "gates": {"G1": true, "G2": true, "G3": true, "G4": false},
   "as_of": "2026-11-12",
   "state_raw": "rel_cheap",
@@ -362,7 +365,7 @@ L3 业务指标   profile.tag_value        biz_* 2 个 enum：好公司×好价�
 }
 ```
 
-- `evidence` 自包含：读到这一行即可独立复算「为什么判成这个值」，无需回查上游标签状态；它是**该行生效时**的判定快照，状态持续期间不刷新。派生字段（`pe_gap` 等）也写进 `evidence`，保证复算不依赖重放。
+- `evidence` 自包含：读到这一行即可独立复算「为什么判成这个值」，无需回查上游标签状态；它是**该行生效时**的判定快照，状态持续期间不刷新。派生字段（`growth_gap` 等）也写进 `evidence`，保证复算不依赖重放。估值结论 v2 起无派生字段，仅凭两个原始分位即可复算。
 - **不放版本号**（`tag_value.version` 已是）、**不放规则全文**（`conclusion_dict` 已是）、**不放原始判定快照**（§4.4.4）。
 - 末 6 个键（`as_of` / `state_raw` / `since_date` / `dwell_days` / `status` / `candidate`）为**日变量**：`as_of` = 当前计算日、`since_date` = 该行 `eff_from`；仅 `dim_position_state` 等需要游程标注的结论使用；只在**当前有效行**原地刷新，不改 `key_value` / `eff_from` / `eff_to` / `version`（§4.6）。
 - 该列随 `tag_value` 的 `eff_from/eff_to` 一起生效。
@@ -490,27 +493,41 @@ WHERE r.source_type = 'derived'
 | --- | --- |
 | 回答 | 相对自身历史与同行，价格处在什么位置；双分位是否一致 |
 | `inputs（判定用）` | `pe_hist_pct` ← `val_pe_hist_pct.num_value`，`float`，0–100 分位（`num_unit='percentile_0_100'`）；`pe_ind_pct` ← `val_pe_ind_pct.num_value`，`float`，0–100；`loss_flag` ← `val_pe_ttm_tier.key_value == 'LOSS'`，`bool`；`negative_flag` ← `val_pb_tier.key_value == 'NEGATIVE'`，`bool`。**G1 分母 = 4**，全部 `pit_capable=True`（`valuation.py:91,109,266,289`） |
-| `derived_fields` | `pe_gap = abs(pe_hist_pct − pe_ind_pct)`（`float`）；`pe_gap_dir ∈ {hist_lower, hist_higher}`（`enum`）。二者写进 `evidence`，**不进 G1 分母** |
+| `derived_fields` | **无**（v2）。两个百分位是序数排名，相减无经济含义，已删除 `pe_gap` / `pe_gap_dir`；判定只读两个原始分位 |
 | `evidence_only` | `val_ps_ttm_tier`、`val_pcf_ttm_tier`、`val_peg_tier`、`val_fcf_yield_tier`（四个 `pit_capable=False`）、`val_pb_ind_pct` 的 `key_value` 档位；以及 `val_pe_ttm_tier` / `val_pb_tier` 的**档位与原值**——这两个标签的 `LOSS`/`NEGATIVE` 业务码已作为 `loss_flag`/`negative_flag` 进入判定 `inputs[]`，此处仅记录其数值，**不重复参与判定**。只写 `evidence`，不进 G1 分母、不改结论 |
 | 判定规则表 | 见下表；命中方式 `first_match`（§4.3.1） |
-| enum 值域 | 7 码，code / label / short_label 见**附录 D.1** |
+| enum 值域 | **11 码**（9 个分位交叉码 + 2 个矩阵外业务码），code / label / short_label 见**附录 D.1** |
 | 门禁 / 频率 | G1 + G2（**双分位必须同时可得**，缺一即不发布——与 `tools/calibrate_conclusion_cutpoints.py` 及生产者的 `role=anchor` 校验一致；否则 VAL-06 兜底会把数据缺失误判成「相对中性」）；**G4 业务码豁免 G1/G2**（§4.2）；`daily`；A+H；`pit_capable=True` |
-| 依据键 | `rule_id`、`as_of`、`pe_hist_pct`、`pe_ind_pct`、`pe_gap`、`pe_gap_dir`、`loss_flag`、`negative_flag`、`tier_pe`、`tier_pb`、`fcf_yield`、`coverage`、`missing_inputs`、`gates` |
+| 依据键 | `rule_id`、`as_of`、`pe_hist_pct`、`pe_ind_pct`、`loss_flag`、`negative_flag`、`tier_pe`、`tier_pb`、`fcf_yield`、`coverage`、`missing_inputs`、`gates` |
 | 措辞 | **禁用「低估 / 高估 / 便宜 / 该买」**，一律「相对偏…」；`compute_logic` 必须写明「横截面分位不等于绝对贵贱」 |
+
+**双分位 3×3 交叉矩阵（v2，9 格全展开，各格互斥）**：
+
+| 历史 PE 分位 ＼ 行业 PE 分位 | 偏低 `≤20` | 中性 `21–79` | 偏高 `≥80` |
+| --- | --- | --- | --- |
+| **偏低 `≤20`** | `rel_cheap`（相对偏便宜） | `hist_cheap_ind_neutral`（相对自身历史偏低、相对同行中性） | `hist_cheap_ind_expensive`（相对自身历史偏低、相对同行偏高） |
+| **中性 `21–79`** | `hist_neutral_ind_cheap`（相对自身历史中性、相对同行偏低） | `rel_fair`（相对中性） | `hist_neutral_ind_expensive`（相对自身历史中性、相对同行偏高） |
+| **偏高 `≥80`** | `hist_expensive_ind_cheap`（相对自身历史偏高、相对同行偏低） | `hist_expensive_ind_neutral`（相对自身历史偏高、相对同行中性） | `rel_expensive`（相对偏贵） |
+
+> 两个参照系是正交维度，机构口径（Bloomberg / FactSet / Wind 估值页面）分列展示、不合成单一标量。故**单侧四格不压成「相对中性」**：否则 L2 的「相对中性」会否定 L1 `val_pe_hist_pct` 已明确给出的「最低 20% 区间」。§4.2「宁可不出档」针对输入缺失 / 覆盖率不足，不适用于「两个参照系未共振」。实测 4 个单侧格共 2,168 只（45.4%），若整行不发布则 L2 出档率仅 54.6%，远低于 §10.1 的 ≥80% 门槛。
 
 | `rule_id` | 优先级 | 条件（全为字面量比较） | 结果 |
 | --- | --- | --- | --- |
 | VAL-00 | 0 | `loss_flag == true` | `loss` |
 | VAL-01 | 1 | `negative_flag == true` | `negative` |
-| VAL-02 | 10 | `pe_gap >= divergence_gap_pctl AND pe_gap_dir == 'hist_lower'` | `hist_cheap_ind_expensive` |
-| VAL-03 | 11 | `pe_gap >= divergence_gap_pctl AND pe_gap_dir == 'hist_higher'` | `hist_expensive_ind_cheap` |
+| VAL-02 | 10 | `pe_hist_pct <= cheap_pctl AND pe_ind_pct >= expensive_pctl` | `hist_cheap_ind_expensive` |
+| VAL-03 | 11 | `pe_hist_pct >= expensive_pctl AND pe_ind_pct <= cheap_pctl` | `hist_expensive_ind_cheap` |
 | VAL-04 | 20 | `pe_hist_pct <= cheap_pctl AND pe_ind_pct <= cheap_pctl` | `rel_cheap` |
 | VAL-05 | 21 | `pe_hist_pct >= expensive_pctl AND pe_ind_pct >= expensive_pctl` | `rel_expensive` |
-| VAL-06 | 99 | 其余 | `rel_fair` |
+| VAL-07 | 30 | `pe_hist_pct <= cheap_pctl AND pe_ind_pct > cheap_pctl AND pe_ind_pct < expensive_pctl` | `hist_cheap_ind_neutral` |
+| VAL-08 | 31 | `pe_hist_pct >= expensive_pctl AND pe_ind_pct > cheap_pctl AND pe_ind_pct < expensive_pctl` | `hist_expensive_ind_neutral` |
+| VAL-09 | 32 | `pe_hist_pct > cheap_pctl AND pe_hist_pct < expensive_pctl AND pe_ind_pct <= cheap_pctl` | `hist_neutral_ind_cheap` |
+| VAL-10 | 33 | `pe_hist_pct > cheap_pctl AND pe_hist_pct < expensive_pctl AND pe_ind_pct >= expensive_pctl` | `hist_neutral_ind_expensive` |
+| VAL-06 | 99 | 其余（即双中性格） | `rel_fair` |
 
-> `params`（已冻结）：`coverage_min=0.6`、`cheap_pctl=20`、`expensive_pctl=80`、`divergence_gap_pctl=30`。**20/80 对齐 `quantile.assign_tier` 的 20/40/60/80 档界**（`quantile.py:453-454`）与 `valuation.py:60-71 _pct_to_tier`；`divergence_gap_pctl` 单位为**分位点差**，与 §5.3 的「档差」是不同参数、不共用键名。
+> `params`（已冻结）：`coverage_min=0.6`、`cheap_pctl=20`、`expensive_pctl=80`。**20/80 对齐 `quantile.assign_tier` 的 20/40/60/80 档界**（`quantile.py:453-454`）与 `valuation.py:60-71 _pct_to_tier`，是**等频五分档档界的借用**，不是按估值意义单独标定的阈值；业界同类粗筛也用 quintile 20/80、四分位 25/75、均值 ±1σ（约 16/84）或行业中性化 z-score，均按资产类别 / 行业 / 窗口分别标定，无通用常数。实测换成 25/75、30/70 时单侧四格占比仅从 45.4% 降到 42.7%，**切点不敏感**；且改切点会让 L1 显示档与 L2 结论档分叉，故保留 20/80。已废弃 `divergence_gap_pctl`（点差门槛）。
 
-**供 §6.1 使用的 3 类归约映射**：`rel_cheap` / `hist_cheap_ind_expensive` → `cheap`；`rel_fair` / `hist_expensive_ind_cheap` → `neutral`；`rel_expensive` → `expensive`；`loss` / `negative` → `no_anchor`（无有效估值锚）。
+**供 §6.1 使用的 3 类归约映射**：`rel_cheap` / `hist_cheap_ind_expensive` → `cheap`；`rel_fair` / `hist_expensive_ind_cheap` / 4 个单侧码（`hist_cheap_ind_neutral`、`hist_expensive_ind_neutral`、`hist_neutral_ind_cheap`、`hist_neutral_ind_expensive`）→ `neutral`；`rel_expensive` → `expensive`；`loss` / `negative` → `no_anchor`（无有效估值锚）。单侧码统一归中性类，避免单侧信号在 §6.1 误产出「价值陷阱嫌疑」。
 
 ### 5.2 `dim_quality_conclusion` 好不好
 
@@ -823,7 +840,7 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 | 覆盖率 | 分市场报：L2 各结论 A/H 分别 ≥80%；**L3 按「可交叉候选」口径 ≥70%** | 按 §4.2 的 G1 分母（`conclusion_dict.inputs`）统计。L3 分母**排除** `no_anchor` 与设计上不发布的 cell，并单列排除数；用全样本分母会把设计使然的排除误判为覆盖不足。**若某结论出档率 <80%，先查 inputs 覆盖率与 `blocked_reason`，不得直接下调 `coverage_min` 凑数**；不达标的写进 `conclusion_detail.missing_inputs`，不得静默。 |
 | 稳定性 | **日频结论单日翻转率 <5%** | 对齐 `doc/stock profile hd.md:698`（日频标签 <5%/日）。**离线算法**：按 `as_of` 回放生成逐日序列再比较相邻日（§4.6 第 3 条），不要求库里存逐日行 |
 | 状态游程 | 报告 `dwell_days` 分布与状态切换次数 | 由事件行 `eff_from` 与当前有效行 `conclusion_detail` 统计；防「每天换一个结论」；参照 `build_business_value.py:420-429` |
-| 分布合理性 | 各 enum 值域的样本占比，报告是否有 0% 档 / 单档 >80% | 参照 regime `zero_states` / `zero_bands` 统计。**双分位合取 + 兜底 `rel_fair` 易造成单档 >80%**，命中时优先调 `divergence_gap_pctl` 或细分 `rel_fair`，不得下调 `coverage_min` |
+| 分布合理性 | 各 enum 值域的样本占比，报告是否有 0% 档 / 单档 >80% | 参照 regime `zero_states` / `zero_bands` 统计。v2 估值结论为 3×3 九格全展开，`rel_fair` 只覆盖双中性格（2026-11-18 本机重建后 1,406 行，占有双分位样本 4,778 只的 29.4%），不再有单档挤占问题；命中告警时先查 inputs 覆盖率，不得下调 `coverage_min` |
 | **值域对齐** | 6 份 `inputs[]` 中每个 `field` 的 `tag_code` / `source_col` / `dtype` / `codes` 与 L1 真实值域一致；规则表所有字面值都在该字段值域内 | §4.3.1；**P0 准入门槛** |
 | 口径一致性 | 同一 enum 在 A/H 语义一致；`conclusion_detail.coverage` 与门禁判定可复算 | §8.4 |
 | 版本一致性 | 规则升级全量重建后，`tag_value.version` 全部等于 `tag_registry.version`；§4.4.2 残留查询返回 **0 行** | 版本即口径（§0）；残留可达性论证见 §4.6 |
@@ -853,7 +870,8 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 9. **事件行**：值不变只刷新 `conclusion_detail` 日变量、不产生新行、不产生重复 `eff_from`；`dwell_days = as_of − eff_from` 可复算；
 10. 结构化条件可由 `rule_id + evidence` 复算出同一 enum；`value_range=NULL` 时 `_tag_pct()` 返回 `None`；
 11. **值域对齐**：所有 `rules[].conditions[].field` 在 `inputs[]` / `derived_fields[]` 内；所有 `value` 字面值在该字段声明的 `codes` / 值域内；档位 `key_value`（字符串 `"1".."5"`）按 `dtype=int` cast 后比较结果符合预期；`op` 不含 `between`、条件内不含表达式；
-12. 6 组 enum 共 35 个 `short_label` 非空；6 阶段 `tst_stage` 编码未被占用；结论层 enum code 全小写、`LOSS`/`NEGATIVE` 原码保留在 `evidence`。
+12. 6 组 enum 共 39 个 `short_label` 非空；6 阶段 `tst_stage` 编码未被占用；结论层 enum code 全小写、`LOSS`/`NEGATIVE` 原码保留在 `evidence`。
+13. **估值结论 v2 九格防回退**：`RULES["dim_valuation_conclusion"]` 无 `derived_fields`、无 `divergence_gap_pctl`；九格逐格可复算，单侧四格不得落 `rel_fair`；`VAL_CLASS` 中 4 个单侧码归 `neutral`；`dim_valuation_conclusion` 版本为 `v2` 且其余 5 个结论仍为 `v1`。
 
 ---
 
@@ -886,7 +904,7 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 
 | 阶段 | 内容 | 产出 | 验收锚点 |
 | --- | --- | --- | --- |
-| **P0 契约冻结** | **已完成** | 本文 **v1.0** | 全部结论可用 enum 表达、值域无「预测/建议」措辞；35 个 `short_label` 非空；规则表字段与字面值全部对齐 L1 真实值域；结构化条件可按投影约定机器复算；切点经实测标定冻结；残留查询设计上可达 0 行 |
+| **P0 契约冻结** | **已完成** | 本文 **v1.1** | 全部结论可用 enum 表达、值域无「预测/建议」措辞；39 个 `short_label` 非空；规则表字段与字面值全部对齐 L1 真实值域；结构化条件可按投影约定机器复算；切点经实测标定冻结；残留查询设计上可达 0 行 |
 | **P1 补数（第一批）** | **部分完成（结构就绪、数据未回填）**：代码/schema 侧均已落地——扩 `A_INDICATOR_MAP` 6 项、港股 CAPEX/并购明细透传、`financial_indicator` 加 10 列、`quantile.py` 显式 SELECT 同步、`sql/schema.sql` + 本机库幂等迁移；**但本机库 10 列 `non_null = 0 / 365,369 行`**，全量财务采集尚未重跑；且按 §8.4 只进 evidence，当前结论生产者还未消费这些字段 | 零新增请求的新字段（仅结构） | 比率列实测 `NUMERIC(12,4)`；`fetch_a('600519')` **函数级**实测有值（未写库）；`tests/test_p1_financial_columns.py` 全绿；**回填后须复核各列非空行数** |
 | **P2 落表 + L2 四结论** | **已完成**：两个 JSONB 列、`RULES` + `sync_conclusion_dict()`、结论生产者、4 个 `dim_*` + 2 个 `biz_*`、`compute_profile` / `profiling.run` 接线、手动重建脚本、防回退测试。`tag_run_log` 已接线；**§3.4 消费端读取本轮不实施** | 6 个可检索 enum + 依据明细 | 本机端到端两次运行：事件行 `inserted=0 / refreshed / closed=811`、残留查询 0、`pytest tests/ -q` 全绿 |
 | **P3 L3 两结论** | **已并入 P2 一次落地**（`biz_value_quality_type` 5 码 + `biz_growth_quality_type` 5 码） | 2 个交叉类型 enum | §6.0 三判据；`growth_code` 设为主锚后，L2 未出档的票正确不发布 |
@@ -902,13 +920,20 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 
 | 阶段 | 状态 | 证据 |
 | --- | --- | --- |
-| P0 契约冻结 | ✅ | 文档 **v1.0**；切点经 `tools/calibrate_conclusion_cutpoints.py` 实测标定冻结；35 个 `short_label` 已入 `profile.enum_value` |
+| P0 契约冻结 | ✅ | 文档 **v1.1**；切点经 `tools/calibrate_conclusion_cutpoints.py` 实测标定冻结；39 个 `short_label` 已入 `profile.enum_value` |
 | P2 落表 + 4 个 L2 | ✅ | 两个 JSONB 列已生效并传播到 4 个分区；`RULES` / `sync_conclusion_dict()` / 生产者 / `compute_profile` + `profiling.run` 接线 / 6 标签注册 / 防回退测试全部落地；本机当前有效 L2 合计 **27,274 行**，`conclusion_detail` 全非空 |
 | P3 两个 L3 | ✅（并入 P2 一次落地） | `biz_value_quality_type` **1,873** 行、`biz_growth_quality_type` **7,354** 行；`growth_code` 设为主锚后 L2 未出档的票正确不发布 |
 | 重建入口 | ✅（手动脚本形态） | `compute_conclusions_rebuild.py` 手动脚本：默认预演 / `--yes` 执行 / 全程 INFO 日志；`system/compute-conclusions-rebuild.service` 已删除、bootstrap 不再渲染 |
 | 全局 | — | 6 个结论当前有效合计 **36,501 行**、`conclusion_detail` 非空 36,501 行；`tag_run_log` 12 条 `ok/v1`；残留查询 **0 行**；回归测试全绿 |
 
 > P0 中「6 组 enum 中文措辞终审」是按 §11 禁用词表由本层复核通过，**未走业务侧单独签字**；若需正式业务确认，列入待办。
+
+> **2026-11-18 估值结论口径升级 v2（本机库已重建，生产库仍零数据）**：
+> - 起因：`VAL-02` 原用 `pe_gap >= 30`（两个序数分位相减）判定「相对同行偏高」，会把行业分位 36（比 64% 同行便宜）误判成偏高。
+> - 改法：废弃点差门槛，改为历史分位 × 行业分位 3×3 九格全展开；新增 4 个单侧码，值域 7 → 11（全层 35 → 39）；`VAL_CLASS` 把 4 个单侧码归 `neutral`；`dim_valuation_conclusion` 版本 `v1` → `v2`，其余 5 个结论仍 `v1`。
+> - 本机验证：`sync_registry` 83 行更新、`sync_conclusion_dict` 6 行；预演后 `--yes` 重建删 50,498 行重写 35,933 行（峰值内存 120.7MB）；残留查询 **0 行**；`tag_value` 估值结论全部 `v2`；`evidence` 中 `pe_gap` 残留 **0 行**；`.venv/bin/python3 -m pytest tests/ -q` **860 passed / 950 subtests**；标定脚本 11 个估值码全部非零、最大单档 35.5%（`loss`），未触发 0% 档 / >80% 告警。
+> - 第一轮反例票复核：`HK.06181`（历史 1.19 / 行业 34.13）、`SZ.002826`（0.67 / 34.26）均判 `hist_cheap_ind_neutral`（相对自身历史偏低、相对同行中性），不再误判「相对同行偏高」。
+> - 上表「全局 36,501 行 / 12 条 `ok/v1`」是 **2026-11-12** 的盘点快照，重建后以本条为准；生产库一行未动，调度未启用（§12.2.4 不变）。
 
 #### 12.2.2 部分完成
 
@@ -983,14 +1008,14 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 | 消费端读取 SQL / enum 值域翻译 / `as_of` 回放 / DAG 版本 | `stock-realtime/db.py` `VERSION_SOURCES`（`:56-76`）、`DATA_SOURCES` + `version_fn`（`:2976-2993, 6246, 6326-6330`）、`get_screen_meta`（`:8098-8183`）、`screen_query`（`:8475-8568`）、`_tag_pct`（`:8805-8826`）、`profile_stock_detail`（`:8888-8902`） |
 | 位置档实现 / 6 阶段暂不注册 | `profiling/tags/trend.py:1-32, 121-220` |
 | 计算任务资源规范 | `AGENTS.md`「计算任务资源约定」；`doc/compute_task_resource_standard.md` §1–§8（§2 为 R1–R7、§5 为 worktree 对比法、§7 为监控登记） |
-| 结论切点标定 | `tools/calibrate_conclusion_cutpoints.py`（只读、不写库；切点已冻结，见 §4.3.1 / §5） |
+| 结论切点标定 | `tools/calibrate_conclusion_cutpoints.py`（只读、不写库；切点已冻结，见 §4.3.1 / §5）。v2 起模拟判定为 3×3 九格映射，与 `RULES` 的 VAL-02..VAL-10 逐格对齐 |
 
 ## 附录 D：6 组 enum 值域冻结表（**唯一真相源**）
 
-> 共 **35 个 code**。`label` 为中文短句、`short_label` 为短语（≤6 字），全部写进 `enum_values` 的 `(label, short_label)` 元组并同步到 `profile.enum_value`（§3.4 R5）。措辞已按 §11 复核。
+> 共 **39 个 code**（v1.1 估值结论增 4 个单侧码）。`label` 为中文短句、`short_label` 为短语（≤6 字），全部写进 `enum_values` 的 `(label, short_label)` 元组并同步到 `profile.enum_value`（§3.4 R5）。措辞已按 §11 复核。
 > `code` / `label` / `short_label` 均为冻结值；中文措辞按 §11 禁用词表复核。
 
-### D.1 `dim_valuation_conclusion`（7）
+### D.1 `dim_valuation_conclusion`（11）
 
 | code | label | short_label |
 | --- | --- | --- |
@@ -999,8 +1024,14 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 | `rel_expensive` | 相对偏贵 | 相对偏高 |
 | `hist_cheap_ind_expensive` | 相对自身历史偏低、相对同行偏高 | 历史低同行高 |
 | `hist_expensive_ind_cheap` | 相对自身历史偏高、相对同行偏低 | 历史高同行低 |
+| `hist_cheap_ind_neutral` | 相对自身历史偏低、相对同行中性 | 历史低同行中 |
+| `hist_expensive_ind_neutral` | 相对自身历史偏高、相对同行中性 | 历史高同行中 |
+| `hist_neutral_ind_cheap` | 相对自身历史中性、相对同行偏低 | 历史中同行低 |
+| `hist_neutral_ind_expensive` | 相对自身历史中性、相对同行偏高 | 历史中同行高 |
 | `loss` | 亏损（无 PE 估值锚） | 亏损无锚 |
 | `negative` | 净资产为负（无 PB 估值锚） | 净资产为负 |
+
+> 前 9 码对应 §5.1 的 3×3 双分位交叉矩阵；`loss` / `negative` 在矩阵外（亏损股与净资产为负的票无 PE 分位），由 VAL-00 / VAL-01 直接发布。
 
 
 ### D.2 `dim_quality_conclusion`（6）
@@ -1063,4 +1094,4 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 
 ---
 
-*本文为个股画像 L2/L3 结论层的数据契约设计文档（v1.0）。涉及数据库结构的改动必须同步 `sql/schema.sql`（AGENTS.md 最高优先级约束）；新增/修改「读库→计算→写库」逻辑前须过 `doc/compute_task_resource_standard.md` §6 检查清单。*
+*本文为个股画像 L2/L3 结论层的数据契约设计文档（v1.1）。涉及数据库结构的改动必须同步 `sql/schema.sql`（AGENTS.md 最高优先级约束）；新增/修改「读库→计算→写库」逻辑前须过 `doc/compute_task_resource_standard.md` §6 检查清单。*
