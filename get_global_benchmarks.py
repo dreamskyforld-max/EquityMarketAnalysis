@@ -49,9 +49,14 @@ _load_dotenv()
 # change_pct 含义: 指数=涨跌幅%, 利率(bp)=收益率变化×100(基点)
 
 ALL_BENCHMARKS: List[Dict] = [
-    # ── 富途 OpenAPI ──
-    {"code": "HK.800000",  "name": "恒生指数",               "source": "futu"},
-    {"code": "HK.800700",  "name": "恒生科技指数",           "source": "futu"},
+    # ── 港股指数（AKShare 新浪港股指数源，与 A 股同口径）──
+    # 2026-11-18：由 futu 快照改为新浪源。原因：富途对指数快照/日K 的 volume
+    # 恒返回 0.0（实测），代码判假后写 NULL，且整行覆盖会冲掉新浪历史回补的
+    # 成交量；新浪源同时提供 volume + amount（amount 与库内 turnover 完全同口径，
+    # 已逐日比对）。代价：新浪为收盘后更新（T+1 语义），盘中无当天数据——与 A 股
+    # 指数现状一致。
+    {"code": "HK.800000",  "name": "恒生指数",               "source": "sina_hk", "sina_hk_symbol": "HSI"},
+    {"code": "HK.800700",  "name": "恒生科技指数",           "source": "sina_hk", "sina_hk_symbol": "HSTECH"},
     # ── A股指数（服务器端 futu 权限不足，改用 AKShare 新浪 A 股指数源）──
     # sina_code 为 stock_zh_index_daily 的带市场前缀代码（小写）
     {"code": "SH.000001",  "name": "上证指数",               "source": "sina_a", "sina_code": "sh000001"},
@@ -130,13 +135,32 @@ def _r(v, ndigits=4):
 
 
 def _save(records: list):
-    """批量写入 daily_benchmark（单连接 execute_values upsert）"""
+    """批量写入 daily_benchmark（单连接 execute_values upsert）。
+
+    2026-11-18：按「是否带有效 OHLC」拆成两批写入。原因：bulk_upsert 把同批
+    record 的 key 取并集、缺键补 None；若某次富途指数快照偶发只回 last_price
+    （OHLC 为空），这批与 A股指数（带 OHLC）混写时，港股记录会被并集补成
+    OHLC=None，UPDATE 把库里已有的开高低冲成 NULL。拆批后缺 OHLC 的那组
+    并集里不含 OHLC 键，UPDATE 不带这几列 → 保留库内原值。
+    """
     if not records:
         return 0
     from db import get_conn, bulk_upsert
+
+    ohlc_keys = ("open_price", "high_price", "low_price")
+    with_ohlc, without_ohlc = [], []
+    for rec in records:
+        if all(rec.get(k) is None for k in ohlc_keys):
+            without_ohlc.append({k: v for k, v in rec.items() if k not in ohlc_keys})
+        else:
+            with_ohlc.append(rec)
+
     try:
         with get_conn() as conn:
-            bulk_upsert(conn, "daily_benchmark", records, conflict_cols=["bench_code", "trade_date"])
+            for group in (with_ohlc, without_ohlc):
+                if group:
+                    bulk_upsert(conn, "daily_benchmark", group,
+                                conflict_cols=["bench_code", "trade_date"])
         return len(records)
     except Exception as e:
         print(f"  ❌ 批量写入失败: {type(e).__name__}: {e}")
@@ -471,6 +495,63 @@ def _collect_sina(items: list) -> list:
     return records
 
 
+# ── AKShare 新浪源港股指数（与 A 股同口径；2026-11-18 由 futu 切换）──
+def _collect_sina_hk(items: list) -> list:
+    """采集 AKShare 新浪源港股指数（恒生 / 恒生科技）。
+
+    使用 stock_hk_index_daily_sina（新浪源），返回日线 OHLCV + amount。
+    与 _collect_sina_a 的唯一差别：该接口多一列 amount（成交额），直接填
+    turnover —— 已实测与富途快照 turnover 完全同口径（逐日数值吻合）。
+
+    ⚠ 新浪为收盘后更新（T+1 语义），盘中拿不到当天数据，与 A 股指数现状一致。
+    """
+    import akshare as ak
+    import warnings; warnings.filterwarnings("ignore")
+
+    _KEEP = 22   # last + prev + 20日前(iloc[-21])，多留 1 行余量
+
+    records = []
+    for it in items:
+        symbol = it.get("sina_hk_symbol")
+        if not symbol:
+            print(f"  [新浪港股] ❌ {it['name']} 缺少 sina_hk_symbol")
+            continue
+        try:
+            df = ak.stock_hk_index_daily_sina(symbol=symbol)
+            if df is None or len(df) < 2:
+                print(f"  [新浪港股] ⚠️ {it['name']}({symbol}) 数据不足")
+                continue
+            df = df.dropna(subset=["close"]).tail(_KEEP)
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            td = last["date"]
+            if not isinstance(td, date):
+                td = date.fromisoformat(str(td)[:10])
+            last_val = float(last["close"])
+            prev_val = float(prev["close"])
+            change = (last_val / prev_val - 1) * 100 if prev_val != 0 else 0.0
+            o, h, lo = clean_ohlc(last.get("open"), last.get("high"), last.get("low"))
+            vol = last.get("volume")
+            amt = last.get("amount")
+
+            records.append({
+                "bench_code": it["code"], "bench_name": it["name"],
+                "trade_date": td,
+                "update_time": datetime.combine(td, datetime.min.time()),
+                "last_price": _r(last_val), "prev_close": _r(prev_val),
+                "change_pct": _r(change),
+                "close_20d_ago": _r(float(df.iloc[-21]["close"])) if len(df) >= 21 else None,
+                "volume": int(vol) if vol and vol == vol else None,
+                "turnover": _r(amt) if amt and amt == amt else None,
+                "open_price": o, "high_price": h, "low_price": lo,
+            })
+            print(f"  [新浪港股] ✅ {it['name']}({symbol})  {last_val:,.2f}  ({change:+.2f}%)  {td}  "
+                  f"量:{vol or '-'}")
+        except Exception as e:
+            print(f"  [新浪港股] ❌ {it['name']}({symbol})  {type(e).__name__}: {e}")
+    return records
+
+
 # ── AKShare 新浪源 A股指数（服务器端 futu 无 A股权限，改用此源）──
 def _collect_sina_a(items: list) -> list:
     """采集 AKShare 新浪源 A股指数（上证 / 深证成指）。
@@ -622,6 +703,7 @@ def collect_all(sources: Optional[set] = None):
         "fred":      _collect_fred,
         "akshare":   _collect_akshare,
         "sina":      _collect_sina,
+        "sina_hk":   _collect_sina_hk,
         "sina_a":    _collect_sina_a,
         "eastmoney": _collect_eastmoney,
         "yfinance":  _collect_yahoo,

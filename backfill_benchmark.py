@@ -32,9 +32,10 @@ if os.path.exists(env_path):
 
 # ── 指数定义 ──
 BENCHMARKS = {
-    # 富途 K线
-    "HK.800000":  ("恒生指数",               "futu"),
-    "HK.800700":  ("恒生科技指数",           "futu"),
+    # 港股指数（2026-11-18 由 futu 切新浪：富途 K 线对指数 volume 恒 0.0，
+    # 会把成交量写成 0/NULL；新浪同时提供 volume + amount，与 A 股指数同口径）
+    "HK.800000":  ("恒生指数",               "hk_sina"),
+    "HK.800700":  ("恒生科技指数",           "hk_sina"),
     # A股指数（服务器端 futu 无权限，改用 AKShare 新浪 A 股指数源）
     "SH.000001":  ("上证指数",               "sina_a"),
     "SZ.399001":  ("深证成指",               "sina_a"),
@@ -243,6 +244,64 @@ def backfill_sina_a(bench_code, bench_name, days):
     return ins
 
 
+def backfill_hk_sina(bench_code, bench_name, days):
+    """AKShare 新浪港股指数回补（恒生 / 恒生科技）。
+
+    2026-11-18 由 futu 切换：富途 K 线对指数 volume 恒 0.0，会把成交量写成 0/NULL；
+    新浪源同时提供 volume + amount（amount 与库内 turnover 同口径，已逐日核对）。
+    全历史起点：HSI 2013-08、HSTECH 2020-08（以源为准）。
+    """
+    import warnings; warnings.filterwarnings("ignore")
+    import akshare as ak
+
+    symbol = {"HK.800000": "HSI", "HK.800700": "HSTECH"}.get(bench_code)
+    if not symbol:
+        print(f"  ❌ 未配置新浪港股符号: {bench_code}")
+        return 0
+    try:
+        df = ak.stock_hk_index_daily_sina(symbol=symbol)
+    except Exception as e:
+        print(f"  ❌ 拉取失败: {type(e).__name__}: {e}")
+        return 0
+    if df is None or len(df) < 2:
+        print(f"  ⚠️ 数据不足 ({len(df) if df is not None else 0}行)")
+        return 0
+    df = df.dropna(subset=["close"]).reset_index(drop=True)
+    if days and len(df) > days + 20:
+        df = df.iloc[-(days + 20):]
+    print(f"  获取 {len(df)} 行 ({df.iloc[0]['date']} ~ {df.iloc[-1]['date']})")
+
+    recs = []
+    for i in range(len(df)):
+        td = df.iloc[i]["date"]
+        if not isinstance(td, datetime.date):
+            td = datetime.date.fromisoformat(str(td)[:10])
+        last_val = float(df.iloc[i]["close"])
+        prev_val = float(df.iloc[i - 1]["close"]) if i > 0 else None
+        chg = round((last_val / prev_val - 1) * 100, 4) if prev_val and prev_val != 0 else None
+        c20 = float(df.iloc[i - 20]["close"]) if i >= 20 else None
+        o, h, lo = clean_ohlc(df.iloc[i].get("open"), df.iloc[i].get("high"),
+                              df.iloc[i].get("low"))
+        vol = df.iloc[i].get("volume")
+        amt = df.iloc[i].get("amount")
+        rec = {
+            "bench_code": bench_code, "bench_name": bench_name,
+            "trade_date": td,
+            "update_time": datetime.datetime.combine(td, datetime.time.min),
+            "last_price": last_val, "prev_close": prev_val,
+            "change_pct": chg, "close_20d_ago": c20,
+            "open_price": o, "high_price": h, "low_price": lo,
+        }
+        if vol is not None and vol == vol and float(vol) != 0:
+            rec["volume"] = int(vol)
+        if amt is not None and amt == amt:
+            rec["turnover"] = float(amt)
+        recs.append(rec)
+    ins, skip = write_records(recs)
+    print(f"  写入 {ins} 条, 跳过 {skip} 条")
+    return ins
+
+
 def backfill_fred(bench_code, bench_name, days):
     """FRED 回补"""
     from config import val
@@ -444,6 +503,8 @@ def backfill(bench_code, days):
         backfill_futu(bench_code, name, days)
     elif source == "fred":
         backfill_fred(bench_code, name, days)
+    elif source == "hk_sina":
+        backfill_hk_sina(bench_code, name, days)
     elif source == "sina_a":
         backfill_sina_a(bench_code, name, days)
     elif source == "yfinance":
