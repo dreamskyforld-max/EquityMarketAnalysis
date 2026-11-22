@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""申万一级行业估值快照采集 —— 写入 regime.sector_valuation_snapshot。
+"""申万行业估值快照采集（一级31 + 二级131）—— 写入 regime.sw_industry_valuation_snapshot。
 
 为什么必须逐日快照：
-    源 `sw_index_first_info`（申万宏源官方口径）**只提供当前横截面**（31 个行业的
-    PE/PB/股息率），**没有任何历史序列** → 行业估值分位/纵向比较只能靠逐日累积，
-    漏采一天即永久缺失（与一致预期快照、行业资金流同类约束）。
+    源 `sw_index_first_info` / `sw_index_second_info`（申万宏源官方口径）**只提供当前横截面**
+    （31 个一级 + 131 个二级行业的 PE/PB/股息率），**没有任何历史序列** → 行业估值分位/
+    纵向比较只能靠逐日累积，漏采一天即永久缺失（与一致预期快照、行业资金流同类约束）。
 
 来源与用法说明：
     · 行业估值常用于「行业贵不贵」的判断（如 PE_TTM 处于 3 年分位何处），
@@ -14,9 +14,9 @@
       不会把快照记成非交易日。
 
 用法:
-    python3 get_sector_valuation.py                  # 采集（调度用）
-    python3 get_sector_valuation.py --dry-run
-    python3 get_sector_valuation.py --date 2026-09-30
+    python3 get_sw_industry_valuation.py                  # 采集（调度用）
+    python3 get_sw_industry_valuation.py --dry-run
+    python3 get_sw_industry_valuation.py --date 2026-09-30
 """
 import argparse
 import datetime
@@ -26,9 +26,10 @@ import pandas as pd
 
 from db import get_conn, bulk_upsert
 
-TABLE = "regime.sector_valuation_snapshot"
+TABLE = "regime.sw_industry_valuation_snapshot"
 CONFLICT = ["snapshot_date", "sw_code"]
-SOURCE = "akshare:sw_index_first_info"
+SOURCE_L1 = "akshare:sw_index_first_info"
+SOURCE_L2 = "akshare:sw_index_second_info"
 
 
 def _recent_cn_trading_date() -> datetime.date:
@@ -47,35 +48,41 @@ def _recent_cn_trading_date() -> datetime.date:
 
 
 def _fetch() -> list:
+    """一级(31) + 二级(131) 估值快照，industry_level 区分层级。"""
     import warnings
     warnings.filterwarnings("ignore")
     import akshare as ak
-
-    df = ak.sw_index_first_info()
-    if df is None or len(df) == 0:
-        return []
 
     def num(v):
         x = pd.to_numeric(v, errors="coerce")
         return None if pd.isna(x) else round(float(x), 4)
 
     rows = []
-    for _, r in df.iterrows():
-        raw = str(r.get("行业代码", "")).strip()
-        code = raw.split(".")[0]                      # 源形如 801010.SI
-        if not code.isdigit():
-            continue
-        rows.append({
-            "sw_code": code,
-            "sw_name": (str(r.get("行业名称", "")).strip() or None),
-            "constituent_count": None if pd.isna(pd.to_numeric(r.get("成份个数"), errors="coerce"))
-            else int(pd.to_numeric(r.get("成份个数"), errors="coerce")),
-            "pe_static": num(r.get("静态市盈率")),
-            "pe_ttm": num(r.get("TTM(滚动)市盈率")),
-            "pb": num(r.get("市净率")),
-            "div_yield": num(r.get("静态股息率")),
-            "source": SOURCE,
-        })
+    for level, fn_name, source in ((1, "sw_index_first_info", SOURCE_L1),
+                                   (2, "sw_index_second_info", SOURCE_L2)):
+        df = getattr(ak, fn_name)()
+        if df is None or len(df) == 0:
+            raise RuntimeError(f"{fn_name} 返回空，拒绝写入（避免缺失某层级）")
+        n = 0
+        for _, r in df.iterrows():
+            raw = str(r.get("行业代码", "")).strip()
+            code = raw.split(".")[0]                  # 源形如 801010.SI
+            if not code.isdigit():
+                continue
+            rows.append({
+                "sw_code": code,
+                "industry_level": level,
+                "sw_name": (str(r.get("行业名称", "")).strip() or None),
+                "constituent_count": None if pd.isna(pd.to_numeric(r.get("成份个数"), errors="coerce"))
+                else int(pd.to_numeric(r.get("成份个数"), errors="coerce")),
+                "pe_static": num(r.get("静态市盈率")),
+                "pe_ttm": num(r.get("TTM(滚动)市盈率")),
+                "pb": num(r.get("市净率")),
+                "div_yield": num(r.get("静态股息率")),
+                "source": source,
+            })
+            n += 1
+        print(f"  {fn_name}: {n} 个（level={level}）")
     return rows
 
 
@@ -83,7 +90,7 @@ def run(codes=None, ctx=None, snapshot_date: datetime.date = None, dry_run: bool
     """采集入口：申万一级行业估值横截面（幂等 upsert）。"""
     snapshot_date = snapshot_date or _recent_cn_trading_date()
     print("=" * 62)
-    print(f"申万一级行业估值快照（{SOURCE}）→ {TABLE}")
+    print(f"申万行业估值快照（一级+二级）→ {TABLE}")
     print(f"归属交易日: {snapshot_date}")
     print("=" * 62)
 

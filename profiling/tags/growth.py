@@ -6,12 +6,14 @@
 ——水平值归 ④ 盈利质量，价格相关归 ③ 估值，这是三域的分界。
 
 口径约定：
-    · 数据统一用最近两期**标准年报**（revenue_yoy / net_profit_yoy 为财报现成字段）
-    · 增速分档在【市场 + GICS 部门】内做（行业的增速中枢差异巨大：消费 5% vs 新能源 40%）
+    · 增速分档取每只票**最近一期标准报告期**（有季报用季报，无则年报），
+      分档在【市场 + GICS 部门 + 报告期类型】内做——季报同比与年报同比不混排
+    · `grw_growth_persistence` 保持年报序列，值域语义是「年」不改成「期」；
+      `grw_growth_accel` 用同类型报告期序列（全季报或全年报，不混期）
     · yoy 的极端值（小基数 +3000%）不影响分档——rank 分位对异常值免疫，num_value 保留原值
     · 全部标签 pit_capable=False（财报无披露日）
 
-数据来源：financial_indicator（年报：revenue_yoy / net_profit_yoy / revenue）
+数据来源：financial_indicator（自适应标准报告期：revenue_yoy / net_profit_yoy / revenue）
 """
 from __future__ import annotations
 
@@ -43,11 +45,19 @@ _ACCEL_RANGE = {
 
 
 def _load_ctx(as_of: date) -> pd.DataFrame:
+    """增速档底表：自适应最近一期，grp 已含报告期类型。"""
     with _conn() as conn:
-        return load_financial_context(conn, as_of)
+        return load_financial_context(conn, as_of, "auto")
 
 
 def _hist(as_of: date, periods: int) -> pd.DataFrame:
+    """同类型报告期序列：加速度用（近 2 期都已是非年报或都是年报）。"""
+    with _conn() as conn:
+        return load_financial_history(conn, as_of, "auto", periods=periods)
+
+
+def _hist_annual(as_of: date, periods: int) -> pd.DataFrame:
+    """年报序列：连续 ≥N 年正增长专用，保持 years 语义。"""
     with _conn() as conn:
         return load_financial_history(conn, as_of, "annual", periods=periods)
 
@@ -67,9 +77,10 @@ def _num(s: pd.Series) -> pd.Series:
     value_type=TIER, value_range=dict(_TIER_RANGE),
     source_type="stat", update_freq="quarterly",
     data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准年报营收同比增速，在【市场+GICS】内五等分：1=增长最慢/萎缩最重，"
+    compute_logic="最近一期标准报告期营收同比增速（有季报用季报，无则年报），"
+                  "在【市场+GICS+报告期类型】内五等分：1=增长最慢/萎缩最重，"
                   "5=增长最快。负增长是正常状态（与估值域不同），不单独打标。num_value 存 yoy 原值(%)",
-    pit_capable=False, owner="profiling",
+    version="v2", pit_capable=False, owner="profiling",
 )
 def grw_revenue_yoy_tier(as_of: date) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
@@ -84,10 +95,11 @@ def grw_revenue_yoy_tier(as_of: date) -> pd.DataFrame:
     value_type=TIER, value_range=dict(_TIER_RANGE),
     source_type="stat", update_freq="quarterly",
     data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准年报归母净利同比增速，在【市场+GICS】内五等分。"
+    compute_logic="最近一期标准报告期归母净利同比增速（有季报用季报，无则年报），"
+                  "在【市场+GICS+报告期类型】内五等分。"
                   "注意：扭亏为盈公司的 yoy 可能出现 +3000% 级极端值，rank 分位对此免疫，"
                   "但筛选时建议结合 num_value 排序复核",
-    pit_capable=False, owner="profiling",
+    version="v2", pit_capable=False, owner="profiling",
 )
 def grw_profit_yoy_tier(as_of: date) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
@@ -111,7 +123,7 @@ def grw_profit_yoy_tier(as_of: date) -> pd.DataFrame:
     pit_capable=False, owner="profiling",
 )
 def grw_growth_persistence(as_of: date) -> pd.DataFrame:
-    hist = _hist(as_of, 15)
+    hist = _hist_annual(as_of, 15)
     g = hist.sort_values(["stock_code", "report_date"], ascending=[True, False]).copy()
     g["hit"] = (_num(g["revenue_yoy"]) > 0).astype(int)   # yoy 缺失视为中断
     g["prod"] = g.groupby("stock_code")["hit"].cumprod()
@@ -139,10 +151,11 @@ def grw_growth_persistence(as_of: date) -> pd.DataFrame:
     num_unit="pp",
     value_type=TIER, value_range=dict(_ACCEL_RANGE),
     source_type="rule", update_freq="quarterly", data_sources=["financial_indicator"],
-    compute_logic="加速度 = 最新年报营收yoy − 上一年报营收yoy（单位 pp）。"
+    compute_logic="加速度 = 最新一期报告期营收yoy − 上一期同类型报告期营收yoy（单位 pp，"
+                  "两期同为非年报或同为年报，不混期）。"
                   "≥+5pp 记 accelerating，≤−5pp 记 decelerating，其余 steady。"
                   "增速的拐点往往比增速本身更有信息量",
-    pit_capable=False, owner="profiling",
+    version="v2", pit_capable=False, owner="profiling",
 )
 def grw_growth_accel(as_of: date) -> pd.DataFrame:
     hist = _hist(as_of, 2)

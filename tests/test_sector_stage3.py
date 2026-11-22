@@ -314,7 +314,7 @@ class TestCrossSectionIsolation(unittest.TestCase):
         self.assertIn("FROM industry.hk_index_daily", src)
         self.assertNotIn("FROM regime.sector_daily", src)
         self.assertNotIn("FROM a_daily_quote", src)
-        self.assertNotIn("FROM regime.sector_valuation_snapshot", src)
+        self.assertNotIn("FROM regime.sw_industry_valuation_snapshot", src)
 
     def test_dict_upsert_is_single_code(self):
         src = _read("sector_layer_hk.py")
@@ -362,6 +362,49 @@ class TestEngineeringGuards(unittest.TestCase):
         self.assertIn('"as_of": date.today()', src)
         self.assertIn('"build_sector_hierarchy.py"', _read("market_scheduler.py"))
         self.assertIn("18, \"minute\": 30", _read("market_scheduler.py"))
+
+    def test_gics_l2_table_three_sources(self):
+        """二级映射表必须在 schema.sql / 脚本 / 画像查询层三处对齐。"""
+        schema, src = _read("sql/schema.sql"), _read("build_sector_hierarchy.py")
+        for rel in (schema, src):
+            self.assertIn("CREATE TABLE IF NOT EXISTS sector_hierarchy_l2", rel)
+        self.assertIn("group_code", schema)
+        self.assertIn("group_name", schema)
+        self.assertIn("COMMENT ON TABLE  sector_hierarchy_l2", schema)
+        self.assertIn("_SECTOR_HIERARCHY_L2_SQL", src)
+        self.assertIn("_L2_COMMENTS", src)
+        self.assertIn("_SECTOR_GROUP_MAP", src)
+        self.assertIn('bulk_upsert(conn, "sector_hierarchy_l2"', src)
+        # 画像查询层：独立函数，不污染一级 load_gics_map
+        q = _read("profiling/quantile.py")
+        self.assertIn("def load_gics_group_map(conn)", q)
+        self.assertIn("JOIN sector_hierarchy_l2 sh", q)
+
+    def test_gics_l2_map_completeness(self):
+        """二级映射 100% 覆盖港股一级板块，二级码全部落在 LEVEL2 码表内。"""
+        import build_sector_hierarchy as bsh
+        hk_codes = {c for c in bsh._SECTOR_MAP if c.startswith("HK.")}
+        self.assertEqual(len(hk_codes), 113)
+        self.assertEqual(set(bsh._SECTOR_GROUP_MAP), hk_codes)   # 无遗漏、无多余
+        self.assertTrue(set(bsh._SECTOR_GROUP_MAP.values()) <= set(bsh.LEVEL2))
+        self.assertEqual(len(bsh.LEVEL2), 26)   # 25 个官方组 + NONE 兜底
+        self.assertEqual(bsh._SECTOR_GROUP_MAP["HK.LIST1061"], "NONE")  # 综合企业无对应
+        # 2026-11 新增板块归属（用户确认）
+        self.assertEqual(bsh._SECTOR_MAP["HK.LIST24340"], ("HEALTH_CARE", "医疗保健"))
+        self.assertEqual(bsh._SECTOR_GROUP_MAP["HK.LIST24340"], "3520")  # CRO/CDMO
+        self.assertEqual(bsh._SECTOR_MAP["HK.LIST24341"], ("INDUSTRIALS", "工业"))
+        self.assertEqual(bsh._SECTOR_GROUP_MAP["HK.LIST24341"], "2010")  # 机器人/资本品
+
+    def test_val_pe_ind2_pct_registered_and_isolated(self):
+        """新增标签已注册、分组用二级码、且不进入估值结论判定。"""
+        src = _read("profiling/tags/valuation.py")
+        self.assertIn('code="val_pe_ind2_pct"', src)
+        self.assertIn("load_gics_group_map", src)
+        self.assertIn('df["gics_group"]', src)
+        # 估值结论 inputs[] 仍只读一级 val_pe_ind_pct，未引入二级标签
+        rules = _read("profiling/conclusions/rules.py")
+        self.assertIn('"val_pe_ind_pct"', rules)
+        self.assertNotIn('"val_pe_ind2_pct"', rules)
 
     def test_hk_runs_after_cn_in_same_unit(self):
         src = _read("system/sector-layer.service")

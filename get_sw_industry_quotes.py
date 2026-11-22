@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""申万一级行业指数回填 —— 写入 daily_benchmark（复用现有基准表，不建新表）。
+"""申万行业指数行情采集（日常增量）—— 写入 daily_benchmark（复用现有基准表，不建新表）。
 
 数据源：AKShare `index_hist_sw(symbol, period='day')`（申万宏源指数，官方口径）
-  · 实测深度：示例 801010 自 **1999-12-30** 起 6465 行 → 31 个一级行业可全量回填，
-    覆盖 2015/2018/2021/2024 全部牛熊（满足"至少 2015 起"要求）。
+  · 覆盖：从 regime.sw_industry_classification 读全部行业代码（一级31/二级131/三级336）；
   · 用途（第④层行业配置）：行业 RS / RRG / 行业动量 / 行业内宽度基准 / 行业估值对照。
+
+职责（单一职责）：只做**日常增量**行情采集；首次全量回填在
+  `backfill_sw_industry_classification.py`（独立 unit 手工跑，本脚本不含 --full）。
 
 命名与落库约定：
   · bench_code = `CN.SW801010` 形式（daily_benchmark 命名空间扩展，不建新表）；
@@ -14,13 +16,12 @@
   · UNIQUE(bench_code, trade_date) 幂等 upsert，可重复跑。
 
 用法:
-    python3 backfill_sw_industry.py                 # 增量更新全部 31 个一级行业（日常/调度默认）
-    python3 backfill_sw_industry.py --full          # 全量回填（首次建库/大修后）
-    python3 backfill_sw_industry.py --only 801010   # 单个行业
-    python3 backfill_sw_industry.py --list          # 只打印行业清单
+    python3 get_sw_industry_quotes.py                 # 增量更新全部行业（日常/调度默认）
+    python3 get_sw_industry_quotes.py --only 801010   # 单个行业
+    python3 get_sw_industry_quotes.py --list          # 只打印行业清单
 
 调度（market_scheduler.GLOBAL_TASKS「申万行业指数」18:10）：调度器在进程内调用
-`run(codes, ctx=...)`，**不传命令行参数** → incremental 必须默认为 True（见 run 文档）。
+`run(codes, ctx=...)`，**不传命令行参数** → incremental 恒为 True（见 run 文档）。
 """
 import argparse
 import datetime
@@ -33,17 +34,19 @@ SOURCE = "akshare:index_hist_sw"
 TABLE = "daily_benchmark"
 CONFLICT = ["bench_code", "trade_date"]
 
-# 申万一级行业（2021 版分类，31 个）
-SW_L1 = {
-    "801010": "农林牧渔", "801030": "基础化工", "801040": "钢铁", "801050": "有色金属",
-    "801080": "电子", "801110": "家用电器", "801120": "食品饮料", "801130": "纺织服饰",
-    "801140": "轻工制造", "801150": "医药生物", "801160": "公用事业", "801170": "交通运输",
-    "801180": "房地产", "801200": "商贸零售", "801210": "社会服务", "801230": "综合",
-    "801710": "建筑材料", "801720": "建筑装饰", "801730": "电力设备", "801740": "国防军工",
-    "801750": "计算机", "801760": "传媒", "801770": "通信", "801780": "银行",
-    "801790": "非银金融", "801880": "汽车", "801890": "机械设备", "801950": "煤炭",
-    "801960": "石油石化", "801970": "环保", "801980": "美容护理",
-}
+def _load_sw_codes() -> dict:
+    """从 regime.sw_industry_classification 读全部行业 {code: name}（一/二/三级）。
+
+    ⚠ 不再写死 SW_L1 常量（名实不符）：分类清单以层级表为单一真相源。
+    若层级表为空，说明 get_sw_industry_classification.py 未跑，直接报错而不静默降级。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT sw_code, sw_name FROM regime.sw_industry_classification ORDER BY level, sw_code")
+            rows = cur.fetchall()
+    if not rows:
+        raise RuntimeError("regime.sw_industry_classification 为空：请先跑 get_sw_industry_classification.py")
+    return dict(rows)
 
 
 def _rows_for(code: str, name: str) -> list:
@@ -102,24 +105,24 @@ def _last_dates() -> dict:
 INCREMENTAL_LOOKBACK = 3   # 增量模式回看天数：容错源侧迟到/修订（幂等 upsert，重复写无害）
 
 
-def run(codes=None, ctx=None, only: str = None, incremental: bool = True):
-    """采集入口：回填/更新行业指数（幂等）。codes 非空时按 8010xx 代码过滤。
+def run(codes=None, ctx=None, only: str = None):
+    """采集入口：行业指数**日常增量**更新（幂等）。codes 非空时按行业代码过滤。
 
-    **incremental 默认 True**：调度器用 `collector_runtime.run_module(script, codes)`
-    在进程内调用 `run(codes, ctx=...)`，**传不了命令行参数**，所以日常默认必须是增量。
-    首次全量回填用 CLI 的 `--full`（或直接调 run(incremental=False)）。
+    调度器用 `collector_runtime.run_module(script, codes)` 进程内调用
+    `run(codes, ctx=...)`，传不了命令行参数，故只做增量（全量回填在独立脚本）。
 
     增量语义：源 `index_hist_sw` 不支持日期参数、只能整段拉回，故仍全量请求，
-    但**只 upsert 库内最新日 −3 天之后的尾部** —— 31 个行业 × 6465 行
-    的全量写入（约 20 万行）压到数十行，同时保留源侧迟到/修订的自愈能力。
+    但**只 upsert 库内最新日 −3 天之后的尾部** —— 每个行业全量拉回、只写尾部，
+    保留源侧迟到/修订的自愈能力。
     """
-    targets = [only] if only else list(SW_L1.keys())
-    last_map = _last_dates() if incremental else {}
+    sw_map = _load_sw_codes()
+    targets = [only] if only else list(sw_map.keys())
+    last_map = _last_dates()
     total = 0
     for code in targets:
-        name = SW_L1.get(code)
+        name = sw_map.get(code)
         if not name:
-            print(f"  ⚠️ {code}: 不在申万一级清单，跳过")
+            print(f"  ⚠️ {code}: 不在申万分类层级表，跳过")
             continue
         try:
             rows = _rows_for(code, name)
@@ -129,11 +132,10 @@ def run(codes=None, ctx=None, only: str = None, incremental: bool = True):
         if not rows:
             print(f"  ⚠️ {code} {name}: 空数据")
             continue
-        if incremental:
-            last = last_map.get(f"CN.SW{code}")
-            if last:
-                floor = last - datetime.timedelta(days=INCREMENTAL_LOOKBACK)
-                rows = [r for r in rows if r["trade_date"] >= floor]
+        last = last_map.get(f"CN.SW{code}")
+        if last:
+            floor = last - datetime.timedelta(days=INCREMENTAL_LOOKBACK)
+            rows = [r for r in rows if r["trade_date"] >= floor]
         with get_conn() as conn:
             bulk_upsert(conn, TABLE, rows, conflict_cols=CONFLICT)
         total += len(rows)
@@ -148,19 +150,18 @@ def _main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default=None, help="单个行业代码，如 801010")
     ap.add_argument("--list", action="store_true", help="只打印行业清单")
-    ap.add_argument("--full", action="store_true",
-                    help="全量回填（首次建库用）；默认增量：只 upsert 库内最新日−3 天之后的尾部")
     args = ap.parse_args()
 
+    sw_map = _load_sw_codes()
     if args.list:
-        for c, n in SW_L1.items():
+        for c, n in sw_map.items():
             print(f"  {c}  {n}")
         return 0
 
     print("=" * 60)
-    print(f"申万一级行业指数{'全量回填' if args.full else '增量更新'}（{len(SW_L1)} 个）→ daily_benchmark")
+    print(f"申万行业指数增量更新（{len(sw_map)} 个，来自分类层级表）→ daily_benchmark")
     print("=" * 60)
-    run(only=args.only, incremental=not args.full)
+    run(only=args.only)
 
     with get_conn() as conn:
         with conn.cursor() as cur:

@@ -104,11 +104,11 @@ _D_PRICE = ("数据：CN 申万一级 31 个官方行业指数（daily_benchmark
 _D_XSEC = ("数据：同一 (CN, SW_L1, trade_date) 内按 M1 中位秩取横截面分位，"
            "n_valid<10 不给值；rank_n 实测 16(≤2010)→28(2014)→31(2018 起) 时变，"
            "早期分母不可与后期直接比")
-_D_SNAP = ("数据：regime.sector_valuation_snapshot 只给当前横截面、无历史序列，"
+_D_SNAP = ("数据：regime.sw_industry_valuation_snapshot 只给当前横截面、无历史序列，"
            "2026-09-30 起逐日累积（实测 27 个快照日），漏采一天即永久缺失")
 _D_FLOW = ("数据：同花顺约 90 个细分行业资金流经 regime.sector_mapping 映射到申万，"
            "只纳入 confirmed=true 或 corr≥0.6；源只给即时快照、2026-09-30 起")
-_D_PIT = ("数据：成分按 industry.constituent 的 [eff_from, eff_to) 取用，"
+_D_PIT = ("数据：成分取 regime.stock_sw_industry_mapping 最新名单（D12/D14：无 PIT，接受幸存者偏差），"
           "有效起点 2021-12-13（决策 A：申万 2021 版分类启用日），更早不得用当前成分回算；"
           "按月 × 按股票分批聚合，pit_capable=false 段须降置信")
 _D_FC = ("数据：regime.analyst_forecast_snapshot 2026-09-30 起、仅 A 股、实测 25 个快照日；"
@@ -169,44 +169,44 @@ INDICATOR_DEFS = [
              _D_XSEC),
     # B 估值（风险侧，高分=更贵）
     D("SEC.VAL.PE_TTM", "行业PE-TTM", "VAL", "risk", "x", "high_risk",
-      "sector_valuation_snapshot.pe_ttm 原值按 snapshot_date 对齐", "M0",
-      value_col="pe_ttm", source="regime.sector_valuation_snapshot",
+      "sw_industry_valuation_snapshot.pe_ttm 原值按 snapshot_date 对齐", "M0",
+      value_col="pe_ttm", source="regime.sw_industry_valuation_snapshot",
       remark="定义：申万一级行业 PE-TTM 官方快照原值（x）" + _SEP +
              "判读：**高 = 行业更贵**（风险侧）；只作估值水位读数，不得用「便宜」抵消拥挤度（§3.5 不产出单一综合分）" + _SEP +
              _D_SNAP + _SEP + "⚠ 首期只有横截面分位可用，时序分位待满 250 观测"),
     D("SEC.VAL.PB", "行业PB", "VAL", "risk", "x", "high_risk",
-      "sector_valuation_snapshot.pb 原值", "M0",
-      value_col="pb", source="regime.sector_valuation_snapshot",
+      "sw_industry_valuation_snapshot.pb 原值", "M0",
+      value_col="pb", source="regime.sw_industry_valuation_snapshot",
       remark="定义：申万一级行业 PB 官方快照原值（x）" + _SEP +
              "判读：高 = 更贵；与 PE_TTM 联读可分辨「盈利下滑推高 PE」与「资产重估推高 PB」" + _SEP +
              _D_SNAP),
     D("SEC.VAL.DIV_YIELD", "行业股息率", "VAL", "risk", "pct", "high_good",
-      "sector_valuation_snapshot.div_yield 原值", "M0",
-      value_col="div_yield", source="regime.sector_valuation_snapshot",
+      "sw_industry_valuation_snapshot.div_yield 原值", "M0",
+      value_col="div_yield", source="regime.sw_industry_valuation_snapshot",
       remark="定义：申万一级行业股息率官方快照原值（%）" + _SEP +
              "判读：高 = 现金回报高、估值相对不贵；与 PE_TTM 反向，是风险侧的缓冲读数" + _SEP +
              _D_SNAP),
     D("SEC.VAL.PE_XSEC_PCT", "PE横截面分位", "VAL", "risk", "score_0_100", "high_risk",
       "M1(pe_ttm)，越高越贵", "M1",
-      pct_x_col="pe_xsec_pct", n_col="n_val", source="regime.sector_valuation_snapshot",
+      pct_x_col="pe_xsec_pct", n_col="n_val", source="regime.sw_industry_valuation_snapshot",
       remark="定义：PE_TTM 当日横截面中位秩分位（M1，0–100），**VALUATION 维度单锚**" + _SEP +
              "判读：>50 比同日多数行业贵；**首期主用口径**，不依赖历史深度；同时是 CROWDING 的 VAL_PCT 一票（跨层重复计权已登记）" + _SEP +
              _D_XSEC),
     D("SEC.VAL.PB_XSEC_PCT", "PB横截面分位", "VAL", "risk", "score_0_100", "high_risk",
       "M1(pb)", "M1", pct_x_col="pb_xsec_pct", n_col="n_val",
-      source="regime.sector_valuation_snapshot",
+      source="regime.sw_industry_valuation_snapshot",
       remark="定义：PB 当日横截面分位（M1，0–100）" + _SEP +
              "判读：>50 比同日多数行业贵；与 PE_XSEC_PCT 概念同源，按 §7.2 去重后**降级为校验项，不进维度分**" + _SEP +
              _D_XSEC),
     D("SEC.VAL.REL_TO_MARKET", "行业PE/市场PE中位数", "VAL", "risk", "ratio", "high_risk",
       "pe_ttm / 当日 31 行业 pe_ttm 中位数", "M0",
-      value_col="rel_to_market", source="regime.sector_valuation_snapshot",
+      value_col="rel_to_market", source="regime.sw_industry_valuation_snapshot",
       remark="定义：行业 PE_TTM / 当日 31 行业 PE_TTM 中位数（ratio）" + _SEP +
              "判读：>1 贵于中位行业；与 PE_XSEC_PCT 高度冗余，**仅作校验项，不进维度分**（§7.2 去重）" + _SEP +
              _D_SNAP),
     D("SEC.VAL.PE_TS_PCT", "PE时序分位", "VAL", "risk", "score_0_100", "high_risk",
       "M2 expanding，min_periods=250", "M2",
-      pct_t_col="pe_ts_pct", n_col="pe_n_sample", source="regime.sector_valuation_snapshot",
+      pct_t_col="pe_ts_pct", n_col="pe_n_sample", source="regime.sw_industry_valuation_snapshot",
       remark="定义：行业 PE_TTM 自身历史的 as-of expanding 时序分位（M2，0–100，min_periods=250）" + _SEP +
              "判读：>50 贵于自身历史多数时候；与横截面分位互补（一个比同侪、一个比自己）" + _SEP +
              "数据：🔴 阶段 1 恒不可用——实测仅 27 个快照日 « 250，按 §5.7 一律 NULL 并写 pe_n_sample，禁止用小样本分位填充" + _SEP +
@@ -268,7 +268,7 @@ INDICATOR_DEFS = [
              "⚠ 早期 rank_n 16→28，同源占比分母随行业数变化，不可与 2018 后 31 行业直接比"),
     D("SEC.CROWD.VAL_PCT", "拥挤·估值因子", "CROWD", "risk", "score_0_100", "high_risk",
       "直取 SEC.VAL.PE_XSEC_PCT（复用，跨层重复计权已登记）", "M1",
-      pct_x_col="pe_xsec_pct", n_col="n_val", source="regime.sector_valuation_snapshot",
+      pct_x_col="pe_xsec_pct", n_col="n_val", source="regime.sw_industry_valuation_snapshot",
       remark="定义：拥挤度估值因子，直取 SEC.VAL.PE_XSEC_PCT（0–100，复用不重复计权）" + _SEP +
              "判读：>80 计一票命中；与 SEC.DIM.VALUATION 读同一批 PE 原子但语义不同（风险共振一票 vs 估值水位程度）" + _SEP +
              _D_SNAP + _SEP +
@@ -288,12 +288,12 @@ INDICATOR_DEFS = [
              "数据：raw_value 存 0–4 编码，label/k/partial/members 在 extra" + _SEP +
              "⚠ 阶段 1(k=2) 与阶段 2(k=3) 分母不同，两期闸门不可跨期比较；阶段 4 因 EXTREME 仅 45 行判 NOT_EVALUABLE，验证完成前只作纯展示标记",
       extra_kind="crowd"),
-    # ── 阶段 2：依赖 industry.constituent 的自下而上指标 ──────────────
+    # ── 阶段 2：依赖 regime.stock_sw_industry_mapping 的自下而上指标 ──────────────
     # 有效起点 2021-12-13（决策 A）；全部由 sector_stage2_agg 按月 × 按股票分批聚合。
     D("SEC.CROWD.TURNOVER_PCT", "行业换手率横截面分位", "CROWD", "risk", "score_0_100", "high_risk",
       "成分股 turnover_rate 按流通市值加权 → 当日横截面分位(M1)", "M6",
       value_col="turnover_w", pct_x_col="turnover_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + industry.constituent",
+      source="a_daily_quote + regime.stock_sw_industry_mapping",
       remark="定义：成分股 turnover_rate 按流通市值加权的行业换手率，再取当日横截面分位（M1，0–100）" + _SEP +
              "判读：高 = 该行业交投相对同侪更热，是拥挤三因子的第三票；阶段 1 该因子恒缺，闸门按 k=2 部分模式" + _SEP +
              _D_PIT + _SEP +
@@ -301,28 +301,28 @@ INDICATOR_DEFS = [
     D("SEC.VAL.INTRA_DISPERSION", "行业内个股PE离散度", "VAL", "risk", "score_0_100", "high_risk",
       "成分股 pe_ttm_ratio 横截面 std → 当日横截面分位(M1)", "M6",
       value_col="pe_dispersion", pct_x_col="pe_disp_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + industry.constituent",
+      source="a_daily_quote + regime.stock_sw_industry_mapping",
       remark="定义：行业内成分股 PE-TTM 的横截面标准差，再取当日横截面分位（M1，0–100）" + _SEP +
              "判读：高 = 行业内估值分化大（龙头与尾部定价撕裂）；与 PE_XSEC_PCT 高冗余，**仅作校验不进维度分**" + _SEP +
              _D_PIT + _SEP + "⚠ 个股 pe_ttm_ratio 2018 起才有，早期为 NULL"),
     D("SEC.BREADTH.UP_RATIO", "行业内上涨占比", "BREADTH", "state", "pct", "high_good",
       "M6：成分股 change_pct>0 占比", "M6",
       value_col="up_ratio", pct_x_col="up_ratio_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + industry.constituent",
+      source="a_daily_quote + regime.stock_sw_industry_mapping",
       remark="定义：行业内当日收涨成分股占有行情成分数比例（%，M6 count-if/n）" + _SEP +
              "判读：**高 = 行业内部参与广度健康**；与市场级 SECTOR.UP_RATIO 区分——后者是「多少个行业在涨」，本项是「行业内多少股票在涨」" + _SEP +
              _D_PIT),
     D("SEC.BREADTH.ABOVE_MA60", "行业内站上MA60占比", "BREADTH", "state", "pct", "high_good",
       "M6：成分股 close > MA60 占比（rolling 60，min_periods=60）", "M6",
       value_col="above_ma60", pct_x_col="above_ma60_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + industry.constituent",
+      source="a_daily_quote + regime.stock_sw_industry_mapping",
       remark="定义：行业内 close > MA60 的成分股占比（%，rolling 60 / min_periods=60）" + _SEP +
              "判读：>50 多数成分站上中期均线 = 中期广度健康；极高位偏过热，须与趋势方向同用" + _SEP +
              _D_PIT + _SEP + "⚠ 需 60 交易日暖机，起点后首 60 日为 NULL"),
     D("SEC.BREADTH.NEW_HIGH_LOW", "行业内新高−新低归一净占比", "BREADTH", "state", "pct", "high_good",
       "100×(n_high−n_low)/(n_high+n_low)，60日窗口；计数类必须归一（§5.7）", "M6",
       value_col="new_high_low", pct_x_col="nhl_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + industry.constituent",
+      source="a_daily_quote + regime.stock_sw_industry_mapping",
       remark="定义：60 日新高−新低**归一净占比** = 100×(n_high−n_low)/(n_high+n_low)（%，−100~100）" + _SEP +
              "判读：>0 创新高者占优 = 中期动能健康；持续为负而行业指数走高 = 内在动能衰竭" + _SEP +
              _D_PIT + _SEP +
@@ -330,14 +330,14 @@ INDICATOR_DEFS = [
     D("SEC.BREADTH.RET_DISPERSION", "行业内收益离散度", "BREADTH", "state", "pct", "high_risk",
       "成分股 20 日收益横截面 std → 横截面分位(M1)", "M6",
       value_col="ret_dispersion", pct_x_col="ret_disp_xsec_pct", n_col="constituent_n",
-      source="a_daily_quote + industry.constituent",
+      source="a_daily_quote + regime.stock_sw_industry_mapping",
       remark="定义：行业内成分股 20 日收益的横截面标准差（M6 + std）" + _SEP +
              "判读：direction=high_risk（**高 = 分化大**）；BREADTH 维度内 sign=-1 翻转，高分位代表更集中" + _SEP +
              _D_PIT + _SEP +
              "⚠ 阶段 4 构念效度实测与维度分相关仅 0.160 <0.3，已登记为待移出成员（见 sector_validation_report.md §3）"),
     D("SEC.FLOW.MARGIN_NET", "行业两融净买入", "FLOW", "state", "yi_yuan", "high_good",
       "M6：成分股 rz_net 求和 / 1e8", "M6",
-      value_col="margin_net", source="daily_margin_balance + industry.constituent",
+      value_col="margin_net", source="daily_margin_balance + regime.stock_sw_industry_mapping",
       remark="定义：行业成分股两融净买入额求和 / 1e8（亿元，M6）" + _SEP +
              "判读：>0 杠杆资金净流入该行业；只作描述性读数，不作预测信号" + _SEP +
              "⚠ 源 daily_margin_balance.rz_net（元→亿元），按 PIT 成分映射" + _SEP +
@@ -345,7 +345,7 @@ INDICATOR_DEFS = [
     D("SEC.FUND.ROE_MEDIAN", "行业ROE中位数", "FUND", "state", "pct", "high_good",
       "M6：按 announce_date ≤ t 取最新报告期（PIT），行业内取中位数", "M6",
       value_col="roe_median", pct_x_col="roe_xsec_pct", n_col="constituent_n",
-      source="financial_indicator + industry.constituent",
+      source="financial_indicator + regime.stock_sw_industry_mapping",
       remark="定义：行业成分股 ROE 的 PIT 中位数（%，按 announce_date ≤ t 取最新报告期）" + _SEP +
              "判读：高 = 行业盈利能力相对强；FUNDAMENTAL 维度 4 成员之一（每成员 25% 权重）" + _SEP +
              _D_PIT + _SEP +
@@ -353,7 +353,7 @@ INDICATOR_DEFS = [
     D("SEC.FUND.NP_YOY_MEDIAN", "行业净利同比中位数", "FUND", "state", "pct", "high_good",
       "PIT 最新报告期 net_profit_yoy 中位数", "M6",
       value_col="np_yoy_median", pct_x_col="npyoy_xsec_pct", n_col="constituent_n",
-      source="financial_indicator + industry.constituent",
+      source="financial_indicator + regime.stock_sw_industry_mapping",
       remark="定义：行业成分股净利同比的 PIT 中位数（%）" + _SEP +
              "判读：>0 行业盈利整体扩张；与 REV_YOY_MEDIAN 联读区分「增收不增利」" + _SEP +
              _D_PIT + _SEP +
@@ -361,20 +361,20 @@ INDICATOR_DEFS = [
     D("SEC.FUND.REV_YOY_MEDIAN", "行业营收同比中位数", "FUND", "state", "pct", "high_good",
       "PIT 最新报告期 revenue_yoy 中位数", "M6",
       value_col="rev_yoy_median", pct_x_col="revyoy_xsec_pct", n_col="constituent_n",
-      source="financial_indicator + industry.constituent",
+      source="financial_indicator + regime.stock_sw_industry_mapping",
       remark="定义：行业成分股营收同比的 PIT 中位数（%）" + _SEP +
              "判读：>0 行业需求端扩张；与 NP_YOY_MEDIAN 背离时提示利润率变化" + _SEP +
              _D_PIT),
     D("SEC.FUND.IMPROVEMENT_BREADTH", "行业盈利改善宽度", "FUND", "state", "pct", "high_good",
       "PIT 最新报告期 net_profit_yoy>0 的成分占比", "M6",
       value_col="improvement_breadth", pct_x_col="improve_xsec_pct", n_col="constituent_n",
-      source="financial_indicator + industry.constituent",
+      source="financial_indicator + regime.stock_sw_industry_mapping",
       remark="定义：行业内净利同比为正的成分占比（0–100%，M6 count-if/n）" + _SEP +
              "判读：高 = 盈利改善是**普遍性**而非少数龙头拉动；与 NP_YOY_MEDIAN 联读区分「中位数被拉高」与「多数改善」" + _SEP +
              _D_PIT + _SEP + "⚠ 归一比率天然平稳（§5.7 L2-a ③），不随股票池扩缩漂移"),
     D("SEC.FUND.COVERAGE", "财务覆盖度", "FUND", "state", "ratio", "high_good",
       "有 ROE 的成分数 / 成分数", "M6",
-      value_col="fund_coverage", source="financial_indicator + industry.constituent",
+      value_col="fund_coverage", source="financial_indicator + regime.stock_sw_industry_mapping",
       remark="定义：有 ROE 的成分数 / PIT 有效成分数（0–1）" + _SEP +
              "判读：**门禁**——<0.6 时 FUNDAMENTAL 组全部读数作废并清库，不得用稀疏样本出中位数" + _SEP +
              _D_PIT + _SEP +
@@ -382,7 +382,7 @@ INDICATOR_DEFS = [
     D("SEC.FUND.REVISION_BREADTH", "行业盈利修正宽度", "FUND", "state", "pct", "high_good",
       "M7：同财年 FY1 EPS 相邻快照差分（±0.5% 噪声），30快照滚动，按成分下沉到行业", "M7",
       value_col="revision_breadth", pct_x_col="revision_xsec_pct", n_col="revision_n",
-      source="regime.analyst_forecast_snapshot + industry.constituent",
+      source="regime.analyst_forecast_snapshot + regime.stock_sw_industry_mapping",
       remark="定义：行业盈利修正宽度 = (Σ上调−Σ下调)/Σ可比样本×100（M7，同财年 FY1 EPS 相邻快照差分 ±0.5% 噪声，30 快照滚动）" + _SEP +
              "判读：>0 分析师预期在上修；FUNDAMENTAL 维度 4 成员之一" + _SEP +
              _D_FC + _SEP +
@@ -390,13 +390,13 @@ INDICATOR_DEFS = [
              "⚠ 阶段 4 构念效度实测载荷 0.156 <0.3，已登记为待移出成员（见 sector_validation_report.md §3）"),
     D("SEC.FUND.RATING_BULL_PCT", "行业评级乐观度", "FUND", "state", "pct", "high_good",
       "(rating_buy+rating_overweight)/五档合计，按成分汇总", "M0",
-      value_col="rating_bull_pct", source="regime.analyst_forecast_snapshot + industry.constituent",
+      value_col="rating_bull_pct", source="regime.analyst_forecast_snapshot + regime.stock_sw_industry_mapping",
       remark="定义：(买入+增持)/评级五档合计，按 PIT 成分汇总（%）" + _SEP +
              "判读：🔴 判别力弱——§7.8 实测 99.3% 结构性集中在买入/增持，**仅作极端背离提示，不进维度分**" + _SEP +
              _D_FC),
     D("SEC.FUND.FORECAST_COVERAGE", "预期覆盖度", "FUND", "state", "ratio", "high_good",
       "有预期数据的成分数 / PIT 有效成分数", "M6",
-      value_col="forecast_coverage", source="regime.analyst_forecast_snapshot + industry.constituent",
+      value_col="forecast_coverage", source="regime.analyst_forecast_snapshot + regime.stock_sw_industry_mapping",
       remark="定义：有预期数据的成分数 / PIT 有效成分数（0–1）" + _SEP +
              "判读：**门禁**——<0.3 时 REVISION_BREADTH 不出值，避免用少数覆盖样本冒充行业一致预期" + _SEP +
              _D_FC),
@@ -914,7 +914,7 @@ def _load_valuation(conn, start: dt.date, end: dt.date) -> pd.DataFrame:
     w = start - dt.timedelta(days=WARMUP_DAYS)
     sql = """
         SELECT snapshot_date AS trade_date, sw_code, pe_ttm, pb, div_yield
-        FROM regime.sector_valuation_snapshot
+        FROM regime.sw_industry_valuation_snapshot
         WHERE snapshot_date BETWEEN %s AND %s
     """
     return read_sql(conn, sql, params=[w, end])

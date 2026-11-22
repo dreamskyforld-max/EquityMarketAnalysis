@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""第④层「行业配置」阶段 2：自下而上聚合（依赖 industry.constituent）。
+"""第④层「行业配置」阶段 2：自下而上聚合（依赖 regime.stock_sw_industry_mapping）。
 
 被 sector_layer.py 调用，产出「一行 = 一个行业日」的阶段 2 原子聚合表，
 再 merge 进 _compute_frame 的宽表。
 
+⚠ D12/D14（2026-11-20）：成分主数据收口到 stock_sw_industry_mapping（废除
+  industry.constituent）。**放弃 PIT**：仍逐日算历史序列，但成分用最新名单贴历史，
+  含幸存者偏差；所有下游指标 pit_capable=false。
+
 设计约束（doc/industry_allocation_feasibility.md §2.2.1 / §4.2、资源规范 R1/R3/R7）：
-  · **PIT**：成分按 trade_date ∈ [eff_from, eff_to) 取用；财务按
-    announce_date ≤ trade_date 取最新报告期；一致预期快照日本身即 PIT。
+  · **成分**：最新名单（无 eff 区间）；财务按 announce_date ≤ trade_date 取最新报告期。
   · **有效起点 2021-12-13**（决策 A）：更早日期一律不产出阶段 2 读数，
     长历史仍由不依赖成分的价格类指标（阶段 1）承担，两段不混排。
   · **分批**：a_daily_quote 自 2021-12-13 起 620 万行、daily_margin_balance 410 万行，
@@ -60,42 +63,41 @@ def _as_dt(s: pd.Series) -> pd.Series:
 
 
 def load_constituent_map(conn) -> pd.DataFrame:
-    """全部版本链（含已关闭区间），约 5~8 千行，一次加载无内存压力。"""
+    """最新成分映射（D12/D14：收口到 stock_sw_industry_mapping，无历史版本）。
+
+    ⚠ 行业指标仍逐日算历史序列，但成分用**最新名单**贴历史（放弃 PIT，接受幸存者偏差）。
+    sector_code 取申万一级（由 sw_code_l3 经分类表 parent 链 join 得出），weight 取 weight_l1。
+    """
     sql = """
-        SELECT sector_code, stock_code, eff_from, eff_to, weight
-        FROM industry.constituent
-        WHERE market='CN'
+        SELECT h.sw_code AS sector_code, m.stock_code, m.weight_l1 AS weight
+        FROM regime.stock_sw_industry_mapping m
+        JOIN regime.sw_industry_classification l3 ON l3.sw_code = m.sw_code_l3
+        JOIN regime.sw_industry_classification l2 ON l2.sw_code = l3.parent_code
+        JOIN regime.sw_industry_classification h  ON h.sw_code = l2.parent_code
+        WHERE h.level = 1
     """
     df = read_sql(conn, sql)
     if df.empty:
-        return pd.DataFrame(columns=["sector_code", "stock_code", "eff_from", "eff_to", "weight"])
-    df["eff_from"] = _as_dt(df["eff_from"])
-    df["eff_to"] = _as_dt(df["eff_to"])
+        return pd.DataFrame(columns=["sector_code", "stock_code", "weight"])
     df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
     return df
 
 
 def pit_join(df: pd.DataFrame, cmap: pd.DataFrame) -> pd.DataFrame:
-    """按 PIT 区间把个股行贴到行业（纯函数，可单测）。
+    """把个股行贴到行业（D14：用最新成分，无 PIT 区间判断）。
 
-    ⚠ 同一股票在同一天若命中多个版本区间，取 eff_from 最大的那条（版本链设计上
-    不应重叠；这一步是防御，避免重复计权）。
+    ⚠ 函数名保留 pit_join 以兼容调用点，但语义已变为"最新成分贴历史"：
+    不再按 eff_from/eff_to 过滤，任何历史日期都用同一份最新名单。
     """
     if df.empty or cmap.empty:
         return pd.DataFrame()
     d = df.copy()
     d["trade_date"] = _as_dt(d["trade_date"])
     keys = d[["stock_code", "trade_date"]].merge(
-        cmap[["sector_code", "stock_code", "eff_from", "eff_to"]],
+        cmap[["sector_code", "stock_code"]].drop_duplicates("stock_code"),
         on="stock_code", how="inner")
-    ok = ((keys["trade_date"] >= keys["eff_from"])
-          & (keys["eff_to"].isna() | (keys["trade_date"] < keys["eff_to"])))
-    keys = keys.loc[ok]
     if keys.empty:
         return pd.DataFrame()
-    keys = (keys.sort_values("eff_from")
-                .drop_duplicates(["stock_code", "trade_date"], keep="last")
-                [["stock_code", "trade_date", "sector_code"]])
     return d.merge(keys, on=["stock_code", "trade_date"], how="inner")
 
 
@@ -414,13 +416,12 @@ def build_forecast_agg(conn, cmap: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.
         "bull": grp["bull"].sum(),
         "ratings": grp["ratings"].sum(),
     }).reset_index().sort_values(["sector_code", "trade_date"])
-    # 覆盖度：该行业有预期数据的成分数 / 当日 PIT 有效成分数
+    # 覆盖度：该行业有预期数据的成分数 / 最新成分数（D14：无 PIT 版本链，每日相同）
     snap_dates = pd.DatetimeIndex(sorted(fc["trade_date"].unique()))
+    latest_n = cmap.groupby("sector_code").size().rename("active_n").reset_index()
     counts = []
     for t in snap_dates:
-        a = cmap[(cmap["eff_from"] <= t)
-                 & (cmap["eff_to"].isna() | (t < cmap["eff_to"]))]
-        cnt = a.groupby("sector_code").size().rename("active_n").reset_index()
+        cnt = latest_n.copy()
         cnt["trade_date"] = t
         counts.append(cnt)
     if counts:

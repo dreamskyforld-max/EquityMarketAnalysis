@@ -139,9 +139,11 @@ class TestEnumContract(unittest.TestCase):
             self.assertTrue(m.value_ref and m.value_ref.startswith("enum:"))
             self.assertIsNone(m.value_range)   # §3.4 R4：不污染 _tag_pct
             self.assertIsNone(m.num_unit)
-            # 规则升级只 bump 变更的那一个标签（§4.4.2）：估值结论 v2，其余仍 v1
-            expected = "v2" if m.code == "dim_valuation_conclusion" else "v1"
+            # 2026-11-19 报告期自适应升级：6 个结论版本号整体随口径推进
+            # （估值 v2→v3，其余 v1→v2），与 RULES.version 必须逐码一致
+            expected = {"dim_valuation_conclusion": "v3"}.get(m.code, "v2")
             self.assertEqual(m.version, expected, m.code)
+            self.assertEqual(m.version, R.RULES[m.code]["version"], m.code)
             self.assertEqual(m.status, "active")
             self.assertFalse(m.is_exclusive)
             self.assertFalse(m.confidence_req)
@@ -199,6 +201,78 @@ class TestProducerPureFunctions(unittest.TestCase):
         self.assertIn("as_of", detail)
         for k in ("state_raw", "since_date", "dwell_days", "status", "candidate"):
             self.assertIn(k, detail)
+
+    def test_evidence_carries_per_input_report_period(self):
+        """财报派生输入逐项标 report_type/report_date；年报口径标签用 annual 期次。"""
+        detail = producer._detail(
+            "GRW-02", {"rev_tier": 4, "np_tier": 4}, 1.0, [],
+            {"G1": True, "G2": True, "G3": True, "G4": False},
+            __import__("datetime").date(2026, 11, 19), with_run=False,
+            period_by_field={
+                "rev_tier": {"report_type": "Q3", "report_date": "2026-09-30"},
+                "persistence": {"report_type": "annual", "report_date": "2025-12-31"},
+            },
+        )
+        rp = detail["evidence"]["report_period"]
+        self.assertEqual(rp["rev_tier"]["report_type"], "Q3")
+        self.assertEqual(rp["persistence"]["report_type"], "annual")
+
+    def test_detail_without_period_no_extra_key(self):
+        detail = producer._detail(
+            "VAL-06", {}, 1.0, [],
+            {"G1": True, "G2": True, "G3": True, "G4": False},
+            __import__("datetime").date(2026, 11, 19), with_run=False)
+        self.assertNotIn("report_period", detail["evidence"])
+
+
+class TestReportPeriodAdaptation(unittest.TestCase):
+    """2026-11-19 报告期自适应：同期次分组 + 年报口径标签不动。"""
+
+    def test_auto_std_filter_binds_type_to_period_end(self):
+        from profiling import quantile
+        src = _src("profiling/quantile.py")
+        self.assertIn('def _financial_std_filter_any(', src)
+        self.assertIn("report_type='auto'", src)
+        # 四类标准期末日都在同一 OR 中，且每类按 report_type 绑定其标准期末日。
+        # 检查运行时生成的 SQL（源码是 f-string 动态拼的，不能字面搜）。
+        clause = quantile._financial_std_filter_any()
+        self.assertTrue(clause.startswith("AND ("))
+        for rt, months in (("Q1", 3), ("H1", 6), ("Q3", 9), ("annual", 12)):
+            with self.subTest(rt=rt):
+                self.assertIn(f"report_type = '{rt}'", clause)
+                self.assertIn(f"INTERVAL '{months} months'", clause)
+
+    def test_context_grp_includes_report_type_only_for_auto(self):
+        src = _src("profiling/quantile.py")
+        self.assertIn('report_type: str = "annual"', src)
+        self.assertIn('if report_type == "auto" else base_grp', src)
+
+    def test_quality_growth_use_auto_except_years_tags(self):
+        q = _src("profiling/tags/quality.py")
+        g = _src("profiling/tags/growth.py")
+        self.assertIn('load_financial_context(conn, as_of, "auto")', q)
+        self.assertIn('load_financial_context(conn, as_of, "auto")', g)
+        # 年报口径的两个标签必须走 _hist_annual
+        self.assertIn("streak = _streak(_hist_annual(as_of, 15),", q)
+        self.assertIn("hist = _hist_annual(as_of, 15)", g)
+        # 序列类走同类型 auto 历史
+        self.assertIn("g = _hist(as_of, 3)", q)
+        self.assertIn("hist = _hist(as_of, 2)", g)
+
+    def test_years_tags_keep_v1_and_semantics(self):
+        q = registry.get("qal_profit_years")
+        g = registry.get("grw_growth_persistence")
+        self.assertEqual(q.version, "v1")
+        self.assertEqual(g.version, "v1")
+        self.assertEqual(q.name, "连续盈利年数")
+        self.assertIn("年", q.compute_logic)
+
+    def test_changed_l1_tags_bumped_to_v2(self):
+        for code in ("qal_roe_tier", "qal_gross_margin_tier", "qal_net_margin_tier",
+                     "qal_leverage_tier", "qal_roe_stability", "qal_earnings_quality",
+                     "grw_revenue_yoy_tier", "grw_profit_yoy_tier", "grw_growth_accel"):
+            with self.subTest(code=code):
+                self.assertEqual(registry.get(code).version, "v2", code)
 
 
 class TestWiringAndSchema(unittest.TestCase):

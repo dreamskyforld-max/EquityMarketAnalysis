@@ -165,7 +165,7 @@ class TestIndicatorDict(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertTrue(d["is_active"])
                 self.assertIn(d, sl.ACTIVE_DEFS)
-                self.assertIn("constituent", d["source"])
+                self.assertIn("stock_sw_industry_mapping", d["source"])
                 self.assertTrue(d["value_col"] or d["pct_x_col"])
         self.assertEqual(sl.CALIB_VERSION, "s2.1")   # 口径断点必须换指纹
         self.assertEqual(len(sl.ENABLED_DIMENSIONS), 6)

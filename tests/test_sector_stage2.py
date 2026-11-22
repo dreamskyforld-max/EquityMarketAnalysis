@@ -1,9 +1,11 @@
-"""第④层「行业配置」阶段 2 测试：成分 PIT、聚合口径、工程接线。
+"""第④层「行业配置」阶段 2 测试：映射代码转换、聚合口径、工程接线。
 
 纯函数 / 静态文本断言为主，任何环境都能跑；需要真实库的契约另见
 tests/test_sector_layer_db.py（本文件不连库）。
 
-背景：doc/industry_allocation_feasibility.md §2.2.1 / §4.2 阶段 2。
+⚠ D12/D14（2026-11-20）：成分 PIT 版本链已废除（industry.constituent →
+  regime.stock_sw_industry_mapping），diff_snapshot 相关测试已删除；
+  pit_join 语义改为"最新成分贴历史"。历史序列起点 PIT_START 仍保留。
 """
 import datetime as dt
 import os
@@ -16,7 +18,7 @@ import pandas as pd
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import get_sector_constituent as cons  # noqa: E402
+import get_stock_sw_industry_mapping as swmap  # noqa: E402
 import sector_layer as sl  # noqa: E402
 import sector_stage2_agg as ag  # noqa: E402
 
@@ -36,75 +38,35 @@ class TestCodeConversion(unittest.TestCase):
                  "430001": "BJ.430001"}
         for raw, expect in cases.items():
             with self.subTest(raw=raw):
-                self.assertEqual(cons.to_stock_code(raw), expect)
+                self.assertEqual(swmap.to_stock_code(raw), expect)
 
     def test_zfill_and_numeric_coercion(self):
-        self.assertEqual(cons.to_stock_code(505), "SZ.000505")
-        self.assertEqual(cons.to_stock_code("505"), "SZ.000505")
-        self.assertEqual(cons.to_stock_code("505.0"), "SZ.000505")
+        self.assertEqual(swmap.to_stock_code(505), "SZ.000505")
+        self.assertEqual(swmap.to_stock_code("505"), "SZ.000505")
+        self.assertEqual(swmap.to_stock_code("505.0"), "SZ.000505")
 
     def test_invalid(self):
         for bad in (None, "", "abc", "SH.600000", "12345678"):
             with self.subTest(bad=bad):
-                self.assertIsNone(cons.to_stock_code(bad))
+                self.assertIsNone(swmap.to_stock_code(bad))
 
 
-class TestDiffSnapshot(unittest.TestCase):
-    """PIT 版本链 diff（纯函数）"""
+class TestHistoryStart(unittest.TestCase):
+    """历史序列起点（D14：成分无 PIT，但历史序列仍从 2021-12-13 起算）"""
 
-    SNAP = dt.date(2026, 11, 13)
-    EFF = dt.date(2021, 12, 13)
-
-    def _row(self, sec, stock, w=1.0):
-        return dict(sector_code=sec, stock_code=stock, eff_from=self.EFF, weight=w)
-
-    def test_first_snapshot_all_add(self):
-        d = cons.diff_snapshot({}, [self._row("A", "SZ.000001")], self.SNAP)
-        self.assertEqual(len(d["add"]), 1)
-        self.assertEqual(d["add"][0]["change_type"], "ADD")
-        self.assertEqual(d["add"][0]["eff_from"], self.EFF)
-        self.assertEqual(d["remove"], [])
-
-    def test_remove(self):
-        active = {("A", "SZ.000001"): (self.EFF, 1.0)}
-        d = cons.diff_snapshot(active, [], self.SNAP)
-        self.assertEqual(len(d["remove"]), 1)
-        self.assertEqual(d["remove"][0]["change_type"], "REMOVE")
-
-    def test_weight_significant_vs_tiny(self):
-        active = {("A", "SZ.000001"): (self.EFF, 1.0)}
-        d = cons.diff_snapshot(active, [self._row("A", "SZ.000001", 1.005)], self.SNAP)
-        self.assertEqual(d["weight"], [])
-        self.assertEqual(len(d["tiny"]), 1)
-        d2 = cons.diff_snapshot(active, [self._row("A", "SZ.000001", 1.05)], self.SNAP)
-        self.assertEqual(len(d2["weight"]), 1)
-        self.assertEqual(d2["weight"][0]["change_type"], "WEIGHT")
-
-    def test_idempotent_rerun(self):
-        rows = [self._row("A", "SZ.000001", 1.0), self._row("A", "SZ.000002", 2.0)]
-        active = {(r["sector_code"], r["stock_code"]): (r["eff_from"], r["weight"])
-                  for r in rows}
-        d = cons.diff_snapshot(active, rows, self.SNAP)
-        self.assertEqual(d["add"], [])
-        self.assertEqual(d["remove"], [])
-        self.assertEqual(d["weight"], [])
-        self.assertEqual(d["tiny"], [])
-
-    def test_pit_start_is_2021_12_13(self):
-        self.assertEqual(cons.PIT_START, dt.date(2021, 12, 13))
-        self.assertEqual(ag.PIT_START, cons.PIT_START)
-        self.assertEqual(sl.PIT_START, cons.PIT_START)
+    def test_history_start_is_2021_12_13(self):
+        self.assertEqual(ag.PIT_START, dt.date(2021, 12, 13))
+        self.assertEqual(sl.PIT_START, dt.date(2021, 12, 13))
 
 
 class TestPitJoin(unittest.TestCase):
-    """成分 PIT 区间过滤（纯函数）"""
+    """最新成分贴历史（D14：无 PIT 区间过滤，函数名保留兼容调用点）"""
 
-    def test_interval_filter(self):
+    def test_latest_component_all_dates(self):
+        """一只股票的最新映射贴到所有历史日期（无 eff 区间；接受幸存者偏差）。"""
         cmap = pd.DataFrame({
-            "sector_code": ["A", "A", "B"],
-            "stock_code": ["SZ.1", "SZ.2", "SZ.1"],
-            "eff_from": pd.to_datetime(["2021-12-13", "2021-12-13", "2024-01-01"]),
-            "eff_to": pd.to_datetime(["2023-12-31", None, None]),
+            "sector_code": ["A", "B", "A"],
+            "stock_code": ["SZ.2", "SZ.1", "SZ.3"],   # 一行一股票（新表 PK 结构）
             "weight": [1.0, 1.0, 1.0],
         })
         q = pd.DataFrame({
@@ -113,26 +75,24 @@ class TestPitJoin(unittest.TestCase):
             "close": [1.0, 2.0, 3.0, 4.0],
         })
         out = ag.pit_join(q, cmap)
-        self.assertEqual(len(out), 3)
+        self.assertEqual(len(out), 4)   # 所有历史日期都贴最新成分，不再按区间过滤
         got = {(r.stock_code, str(r.trade_date.date()), r.sector_code)
                for r in out.itertuples()}
-        self.assertIn(("SZ.1", "2022-06-01", "A"), got)
-        self.assertNotIn(("SZ.1", "2024-06-01", "A"), got)   # A 区间已关闭
+        self.assertIn(("SZ.1", "2022-06-01", "B"), got)   # 2022 年也贴最新的 B
         self.assertIn(("SZ.1", "2024-06-01", "B"), got)
+        self.assertIn(("SZ.2", "2025-01-01", "A"), got)
 
-    def test_closed_interval_end_exclusive(self):
-        """eff_to 是开区间边界：trade_date == eff_to 时旧版本不再有效。"""
+    def test_no_interval_columns_needed(self):
+        """cmap 无 eff_from/eff_to 列也能工作（新表结构）。"""
         cmap = pd.DataFrame({
-            "sector_code": ["A"], "stock_code": ["SZ.1"],
-            "eff_from": pd.to_datetime(["2021-12-13"]),
-            "eff_to": pd.to_datetime(["2024-01-01"]), "weight": [1.0],
+            "sector_code": ["A"], "stock_code": ["SZ.1"], "weight": [1.0],
         })
         q = pd.DataFrame({"stock_code": ["SZ.1", "SZ.1"],
                           "trade_date": ["2023-12-31", "2024-01-01"],
                           "close": [1.0, 2.0]})
         out = ag.pit_join(q, cmap)
-        self.assertEqual(len(out), 1)
-        self.assertEqual(str(out.iloc[0]["trade_date"].date()), "2023-12-31")
+        self.assertEqual(len(out), 2)   # 两天都贴 A（最新成分）
+        self.assertEqual(set(out["sector_code"]), {"A"})
 
 
 class TestSufficientStatistics(unittest.TestCase):
@@ -293,29 +253,32 @@ class TestEngineeringGuards(unittest.TestCase):
     """双同步 / 调度 / 监控 / 资源红线，防止阶段 2 接线静默回退"""
 
     def test_ddl_dual_source(self):
+        """D12 收口：新映射表在 schema.sql / regime_schema.py 双源同步。"""
         schema = _read("sql/schema.sql")
         code = _read("regime_schema.py")
-        for tbl in ("industry.constituent", "industry.constituent_change"):
+        for tbl in ("regime.stock_sw_industry_mapping", "regime.stock_hsics_industry_mapping"):
             with self.subTest(tbl=tbl):
                 self.assertIn("CREATE TABLE IF NOT EXISTS " + tbl, schema)
                 self.assertIn("CREATE TABLE IF NOT EXISTS " + tbl, code)
-        self.assertIn("eff_from", schema)
+        self.assertIn("sw_code_l3", schema)
+        self.assertNotIn("sw_code_l1", schema)   # 层级关系不冗余（只在分类表）
+        self.assertNotIn("eff_from", schema.split("stock_sw_industry_mapping")[1][:400])
         self.assertIn("_SECTOR_DDL_KEYS", code)
-        self.assertIn("CREATE SCHEMA IF NOT EXISTS industry", code)
 
     def test_scheduler_registration(self):
         src = _read("market_scheduler.py")
-        self.assertIn('"get_sector_constituent.py"', src)
-        self.assertIn('"hour": 18, "minute": 5', src)
+        self.assertIn('"get_stock_sw_industry_mapping.py"', src)
+        self.assertIn('"get_stock_hsics_industry_mapping.py"', src)
+        self.assertNotIn('"get_sector_constituent.py"', src)
         # 计算层仍禁止挂进调度器（R4/R5）
         self.assertNotIn('"sector_layer.py"', src)
 
     def test_monitor_registration(self):
         src = _read("monitor_collector.py")
-        for tbl in ("constituent", "constituent_change"):
+        for tbl in ("stock_sw_industry_mapping", "stock_hsics_industry_mapping"):
             with self.subTest(tbl=tbl):
-                self.assertIn('("industry", "' + tbl + '"', src)
-                self.assertIn('("industry", "' + tbl + '")', src)
+                self.assertIn('("regime", "' + tbl + '"', src)
+        self.assertNotIn('"constituent_change"', src)
 
     def test_resource_guards(self):
         src = _read("sector_stage2_agg.py")

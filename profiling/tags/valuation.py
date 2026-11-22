@@ -40,7 +40,8 @@ import pandas as pd
 from ..registry import tag, TIER, PLANNED_NO_DATA
 from ..quantile import (
     QUOTE_TABLES, load_quote_snapshot, load_financial_latest, load_gics_map,
-    assign_tier, historical_percentile, tier_or_flag, load_financial_ttm,
+    load_gics_group_map, assign_tier, historical_percentile, tier_or_flag,
+    load_financial_ttm,
 )
 from ._base import _conn, _read_sql, _frame
 
@@ -274,6 +275,34 @@ def val_pe_ind_pct(as_of: date) -> pd.DataFrame:
     df = df[df["pe_ttm"] > 0]
 
     grp = _market_industry_key(df["market"], df["gics"])
+    pct = df["pe_ttm"].groupby(grp).rank(pct=True, method="average") * 100.0
+    return _frame(df["stock_code"], _pct_to_tier(pct), pct.round(2))
+
+
+@tag(
+    code="val_pe_ind2_pct", name="PE二级行业分位", domain=DOMAIN,
+    num_unit="percentile_0_100",
+    value_type=TIER, value_range=dict(_PCT_RANGE),
+    source_type="stat", update_freq="daily",
+    data_sources=["a_daily_quote", "hk_daily_quote", "stock_sector", "sector_hierarchy_l2"],
+    compute_logic="在【市场 + GICS 二级行业组】内对 PE(TTM) 算横截面百分位，再切成五档："
+                  "1=二级组内最便宜20%，5=最贵20%。num_value 存百分位(0-100)。"
+                  "仅正 PE 参与，亏损股不打标。二级组来自 sector_hierarchy_l2（GICS 2023 口径 25 组），"
+                  "由富途板块人工语义映射，非官方 GICS 个股分类；首期只做港股，A 股不打标。"
+                  "与 val_pe_ind_pct（一级部门）并存，不参与估值结论判定",
+    pit_capable=True, owner="profiling",
+)
+def val_pe_ind2_pct(as_of: date) -> pd.DataFrame:
+    with _conn() as conn:
+        snap = load_quote_snapshot(conn, as_of)
+        group_map = load_gics_group_map(conn)
+
+    df = snap[["stock_code", "market", "pe_ttm"]].merge(group_map, on="stock_code", how="inner")
+    df = df[df["pe_ttm"] > 0]
+    if df.empty:
+        return _frame([], [])
+
+    grp = _market_industry_key(df["market"], df["gics_group"])
     pct = df["pe_ttm"].groupby(grp).rank(pct=True, method="average") * 100.0
     return _frame(df["stock_code"], _pct_to_tier(pct), pct.round(2))
 

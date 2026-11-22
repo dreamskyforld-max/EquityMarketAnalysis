@@ -53,7 +53,7 @@ def _all(*items) -> dict:
 RULES: dict[str, dict] = {
     # ── §5.1 估值 ────────────────────────────────────────────────
     "dim_valuation_conclusion": {
-        "version": "v2",
+        "version": "v3",
         "update_freq": _DAILY,
         "inputs": [
             {"field": "pe_hist_pct", "tag_code": "val_pe_hist_pct",
@@ -122,7 +122,7 @@ RULES: dict[str, dict] = {
 
     # ── §5.2 盈利质量 ─────────────────────────────────────────────
     "dim_quality_conclusion": {
-        "version": "v1",
+        "version": "v2",
         "update_freq": _QUARTERLY,
         "inputs": [
             {"field": "roe_tier", "tag_code": "qal_roe_tier",
@@ -162,7 +162,7 @@ RULES: dict[str, dict] = {
 
     # ── §5.3 成长 ────────────────────────────────────────────────
     "dim_growth_conclusion": {
-        "version": "v1",
+        "version": "v2",
         "update_freq": _QUARTERLY,
         "inputs": [
             {"field": "rev_tier", "tag_code": "grw_revenue_yoy_tier",
@@ -214,7 +214,7 @@ RULES: dict[str, dict] = {
 
     # ── §5.4 当前位置与状态 ────────────────────────────────────────
     "dim_position_state": {
-        "version": "v1",
+        "version": "v2",
         "update_freq": _DAILY,
         "inputs": [
             {"field": "position_tier", "tag_code": "tst_price_position_52w",
@@ -265,7 +265,7 @@ RULES: dict[str, dict] = {
 
     # ── §6.1 好公司 × 好价格 ───────────────────────────────────────
     "biz_value_quality_type": {
-        "version": "v1",
+        "version": "v2",
         "update_freq": _DAILY,
         "inputs": [
             {"field": "valuation_class", "source": "derived", "compute": "val_class",
@@ -317,7 +317,7 @@ RULES: dict[str, dict] = {
 
     # ── §6.2 增长质量 ─────────────────────────────────────────────
     "biz_growth_quality_type": {
-        "version": "v1",
+        "version": "v2",
         "update_freq": _QUARTERLY,
         "inputs": [
             # 主锚：L2 未出档时整行不发布，否则 GQ-04 兜底会把数据不足的票

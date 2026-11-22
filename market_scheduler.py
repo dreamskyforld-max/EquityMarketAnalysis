@@ -136,6 +136,16 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     ("南向资金", "get_south_flow.py",
      {"hour": "8,19", "minute": 0, "day_of_week": "mon-fri"}, None, True, None, 300),
 
+    # 行业分类主数据（日频，实测轻量：申万三接口≈20s / HSICS PDF≈1s）。
+    # 08:10 申万层级 → 08:15 HSICS 层级+码映射 → 08:20 行业映射重算，顺序无冲突。
+    ("申万行业分类", "get_sw_industry_classification.py",
+     {"hour": 8, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("HSICS行业分类", "get_hsics_industry_classification.py",
+     {"hour": 8, "minute": 15, "day_of_week": "mon-fri"}, None, True, None, 300),
+    # 个股-HSICS 行业映射（D12 收口，08:15 分类之后）
+    ("港股行业映射", "get_stock_hsics_industry_mapping.py",
+     {"hour": 8, "minute": 17, "day_of_week": "mon-fri"}, None, True, None, 300),
+
     # 行业映射月度复核：confirmed=true 的行不被自动结果覆盖。
     ("行业映射重算", "build_sector_mapping.py",
      {"day": 1, "hour": 8, "minute": 20}, None, True, None, 900),
@@ -189,12 +199,13 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     # 周二：成分归属 18:00 → 展示标签 18:35（须在其后取刚刷新的 INDUSTRY 清单）。
     ("指数成分归属", "get_stock_sector.py", {"day_of_week": 2, "hour": 18, "minute": 0}, None, True, None, 180),
     # PIT 版本链：逐日必跑，eff_to 靠快照对比累积，漏采一天即永久断链。
-    ("行业成分主数据", "get_sector_constituent.py",
-     {"hour": 18, "minute": 5, "day_of_week": "mon-fri"}, None, True, None, 600),
-    ("申万行业指数", "backfill_sw_industry.py",
+    # 个股-申万行业映射（D12 收口：原 get_sector_constituent.py 已废除）
+    ("申万行业映射", "get_stock_sw_industry_mapping.py",
+     {"hour": 8, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 300),
+    ("申万行业指数", "get_sw_industry_quotes.py",
      {"hour": 18, "minute": 10, "day_of_week": "mon-fri"}, None, True, None, 900),
-    # 行业估值快照：源无历史，漏采即永久缺失。
-    ("行业估值快照", "get_sector_valuation.py",
+    # 行业估值快照：源无历史，漏采即永久缺失（一/二级并存）。
+    ("行业估值快照", "get_sw_industry_valuation.py",
      {"hour": 18, "minute": 15, "day_of_week": "mon-fri"}, None, True, None, 300),
     ("宏观月频采集", "get_macro_monthly.py",
      {"hour": 18, "minute": 20, "day_of_week": "mon-fri"}, None, True, None, 600),
@@ -244,7 +255,7 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
     # ══ P5 低频 · 凌晨 / 周末 ═════════════════════════════════════════════
     # 全量任务超时后 daemon 线程会续跑至自然完成，数据照常入库。
     ("财务指标全量", "get_financial.py",
-     {"hour": 2, "minute": 0, "day_of_week": "mon"}, None, True, None, 7200),
+     {"hour": 2, "minute": 0}, None, True, None, 7200),
     # 公司资料：富途限流 30 次/30s（脚本按 26 次节流），全市场 ≈2.7h。
     ("公司资料全量", "get_company_profile.py",
      {"hour": 3, "minute": 0, "day_of_week": "sun"}, None, True, None, 14400),

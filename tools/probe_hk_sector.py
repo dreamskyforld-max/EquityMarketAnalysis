@@ -122,12 +122,14 @@ QUERIES = [
      "count(DISTINCT params_hash) AS hashes "
      "FROM industry.indicator_dict"),
 
-    ("⑥ sector_constituent 现状",
-     "SELECT market, count(*) AS rows, "
-     "count(DISTINCT sector_code) AS sectors, count(DISTINCT stock_code) AS stocks, "
-     "min(eff_from) AS min_eff, max(eff_from) AS max_eff, "
-     "count(*) FILTER (WHERE eff_to IS NOT NULL) AS closed "
-     "FROM industry.constituent GROUP BY 1, 2 ORDER BY 1, 2"),
+    ("⑥ 个股-行业映射现状（D12 收口）",
+     "SELECT 'SW' AS system, count(*) AS rows, "
+     "count(DISTINCT sw_code_l3) AS sectors, count(DISTINCT stock_code) AS stocks, "
+     "min(as_of) AS min_asof, max(as_of) AS max_asof, 0 AS closed "
+     "FROM regime.stock_sw_industry_mapping "
+     "UNION ALL "
+     "SELECT 'HSICS', count(*), count(DISTINCT hsics_code_l3), count(DISTINCT stock_code), "
+     "min(as_of), max(as_of), 0 FROM regime.stock_hsics_industry_mapping"),
 
     ("⑥ 输出表现有 market / biz_code 分布",
      "SELECT 'indicator_value' AS tbl, market, '' AS biz_code, count(*) AS rows "

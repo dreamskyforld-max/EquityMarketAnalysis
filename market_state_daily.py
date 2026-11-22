@@ -720,7 +720,7 @@ INDICATORS: list[dict] = [
          formula="median(行业 PE-TTM)，31 个申万一级行业"),
     dict(code="SECTOR.PB_MEDIAN", name="行业 PB 中位数(申万一级)", scope="SECTOR", dimension="估值",
          market_scope="CN", unit="x", direction="high_risk", freq="day",
-         remark="定义：31 个申万一级行业 PB 的中位数　·　判读：同 PE 口径；重资产行业占比高时 PB 比 PE 更可靠　·　数据：源只有当前横截面，分位逐日累积；逐行业明细见 regime.sector_valuation_snapshot；仅 CN",
+         remark="定义：31 个申万一级行业 PB 的中位数　·　判读：同 PE 口径；重资产行业占比高时 PB 比 PE 更可靠　·　数据：源只有当前横截面，分位逐日累积；逐行业明细见 regime.sw_industry_valuation_snapshot；仅 CN",
          formula="median(行业 PB)，31 个申万一级行业"),
     dict(code="SECTOR.FLOW_NET", name="行业资金净流入合计(同花顺)", scope="SECTOR", dimension="资金",
          market_scope="CN", unit="yi_yuan", direction="high_good", freq="day",
@@ -2658,7 +2658,7 @@ def _sector_indicators(conn, idx) -> dict:
         out["SECTOR.RS_DISPERSION"] = _dated(excess.std(axis=1))
 
     # ② 行业估值（快照表；源无历史 → 逐日累积，此处只做市场级中位数）
-    val = _q(conn, """SELECT snapshot_date, pe_ttm, pb FROM regime.sector_valuation_snapshot
+    val = _q(conn, """SELECT snapshot_date, pe_ttm, pb FROM regime.sw_industry_valuation_snapshot
                       WHERE snapshot_date <= %s""", [end])
     if not val.empty:
         val["snapshot_date"] = pd.to_datetime(val["snapshot_date"])

@@ -156,7 +156,7 @@ HK_INDICATOR_DEFS = [
       "Σw/Σ(w/pe)，仅 pe>0；成分覆盖<60% 置 NULL", "M6", value_col="pe_agg",
       remark="定义：行业内成分股市值加权调和 PE = Σw/Σ(w/pe)，仅取 pe>0，等价「行业总市值 / 行业总盈利」（x）" + _SEP +
              "判读：**高 = 更贵**（风险侧）；只作估值水位读数，不得与拥挤度相加抵消（§3.5 不产出单一综合分）" + _SEP +
-             "⚠ **不是官方行业指数 PE**：由个股 pe_ttm_ratio 聚合，与 CN sector_valuation_snapshot 的申万口径不同构" + _SEP +
+             "⚠ **不是官方行业指数 PE**：由个股 pe_ttm_ratio 聚合，与 CN sw_industry_valuation_snapshot 的申万口径不同构" + _SEP +
              "⚠ M8 口径变更：文档原文「流通市值加权」，实测 circular_market_val 2000-2023 全 NULL、2024-05 起仅 65 日有值 → 改用 total_market_val；成分覆盖 <60% 置 NULL"),
     D("SEC.VAL.PB", "行业PB(市值加权调和)", "VAL", "risk", "x", "high_risk",
       "Σw/Σ(w/pb)，仅 pb>0", "M6", value_col="pb_agg",

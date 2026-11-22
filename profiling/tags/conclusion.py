@@ -97,7 +97,7 @@ def _no_direct_compute(name: str):
                   "单侧四格按各自位置单列中性码，双中性格判相对中性。"
                   "LOSS/NEGATIVE 业务码豁免 G1 直接发布。横截面分位不等于绝对贵贱。"
                   + _DISCLAIMER,
-    parent_tag="val_pe_hist_pct", version="v2", pit_capable=True,
+    parent_tag="val_pe_hist_pct", version="v3", pit_capable=True,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def dim_valuation_conclusion(as_of: date):
@@ -111,7 +111,7 @@ def dim_valuation_conclusion(as_of: date):
     data_sources=["qal_roe_tier", "qal_roe_stability", "qal_earnings_quality", "qal_leverage_tier"],
     compute_logic="盈利水平 × 稳定性 × 现金转化真实性三腿合取；杠杆单独降级。"
                   "描述的是财报特征，不评价证券好坏。" + _DISCLAIMER,
-    parent_tag="qal_roe_tier", version="v1", pit_capable=False,
+    parent_tag="qal_roe_tier", version="v2", pit_capable=False,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def dim_quality_conclusion(as_of: date):
@@ -126,7 +126,7 @@ def dim_quality_conclusion(as_of: date):
                   "grw_growth_persistence", "grw_growth_accel"],
     compute_logic="增速档 × 持续性 × 加速度 → 状态；营收档与净利档背离优先单列。"
                   "现状判断，非未来增速预测。" + _DISCLAIMER,
-    parent_tag="grw_revenue_yoy_tier", version="v1", pit_capable=False,
+    parent_tag="grw_revenue_yoy_tier", version="v2", pit_capable=False,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def dim_growth_conclusion(as_of: date):
@@ -139,7 +139,7 @@ def dim_growth_conclusion(as_of: date):
     source_type="derived", update_freq="daily",
     data_sources=["tst_price_position_52w", "trd_momentum_12_1", "att_volume_surge", "v_daily_quote"],
     compute_logic="确定性条件合取 + 游程标注（裸判，不加滞回状态机）。" + _DISCLAIMER,
-    parent_tag="tst_price_position_52w", version="v1", pit_capable=True,
+    parent_tag="tst_price_position_52w", version="v2", pit_capable=True,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def dim_position_state(as_of: date):
@@ -153,7 +153,7 @@ def dim_position_state(as_of: date):
     data_sources=["dim_valuation_conclusion", "dim_quality_conclusion"],
     compute_logic="估值 × 盈利质量 3×3 交叉矩阵；无估值锚或无明确交叉特征的 cell 整行不发布。"
                   + _DISCLAIMER,
-    parent_tag="dim_valuation_conclusion", version="v1", pit_capable=False,
+    parent_tag="dim_valuation_conclusion", version="v2", pit_capable=False,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def biz_value_quality_type(as_of: date):
@@ -166,7 +166,7 @@ def biz_value_quality_type(as_of: date):
     source_type="derived", update_freq="quarterly",
     data_sources=["dim_growth_conclusion", "qal_earnings_quality", "financial_indicator"],
     compute_logic="增速状态 × 现金转化 × FCF 符号 → 类型码；背离优先于增速。" + _DISCLAIMER,
-    parent_tag="dim_growth_conclusion", version="v1", pit_capable=False,
+    parent_tag="dim_growth_conclusion", version="v2", pit_capable=False,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def biz_growth_quality_type(as_of: date):

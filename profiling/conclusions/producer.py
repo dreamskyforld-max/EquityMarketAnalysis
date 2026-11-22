@@ -74,6 +74,29 @@ def _load_fcf_sign(conn) -> dict:
             for s, v in rows if v is not None}
 
 
+# 这两个标签刻意保持年报口径（years 语义），evidence 标注必须用年报期次，
+# 其余 qal_*/grw_* 已切自适应，用 auto 期次。两者不可混标。
+_ANNUAL_ONLY_TAGS = frozenset({"qal_profit_years", "grw_growth_persistence"})
+
+
+def _load_financial_period(conn, as_of: date, report_type: str) -> dict:
+    """每票最近一期标准报告期（类型+截止日），供结论 evidence 标注输入财报期次。
+
+    与 L1 取数同一口径（`load_financial_latest`）：'auto' 对应已自适应的
+    qal_*/grw_* 标签，'annual' 对应保留年报口径的 qal_profit_years /
+    grw_growth_persistence。保证「结论说基于哪一期」与「L1 实际用哪一期」一致。
+    """
+    from profiling.quantile import load_financial_latest
+
+    df = load_financial_latest(conn, as_of, report_type)
+    if df.empty:
+        return {}
+    return {
+        s: {"report_type": rt, "report_date": str(rd)}
+        for s, rt, rd in zip(df["stock_code"], df["report_type"], df["report_date"])
+    }
+
+
 def _load_ma_alignment(conn, codes: list[str], as_of: date) -> dict:
     """由 v_daily_quote.close 现算 MA20/MA60（视图无 MA 列，daily_trend 只覆盖采集池）。
 
@@ -135,12 +158,20 @@ def _cast(raw, item: dict):
 def _build_values(spec: dict, stock: str, snap: dict, extras: dict, l2: dict):
     values: dict = {}
     missing: list[str] = []
+    period_by_field: dict = {}
     for item in spec["inputs"]:
         field = item["field"]
         compute = item.get("compute")
         if "tag_code" in item:
             raw = snap.get(stock, {}).get((item["tag_code"], item["source_col"]))
             value = _cast(raw, item)
+            # 财报类输入标注实际取数期次；非财报标签（估值分位/量价）不标
+            tc = item["tag_code"]
+            if tc.startswith(("qal_", "grw_")):
+                mode = "annual" if tc in _ANNUAL_ONLY_TAGS else "auto"
+                p = extras.get(f"period_{mode}", {}).get(stock)
+                if p:
+                    period_by_field[field] = p
         elif compute == "ma_alignment":
             value = extras["ma"].get(stock)
         elif compute == "l2_growth":
@@ -159,7 +190,7 @@ def _build_values(spec: dict, stock: str, snap: dict, extras: dict, l2: dict):
         if value is None:
             missing.append(field)
     coverage = 1.0 - len(missing) / len(spec["inputs"])
-    return values, coverage, missing
+    return values, coverage, missing, period_by_field
 
 
 def _derive(spec: dict, values: dict) -> dict:
@@ -203,12 +234,18 @@ def _judge(spec: dict, code: str, values: dict, coverage: float):
 
 
 def _detail(rule_id, values, coverage, missing, gates, as_of: date,
-            with_run: bool, eff_from: date | None = None) -> dict:
+            with_run: bool, eff_from: date | None = None,
+            period_by_field: dict | None = None) -> dict:
+    evidence = {k: v for k, v in values.items() if v is not None}
+    # 每个财报派生输入都标出它实际取数的报告期；年报口径标签标 annual 期次，
+    # 自适应标签标 auto 期次。非财报输入（估值分位/量价）不标。
+    if period_by_field:
+        evidence["report_period"] = period_by_field
     detail = {
         "rule_id": rule_id,
         "coverage": round(coverage, 4),
         "missing_inputs": missing,
-        "evidence": {k: v for k, v in values.items() if v is not None},
+        "evidence": evidence,
         "gates": gates,
         "as_of": str(as_of),
     }
@@ -318,6 +355,8 @@ def produce(as_of: date | None = None, sync_dict: bool = True) -> dict:
         extras = {
             "fcf": _load_fcf_sign(conn),
             "ma": _load_ma_alignment(conn, sorted(snap), as_of),
+            "period_auto": _load_financial_period(conn, as_of, "auto"),
+            "period_annual": _load_financial_period(conn, as_of, "annual"),
         }
         if sync_dict:
             R.sync_conclusion_dict(conn)
@@ -328,11 +367,12 @@ def produce(as_of: date | None = None, sync_dict: bool = True) -> dict:
         spec = R.RULES[code]
         bucket: dict = {}
         for stock in snap:
-            values, coverage, missing = _build_values(spec, stock, snap, extras, l2)
+            values, coverage, missing, periods = _build_values(spec, stock, snap, extras, l2)
             _derive(spec, values)
             rule_id, result, gates = _judge(spec, code, values, coverage)
             detail = _detail(rule_id, values, coverage, missing, gates, as_of,
-                             with_run=(code == "dim_position_state"))
+                             with_run=(code == "dim_position_state"),
+                             period_by_field=periods)
             if "state_raw" in detail:
                 detail["state_raw"] = result
             bucket[stock] = (result, detail)

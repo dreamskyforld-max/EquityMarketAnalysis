@@ -62,7 +62,7 @@ BOOTSTRAP_DEFAULT = 200
 RANDOM_SEED = 42
 
 _SNAPSHOT_TABLES = {
-    "sector_valuation_snapshot": ("snapshot_date", "regime.sector_valuation_snapshot"),
+    "sw_industry_valuation_snapshot": ("snapshot_date", "regime.sw_industry_valuation_snapshot"),
     "sector_fund_flow": ("trade_date", "regime.sector_fund_flow"),
     "analyst_forecast_snapshot": ("snapshot_date", "regime.analyst_forecast_snapshot"),
 }

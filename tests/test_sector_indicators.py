@@ -178,31 +178,49 @@ class TestSectorValuationSnapshot(unittest.TestCase):
             pass
 
     def test_codes_are_valid_sw(self):
-        self.cur.execute("SELECT DISTINCT bench_code FROM daily_benchmark WHERE bench_code LIKE 'CN.SW%'")
-        sw_codes = {r[0].replace("CN.SW", "") for r in self.cur.fetchall()}
-        self.cur.execute("SELECT DISTINCT sw_code FROM regime.sector_valuation_snapshot")
+        # 估值快照表现含一级(31)+二级(131)：所有 code 必须在分类层级表；
+        # 只有一级 code 需要在 daily_benchmark 有对应指数（二级不采指数）。
+        self.cur.execute("SELECT DISTINCT sw_code FROM regime.sw_industry_classification")
+        class_codes = {r[0] for r in self.cur.fetchall()}
+        self.cur.execute("SELECT DISTINCT sw_code FROM regime.sw_industry_valuation_snapshot")
         codes = {r[0] for r in self.cur.fetchall()}
-        self.assertTrue(codes, "估值快照表为空（先跑 get_sector_valuation.py）")
-        self.assertEqual(codes - sw_codes, set())
+        self.assertTrue(codes, "估值快照表为空（先跑 get_sw_industry_valuation.py）")
+        self.assertEqual(codes - class_codes, set(), "估值快照出现分类层级表之外的 code")
+        self.cur.execute("SELECT DISTINCT bench_code FROM daily_benchmark WHERE bench_code LIKE 'CN.SW%'")
+        bench_codes = {r[0].replace("CN.SW", "") for r in self.cur.fetchall()}
+        self.cur.execute("SELECT DISTINCT sw_code FROM regime.sw_industry_valuation_snapshot WHERE industry_level=1")
+        level1_codes = {r[0] for r in self.cur.fetchall()}
+        self.assertEqual(level1_codes - bench_codes, set(), "一级行业 code 在 benchmark 缺失")
 
     def test_value_ranges(self):
-        """估值需在合理量级（PE/PB 为正；股息率 0~20%）——挡掉源侧单位/口径漂移。"""
+        """估值需在合理量级——只严格校验一级31；二级行业长尾（如 PE=0/极小行业）属源侧正常值。"""
         self.cur.execute("""SELECT count(*) FILTER (WHERE pe_ttm IS NOT NULL AND (pe_ttm <= 0 OR pe_ttm > 300)),
                                    count(*) FILTER (WHERE pb IS NOT NULL AND (pb <= 0 OR pb > 100)),
                                    count(*) FILTER (WHERE div_yield IS NOT NULL AND (div_yield < 0 OR div_yield > 20))
-                            FROM regime.sector_valuation_snapshot""")
+                            FROM regime.sw_industry_valuation_snapshot WHERE industry_level=1""")
         bad_pe, bad_pb, bad_dy = self.cur.fetchone()
         self.assertEqual((bad_pe, bad_pb, bad_dy), (0, 0, 0))
 
     def test_market_indicator_matches_snapshot_median(self):
-        """市场级指标必须等于快照的中位数（防口径漂移：改了 SQL 忘改指标口径）。"""
+        """市场级指标必须等于快照的中位数（防口径漂移：改了 SQL 忘改指标口径）。
+
+        取「快照与指标都存在的最近交易日」：当日快照可能已采、但 18:45 计算层未跑，
+        不能拿绝对最新快照日去比对尚未产出的指标。
+        """
         self.cur.execute("""SELECT s.snapshot_date, median_pe.pe, median_pb.pb
-                            FROM (SELECT DISTINCT snapshot_date FROM regime.sector_valuation_snapshot
+                            FROM (SELECT i.trade_date AS snapshot_date
+                                  FROM regime.indicator_value i
+                                  WHERE i.indicator_code IN ('SECTOR.PE_TTM_MEDIAN','SECTOR.PB_MEDIAN')
+                                  GROUP BY i.trade_date
+                                  INTERSECT
+                                  SELECT DISTINCT snapshot_date FROM regime.sw_industry_valuation_snapshot
                                   ORDER BY 1 DESC LIMIT 1) s,
                                  LATERAL (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY pe_ttm) AS pe
-                                          FROM regime.sector_valuation_snapshot WHERE snapshot_date = s.snapshot_date) median_pe,
+                                          FROM regime.sw_industry_valuation_snapshot
+                                          WHERE snapshot_date = s.snapshot_date AND industry_level=1) median_pe,
                                  LATERAL (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY pb) AS pb
-                                          FROM regime.sector_valuation_snapshot WHERE snapshot_date = s.snapshot_date) median_pb""")
+                                          FROM regime.sw_industry_valuation_snapshot
+                                          WHERE snapshot_date = s.snapshot_date AND industry_level=1) median_pb""")
         d, pe, pb = self.cur.fetchone()
         self.cur.execute("""SELECT indicator_code, raw_value FROM regime.indicator_value
                             WHERE trade_date = %s AND indicator_code IN ('SECTOR.PE_TTM_MEDIAN','SECTOR.PB_MEDIAN')""",

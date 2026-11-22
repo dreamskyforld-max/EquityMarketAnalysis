@@ -119,21 +119,56 @@ def load_quote_snapshot(conn, as_of: date, use_cache: bool = True,
     return out
 
 
-def load_gics_map(conn) -> pd.DataFrame:
-    """stock_code → GICS 一级部门（官方英文标识）。
+def load_industry_map(conn, level: int) -> pd.DataFrame:
+    """个股 → 行业归属（阶段 C 唯一分组入口，D2/D12 收口）。
 
-    行业内分位/排名的分组依据。用一级部门（13 类）而非细粒度行业，
-    保证每组样本量足够（细粒度行业里很多组不足 5 只，无法分五档）。
+    读阶段 B 统一映射表 + 分类表层级关系：
+      · A 股：stock_sw_industry_mapping（只存 sw_code_l3）+ sw_industry_classification
+        （parent_code 链）推导一/二级；
+      · 港股：stock_hsics_industry_mapping（只存 hsics_code_l3）+ hsics_industry_classification
+        （sector_code/industry_code 列）推导一/二级。
+    ⚠ 层级关系只在分类表一处维护（用户原则），映射表只存三级原子归属。
+
+    level: 1=一级 / 2=二级 / 3=三级（必填，不允许默认，避免口径含糊）。
+    返回列：stock_code / industry_code / market。
     """
-    return _read_sql(
-        conn,
-        """
-        SELECT ss.stock_code, sh.parent_code AS gics
-        FROM stock_sector ss
-        JOIN sector_hierarchy sh ON sh.sector_code = ss.sector_code
-        WHERE ss.sector_type = 'INDUSTRY' AND sh.parent_code IS NOT NULL
-        """,
-    )
+    if level not in (1, 2, 3):
+        raise ValueError(f"level 必须是 1/2/3，收到 {level}")
+    # A 股：三级码经 parent 链推导
+    cn_expr = {
+        3: "m.sw_code_l3",
+        2: "l2.sw_code",
+        1: "l1.sw_code",
+    }[level]
+    cn_join = {
+        3: "",
+        # 三级码的 parent_code 才是二级码（三级→二级→一级）
+        2: ("JOIN regime.sw_industry_classification l3c "
+            "ON l3c.sw_code = m.sw_code_l3 "
+            "JOIN regime.sw_industry_classification l2 ON l2.sw_code = l3c.parent_code"),
+        1: ("JOIN regime.sw_industry_classification l3c ON l3c.sw_code = m.sw_code_l3 "
+            "JOIN regime.sw_industry_classification l2 ON l2.sw_code = l3c.parent_code "
+            "JOIN regime.sw_industry_classification l1 ON l1.sw_code = l2.parent_code"),
+    }[level]
+    cn_where = {
+        3: "m.sw_code_l3 IS NOT NULL",
+        2: "l2.level = 2",
+        1: "l1.level = 1",
+    }[level]
+    # 港股：分类表有直接的 sector_code(二级)/industry_code(一级) 列
+    hk_code = {1: "c.industry_code", 2: "c.sector_code", 3: "m.hsics_code_l3"}[level]
+    sql = f"""
+        SELECT stock_code, {cn_expr} AS industry_code, 'CN' AS market
+        FROM regime.stock_sw_industry_mapping m
+        {cn_join}
+        WHERE {cn_where} AND {cn_expr} IS NOT NULL
+        UNION ALL
+        SELECT stock_code, {hk_code} AS industry_code, 'HK' AS market
+        FROM regime.stock_hsics_industry_mapping m
+        JOIN regime.hsics_industry_classification c ON c.subsector_code = m.hsics_code_l3
+        WHERE {hk_code} IS NOT NULL
+    """
+    return _read_sql(conn, sql)
 
 
 def load_stock_connect(conn) -> set:
@@ -182,8 +217,35 @@ def _financial_std_filter(report_type: str) -> tuple[str, list]:
             [md[0], md[1]])
 
 
+def _financial_std_filter_any(prefix: str = "") -> str:
+    """「任一标准报告期」过滤（财政年度无关）：四类的标准期末日任一命中即可。
+
+    与 `_financial_std_filter` 的差别：后者固定一个 report_type，本函数把
+    「类型 ↔ 标准期末日」绑定写进同一个 OR 分支，供 report_type='auto' 使用。
+    分支内的月份/日期是模块常量，非外部输入，直接内联不需要参数化。
+    prefix 供带表别名/CTE 的 FROM 使用（如 'f.'）。
+    """
+    tc = f"{prefix}report_type"
+    dc = f"{prefix}report_date"
+    fc = f"{prefix}fiscal_year_start"
+    clauses = []
+    for rt, months in _STD_REPORT_MONTHS.items():
+        md = _STD_REPORT_MD[rt]
+        clauses.append(
+            f"({tc} = '{rt}' AND (CASE WHEN {fc} IS NOT NULL"
+            f" THEN {dc} = ({fc} + INTERVAL '{months} months')::date - 1"
+            f" ELSE EXTRACT(MONTH FROM {dc}) = {md[0]}"
+            f" AND EXTRACT(DAY FROM {dc}) = {md[1]} END))"
+        )
+    return "AND (" + " OR ".join(clauses) + ")"
+
+
 def load_financial_latest(conn, as_of: date, report_type: str = "annual") -> pd.DataFrame:
     """取每只股票 as_of 之前最近一期**标准报告期**财报（PIT：按实际披露日过滤）。
+
+    report_type='auto' 时改为「每只票各自最近一期标准报告期，类型不限」，
+    返回列额外带 report_type / report_date 供上层做同期次分组与 evidence 标注。
+    有 Q3 的票取 Q3、只有 H1 的取 H1、只有年报的取年报——不跨期次比较。
 
     时点口径（PIT，防前视）：
         过滤条件是 `report_date <= as_of` **且**（若有披露日）`announce_date <= as_of`。
@@ -194,12 +256,19 @@ def load_financial_latest(conn, as_of: date, report_type: str = "annual") -> pd.
         · 港股：披露日列全空 → `announce_date IS NULL` 放行，退化为「仅按报告期」，
           仍有前视，港股的财报派生标签暂不可用于严格回测。
     """
-    std, std_params = _financial_std_filter(report_type)
+    if report_type == "auto":
+        std, std_params = _financial_std_filter_any(), []
+        type_filter = "report_type IN ('Q1','H1','Q3','annual')"
+        head = [as_of]
+    else:
+        std, std_params = _financial_std_filter(report_type)
+        type_filter = "report_type = %s"
+        head = [report_type, as_of]
     return _read_sql(
         conn,
         f"""
         SELECT DISTINCT ON (stock_code)
-               stock_code, report_date, revenue, net_profit, roe,
+               stock_code, report_date, report_type, revenue, net_profit, roe,
                gross_profit_rate, net_profit_rate, debt_ratio,
                operating_cash_flow, free_cash_flow, revenue_yoy, net_profit_yoy,
                -- P1 补数（doc/stock_profile_l2_l3.md §8.3）：显式列 SELECT 必须逐处同步，
@@ -208,7 +277,7 @@ def load_financial_latest(conn, as_of: date, report_type: str = "annual") -> pd.
                inventory_turnover, receivable_turnover, total_asset_turnover,
                capex_fixed, capex_intangible, acquisition_cash_flow, rd_expense
         FROM financial_indicator
-        WHERE report_type = %s AND report_date <= %s {std}
+        WHERE {type_filter} AND report_date <= %s {std}
           -- 披露日可信度护栏：announce_date 回填存在污染（历史行普遍后移约 1 年，
           -- 间隔中位数 392~475 天），只有「合理且已披露」才据此过滤；
           -- 不合理的老数据按「未知」放行，避免把有效财报误判为未披露（错退回更老一期）。
@@ -218,7 +287,7 @@ def load_financial_latest(conn, as_of: date, report_type: str = "annual") -> pd.
                OR announce_date <= %s)
         ORDER BY stock_code, report_date DESC
         """,
-        [report_type, as_of] + std_params + [as_of],
+        head + std_params + [as_of],
     )
 
 
@@ -230,12 +299,46 @@ def load_financial_history(conn, as_of: date, report_type: str = "annual",
     rn 是「期数序号」而非自然年——个别年份报告缺失时，连续性判断按期数近似。
     PIT 同 load_financial_latest（A 股按披露日过滤；港股披露日为空则放行）。
     """
+    if report_type == "auto":
+        # 先定每票最近一期报告期类型，再只取该类型的历史 → 「同类型序列」，
+        # 绝不把 Q3 累计与 annual 全年排进同一条 ROE 波动/加速度序列。
+        std = _financial_std_filter_any()
+        std_f = _financial_std_filter_any("f.")
+        return _read_sql(
+            conn,
+            f"""
+            WITH want AS (
+                SELECT DISTINCT ON (stock_code) stock_code, report_type AS want_type
+                FROM financial_indicator
+                WHERE report_type IN ('Q1','H1','Q3','annual')
+                  AND report_date <= %s {std}
+                  AND (announce_date IS NULL OR announce_date < report_date
+                       OR announce_date - report_date > 180 OR announce_date <= %s)
+                ORDER BY stock_code, report_date DESC
+            ),
+            ranked AS (
+                SELECT f.stock_code, f.report_date, f.report_type, f.revenue, f.net_profit,
+                       f.roe, f.gross_profit_rate, f.net_profit_rate, f.debt_ratio,
+                       f.operating_cash_flow, f.revenue_yoy, f.net_profit_yoy,
+                       ROW_NUMBER() OVER (PARTITION BY f.stock_code
+                                          ORDER BY f.report_date DESC) - 1 AS rn
+                FROM financial_indicator f
+                JOIN want w ON w.stock_code = f.stock_code AND w.want_type = f.report_type
+                WHERE f.report_date <= %s AND f.report_type = w.want_type {std_f}
+                  AND (f.announce_date IS NULL OR f.announce_date < f.report_date
+                       OR f.announce_date - f.report_date > 180 OR f.announce_date <= %s)
+            )
+            SELECT * FROM ranked WHERE rn <= %s
+            """,
+            [as_of, as_of, as_of, as_of, periods],
+        )
+
     std, std_params = _financial_std_filter(report_type)
     return _read_sql(
         conn,
         f"""
         SELECT * FROM (
-            SELECT stock_code, report_date, revenue, net_profit, roe,
+            SELECT stock_code, report_date, report_type, revenue, net_profit, roe,
                    gross_profit_rate, net_profit_rate, debt_ratio,
                    operating_cash_flow, revenue_yoy, net_profit_yoy,
                    ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY report_date DESC) - 1 AS rn
@@ -412,27 +515,42 @@ def tier_or_flag(values: pd.Series, by: pd.Series, flag: str,
 _FIN_CTX_CACHE: dict[date, pd.DataFrame] = {}
 
 
-def load_financial_context(conn, as_of: date) -> pd.DataFrame:
-    """④⑤ 域共用底表：最新标准年报 × 行情市场 × GICS 部门（一次加载多处复用）。
+def load_financial_context(conn, as_of: date,
+                           report_type: str = "annual") -> pd.DataFrame:
+    """④⑤ 域共用底表：最新标准报告期 × 行情市场 × 行业（一/二级并存，D16 甲）。
 
-    grp 列 = 市场|GICS，是所有「行业内分位」的分组键（同时规避跨市场币种与跨行业不可比）。
+    ⚠ 阶段 C：行业来源改为阶段 B 统一映射表（申万/HSICS），GICS 已废弃（D2）。
+    一次加载 l1/l2 两套 map，产出 grp_l1 / grp_l2 两列（缓存键不变，一次加载两用，
+    避免重复加载财务大表）；grp（旧单列）保留为 grp_l1 的别名兼容存量读取。
+
+    report_type='annual'（默认）：grp_* = 市场|行业；
+    report_type='auto'（④⑤ 自适应）：grp_* = 市场|行业|报告期类型——
+    季报（累计 6/9 个月）与年报（全年）不混进同一组内比较或排序。
     """
-    if as_of in _FIN_CTX_CACHE:
-        return _FIN_CTX_CACHE[as_of]
+    key = (as_of, report_type)
+    if key in _FIN_CTX_CACHE:
+        return _FIN_CTX_CACHE[key]
 
     snap = load_quote_snapshot(conn, as_of)
-    fin = load_financial_latest(conn, as_of, "annual")
-    gics_map = load_gics_map(conn)
+    fin = load_financial_latest(conn, as_of, report_type)
+    m1 = load_industry_map(conn, 1)
+    m2 = load_industry_map(conn, 2)
 
     df = (
         snap[["stock_code", "market", "total_market_val", "close"]]
         .merge(fin, on="stock_code", how="inner")
-        .merge(gics_map, on="stock_code", how="left")
+        .merge(m1[["stock_code", "industry_code"]].rename(columns={"industry_code": "ind1"}),
+               on="stock_code", how="left")
+        .merge(m2[["stock_code", "industry_code"]].rename(columns={"industry_code": "ind2"}),
+               on="stock_code", how="left")
     )
-    df["grp"] = df["market"].astype(str) + "|" + df["gics"].astype(str)
+    suffix = "|" + df["report_type"].astype(str) if report_type == "auto" else ""
+    df["grp_l1"] = df["market"].astype(str) + "|" + df["ind1"].astype(str) + suffix
+    df["grp_l2"] = df["market"].astype(str) + "|" + df["ind2"].astype(str) + suffix
+    df["grp"] = df["grp_l1"]   # 兼容别名（存量读取逐步迁到 grp_l1/grp_l2）
 
     _FIN_CTX_CACHE.clear()
-    _FIN_CTX_CACHE[as_of] = df
+    _FIN_CTX_CACHE[key] = df
     return df
 
 
@@ -460,6 +578,32 @@ def assign_tier(values: pd.Series, n_tiers: int = 5, by: pd.Series | None = None
         out.loc[idx] = tier.astype(str)
 
     return out
+
+
+def assign_tier_with_pct(values: pd.Series, n_tiers: int = 5,
+                         by: pd.Series | None = None) -> tuple[pd.Series, pd.Series]:
+    """横截面分档 + 连续百分位（D15）。
+
+    与 assign_tier 同逻辑，但额外返回组内 rank(pct=True)*100 连续值——
+    assign_tier 内部本就算了 pct，这里只是不丢弃。原 assign_tier 签名不变（保护存量调用）。
+
+    返回 (tier: 字符串 "1".."5", pct: float 0-100)；无效/样本不足两列都为 NA。
+    """
+    v = pd.to_numeric(values, errors="coerce")
+    valid = v.notna()
+    tier_out = pd.Series(pd.NA, index=values.index, dtype="object")
+    pct_out = pd.Series(pd.NA, index=values.index, dtype="float64")
+    if not valid.any():
+        return tier_out, pct_out
+    groups = pd.Series("_all", index=values.index) if by is None else by
+    for _, idx in valid.groupby(groups[valid]).groups.items():
+        sub = v.loc[idx]
+        if len(sub) < n_tiers:
+            continue
+        pct = sub.rank(pct=True, method="average")
+        tier_out.loc[idx] = np.ceil(pct * n_tiers).clip(1, n_tiers).astype(int).astype(str)
+        pct_out.loc[idx] = (pct * 100).round(2)
+    return tier_out, pct_out
 
 
 def rank_within_group(values: pd.Series, by: pd.Series, ascending: bool = False) -> pd.Series:

@@ -1236,6 +1236,24 @@ COMMENT ON COLUMN sector_hierarchy.parent_code  IS '一级部门 code：GICS 11 
 COMMENT ON COLUMN sector_hierarchy.parent_name  IS '一级部门中文名';
 COMMENT ON COLUMN sector_hierarchy.as_of        IS '映射快照归属日（build_sector_hierarchy 每次运行写当天）。⚠ 只标快照日，不是 PIT 版本链；GICS 仅作展示层标签，不作行业配置计算口径（阶段3 用 HS_L3 113 行业）';
 
+-- 3.3b 行业二级映射（build_sector_hierarchy.py，2026-11-19 新增）
+-- 富途细粒度 INDUSTRY 板块 → GICS 二级行业组（2023 口径 25 组）；一级映射仍存 sector_hierarchy
+CREATE TABLE IF NOT EXISTS sector_hierarchy_l2 (
+    sector_code   VARCHAR(20)   NOT NULL,        -- 细粒度行业板块 code（= stock_sector.sector_code）
+    sector_name   VARCHAR(100),                   -- 板块名（冗余自 stock_sector）
+    group_code    VARCHAR(30)   NOT NULL,        -- GICS 二级行业组四位码；NONE=无对应
+    group_name    VARCHAR(50),                    -- 二级组标准简体中文名
+    sector_type   VARCHAR(20)   DEFAULT 'INDUSTRY',
+    as_of         DATE,                           -- 映射快照归属日（不是 PIT 生效日）
+    updated_at    TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (sector_code)
+);
+
+COMMENT ON TABLE  sector_hierarchy_l2             IS '行业二级映射：富途细粒度 INDUSTRY 板块 → GICS 二级行业组（2023 口径 25 组）。⚠ 人工语义近似映射，非官方 GICS 个股分类；供画像 val_pe_ind2_pct 分位使用';
+COMMENT ON COLUMN sector_hierarchy_l2.group_code  IS 'GICS 2023 二级行业组四位码（1010~6020）；NONE=综合企业等无对应二级组的兜底码（非官方 GICS code）';
+COMMENT ON COLUMN sector_hierarchy_l2.group_name  IS '二级行业组标准简体中文名（对齐 GICS 2023 开源中文对照，非 MSCI 官方发布）';
+COMMENT ON COLUMN sector_hierarchy_l2.as_of       IS '映射快照归属日。⚠ 只标快照日，不是 PIT 版本链；stock_sector 当前成分含幸存者偏差';
+
 -- 3.4 个股-基准相关性（benchmark_correlation_daily.py）
 CREATE TABLE IF NOT EXISTS benchmark_correlation (
     stock_code      TEXT    NOT NULL,
@@ -1634,7 +1652,7 @@ CREATE INDEX IF NOT EXISTS idx_company_rev_break_stock
 CREATE SCHEMA IF NOT EXISTS regime;
 
 -- 第④层「行业热点」独立域（2026-11-16）：只放行业指标层的 8 张专属表。
--- ⚠ regime.sector_daily / sector_valuation_snapshot / sector_fund_flow /
+-- ⚠ regime.sector_daily / sw_industry_valuation_snapshot / sector_fund_flow /
 --   sector_mapping / analyst_forecast_snapshot 是采集层与第③层共用的输入表，
 --   **留在 regime 不动**（market_state_daily.py 直接读写），本层跨 schema 只读。
 CREATE SCHEMA IF NOT EXISTS industry;
@@ -1897,29 +1915,99 @@ COMMENT ON COLUMN regime.analyst_forecast_snapshot.fy1_year        IS '财年标
 CREATE INDEX IF NOT EXISTS idx_forecast_stock_date
     ON regime.analyst_forecast_snapshot (stock_code, snapshot_date DESC);
 
--- 9.4 申万一级行业估值每日快照（源只给当前横截面无历史 → 行业估值分位只能逐日累积）
-CREATE TABLE IF NOT EXISTS regime.sector_valuation_snapshot (
+-- 9.4 申万行业估值每日快照（一级31+二级131，源只给当前横截面无历史 → 逐日累积）
+CREATE TABLE IF NOT EXISTS regime.sw_industry_valuation_snapshot (
     snapshot_date   DATE            NOT NULL,          -- 快照日（采集日，取最近 A 股交易日）
-    sw_code         VARCHAR(12)     NOT NULL,          -- 申万一级行业代码（801xxx）
-    sw_name         VARCHAR(40),
+    sw_code         VARCHAR(12)     NOT NULL,          -- 申万行业代码：一级/二级 801xxx
+    industry_level  SMALLINT        NOT NULL,          -- 1=一级(31) / 2=二级(131)
+    sw_name         VARCHAR(80),
     constituent_count INT,                             -- 成份个数（口径参考）
     pe_static       NUMERIC(12,4),                     -- 静态市盈率
     pe_ttm          NUMERIC(12,4),                     -- TTM(滚动)市盈率
     pb              NUMERIC(12,4),                     -- 市净率
     div_yield       NUMERIC(12,4),                     -- 静态股息率 %
-    source          VARCHAR(48)     NOT NULL DEFAULT 'akshare:sw_index_first_info',
+    source          VARCHAR(48)     NOT NULL,
     created_at      TIMESTAMPTZ     DEFAULT NOW(),
     updated_at      TIMESTAMPTZ     DEFAULT NOW(),
 
     PRIMARY KEY (snapshot_date, sw_code)
 );
 
-COMMENT ON TABLE  regime.sector_valuation_snapshot            IS '申万一级行业估值每日快照（源只给当前横截面无历史 → 行业估值分位只能逐日累积）';
-COMMENT ON COLUMN regime.sector_valuation_snapshot.snapshot_date IS '快照日（取最近 A 股交易日）；同一天重复运行幂等覆盖';
-COMMENT ON COLUMN regime.sector_valuation_snapshot.div_yield   IS '静态股息率 %（用于「股息率-国债利差」类行业配置口径）';
+COMMENT ON TABLE  regime.sw_industry_valuation_snapshot               IS '申万行业估值每日快照（一级31+二级131，industry_level 区分；源只给横截面无历史 → 逐日累积）';
+COMMENT ON COLUMN regime.sw_industry_valuation_snapshot.industry_level IS '1=申万一级 / 2=申万二级；与 sw_industry_classification.level 对齐';
+COMMENT ON COLUMN regime.sw_industry_valuation_snapshot.snapshot_date  IS '快照日（取最近 A 股交易日）；同一天重复运行幂等覆盖';
+COMMENT ON COLUMN regime.sw_industry_valuation_snapshot.div_yield     IS '静态股息率 %（用于「股息率-国债利差」类行业配置口径）';
 
-CREATE INDEX IF NOT EXISTS idx_sector_val_code
-    ON regime.sector_valuation_snapshot (sw_code, snapshot_date DESC);
+CREATE INDEX IF NOT EXISTS idx_sw_ind_val_code
+    ON regime.sw_industry_valuation_snapshot (industry_level, sw_code, snapshot_date DESC);
+
+-- 9.4b 行业分类体系统一改造：三张主数据表（阶段 A，2026-11-20）
+-- 纯分类/映射主数据，不含行情/估值/成分（单一职责）
+CREATE TABLE IF NOT EXISTS regime.sw_industry_classification (
+    sw_code      VARCHAR(12)     NOT NULL,          -- 申万行业代码：一级/二级 801xxx，三级 85xxxx
+    sw_name      VARCHAR(80)     NOT NULL,          -- 行业名称
+    level        SMALLINT        NOT NULL,          -- 层级：1=一级(31) / 2=二级(131) / 3=三级(336)
+    parent_code  VARCHAR(12),                       -- 上级行业代码（一级为 NULL）
+    as_of        DATE            NOT NULL,          -- 分类快照日
+    updated_at   TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (sw_code)
+);
+COMMENT ON TABLE  regime.sw_industry_classification           IS '申万行业分类层级（一级31/二级131/三级336，parent_code 串层级）。纯分类主数据：不含行情/估值/个股映射';
+COMMENT ON COLUMN regime.sw_industry_classification.level     IS '层级：1=申万一级 / 2=二级 / 3=三级；按 level 过滤定位某层级全部行业';
+
+CREATE TABLE IF NOT EXISTS regime.hsics_industry_classification (
+    subsector_code VARCHAR(8)    NOT NULL,          -- HSICS 三级子行业官方 6 位码（如 702015）
+    subsector_name VARCHAR(120)  NOT NULL,          -- 三级子行业英文名
+    sector_code    VARCHAR(8)    NOT NULL,          -- 二级 sector 官方 4 位码（如 7020）
+    sector_name    VARCHAR(120),                    -- 二级 sector 英文名
+    industry_code  VARCHAR(8)    NOT NULL,          -- 一级 industry 官方 2 位码（如 70）
+    industry_name  VARCHAR(120),                    -- 一级 industry 英文名
+    as_of          DATE          NOT NULL,
+    updated_at     TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (subsector_code)
+);
+COMMENT ON TABLE  regime.hsics_industry_classification        IS '恒生 HSICS 官方分类层级（一级12/二级31/三级114，官方6位码）。纯分类主数据：不含富途码/映射';
+
+CREATE TABLE IF NOT EXISTS regime.futu_hsics_code_mapping (
+    futu_code     VARCHAR(20)    NOT NULL,          -- 富途板块 code（如 HK.LIST23363）
+    futu_name     VARCHAR(120),                     -- 富途板块英文名（匹配依据）
+    hsics_code    VARCHAR(8),                       -- HSICS 官方三级 6 位码；NULL=无对应
+    match_method  VARCHAR(16)    NOT NULL,          -- auto=英文名自动匹配 / manual=人工确认
+    confirmed     BOOLEAN        NOT NULL DEFAULT FALSE,  -- 人工确认；重算不覆盖 confirmed=true 的行
+    as_of         DATE           NOT NULL,
+    updated_at    TIMESTAMPTZ    DEFAULT NOW(),
+    PRIMARY KEY (futu_code)
+);
+COMMENT ON TABLE  regime.futu_hsics_code_mapping              IS '富途板块码 HK.LISTxxxx → HSICS 官方三级 6 位码映射（D4 两跳方案中间层）；confirmed=true 为人工核对结果，每日重算不覆盖';
+COMMENT ON COLUMN regime.futu_hsics_code_mapping.match_method IS 'auto=英文名自动匹配 / manual=人工核对；confirmed=true 表示已人工确认，恒不被自动刷新覆盖';
+
+-- 9.4c 阶段 B：个股-行业映射统一收口（D12~D14，2026-11-20）
+-- 一行一股票、三层级横向展开；不存 eff_from/eff_to（历史不保留，覆盖式更新）
+CREATE TABLE IF NOT EXISTS regime.stock_sw_industry_mapping (
+    stock_code     VARCHAR(20)     NOT NULL,       -- 项目格式 SH./SZ./BJ. + 6 位
+    sw_code_l3     VARCHAR(12),                     -- 申万三级行业码（85xxxx）；一/二级归属从 sw_industry_classification.parent_code 链 join
+    weight_l1      NUMERIC(8,4),                    -- 一级行业指数内权重%（采集数据，非层级关系；单行业合计≈100）
+    weight_l2      NUMERIC(8,4),                    -- 二级行业指数内权重%
+    weight_l3      NUMERIC(8,4),                    -- 三级行业指数内权重%
+    as_of          DATE            NOT NULL,        -- 映射快照日（覆盖式）
+    updated_at     TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (stock_code)
+);
+COMMENT ON TABLE  regime.stock_sw_industry_mapping              IS 'A股个股↔申万三级行业原子映射（一行一股票，只存 sw_code_l3 + 三层采集权重）。层级关系只在 sw_industry_classification.parent_code 维护，不冗余；D12 收口废除 industry.constituent；不存历史版本';
+COMMENT ON COLUMN regime.stock_sw_industry_mapping.weight_l1    IS '一级行业指数内权重%（采集数据，非层级关系；合计≈100）；与 weight_l2/l3 分母不同，同股三层值不同';
+
+CREATE TABLE IF NOT EXISTS regime.stock_hsics_industry_mapping (
+    stock_code       VARCHAR(20)    NOT NULL,       -- HK. + 5 位
+    hsics_code_l3    VARCHAR(8),                     -- HSICS 三级 subsector 6 位码；一/二级从 hsics_industry_classification parent 链 join
+    futu_sector_code VARCHAR(20),                    -- 富途板块 code（HK.LISTxxxx）
+    as_of            DATE           NOT NULL,
+    updated_at       TIMESTAMPTZ    DEFAULT NOW(),
+    PRIMARY KEY (stock_code)
+);
+COMMENT ON TABLE  regime.stock_hsics_industry_mapping           IS '港股个股↔HSICS 三级行业原子映射（一行一股票，只存 hsics_code_l3 + 富途板块code）。层级关系只在 hsics_industry_classification 维护；来源 stock_sector 当前快照，pit_capable=false';
+
+CREATE INDEX IF NOT EXISTS idx_stock_sw_l3 ON regime.stock_sw_industry_mapping (sw_code_l3);
+CREATE INDEX IF NOT EXISTS idx_stock_hsics_l3 ON regime.stock_hsics_industry_mapping (hsics_code_l3);
 
 -- 9.5 同花顺行业 → 申万一级 映射（日收益相关性客观推断；低置信度需人工 confirmed）
 CREATE TABLE IF NOT EXISTS regime.sector_mapping (
@@ -2252,7 +2340,7 @@ COMMENT ON COLUMN force_round_daily.applicable IS '适用性：近 20 个已落�
 -- 21~24. 第④层 行业配置（阶段 1，sector_layer.py）
 --     生产：sector_layer.py（sector-layer.service 第一个 ExecStart，工作日 19:10；
 --           ⚠ 不得挂进 market_scheduler —— 资源规范 R4/R5）
---     输入：regime.sector_daily / sector_valuation_snapshot / sector_fund_flow
+--     输入：regime.sector_daily / sw_industry_valuation_snapshot / sector_fund_flow
 --     口径：doc/industry_allocation_feasibility.md（§3 指标体系 / §4.2 阶段 1）
 --     ⚠ 实体键含 market：CN 与 HK 物理分行，禁止混合排名/混合分位。
 --     ⚠ 字典表与 regime 同构：**一行一个领域概念**，市场适用范围由 market_scope
@@ -2272,6 +2360,7 @@ CREATE TABLE IF NOT EXISTS industry.indicator_dict (
     source          VARCHAR(160),                   -- 概念级来源；两市场实现见 params.per_market
     formula         TEXT,                            -- 同名 code 并列两市场公式「CN：…；HK：…」，照 regime.SECTOR.UP_RATIO
     model_key       VARCHAR(8),                    -- M0~M8，见设计文档 §3.2
+    industry_level  SMALLINT,                       -- 行业层级：1/2/3；NULL=非行业层级指标（D8）
     params          JSONB,                          -- per_market.{CN,HK} 实现差异 + 概念级参数
     params_hash     VARCHAR(16),                   -- 口径变更触发历史重算（全市场统一）
     min_periods     INT             NOT NULL DEFAULT 0,
@@ -2383,51 +2472,11 @@ COMMENT ON COLUMN industry.business_value.level IS '⚠ 多态列：SEC.BIZ.RANK
 COMMENT ON COLUMN industry.business_value.applicable IS '近20交易日有效读数≥15日 且 coverage≥0.6 且无 DATA_COVERAGE/BREAK 闸门。false 时前端只提示数据不足，不显示排名与象限';
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- 25~26. 第④层 行业成分主数据（阶段 2，PIT 版本链）
---     生产：get_sector_constituent.py（market_scheduler 交易日 18:05，早于 19:10 计算层）
---     源  ：AKShare index_component_sw（申万官方指数详情，31 个一级行业 × 5 列）
---     口径：doc/industry_allocation_feasibility.md §2.2.1 / §4.2 阶段 2
---     ⚠ 决策 A：自下而上指标有效起点限 **2021-12-13**（申万 2021 版分类启用日）。
---       源只有「计入日期」**没有剔除记录**，eff_to 只能靠逐日快照对比累积；
---       更早历史不得用当前成分回算后声称 PIT。
---     ⚠ 决策 B：权重只落本表，**不回写 public.stock_sector**（后者是证监会/富途分类，
---       口径不同且无生效日，混写会造成不同分类的权重同列）。
+-- 25~26.（已废除 D12）第④层 行业成分 PIT 版本链
+--     原 industry.constituent / industry.constituent_change 已废除，统一收口到
+--     9.4c regime.stock_sw_industry_mapping（无历史版本，覆盖式更新；
+--     行业指标仍逐日算历史序列但用最新成分，pit_capable=false）。
 -- ═══════════════════════════════════════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS industry.constituent (
-    market          VARCHAR(8)      NOT NULL DEFAULT 'CN',
-    sector_code     VARCHAR(20)     NOT NULL,       -- 申万一级代码，如 801010
-    stock_code      VARCHAR(20)     NOT NULL,       -- 项目格式 SH./SZ./BJ. + 6 位
-    eff_from        DATE            NOT NULL,       -- = max(计入日期, 2021-12-13)
-    eff_to          DATE,                           -- NULL = 至今；由后续快照关闭
-    weight          NUMERIC(8,4),                   -- 百分数（源原值，单行业合计≈100）
-    source          VARCHAR(64)     NOT NULL DEFAULT 'akshare:index_component_sw',
-    created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (market, sector_code, stock_code, eff_from)
-);
-CREATE INDEX IF NOT EXISTS idx_sector_const_stock
-    ON industry.constituent (stock_code, eff_from, eff_to);
-CREATE INDEX IF NOT EXISTS idx_sector_const_active
-    ON industry.constituent (sector_code, eff_to);
-COMMENT ON TABLE  industry.constituent IS '第④层行业成分主数据 PIT 版本链（阶段2）。每交易日快照与 active 行对比生成 ADD/REMOVE/WEIGHT 变更；eff_from 最小 2021-12-13，eff_to 由后续快照关闭。⚠ 无历史剔除记录，2021-12-13 前的成分不可还原';
-COMMENT ON COLUMN industry.constituent.eff_from IS '生效日 = max(源计入日期, 2021-12-13)；PIT 取用条件 trade_date >= eff_from AND (eff_to IS NULL OR trade_date < eff_to)';
-COMMENT ON COLUMN industry.constituent.weight IS '申万指数成分权重，**百分数**（如 8.72 = 8.72%，单行业合计≈100，不是 0~1 小数）；权重变化 ≥0.01 个百分点才关旧开新，微小波动只更新当前行';
-
-CREATE TABLE IF NOT EXISTS industry.constituent_change (
-    id              BIGSERIAL       PRIMARY KEY,
-    snapshot_date   DATE            NOT NULL,
-    market          VARCHAR(8)      NOT NULL DEFAULT 'CN',
-    sector_code     VARCHAR(20)     NOT NULL,
-    stock_code      VARCHAR(20)     NOT NULL,
-    change_type     VARCHAR(12)     NOT NULL,       -- ADD / REMOVE / WEIGHT
-    old_weight      NUMERIC(8,4),
-    new_weight      NUMERIC(8,4),
-    eff_from        DATE,
-    created_at      TIMESTAMPTZ     DEFAULT NOW(),
-    UNIQUE (snapshot_date, market, sector_code, stock_code, change_type)
-);
-CREATE INDEX IF NOT EXISTS idx_sector_const_change_date
-    ON industry.constituent_change (snapshot_date DESC);
-COMMENT ON TABLE industry.constituent_change IS '行业成分变更日志（逐日快照审计）：ADD/REMOVE/WEIGHT 三类，可据此重建任意历史截面。⚠ 只在首次采到之后才逐步累积，不是历史回填产物';
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 27. 第④层 港股行业层数据底座（阶段 3 / D4，hk_sector_index.py）
@@ -2474,5 +2523,5 @@ CREATE INDEX IF NOT EXISTS idx_hk_sector_index_date
     ON industry.hk_index_daily (trade_date DESC);
 COMMENT ON TABLE  industry.hk_index_daily IS '第④层 HK 行业日聚合与自算指数（M8 两版并列）。⚠ 成分取 stock_sector 当前快照，非 PIT，历史读数含幸存者偏差；⚠ 113 个恒生三级行业与 CN 31 个申万一级不同构，不得混合分位/排名';
 COMMENT ON COLUMN industry.hk_index_daily.ret_cap IS 'M8 口径变更：文档原文「流通市值加权」，实测 circular_market_val 长期缺失（2024-05 起仅 65 日有值）→ 改用 total_market_val。权重取当日市值（非前收市值），与 market_state_daily 的 HK cap_ret 同源；与 CN 用 circular_market_val 的口径差异已登记';
-COMMENT ON COLUMN industry.hk_index_daily.pe_agg IS '行业估值 = 成分股市值加权调和均值 Σw/Σ(w/pe)（等价「行业总市值 / 行业总盈利」），仅取 pe>0 的成分；不是官方行业指数 PE，与 CN sector_valuation_snapshot 不同构。覆盖成分 <60% 时置 NULL';
+COMMENT ON COLUMN industry.hk_index_daily.pe_agg IS '行业估值 = 成分股市值加权调和均值 Σw/Σ(w/pe)（等价「行业总市值 / 行业总盈利」），仅取 pe>0 的成分；不是官方行业指数 PE，与 CN sw_industry_valuation_snapshot 不同构。覆盖成分 <60% 时置 NULL';
 COMMENT ON COLUMN industry.hk_index_daily.southbound_net IS 'daily_ggt_hold.est_net_inflow 按行业求和（亿港元）。⚠ 源 2026-04-20 起仅 136 个交易日、est_ 为估算值、按当前成分回算 → survivorship_bias=true';

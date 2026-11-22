@@ -35,9 +35,9 @@ DB_QUERIES = [
     ("regime.sector_daily",
      "SELECT min(trade_date), max(trade_date), count(DISTINCT trade_date), "
      "count(DISTINCT sw_code), count(*) FROM regime.sector_daily"),
-    ("regime.sector_valuation_snapshot",
+    ("regime.sw_industry_valuation_snapshot",
      "SELECT min(snapshot_date), max(snapshot_date), count(DISTINCT snapshot_date), "
-     "count(*) FROM regime.sector_valuation_snapshot"),
+     "count(*) FROM regime.sw_industry_valuation_snapshot"),
     ("regime.sector_fund_flow",
      "SELECT min(trade_date), max(trade_date), count(DISTINCT trade_date), "
      "count(*) FROM regime.sector_fund_flow"),

@@ -6,13 +6,13 @@
 ——这是它与 ③ 估值（含价格）、⑤ 成长（变化率）的双重分界。
 
 口径约定：
-    · 数据统一用最近一期**标准年报**（report_date=12-31；业绩快报等非标报告期已过滤）
-    · 分档在【市场 + GICS 部门】内做：银行负债率 90% 属正常、科技 30% 已偏高，
-      全市场统一分档会让「最低档」被金融业占满
+    · 水平/比率类取每只票**最近一期标准报告期**（有季报用季报、无则年报，非标报告期已过滤）；
+      分档在【市场 + GICS 部门 + 报告期类型】内做——Q3 累计 9 个月与 annual 全年不混排
+    · `qal_profit_years`（连续盈利年数）保持年报口径，语义是「年」不改成「期」
     · 档位统一规则 1=数值最小 5=数值最大，好坏方向看语义（label 已注明）
     · 全部标签 pit_capable=False：财报无实际披露日，存在前视（见 load_financial_latest）
 
-数据来源：financial_indicator（年报：ROE/毛利率/净利率/负债率/OCF/净利润）
+数据来源：financial_indicator（自适应标准报告期：ROE/毛利率/净利率/负债率/OCF/净利润）
 """
 from __future__ import annotations
 
@@ -39,11 +39,19 @@ _PROFIT_YEARS_RANGE = {
 
 
 def _load_ctx(as_of: date) -> pd.DataFrame:
+    """④⑤ 水平/比率类底表：自适应最近一期，grp 已含报告期类型。"""
     with _conn() as conn:
-        return load_financial_context(conn, as_of)
+        return load_financial_context(conn, as_of, "auto")
 
 
 def _hist(as_of: date, periods: int) -> pd.DataFrame:
+    """同类型报告期序列：ROE 稳定性用（近 3 期都已是非年报或都是年报）。"""
+    with _conn() as conn:
+        return load_financial_history(conn, as_of, "auto", periods=periods)
+
+
+def _hist_annual(as_of: date, periods: int) -> pd.DataFrame:
+    """年报序列：连续盈利年数专用，保持 years 语义。"""
     with _conn() as conn:
         return load_financial_history(conn, as_of, "annual", periods=periods)
 
@@ -89,9 +97,10 @@ def _bucket_years(n: int) -> str:
     value_range={**_TIER_RANGE, "LOSS": "ROE 为负（当年亏损），不参与分档"},
     source_type="stat", update_freq="quarterly",
     data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准年报加权 ROE，在【市场+GICS】内五等分：1=最低，5=最高。"
+    compute_logic="最近一期标准报告期加权 ROE（有季报用季报，无则年报），"
+                  "在【市场+GICS+报告期类型】内五等分：1=最低，5=最高。"
                   "num_value 存 ROE 原值(%)。负值打 LOSS",
-    pit_capable=False, owner="profiling",
+    version="v2", pit_capable=False, owner="profiling",
 )
 def qal_roe_tier(as_of: date) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
@@ -110,9 +119,10 @@ def qal_roe_tier(as_of: date) -> pd.DataFrame:
     value_range={**_TIER_RANGE, "LOSS": "毛利率为负（毛亏），不参与分档"},
     source_type="stat", update_freq="quarterly",
     data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准年报毛利率，在【市场+GICS】内五等分。毛利率的行业属性极强"
+    compute_logic="最近一期标准报告期毛利率（有季报用季报，无则年报），"
+                  "在【市场+GICS+报告期类型】内五等分。毛利率的行业属性极强"
                   "（白酒 80% vs 零售 15%），必须行业内比较才有意义",
-    pit_capable=False, owner="profiling",
+    version="v2", pit_capable=False, owner="profiling",
 )
 def qal_gross_margin_tier(as_of: date) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
@@ -131,8 +141,9 @@ def qal_gross_margin_tier(as_of: date) -> pd.DataFrame:
     value_range={**_TIER_RANGE, "LOSS": "净利率为负（亏损），不参与分档"},
     source_type="stat", update_freq="quarterly",
     data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准年报净利率，在【市场+GICS】内五等分",
-    pit_capable=False, owner="profiling",
+    compute_logic="最近一期标准报告期净利率（有季报用季报，无则年报），"
+                  "在【市场+GICS+报告期类型】内五等分",
+    version="v2", pit_capable=False, owner="profiling",
 )
 def qal_net_margin_tier(as_of: date) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
@@ -154,10 +165,11 @@ def qal_net_margin_tier(as_of: date) -> pd.DataFrame:
     },
     source_type="stat", update_freq="quarterly",
     data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准年报资产负债率，在【市场+GICS】内五等分。"
+    compute_logic="最近一期标准报告期资产负债率（有季报用季报，无则年报），"
+                  "在【市场+GICS+报告期类型】内五等分。"
                   "注意方向：1=杠杆最低，5=杠杆最高——筛选「财务稳健」应取低档。"
                   "组内比较可缓解金融业负债率天然偏高的问题，但银行 vs 银行仍需注意商业模式差异",
-    pit_capable=False, owner="profiling",
+    version="v2", pit_capable=False, owner="profiling",
 )
 def qal_leverage_tier(as_of: date) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
@@ -181,9 +193,10 @@ def qal_leverage_tier(as_of: date) -> pd.DataFrame:
     },
     source_type="stat", update_freq="quarterly",
     data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近 3 期年报 ROE 的标准差，在【市场+GICS】内五等分：1=最稳定，5=波动最大。"
-                  "质量的核心是稳定（MSCI Quality 定义），仅覆盖近 3 年年报齐全的股票",
-    pit_capable=False, owner="profiling",
+    compute_logic="最近 3 期同类型报告期 ROE 的标准差（全季报或全年报，不混期），"
+                  "在【市场+GICS+报告期类型】内五等分：1=最稳定，5=波动最大。"
+                  "质量的核心是稳定（MSCI Quality 定义），仅覆盖近 3 期同类型报告期齐全的股票",
+    version="v2", pit_capable=False, owner="profiling",
 )
 def qal_roe_stability(as_of: date) -> pd.DataFrame:
     g = _hist(as_of, 3)
@@ -209,9 +222,10 @@ def qal_roe_stability(as_of: date) -> pd.DataFrame:
     },
     source_type="stat", update_freq="quarterly",
     data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="盈利真实性 = 经营现金流 / 净利润 × 100，在【市场+GICS】内五等分。"
+    compute_logic="盈利真实性 = 最近一期标准报告期经营现金流 / 净利润 × 100"
+                  "（有季报用季报，无则年报），在【市场+GICS+报告期类型】内五等分。"
                   "净利>0 才有意义（亏损股打 LOSS）；比率低说明利润停留在应收账款上（纸面利润）",
-    pit_capable=False, owner="profiling",
+    version="v2", pit_capable=False, owner="profiling",
 )
 def qal_earnings_quality(as_of: date) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
@@ -243,7 +257,7 @@ def qal_earnings_quality(as_of: date) -> pd.DataFrame:
     pit_capable=False, owner="profiling",
 )
 def qal_profit_years(as_of: date) -> pd.DataFrame:
-    streak = _streak(_hist(as_of, 15), "net_profit")
+    streak = _streak(_hist_annual(as_of, 15), "net_profit")
     latest = streak.rename("streak").reset_index()
     return _frame(latest["stock_code"], latest["streak"].map(_bucket_years), latest["streak"])
 

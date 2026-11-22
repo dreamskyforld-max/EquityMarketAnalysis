@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 文档版本 | **v1.1**（2026-11-18 估值结论口径升级 v2，进度与生产状态见 §12.2） |
+| 文档版本 | **v1.2**（2026-11-19 报告期自适应：④⑤ 取最近一期标准报告期、同期次分档、年报口径标签保留；进度与生产状态见 §12.2） |
 | 编制日期 | 2026-11-12 |
 | 适用范围 | 个股画像现有 L1 标签（③④⑤⑥⑦⑩ 等）之上的结论层 |
 | 文档性质 | **数据架构 / 数据契约 + 口径规格**；不含实现代码、不建表 |
@@ -65,7 +65,7 @@
 
 ### 1.3 时间尺度区分（易被忽略）
 
-③ 估值、⑦ 交易特征、⑩ 位置是**日频**（随价变）；④⑤ 成长与质量是**季频**（财报驱动）。L3 `biz_value_quality_type` 频率取上游最快侧为 `daily`，但**只在任一 L2 码变化时切换**（§4.6 事件行），不产生「财报没出但结论天天跳」。
+③ 估值、⑦ 交易特征、⑩ 位置是**日频**（随价变）；④⑤ 成长与质量是**季频**（财报驱动）。④⑤ 水平/比率类取每票最近一期标准报告期（有季报用季报，无则年报，同期次内分档），`qal_profit_years` / `grw_growth_persistence` 保持年报序列；财务采集 02:00 入库、画像 17:30 全量重算（`force=True` 跳过频率门禁），新财报当日即反映到结论。L3 `biz_value_quality_type` 频率取上游最快侧为 `daily`，但**只在任一 L2 码变化时切换**（§4.6 事件行），不产生「财报没出但结论天天跳」。
 
 > 数据契约里必须区分**档案结论**（慢变量、季度更新）与**今日状态**（快变量、日频）。各结论的 `update_freq` 按域分别声明（§5），`pit_capable` 按判定用输入的最弱环声明（§4.1 / §8.5）。
 
@@ -539,7 +539,7 @@ WHERE r.source_type = 'derived'
 | 判定规则表 | 水平（ROE）× 稳定性 × 真实性三腿合取；杠杆单独降级；见下表 |
 | enum 值域 | 6 码，见**附录 D.2** |
 | 门禁 / 频率 | G1 + G2（`roe_tier` 与 `earnings_quality_tier` 至少一个有效）；`quarterly`（财报驱动）；A+H；`pit_capable=False` |
-| 依据键 | `rule_id`、`as_of`、`roe_tier`、`roe_stability`、`earnings_quality_tier`、`leverage_tier`、`profit_years`、`coverage`、`missing_inputs`、`gates` |
+| 依据键 | `rule_id`、`as_of`、`roe_tier`、`roe_stability`、`earnings_quality_tier`、`leverage_tier`、`profit_years`、`coverage`、`missing_inputs`、`gates`、`report_period`（逐输入标 `report_type`/`report_date`） |
 | 措辞 | 禁用「好公司 / 优质 / 白马」；「盈利稳且现金实」描述的是**财报特征**，不是「证券好不好」 |
 
 | `rule_id` | 优先级 | 条件 | 结果 |
@@ -566,7 +566,7 @@ WHERE r.source_type = 'derived'
 | 判定规则表 | 见下表；背离优先于增速 |
 | enum 值域 | 6 码，见**附录 D.3** |
 | 门禁 / 频率 | G1 + G2；`quarterly`；A+H；`pit_capable=False` |
-| 依据键 | `rule_id`、`as_of`、`rev_tier`、`np_tier`、`rev_yoy`、`np_yoy`、`growth_gap`、`persistence`、`accel`、`evidence_enhancements[]`、`market_scope`、`coverage`、`missing_inputs`、`gates` |
+| 依据键 | `rule_id`、`as_of`、`rev_tier`、`np_tier`、`rev_yoy`、`np_yoy`、`growth_gap`、`persistence`、`accel`、`evidence_enhancements[]`、`market_scope`、`coverage`、`missing_inputs`、`gates`、`report_period`（`persistence` 标 annual 期次，其余财报输入标 auto 期次） |
 | **⚠ 关键约束** | **A/H 可用成员集不同**（§8.1）。若把新补的 A 股扣非 / 港股 CAPEX 放进判定，同一 enum 在两市场语义会不一致——正是 regime `DIM.FLOW` 单锚代理分的陷阱（§2.3 A2）。故新补数据**一律只进 evidence**，判定只用共有 4 标签。此约束不得因「数据补上了」而放宽（§8.4） |
 
 | `rule_id` | 优先级 | 条件 | 结果 |
@@ -788,6 +788,7 @@ regime 的 `BIZ.MARKET_REGIME` 用的是**状态机改值**（`build_business_va
 - **按「判定用输入」的最弱环声明 `pit_capable`**（§4.1）：④⑤ 及两个 L3 的判定含财报衍生且港股无披露日 → `False`、`update_freq=quarterly`，**不用于严格回测**；③⑦⑩ 判定输入仅量价 / PE 分位（§5.1 已把 4 个 `pit_capable=False` 的估值档移到 `evidence_only`）→ `True`、`update_freq=daily`。这与 §1.3 的日频/季频口径一致。
 - `profiling/tags/growth.py` 8 个 `@tag` 全部 `pit_capable=False`，与代码一致；「财报无披露日」应理解为「A 股 96.5% 有 `announce_date`、港股恒 NULL」。
 - 东财利润表的 `NOTICE_DATE` 可补齐 A 股披露日（P2 顺带），港股披露日仍无源。
+- 报告期自适应的 PIT 与年报口径同：`load_financial_latest/history` 的 auto 分支沿用同一 `announce_date` 可信度护栏（A 股按披露日过滤；港股 NULL 放行），不因换成季报而放宽。每票取「最近一期标准报告期」时用的是 `report_date` 排序，配合披露日护栏，不会取到尚未披露的期次（港股除外，同既有局限）。
 - ⚠ 全量重建历史时仍须按 `as_of` 取当时的 L1 版本（§4.4.3 约束 1）。**已知局限**：L1 当日走 snapshot 原地 `UPDATE`（`engine.py:224-225,369-381`），历史日才是版本链，因此「取当时版本」的严格性受既有 L1 写入方式限制；不得据此宣称严格 PIT。
 
 ---
@@ -871,7 +872,8 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 10. 结构化条件可由 `rule_id + evidence` 复算出同一 enum；`value_range=NULL` 时 `_tag_pct()` 返回 `None`；
 11. **值域对齐**：所有 `rules[].conditions[].field` 在 `inputs[]` / `derived_fields[]` 内；所有 `value` 字面值在该字段声明的 `codes` / 值域内；档位 `key_value`（字符串 `"1".."5"`）按 `dtype=int` cast 后比较结果符合预期；`op` 不含 `between`、条件内不含表达式；
 12. 6 组 enum 共 39 个 `short_label` 非空；6 阶段 `tst_stage` 编码未被占用；结论层 enum code 全小写、`LOSS`/`NEGATIVE` 原码保留在 `evidence`。
-13. **估值结论 v2 九格防回退**：`RULES["dim_valuation_conclusion"]` 无 `derived_fields`、无 `divergence_gap_pctl`；九格逐格可复算，单侧四格不得落 `rel_fair`；`VAL_CLASS` 中 4 个单侧码归 `neutral`；`dim_valuation_conclusion` 版本为 `v2` 且其余 5 个结论仍为 `v1`。
+13. **估值结论九格防回退**：`RULES["dim_valuation_conclusion"]` 无 `derived_fields`、无 `divergence_gap_pctl`；九格逐格可复算，单侧四格不得落 `rel_fair`；`VAL_CLASS` 中 4 个单侧码归 `neutral`。版本：2026-11-19 报告期自适应升级后为 `v3`（此前 v2），其余 5 个结论为 `v2`。
+14. **报告期自适应（2026-11-19）**：`load_financial_latest/history(..., report_type='auto')` 按每票最近一期标准报告期取数，`load_financial_context` 的 `grp` 在 auto 下为 `市场|GICS|报告期类型`——季报与年报不混排；`qal_roe_stability`/`grw_growth_accel` 用同类型报告期序列；`qal_profit_years`/`grw_growth_persistence` 保持年报口径（years 语义）；结论 `conclusion_detail.evidence.report_period` 逐输入标 `report_type`/`report_date`，年报口径标签标 annual 期次。
 
 ---
 
@@ -989,6 +991,8 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 
 > **值域事实（规则表 `inputs[]` 的对齐基准）**：`assign_tier` 输出的 `key_value` 是**字符串** `"1".."5"`（`profiling/quantile.py:455`），边界 20/40/60/80（`:453-454`）；`num_value` 才是连续值。`qal_roe_stability` 1=最稳定 / 5=波动最大；`qal_earnings_quality` 1=纸面利润风险最高 / 5=现金支撑充足、另有 `LOSS`；`qal_leverage_tier` 1=最低 / 5=最高；`grw_growth_persistence` 为 `"0".."3"` 连续正增长期数档；`grw_growth_accel` 为 `accelerating`/`steady`/`decelerating`（±5pp）；`tst_price_position_52w` 档 `1=[0,20)` … `5=[80,100]`；`att_volume_surge` 为 `surge`/`normal`/`shrink`；`trd_momentum_12_1` 1=最弱。**L1 只有 3 个域用 `enum_values`，其余 6 域用 `TIER + value_range`**，故结论层必须按 `source_col` 明确取 `key_value` 还是 `num_value`。
 
+> **估值域新增 `val_pe_ind2_pct`（2026-11-19，不参与结论）**：与 `val_pe_ind_pct`（GICS **一级**部门分位）并存，分组键为【市场 + GICS **二级**行业组】，口径同 `percentile_0_100`（`profiling/tags/valuation.py`）。二级映射存独立表 `sector_hierarchy_l2`（`build_sector_hierarchy.py` 维护），25 个组按 GICS 2023 四位码 + 标准简体中文名；由富途板块人工语义映射，**非官方 GICS 个股分类**，首期只做港股（A 股不打标），综合企业落 `NONE`。二级组粒度不均（能源/材料/公用事业仅 1 组 = 与一级等价），分位可比性有限。**不进 `dim_valuation_conclusion` 的 `inputs[]`、不改估值结论**，仅供个股估值分析对照。
+
 ## 附录 C：关键证据索引
 
 > **引用格式**：以「文件 + 符号 / 章节」为主，行号仅作辅助（纯行号引用易随代码改动错位）。
@@ -1009,6 +1013,7 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 | 位置档实现 / 6 阶段暂不注册 | `profiling/tags/trend.py:1-32, 121-220` |
 | 计算任务资源规范 | `AGENTS.md`「计算任务资源约定」；`doc/compute_task_resource_standard.md` §1–§8（§2 为 R1–R7、§5 为 worktree 对比法、§7 为监控登记） |
 | 结论切点标定 | `tools/calibrate_conclusion_cutpoints.py`（只读、不写库；切点已冻结，见 §4.3.1 / §5）。v2 起模拟判定为 3×3 九格映射，与 `RULES` 的 VAL-02..VAL-10 逐格对齐 |
+| GICS 二级映射 / 二级分位标签 | `build_sector_hierarchy.py` `LEVEL2` / `_SECTOR_GROUP_MAP` / `_build_l2_rows`；`sql/schema.sql` 第 3.3b 节 `sector_hierarchy_l2`；`profiling/quantile.py:load_gics_group_map`；`profiling/tags/valuation.py:val_pe_ind2_pct`；`tests/test_sector_stage3.py:test_gics_l2_*` |
 
 ## 附录 D：6 组 enum 值域冻结表（**唯一真相源**）
 

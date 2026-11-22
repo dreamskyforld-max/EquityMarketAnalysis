@@ -331,7 +331,7 @@ _REGIME_TABLE_CONFIG = [
      "build_sector_mapping（行业映射月度复核，每月 1 日）", True),
     ("regime", "sector_daily", "updated_at", "day", 1, 0,
      "market_state_daily（逐行业横截面，18:45 计算层写入）", True),
-    ("regime", "sector_valuation_snapshot", "updated_at", "day", 1, 0,
+    ("regime", "sw_industry_valuation_snapshot", "updated_at", "day", 1, 0,
      "get_sector_valuation（行业估值快照，18:15；源无历史，漏采即永久缺失）", True),
     # 第④层行业热点计算层（industry 域；sector_layer.py，sector-layer.service 19:10 第一个 ExecStart）
     ("industry", "indicator_dict", "updated_at", "lowfreq", 30, 0,
@@ -344,13 +344,12 @@ _REGIME_TABLE_CONFIG = [
      "sector_layer（第④层 L2 维度读数，19:10）", True),
     ("industry", "business_value", "trade_date", "day", 1, 0,
      "sector_layer（第④层 L3 业务读数长表，19:10；增量默认回退 3 天自愈）", True),
-    # 第④层阶段 2 行业成分主数据（get_sector_constituent.py，交易日 18:05）。
-    # ⚠ 两表都是**事件驱动**：成分无变更的日子不写新行，用 day/1 会天天误报。
-    #    表级用 lowfreq/7 兜底；采集是否停摆由调度器的 collection_task_log 判。
-    ("industry", "constituent", "created_at", "lowfreq", 7, 0,
-     "get_sector_constituent（PIT 版本链，18:05；事件驱动，无变更日不写）", True),
-    ("industry", "constituent_change", "created_at", "lowfreq", 7, 0,
-     "get_sector_constituent（成分变更日志，18:05；事件驱动）", True),
+    # 个股-行业映射统一收口表（D12：废除 industry.constituent / constituent_change）。
+    # 覆盖式每日写（非事件驱动），按 updated_at 判新鲜度 day/1。
+    ("regime", "stock_sw_industry_mapping", "updated_at", "day", 1, 0,
+     "get_stock_sw_industry_mapping（A股个股-申万三级映射，日频 08:20）", True),
+    ("regime", "stock_hsics_industry_mapping", "updated_at", "day", 1, 0,
+     "get_stock_hsics_industry_mapping（港股个股-HSICS 三级映射，日频 08:17）", True),
     # 第④层阶段 3 / D4：HK 行业日聚合与自算指数（同一 sector-layer.service 的第二个 ExecStart）。
     # ⚠ 按 trade_date 判新鲜度；CN/HK 输出共用表，表级监控按 CN 日历（见下方已知残差）。
     ("industry", "hk_index_daily", "trade_date", "day", 1, 0,
@@ -425,7 +424,7 @@ _CN_MONITOR_TABLES = {
     ("regime", "sector_fund_flow"),
     ("regime", "sector_mapping"),
     ("regime", "sector_daily"),
-    ("regime", "sector_valuation_snapshot"),
+    ("regime", "sw_industry_valuation_snapshot"),
     # 第④层行业配置：阶段 1/2 均仅 CN 申万一级，按 A 股日历判停滞。
     # ⚠ 阶段 3 已知残差（2026-11-14 决策「沿用现有 4 表」）：HK / HS_L3 行写入
     #   同一张表，表级 MAX(trade_date) 仍按 CN 日历。港股独家交易日可能晚一日，
@@ -436,8 +435,8 @@ _CN_MONITOR_TABLES = {
     ("industry", "indicator_value"),
     ("industry", "dimension_value"),
     ("industry", "business_value"),
-    ("industry", "constituent"),
-    ("industry", "constituent_change"),
+    ("regime", "stock_sw_industry_mapping"),
+    ("regime", "stock_hsics_industry_mapping"),
 }
 
 

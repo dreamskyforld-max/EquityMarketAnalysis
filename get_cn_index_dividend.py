@@ -6,7 +6,7 @@
     —— 此前全市场股息率**只散落在个股层面**，且无法聚合：实测（2026-10-16）
     `a_daily_quote.dividend_ratio_ttm` 在 2019-2025 各年非空值仅 2~7 条（覆盖率≈0.00%），
     2026 年才有 14.74% —— **既无历史、覆盖也太薄**，故**无法回填**，只能另接指数级数据源。
-    （行业级 `sector_valuation_snapshot.div_yield` 只有横截面快照、无历史序列。）
+    （行业级 `sw_industry_valuation_snapshot.div_yield` 只有横截面快照、无历史序列。）
   · 取 **000985 中证全指** = 全市场口径（如需沪深300 口径，改 collect_params.index 即可，
     不必改代码：见 seed_series_meta / load_series_defs）。
   · ⚠ 实测（2026-10-15）：该接口只返回**最近 20 个交易日**的滚动窗口 → **无法回填历史**，
