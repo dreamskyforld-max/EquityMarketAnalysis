@@ -73,7 +73,7 @@
 | D12 | A 股个股-行业映射收口 | 统一到 `regime.stock_sw_industry_mapping`（`get_stock_sw_industry_mapping.py` 唯一维护），**废除** `industry.constituent`/`constituent_change`/`get_sector_constituent.py` 及全部引用 |
 | D13 | 映射表结构 | 一行一股票（PK `stock_code`），三层级横向展开 `sw_code_l1/l2/l3` + `weight_l1/l2/l3` + `as_of`；**不存** `eff_from/eff_to` 历史版本 |
 | D14 | 行业指标 PIT 取舍 | 仍逐日算历史序列（2021-12-13 起），但成分用**最新名单**贴历史（放弃 PIT，接受幸存者偏差）；`pit_capable=false` 标注 |
-| D15 | 档位型标签加连续百分位 | 14 个档位型标签（PS/PCF/PEG、质量6、成长2、规模2、回报1）除 1-5 档外同时输出 `num_value` 0-100 连续百分位，与估值域 3 个对齐；阶段 C 一并做 |
+| D15 | 档位型标签加连续百分位 —— **已撤销** | 评估后决定 `num_value` 保持原值语义（PS倍数/ROE%等），不新增百分位存储：加列要改 engine.py 核心写入与版本判断（pct 日变会触发大量新版本行），且 conclusion_detail 是 L2/L3 专用不可复用 |
 
 **历史说明**：`val_pe_ind2_pct` 在 2026-11-19 曾作为"GICS 二级"标签创建并落库（`eff_from=2026-11-19`）。按 D2/D5，该 code **复用但改口径**（GICS 二级 → 申万/HSICS 二级），当日已产出的值全部作废重算。
 
@@ -265,7 +265,7 @@ L2/L3 结论   本期暂停产出（D3），行业改造完成后再优化
 | ④质量 | `qal_net_margin_tier` | 净利率档 | `qal_net_margin_ind1_tier` + `qal_net_margin_ind2_tier` | 同上 |
 | ④质量 | `qal_leverage_tier` | 杠杆水平档 | `qal_leverage_ind1_tier` + `qal_leverage_ind2_tier` | 同上 |
 | ④质量 | `qal_roe_stability` | ROE稳定性 | `qal_roe_stability_ind1` + `qal_roe_stability_ind2` | 同上 |
-| ④质量 | `qal_earnings_quality` | 盈利真实性 | `qal_earnings_quality_ind1` + `qal_earnings_quality_ind2` | 同上 |
+| ④质量 | `qal_earnings_quality` | 利润现金转换率 | `qal_earnings_quality_ind1` + `qal_earnings_quality_ind2` | 同上 |
 | ⑤成长 | `grw_revenue_yoy_tier` | 营收增速档 | `grw_revenue_yoy_ind1_tier` + `grw_revenue_yoy_ind2_tier` | 市场+行业+报告期 |
 | ⑤成长 | `grw_profit_yoy_tier` | 净利增速档 | `grw_profit_yoy_ind1_tier` + `grw_profit_yoy_ind2_tier` | 同上 |
 | ②规模 | `scl_revenue_tier` | 营收规模档 | `scl_revenue_ind1_tier` + `scl_revenue_ind2_tier` | 市场+行业 |
@@ -288,11 +288,16 @@ L2/L3 结论   本期暂停产出（D3），行业改造完成后再优化
 - 所有标签分组键统一走 `load_industry_map`（单一真相源），禁止各模块各自 join。
 - 组内有效样本 <15 只时：`confidence` 降级 + 记录 `n_sample`。
 - `val_pe_ind2_pct` 的 2026-11-19 旧值（GICS 口径）作废重算。
-- **D15 连续百分位（用户确认，阶段 C 一并做）**：**所有档位型标签**（17 个行业相关的 14 个 + 全市场档 `val_pe_ttm_tier`/`val_pb_tier` 等）除 `key_value` 1-5 档外，**统一输出 `num_value` 0-100 连续百分位**。理由：`assign_tier` 内部本就算了 `pct=rank(pct=True)`，边际成本近零；保留连续值为将来 L2/L3 恢复时的切点重标定、一/二级分位有效性验证（IC/单调性）留信息。实现上加 `assign_tier_with_pct()` 返回 (tier, pct)，不改原 `assign_tier` 签名（保护现有 10+ 调用点），所有档位型标签的 `_frame()` 多传 num_value + 声明 `num_unit='percentile_0_100'`。
+- **D15 连续百分位 —— 已撤销（2026-11-23）**：曾计划给档位型标签加 `num_value` 连续百分位，评估实施路径后发现：① `profile.tag_value` 无 `extra` 列、`conclusion_detail` 是 L2/L3 专用（L1 恒 NULL，schema.py:100），存 L1 百分位会破坏契约；② 加独立列要改 `engine.py` 核心写入链路的 INSERT/UPDATE 与 `_same_value` 版本判断，pct 每日微变会触发大量新版本行；③ 档位型标签的 `num_value` 现为**原值语义**（PS 倍数/ROE%/市值元等），前端与消费方依赖该量纲。**最终决策：num_value 保持原值语义不变，不新增百分位存储。** 阶段 C 不再引入任何新工具函数。
 - **D16 `load_financial_context` 改法（甲）**：一次加载 l1/l2 两套行业 map，产出 `grp_l1`/`grp_l2` 两列（缓存键不变，一次加载两用，避免重复加载财务大表）；quality/growth 8 个标签各算两遍用不同 grp 列。
-- **D17 L2/L3 暂停方式**：在 `profiling/run.py` 计算入口跳过 L2/L3（保留 `RULES` 代码与 `is_active` 契约不动）。
+- **D17 L2/L3 暂停方式**：在 `compute_profile.py` 计算入口跳过 L2/L3（`L2_L3_PAUSED=True`，保留 `RULES` 代码与 `is_active` 契约不动）。
+- **D20 L2 估值结论整改（2026-11-23，已实施）**：行业 PE 分位从废弃的 `val_pe_ind_pct` 改为 **`val_pe_ind2_pct`（二级行业分位）**；二级组加分层样本门禁（正 PE ≤5 只不产出、6–14 只 conf=0.5、≥15 只 conf=1.0）；规则表加 `hist_tier`/`ind_tier` 档位派生字段，11 条规则条件从范围比较改为枚举比较（条数不变，可读性提升）；版本 v3→v4。L3 继续暂停（D17），`VAL_CLASS` 不动。
+- **D21 L2 质量结论整改（2026-11-23，待实施）**：① 质量指标行业分档**用一级**（`qal_*_ind1_*`）——质量的行业差异主要在一级层面（银行/钢铁/白酒 ROE 结构性差异），二级多丢 60-70 只且差异小；② 杠杆从一票否决（QAL-03 priority 2）改为**降级因素**，不覆盖高质量的正面码；③ `weak` 兜底过宽（约 73%）→ 新增 `moderate` 档（ROE 3-4 档且无负面信号），`weak` 只留 ROE≤2 或有明显短板；④ 增加 ROE 绝对底线：inputs 加 `roe_raw`（`qal_roe_ind1_tier.num_value`），ROE<5%（可配阈值）最高只能到 `moderate`，不能 `solid`。L3 继续暂停（D17），`QAL_CLASS` 不动。
 
-**阶段 C 验收**：逐票对比 HK.00700 / SH.688981；分组键无 GICS 残留；一/二级两值成对产出；**17 个标签 num_value 连续百分位非空**；L2/L3 确认无新产出；`profiling/tags/__init__.py` 注册数量更新；全量测试通过。
+- **D19 GICS 遗留清理（2026-11-23）**：D18 斩断英文名依赖后，`build_sector_hierarchy.py` 已无任何消费方 → git rm 删除；`sector_hierarchy`（196 行）/ `sector_hierarchy_l2`（113 行）两表 DROP；`market_scheduler.py` 周二 18:35「行业层级映射」任务移除；`sql/schema.sql` 两表 DDL/COMMENT 删除、探针/测试/可行性文档同步。至此 GICS 代码残留清零（SCHEMA_FIX 历史归档文件除外）。
+- **D18 富途英文名来源（2026-11-23）**：`get_hsics_industry_classification.py` 不再正则解析 `build_sector_hierarchy._SECTOR_MAP` 的行尾注释取富途英文名；改为从**富途 API 英文版** `get_plate_list(Market.HK, Plate.INDUSTRY)` 实测拉取 113 个板块标准英文名，固化为本文件常量 `FUTU_EN_NAME`。至此 HSICS 采集脚本对 GICS 遗留脚本零依赖；富途新增板块时手工往 MAP 补一行。实跑：auto 匹配从 46 升至 50（confirmed 67 行保护后落库仍 46 auto + 67 confirmed）。
+
+**阶段 C 验收**：逐票对比 HK.00700 / SH.688981；分组键无 GICS 残留；一/二级两值成对产出；num_value 保持原值语义（不变）；L2/L3 确认无新产出；`profiling/tags/__init__.py` 注册数量更新；全量测试通过。
 
 ---
 
@@ -348,9 +353,9 @@ L2/L3 结论   本期暂停产出（D3），行业改造完成后再优化
 | 质量 | `qal_roe_tier` ROE档 | `qal_roe_ind1_tier` / ROE一级行业档 | `qal_roe_ind2_tier` / ROE二级行业档 |
 | 质量 | `qal_gross_margin_tier` 毛利率档 | `qal_gross_margin_ind1_tier` / 毛利率一级行业档 | `qal_gross_margin_ind2_tier` / 毛利率二级行业档 |
 | 质量 | `qal_net_margin_tier` 净利率档 | `qal_net_margin_ind1_tier` / 净利率一级行业档 | `qal_net_margin_ind2_tier` / 净利率二级行业档 |
-| 质量 | `qal_leverage_tier` 杠杆水平档 | `qal_leverage_ind1_tier` / 杠杆一级行业档 | `qal_leverage_ind2_tier` / 杠杆二级行业档 |
-| 质量 | `qal_roe_stability` ROE稳定性 | `qal_roe_stability_ind1` / ROE一级行业稳定性 | `qal_roe_stability_ind2` / ROE二级行业稳定性 |
-| 质量 | `qal_earnings_quality` 盈利真实性 | `qal_earnings_quality_ind1` / 盈利真实性一级行业档 | `qal_earnings_quality_ind2` / 盈利真实性二级行业档 |
+| 质量 | `qal_leverage_tier` 杠杆水平档 | `qal_leverage_ind1_tier` / 资产负债率一级行业档 | `qal_leverage_ind2_tier` / 资产负债率二级行业档 |
+| 质量 | `qal_roe_stability` ROE稳定性 | `qal_roe_stability_ind1` / ROE波动程度一级行业档 | `qal_roe_stability_ind2` / ROE波动程度二级行业档 |
+| 质量 | `qal_earnings_quality` 利润现金转换率 | `qal_earnings_quality_ind1` / 利润现金转换率一级行业档 | `qal_earnings_quality_ind2` / 利润现金转换率二级行业档 |
 | 成长 | `grw_revenue_yoy_tier` 营收增速档 | `grw_revenue_yoy_ind1_tier` / 营收增速一级行业档 | `grw_revenue_yoy_ind2_tier` / 营收增速二级行业档 |
 | 成长 | `grw_profit_yoy_tier` 净利增速档 | `grw_profit_yoy_ind1_tier` / 净利增速一级行业档 | `grw_profit_yoy_ind2_tier` / 净利增速二级行业档 |
 | 规模 | `scl_revenue_tier` 营收规模档 | `scl_revenue_ind1_tier` / 营收一级行业规模档 | `scl_revenue_ind2_tier` / 营收二级行业规模档 |
@@ -389,7 +394,7 @@ L2/L3 结论   本期暂停产出（D3），行业改造完成后再优化
 - [x] D10 全量回填拆分（新建 `backfill_sw_industry_classification.py`）+ 表名同步改名确认
 - [x] D11 层级表去 `info` 改名 + 富途码映射拆表确认
 - [x] D12~D14 阶段 B 统一收口方案（一张表/无历史版本/行业指标放弃 PIT）确认
-- [x] D15 档位型标签加连续百分位（阶段 C 一并做）确认
+- [x] D15 连续百分位 —— 已撤销（num_value 保持原值语义）
 - [ ] 计算任务 unit 模板准备（阶段 A2，开工时执行）
 
 ---

@@ -226,8 +226,6 @@ GLOBAL_TASKS: list[GlobalTask] = [  # pyright: ignore[reportUnknownVariableType,
      {"hour": 18, "minute": 30, "day_of_week": "mon-fri"}, None, True, None, 300),
     ("沪深总市值", "get_market_cap.py",
      {"hour": 18, "minute": 32, "day_of_week": "mon-fri"}, None, True, None, 300),
-    ("行业层级映射", "build_sector_hierarchy.py",
-     {"day_of_week": 2, "hour": 18, "minute": 35}, None, True, None, 180),
     # 一致预期快照：逐日差分，漏采一天即永久断档。
     ("一致预期快照", "get_analyst_forecast.py",
      {"hour": 18, "minute": 40, "day_of_week": "mon-fri"}, None, True, None, 600),

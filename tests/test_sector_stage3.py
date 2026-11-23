@@ -352,59 +352,33 @@ class TestEngineeringGuards(unittest.TestCase):
         self.assertIn("ret_cap", schema)
         self.assertIn("southbound_net", schema)
 
-    def test_sector_hierarchy_as_of_three_sources(self):
-        for rel in ("sql/schema.sql", "build_sector_hierarchy.py"):
-            with self.subTest(rel=rel):
-                self.assertIn("as_of", _read(rel))
-        src = _read("build_sector_hierarchy.py")
-        self.assertIn("ADD COLUMN IF NOT EXISTS as_of DATE", src)
-        self.assertIn("def run(codes=None, ctx=None)", src)
-        self.assertIn('"as_of": date.today()', src)
-        self.assertIn('"build_sector_hierarchy.py"', _read("market_scheduler.py"))
-        self.assertIn("18, \"minute\": 30", _read("market_scheduler.py"))
+    def test_gics_legacy_removed(self):
+        """GICS 遗留（D2/D18）：sector_hierarchy* 表与 build_sector_hierarchy.py 已清除。"""
+        schema = _read("sql/schema.sql")
+        self.assertNotIn("CREATE TABLE IF NOT EXISTS sector_hierarchy", schema)
+        self.assertNotIn("CREATE TABLE IF NOT EXISTS sector_hierarchy_l2", schema)
+        self.assertNotIn('"build_sector_hierarchy.py"', _read("market_scheduler.py"))
+        self.assertNotIn("load_gics_map", _read("profiling/quantile.py"))
 
-    def test_gics_l2_table_three_sources(self):
-        """二级映射表必须在 schema.sql / 脚本 / 画像查询层三处对齐。"""
-        schema, src = _read("sql/schema.sql"), _read("build_sector_hierarchy.py")
-        for rel in (schema, src):
-            self.assertIn("CREATE TABLE IF NOT EXISTS sector_hierarchy_l2", rel)
-        self.assertIn("group_code", schema)
-        self.assertIn("group_name", schema)
-        self.assertIn("COMMENT ON TABLE  sector_hierarchy_l2", schema)
-        self.assertIn("_SECTOR_HIERARCHY_L2_SQL", src)
-        self.assertIn("_L2_COMMENTS", src)
-        self.assertIn("_SECTOR_GROUP_MAP", src)
-        self.assertIn('bulk_upsert(conn, "sector_hierarchy_l2"', src)
-        # 画像查询层：独立函数，不污染一级 load_gics_map
-        q = _read("profiling/quantile.py")
-        self.assertIn("def load_gics_group_map(conn)", q)
-        self.assertIn("JOIN sector_hierarchy_l2 sh", q)
-
-    def test_gics_l2_map_completeness(self):
-        """二级映射 100% 覆盖港股一级板块，二级码全部落在 LEVEL2 码表内。"""
-        import build_sector_hierarchy as bsh
-        hk_codes = {c for c in bsh._SECTOR_MAP if c.startswith("HK.")}
-        self.assertEqual(len(hk_codes), 113)
-        self.assertEqual(set(bsh._SECTOR_GROUP_MAP), hk_codes)   # 无遗漏、无多余
-        self.assertTrue(set(bsh._SECTOR_GROUP_MAP.values()) <= set(bsh.LEVEL2))
-        self.assertEqual(len(bsh.LEVEL2), 26)   # 25 个官方组 + NONE 兜底
-        self.assertEqual(bsh._SECTOR_GROUP_MAP["HK.LIST1061"], "NONE")  # 综合企业无对应
-        # 2026-11 新增板块归属（用户确认）
-        self.assertEqual(bsh._SECTOR_MAP["HK.LIST24340"], ("HEALTH_CARE", "医疗保健"))
-        self.assertEqual(bsh._SECTOR_GROUP_MAP["HK.LIST24340"], "3520")  # CRO/CDMO
-        self.assertEqual(bsh._SECTOR_MAP["HK.LIST24341"], ("INDUSTRIALS", "工业"))
-        self.assertEqual(bsh._SECTOR_GROUP_MAP["HK.LIST24341"], "2010")  # 机器人/资本品
-
-    def test_val_pe_ind2_pct_registered_and_isolated(self):
-        """新增标签已注册、分组用二级码、且不进入估值结论判定。"""
+    def test_stage_c_industry_pairs_registered(self):
+        """阶段 C：一/二级行业标签成对注册，分组统一走 load_industry_map（GICS 已废弃）。"""
         src = _read("profiling/tags/valuation.py")
+        self.assertIn('code="val_pe_ind1_pct"', src)
         self.assertIn('code="val_pe_ind2_pct"', src)
-        self.assertIn("load_gics_group_map", src)
-        self.assertIn('df["gics_group"]', src)
-        # 估值结论 inputs[] 仍只读一级 val_pe_ind_pct，未引入二级标签
-        rules = _read("profiling/conclusions/rules.py")
-        self.assertIn('"val_pe_ind_pct"', rules)
-        self.assertNotIn('"val_pe_ind2_pct"', rules)
+        self.assertIn("load_industry_map", src)
+        self.assertNotIn("load_gics_map", src)
+        q = _read("profiling/quantile.py")
+        self.assertIn("def load_industry_map(conn, level: int)", q)
+        self.assertNotIn("def load_gics_group_map", q)
+        # 阶段 B 统一映射表是唯一分组来源
+        self.assertIn("regime.stock_sw_industry_mapping", src)
+        self.assertIn("regime.stock_hsics_industry_mapping", src)
+
+    def test_stage_c_l2_l3_paused(self):
+        """D3/D17：L2/L3 结论在生产入口跳过（保留 RULES 代码）。"""
+        cp = _read("compute_profile.py")
+        self.assertIn("L2_L3_PAUSED = True", cp)
+        self.assertIn("conclusion_producer.produce(", cp)   # 恢复开关仍在
 
     def test_hk_runs_after_cn_in_same_unit(self):
         src = _read("system/sector-layer.service")

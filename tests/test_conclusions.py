@@ -62,10 +62,10 @@ class TestRulesSchema(unittest.TestCase):
         spec = R.RULES["dim_valuation_conclusion"]
         rid, result = R.first_match(spec, {"loss_flag": True})
         self.assertEqual((rid, result), ("VAL-00", "loss"))
-        rid, result = R.first_match(spec, {
-            "loss_flag": False, "negative_flag": False,
-            "pe_hist_pct": 18.0, "pe_ind_pct": 19.0,
-        })
+        vals = {"loss_flag": False, "negative_flag": False,
+                "pe_hist_pct": 18.0, "pe_ind_pct": 19.0}
+        producer._derive(spec, vals)   # D20：规则读档位，须先派生
+        rid, result = R.first_match(spec, vals)
         self.assertEqual((rid, result), ("VAL-04", "rel_cheap"))
         # 空合取恒真 = priority 99 兜底
         self.assertTrue(R.eval_condition({"all": []}, {}))
@@ -95,33 +95,37 @@ class TestRulesSchema(unittest.TestCase):
         ]
         for hist, ind, rule_id, result in cases:
             with self.subTest(hist=hist, ind=ind):
-                self.assertEqual(
-                    R.first_match(spec, {"loss_flag": False, "negative_flag": False,
-                                        "pe_hist_pct": hist, "pe_ind_pct": ind}),
-                    (rule_id, result),
-                )
+                vals = {"loss_flag": False, "negative_flag": False,
+                        "pe_hist_pct": hist, "pe_ind_pct": ind}
+                producer._derive(spec, vals)   # D20：先切档，再按档位枚举匹配
+                self.assertEqual(R.first_match(spec, vals), (rule_id, result))
 
     def test_valuation_has_no_gap_derived_fields(self):
-        """两个百分位是序数排名，相减无经济含义：v2 不得再有点差派生字段。"""
+        """v4（D20）：只有 hist_tier/ind_tier 两个档位派生；仍不得有点差派生字段。"""
         spec = R.RULES["dim_valuation_conclusion"]
-        self.assertEqual(spec["derived_fields"], [])
+        self.assertEqual([d["field"] for d in spec["derived_fields"]],
+                         ["hist_tier", "ind_tier"])
         self.assertNotIn("divergence_gap_pctl", spec["params"])
         self.assertEqual(spec["params"]["cheap_pctl"], 20)
         self.assertEqual(spec["params"]["expensive_pctl"], 80)
         values = {"pe_hist_pct": 1.19, "pe_ind_pct": 34.13}
+        original = dict(values)
         producer._derive(spec, values)
-        self.assertEqual(values, {"pe_hist_pct": 1.19, "pe_ind_pct": 34.13})
+        self.assertEqual(values["pe_hist_pct"], original["pe_hist_pct"])
+        self.assertEqual(values["pe_ind_pct"], original["pe_ind_pct"])
+        self.assertEqual(values["hist_tier"], "cheap")
+        self.assertEqual(values["ind_tier"], "mid")
 
 
 class TestEnumContract(unittest.TestCase):
-    def test_39_codes_exactly_cover_all_results(self):
+    def test_43_codes_exactly_cover_all_results(self):
         codes = set()
         for m in registry.all_tags():
             if m.source_type == "derived":
                 codes |= set(m.enum_values)
         results = {r["result"] for spec in R.RULES.values()
                    for r in spec["rules"] if r["result"] is not None}
-        self.assertEqual(len(codes), 39)
+        self.assertEqual(len(codes), 43)   # D21 质量 moderate + D22 价值质量 3 码
         self.assertEqual(codes, results)  # 无越界码、无孤儿码
 
     def test_all_short_labels_nonempty(self):
@@ -139,9 +143,14 @@ class TestEnumContract(unittest.TestCase):
             self.assertTrue(m.value_ref and m.value_ref.startswith("enum:"))
             self.assertIsNone(m.value_range)   # §3.4 R4：不污染 _tag_pct
             self.assertIsNone(m.num_unit)
-            # 2026-11-19 报告期自适应升级：6 个结论版本号整体随口径推进
-            # （估值 v2→v3，其余 v1→v2），与 RULES.version 必须逐码一致
-            expected = {"dim_valuation_conclusion": "v3"}.get(m.code, "v2")
+            # D21 质量结论 v2→v3（一级行业口径+7 码），估值 v4，其余维持 v2；
+            # 与 RULES.version 必须逐码一致（sync_conclusion_dict 会硬校验）
+            expected = {"dim_valuation_conclusion": "v4",
+                        "dim_quality_conclusion": "v3",
+                        "dim_growth_conclusion": "v4",
+                        "dim_position_state": "v3",
+                        "biz_value_quality_type": "v3",
+                        "biz_growth_quality_type": "v3"}.get(m.code, "v2")
             self.assertEqual(m.version, expected, m.code)
             self.assertEqual(m.version, R.RULES[m.code]["version"], m.code)
             self.assertEqual(m.status, "active")
@@ -223,6 +232,245 @@ class TestProducerPureFunctions(unittest.TestCase):
             {"G1": True, "G2": True, "G3": True, "G4": False},
             __import__("datetime").date(2026, 11, 19), with_run=False)
         self.assertNotIn("report_period", detail["evidence"])
+        self.assertNotIn("primary_report_period", detail)
+
+    def test_detail_primary_report_period(self):
+        primary = {"report_type": "Q3", "report_date": "2026-09-30"}
+        detail = producer._detail(
+            "GRW-02", {}, 1.0, [],
+            {"G1": True, "G2": True, "G3": True, "G4": False},
+            __import__("datetime").date(2026, 11, 19), with_run=False,
+            primary_report_period=primary)
+        self.assertEqual(detail["primary_report_period"], primary)
+
+    def test_primary_period_only_for_financial_l2(self):
+        """主报告期只由 qal_*/grw_* 输入产生；估值/量价 L2 不写该键。"""
+        stock = "SH.600519"
+        snap = {
+            (stock, "qal_roe_ind1_tier", "key_value"): "4",
+            (stock, "grw_revenue_yoy_ind1_tier", "key_value"): "4",
+            (stock, "val_pe_hist_pct", "num_value"): 18.0,
+            (stock, "tst_price_position_52w", "key_value"): "3",
+        }
+        auto = {stock: {"report_type": "Q3", "report_date": "2026-09-30"}}
+        annual = {stock: {"report_type": "annual", "report_date": "2025-12-31"}}
+        extras = {"period_auto": auto, "period_annual": annual, "ma": {}}
+        for code in ("dim_quality_conclusion", "dim_growth_conclusion"):
+            with self.subTest(code=code):
+                _v, _c, _m, periods, primary = producer._build_values(
+                    R.RULES[code], stock, snap, extras, {})
+                self.assertEqual(primary, auto[stock])
+                # annual-only 字段逐字段标注，但不覆盖主期次
+                if code == "dim_growth_conclusion":
+                    self.assertEqual(periods["persistence"], annual[stock])
+        for code in ("dim_valuation_conclusion", "dim_position_state"):
+            with self.subTest(code=code):
+                _v, _c, _m, _p, primary = producer._build_values(
+                    R.RULES[code], stock, snap, extras, {})
+                self.assertIsNone(primary)
+
+
+class TestGrowthConclusionIndustry(unittest.TestCase):
+    """§5.3：增速档输入切一级行业口径（旧 grw_*_yoy_tier 已拆 ind1/ind2 下线）。"""
+
+    def test_inputs_use_industry_level_1_tags(self):
+        spec = R.RULES["dim_growth_conclusion"]
+        codes = {i["tag_code"] for i in spec["inputs"] if "tag_code" in i}
+        self.assertEqual(len(codes), 4)
+        self.assertIn("grw_revenue_yoy_ind1_tier", codes)
+        self.assertIn("grw_profit_yoy_ind1_tier", codes)
+        self.assertNotIn("grw_revenue_yoy_tier", codes)
+        self.assertNotIn("grw_profit_yoy_tier", codes)
+
+    def test_rules_and_params_unchanged(self):
+        # 6 码 / 6 规则 / 参数均不动（仅 GRW-02 条件与输入口径变过）
+        spec = R.RULES["dim_growth_conclusion"]
+        self.assertEqual([r["rule_id"] for r in spec["rules"]],
+                         ["GRW-00", "GRW-01", "GRW-02", "GRW-03", "GRW-04", "GRW-05"])
+        self.assertEqual({r["result"] for r in spec["rules"]},
+                         {"revenue_profit_divergent", "contracting", "fast_sustained",
+                          "fast_accelerating", "fast_decelerating", "slow_steady"})
+        self.assertEqual((spec["params"]["divergence_gap_tier"],
+                          spec["params"]["high_growth_min"],
+                          spec["params"]["persistence_min"]), (2, 4, 2))
+
+    def test_grw02_ignores_accel(self):
+        """v4：持续高增长不以当期加速度为必要条件，accel 缺失也不能误落 slow_steady。"""
+        spec = R.RULES["dim_growth_conclusion"]
+        for ac in ("accelerating", "steady", "decelerating", None):
+            with self.subTest(accel=ac):
+                v = {"rev_tier": 4, "np_tier": 4, "persistence": 2, "accel": ac,
+                     "rev_yoy": 20.0, "np_yoy": 20.0, "growth_gap": 0}
+                self.assertEqual(R.first_match(spec, v), ("GRW-02", "fast_sustained"))
+        # 加速度仍参与 GRW-03/04
+        v = {"rev_tier": 4, "np_tier": 3, "persistence": 2,
+             "accel": "accelerating", "rev_yoy": 20.0, "np_yoy": 10.0, "growth_gap": 1}
+        self.assertEqual(R.first_match(spec, v), ("GRW-03", "fast_accelerating"))
+        v["accel"] = "decelerating"
+        self.assertEqual(R.first_match(spec, v), ("GRW-04", "fast_decelerating"))
+
+
+class TestValueQualityV3(unittest.TestCase):
+    """§6.1 D22：四档质量矩阵 + 单侧估值归中性 + moderate 三码。"""
+
+    def setUp(self):
+        self.spec = R.RULES["biz_value_quality_type"]
+
+    def test_class_maps(self):
+        self.assertEqual(R.VAL_CLASS["hist_cheap_ind_expensive"], "neutral")
+        self.assertEqual(R.VAL_CLASS["hist_expensive_ind_cheap"], "neutral")
+        self.assertEqual(R.QAL_CLASS["moderate"], "moderate")
+
+    def test_moderate_cells(self):
+        cases = [
+            ("cheap", "moderate", "VQ-C1M", "moderate_rel_cheap"),
+            ("neutral", "moderate", "VQ-C4M", "moderate_rel_fair"),
+            ("expensive", "moderate", "VQ-C6M", "moderate_rel_expensive"),
+        ]
+        for vc, qc, rid, result in cases:
+            with self.subTest(cell=(vc, qc)):
+                v = {"valuation_class": vc, "quality_class": qc}
+                self.assertEqual(R.first_match(self.spec, v), (rid, result))
+
+    def test_priorities_unique(self):
+        ps = [r["priority"] for r in self.spec["rules"]]
+        self.assertEqual(len(ps), len(set(ps)))
+
+
+class TestGrowthQualityV3(unittest.TestCase):
+    """§6.2 v3：FCF 精细化门禁 + 一级行业现金转化档。"""
+
+    def setUp(self):
+        self.spec = R.RULES["biz_growth_quality_type"]
+
+    def test_inputs(self):
+        codes = {i["tag_code"] for i in self.spec["inputs"] if "tag_code" in i}
+        self.assertIn("qal_earnings_quality_ind1", codes)
+        self.assertNotIn("qal_earnings_quality", codes)
+        # FCF 不设 anchor：GQ-00/01/03 不能被门禁无差别拦截
+        fcf = next(i for i in self.spec["inputs"] if i["field"] == "fcf_sign")
+        self.assertIsNone(fcf.get("role"))
+
+    def test_fcf_gate_only_blocks_positive_code(self):
+        base = {"growth_code": "slow_steady", "earnings_quality_tier": 3,
+                "persistence": 2, "accel": "steady"}
+        for sign in (0, 1):
+            self.assertEqual(R.first_match(self.spec, {**base, "fcf_sign": sign}),
+                             ("GQ-04", "sustained_cash_backed"))
+        for sign in (None, -1):
+            self.assertEqual(R.first_match(self.spec, {**base, "fcf_sign": sign})[1], None)
+        # 负面码不依赖 FCF，缺 FCF 仍发布
+        self.assertEqual(R.first_match(self.spec, {**base, "growth_code": "contracting",
+                                                  "fcf_sign": None}),
+                         ("GQ-00", "contraction"))
+        self.assertEqual(R.first_match(self.spec, {**base, "earnings_quality_tier": 2,
+                                                  "fcf_sign": None}),
+                         ("GQ-01", "paper_growth"))
+
+
+class TestPositionStateV3(unittest.TestCase):
+    """§5.4 v3：POS-01 去 bullish、POS-04 去 position==3，修复两个近死档。"""
+
+    def setUp(self):
+        self.spec = R.RULES["dim_position_state"]
+
+    def test_pos01_low_volume_without_ma(self):
+        for ma in ("bearish", "neutral", "bullish", None):
+            with self.subTest(ma=ma):
+                v = {"position_tier": 2, "volume_ratio_60": 2.5, "ma_alignment": ma,
+                     "momentum_tier": 3, "volume_surge": "surge"}
+                self.assertEqual(R.first_match(self.spec, v),
+                                 ("POS-01", "low_volume_start"))
+
+    def test_pos04_any_bullish_position(self):
+        for pos in (1, 2, 3, 4, 5):
+            with self.subTest(position=pos):
+                v = {"position_tier": pos, "volume_ratio_60": 1.0, "ma_alignment": "bullish",
+                     "momentum_tier": 3, "volume_surge": "normal"}
+                # pos<=2 且 vr>=2 才走 POS-01；vr=1.0 不抢，落到 POS-04
+                self.assertEqual(R.first_match(self.spec, v),
+                                 ("POS-04", "trend_continuation"))
+
+    def test_thresholds_unchanged(self):
+        p = self.spec["params"]
+        self.assertEqual((p["low_pos_max"], p["high_pos_min"], p["vol_quiet_max"],
+                          p["vol_active_min"], p["weak_momentum_max"]), (2, 4, 0.5, 2.0, 2))
+
+
+class TestQualityConclusionD21(unittest.TestCase):
+    """§5.2 D21/v3：一级行业输入 + 7 码 + 杠杆降级 + ROE 绝对底线 + anchor_any 门禁。"""
+
+    def setUp(self):
+        self.spec = R.RULES["dim_quality_conclusion"]
+
+    def test_inputs_use_industry_level_1_tags(self):
+        codes = {i["tag_code"] for i in self.spec["inputs"] if "tag_code" in i}
+        self.assertEqual(len(codes), 4)
+        self.assertTrue(all("_ind1" in c for c in codes), codes)
+        self.assertEqual(self.spec["inputs"][-1]["source_col"], "num_value")
+
+    def test_seven_results_literal_params(self):
+        results = {r["result"] for r in self.spec["rules"]}
+        self.assertEqual(results, {"deteriorating", "paper_profit", "solid",
+                                   "high_but_volatile", "leveraged", "moderate", "weak"})
+        p = self.spec["params"]
+        self.assertEqual((p["stable_max"], p["volatile_min"], p["quality_weak_max"],
+                          p["quality_ok_min"], p["leverage_high"], p["roe_high"],
+                          p["moderate_min"], p["moderate_max"], p["roe_floor_pct"]),
+                         (2, 4, 2, 3, 4, 4, 3, 4, 5))
+
+    def test_all_seven_rules_first_match(self):
+        cases = [
+            ({"roe_stability": 4, "earnings_quality_tier": 2},
+             "QAL-01", "deteriorating"),
+            ({"roe_stability": 2, "earnings_quality_tier": 2},
+             "QAL-02", "paper_profit"),
+            ({"roe_tier": 4, "roe_stability": 2, "earnings_quality_tier": 3, "roe_raw": 6.0},
+             "QAL-04", "solid"),
+            ({"roe_tier": 4, "roe_stability": 4, "earnings_quality_tier": 3, "roe_raw": 6.0},
+             "QAL-05", "high_but_volatile"),
+            ({"roe_tier": 2, "leverage_tier": 4, "earnings_quality_tier": 3},
+             "QAL-03", "leveraged"),
+            ({"roe_tier": 3, "earnings_quality_tier": 3},
+             "QAL-07", "moderate"),
+            ({"roe_tier": 2, "earnings_quality_tier": 3},
+             "QAL-06", "weak"),
+        ]
+        for values, rule_id, result in cases:
+            with self.subTest(rule_id=rule_id):
+                self.assertEqual(R.first_match(self.spec, values), (rule_id, result))
+
+    def test_leverage_is_downgrade_not_veto(self):
+        # 高 ROE 且现金实：即使杠杆档=4 也不被 QAL-03 一票否决
+        values = {"roe_tier": 4, "roe_stability": 2, "earnings_quality_tier": 3,
+                  "roe_raw": 6.0, "leverage_tier": 4}
+        self.assertEqual(R.first_match(self.spec, values), ("QAL-04", "solid"))
+
+    def test_roe_floor_falls_to_moderate(self):
+        # §5.2 中文写法：3-4 档归中等。ROE 绝对值 <5% 的 4 档票落 moderate 而非 weak，
+        # 兑现「低于 5% 最高只能评盈利中等」
+        values = {"roe_tier": 4, "roe_stability": 2, "earnings_quality_tier": 3,
+                  "roe_raw": 3.0, "leverage_tier": 1}
+        self.assertEqual(R.first_match(self.spec, values), ("QAL-07", "moderate"))
+        # 5 档同样不得评两个正面码（保险丝）
+        self.assertNotIn(R.first_match(self.spec, {**values, "roe_tier": 5})[1],
+                         ("solid", "high_but_volatile"))
+
+    def test_anchor_any_gate(self):
+        values = {"roe_tier": 2, "earnings_quality_tier": None}
+        _rid, result, gates = producer._judge(
+            self.spec, "dim_quality_conclusion", values, 0.8)
+        self.assertTrue(gates["G2"])
+        self.assertIsNotNone(result)
+        values = {"roe_tier": None, "earnings_quality_tier": None}
+        _rid, result, gates = producer._judge(
+            self.spec, "dim_quality_conclusion", values, 0.6)
+        self.assertFalse(gates["G2"])
+        self.assertIsNone(result)
+
+    def test_moderate_in_l3_class_map(self):
+        # D22 裁决：单开 moderate 类（D21 时暂未纳入）
+        self.assertEqual(R.QAL_CLASS["moderate"], "moderate")
 
 
 class TestReportPeriodAdaptation(unittest.TestCase):
@@ -243,9 +491,12 @@ class TestReportPeriodAdaptation(unittest.TestCase):
                 self.assertIn(f"INTERVAL '{months} months'", clause)
 
     def test_context_grp_includes_report_type_only_for_auto(self):
+        """D16 甲：load_financial_context 一次产出 grp_l1/grp_l2，报告期后缀只 auto 时附加。"""
         src = _src("profiling/quantile.py")
         self.assertIn('report_type: str = "annual"', src)
-        self.assertIn('if report_type == "auto" else base_grp', src)
+        self.assertIn('df["grp_l1"]', src)
+        self.assertIn('df["grp_l2"]', src)
+        self.assertIn('if report_type == "auto" else ""', src)
 
     def test_quality_growth_use_auto_except_years_tags(self):
         q = _src("profiling/tags/quality.py")
@@ -268,10 +519,15 @@ class TestReportPeriodAdaptation(unittest.TestCase):
         self.assertIn("年", q.compute_logic)
 
     def test_changed_l1_tags_bumped_to_v2(self):
-        for code in ("qal_roe_tier", "qal_gross_margin_tier", "qal_net_margin_tier",
-                     "qal_leverage_tier", "qal_roe_stability", "qal_earnings_quality",
-                     "grw_revenue_yoy_tier", "grw_profit_yoy_tier", "grw_growth_accel"):
+        # 阶段 C：行业标签已拆成一级/二级并存（新 code），仍须保持 v2 版本指纹
+        for code in ("qal_roe_ind1_tier", "qal_roe_ind2_tier",
+                     "qal_gross_margin_ind1_tier", "qal_net_margin_ind1_tier",
+                     "qal_leverage_ind1_tier", "qal_roe_stability_ind1",
+                     "qal_earnings_quality_ind1",
+                     "grw_revenue_yoy_ind1_tier", "grw_profit_yoy_ind1_tier",
+                     "grw_growth_accel"):
             with self.subTest(code=code):
+                self.assertIsNotNone(registry.get(code), code)
                 self.assertEqual(registry.get(code).version, "v2", code)
 
 

@@ -47,7 +47,7 @@
 | # | 投资者问的 | 系统回答的（业务语义） | 不得写成 | 层 | 主要数据域 |
 | --- | --- | --- | --- | --- | --- |
 | Q1 | 贵还是便宜 | 相对自身历史 / 同行，价格处在什么位置；双分位是否一致 | 「低估 / 高估」「值得买」 | L2 | ③ 估值水平 |
-| Q2 | 公司好不好 | 盈利的水平、稳定性、真实性与杠杆 | 「优质股 / 好股票」「会涨」 | L2 | ④ 盈利质量 |
+| Q2 | 公司好不好 | ROE 水平、ROE 波动程度、利润现金转换率与资产负债率 | 「优质股 / 好股票」「会涨」 | L2 | ④ 盈利质量 |
 | Q3 | 长得快不快 | 增速、持续性、加速度，以及增收与增利是否背离 | 「高成长股」「未来增速」 | L2 | ⑤ 成长特征 |
 | Q4 | 现在买合不合适 | **当前处于什么位置 / 状态**（滞后描述） | 「买点 / 卖点」「合适 / 不合适」 | L2 | ⑩ 趋势状态 + ⑦⑨ |
 | Q5 | 综合起来是什么类型的标的 | 好公司 × 好价格的交叉类型 | 「推荐 / 评级 / 打分」 | L3 | ③④⑤ 交叉 |
@@ -484,126 +484,206 @@ WHERE r.source_type = 'derived'
 > **`inputs（判定用）` 即 `conclusion_dict.inputs`，是 G1 分母的唯一依据**（§4.2）；`evidence_only` 与 `derived_fields` 不进门禁、不进判定、不影响 `pit_capable`。
 > **每个 `field` 必须声明来源 `tag_code`（或 `source`）、取值列 `source_col`、类型 `dtype`**（§4.3.1）。L1 档位 `key_value` 是字符串 `"1".."5"`，按 `dtype=int` cast 后比较；`LOSS` / `NEGATIVE` 视为无效成员。
 > 章节标题即正式 `tag_code`；各表「依据键」为 `tag_value.conclusion_detail` 的键集合。
+> **主报告期**：财报驱动的 L2（§5.2 质量 / §5.3 成长）在 `conclusion_detail.primary_report_period` 顶层写最近一期标准报告期（`{"report_type","report_date"}`），回答「这条结论基于哪一期财报」；估值结论（PE/PB 行情字段）与位置状态（量价）无财报输入，**不写此键**。`evidence.report_period` 仍逐字段标注，供核对 `persistence` 等 annual-only 输入的期次。两者都是**报告期截止日**，不是披露日；港股 `announce_date` 全空，存在前视（§8.5）。
 > 结论层值域用 `enum_values` 内置声明，`label` 为中文短句、**`short_label` 必填**（附录 D 为唯一真相源）；code 统一小写。表中 `params` 切点为冻结值。
 > **规则表里的参数名不是条件值**：各表为便于阅读写 `cheap_pctl` 这类参数名，但 `RULES` 的 `conditions[].value` 只接受字面量，发布时必须展开（§4.3.1）；标定后 `params` 与展开值同步更新，由 `sync_conclusion_dict()` 校验。
 
 ### 5.1 `dim_valuation_conclusion` 贵不贵
 
+**判定输入（4 项）**：
+
+| 输入 | 中文说明 | 数据来源 |
+| --- | --- | --- |
+| 输入 1：自身历史 PE 分位 | 当前 PE 相对这只股票自己过去约 3 年的位置，0=历史最低、100=历史最高 | `pe_hist_pct` ← `val_pe_hist_pct.num_value`（`float`） |
+| 输入 2：行业内 PE 分位 | 当前 PE 相对**同一二级行业**其他股票的位置，0=同行最低、100=同行最高（D20 从一级改为二级） | `pe_ind_pct` ← `val_pe_ind2_pct.num_value`（`float`） |
+| 输入 3：亏损标记 | 公司是否亏损（亏损时 PE 无意义，直接给"亏损"结论） | `loss_flag` ← `val_pe_ttm_tier.key_value`（`bool`，匹配 `LOSS`） |
+| 输入 4：净资产为负标记 | 公司净资产是否为负（PB 无意义，直接给"净资产为负"结论） | `negative_flag` ← `val_pb_tier.key_value`（`bool`，匹配 `NEGATIVE`） |
+
+> 两个分位会各自切成三档：**偏低**（≤20）、**中性**（21–79）、**偏高**（≥80）。仍**不计算"点差"**——两个分位相减没有经济含义。
+> 另外，市销率、市现率、PEG、自由现金流收益率、PB 档位等只作**旁证**展示，不参与判定（详见下文"旁证信息"）。
+
 | 项 | 内容 |
 | --- | --- |
-| 回答 | 相对自身历史与同行，价格处在什么位置；双分位是否一致 |
-| `inputs（判定用）` | `pe_hist_pct` ← `val_pe_hist_pct.num_value`，`float`，0–100 分位（`num_unit='percentile_0_100'`）；`pe_ind_pct` ← `val_pe_ind_pct.num_value`，`float`，0–100；`loss_flag` ← `val_pe_ttm_tier.key_value == 'LOSS'`，`bool`；`negative_flag` ← `val_pb_tier.key_value == 'NEGATIVE'`，`bool`。**G1 分母 = 4**，全部 `pit_capable=True`（`valuation.py:91,109,266,289`） |
-| `derived_fields` | **无**（v2）。两个百分位是序数排名，相减无经济含义，已删除 `pe_gap` / `pe_gap_dir`；判定只读两个原始分位 |
-| `evidence_only` | `val_ps_ttm_tier`、`val_pcf_ttm_tier`、`val_peg_tier`、`val_fcf_yield_tier`（四个 `pit_capable=False`）、`val_pb_ind_pct` 的 `key_value` 档位；以及 `val_pe_ttm_tier` / `val_pb_tier` 的**档位与原值**——这两个标签的 `LOSS`/`NEGATIVE` 业务码已作为 `loss_flag`/`negative_flag` 进入判定 `inputs[]`，此处仅记录其数值，**不重复参与判定**。只写 `evidence`，不进 G1 分母、不改结论 |
-| 判定规则表 | 见下表；命中方式 `first_match`（§4.3.1） |
-| enum 值域 | **11 码**（9 个分位交叉码 + 2 个矩阵外业务码），code / label / short_label 见**附录 D.1** |
-| 门禁 / 频率 | G1 + G2（**双分位必须同时可得**，缺一即不发布——与 `tools/calibrate_conclusion_cutpoints.py` 及生产者的 `role=anchor` 校验一致；否则 VAL-06 兜底会把数据缺失误判成「相对中性」）；**G4 业务码豁免 G1/G2**（§4.2）；`daily`；A+H；`pit_capable=True` |
-| 依据键 | `rule_id`、`as_of`、`pe_hist_pct`、`pe_ind_pct`、`loss_flag`、`negative_flag`、`tier_pe`、`tier_pb`、`fcf_yield`、`coverage`、`missing_inputs`、`gates` |
-| 措辞 | **禁用「低估 / 高估 / 便宜 / 该买」**，一律「相对偏…」；`compute_logic` 必须写明「横截面分位不等于绝对贵贱」 |
+| 回答 | 相对自身历史与同行，价格处在什么位置；两个参照系是否一致 |
+| 判定规则表 | 见下表；按优先级顺序取第一条命中的规则 |
+| enum 值域 | **11 种结论**（9 种分位交叉 + 2 种业务码），见**附录 D.1** |
+| 门禁 / 频率 | **两个分位必须同时可得，缺任一就不发布**（否则缺失会被误判成"相对中性"）；亏损/净资产为负两种业务码豁免此门禁；每日更新，覆盖 A 股和港股，可回测历史 |
+| 旁证信息 | 市销率/市现率/PEG/自由现金流收益率档位、PB 档位；PE 全市场档和 PB 全市场档的档位与原始数值（这两项的 `LOSS`/`NEGATIVE` 已作为输入 3/4 参与判定，此处只记录数值，不重复判定） |
+| 依据键 | 规则编号、判定日、两个分位原值、两个业务标记、市销率等旁证值、覆盖率、缺失项、门禁结果 |
+| 措辞 | **禁用「低估 / 高估 / 便宜 / 该买」**，一律「相对偏…」；横截面分位不等于绝对贵贱 |
 
-**双分位 3×3 交叉矩阵（v2，9 格全展开，各格互斥）**：
+**两个参照系的九种组合**（行=相对自己历史，列=相对同行；每格一个独立结论）：
 
-| 历史 PE 分位 ＼ 行业 PE 分位 | 偏低 `≤20` | 中性 `21–79` | 偏高 `≥80` |
+| 自身历史 ＼ 同行 | 相对同行偏低 | 相对同行中性 | 相对同行偏高 |
 | --- | --- | --- | --- |
-| **偏低 `≤20`** | `rel_cheap`（相对偏便宜） | `hist_cheap_ind_neutral`（相对自身历史偏低、相对同行中性） | `hist_cheap_ind_expensive`（相对自身历史偏低、相对同行偏高） |
-| **中性 `21–79`** | `hist_neutral_ind_cheap`（相对自身历史中性、相对同行偏低） | `rel_fair`（相对中性） | `hist_neutral_ind_expensive`（相对自身历史中性、相对同行偏高） |
-| **偏高 `≥80`** | `hist_expensive_ind_cheap`（相对自身历史偏高、相对同行偏低） | `hist_expensive_ind_neutral`（相对自身历史偏高、相对同行中性） | `rel_expensive`（相对偏贵） |
+| **相对历史偏低** | 相对偏便宜（`rel_cheap`） | 自身低、同行中（`hist_cheap_ind_neutral`） | 自身低、同行高（`hist_cheap_ind_expensive`） |
+| **相对历史中性** | 自身中、同行低（`hist_neutral_ind_cheap`） | 相对中性（`rel_fair`） | 自身中、同行高（`hist_neutral_ind_expensive`） |
+| **相对历史偏高** | 自身高、同行低（`hist_expensive_ind_cheap`） | 自身高、同行中（`hist_expensive_ind_neutral`） | 相对偏贵（`rel_expensive`） |
 
-> 两个参照系是正交维度，机构口径（Bloomberg / FactSet / Wind 估值页面）分列展示、不合成单一标量。故**单侧四格不压成「相对中性」**：否则 L2 的「相对中性」会否定 L1 `val_pe_hist_pct` 已明确给出的「最低 20% 区间」。§4.2「宁可不出档」针对输入缺失 / 覆盖率不足，不适用于「两个参照系未共振」。实测 4 个单侧格共 2,168 只（45.4%），若整行不发布则 L2 出档率仅 54.6%，远低于 §10.1 的 ≥80% 门槛。
+> 这是两个互相独立的观察角度（机构终端如 Bloomberg/Wind 也是分列展示），**不合成一个数字**。所以四个"只有一侧有信号"的格子各自保留结论，不压成"相对中性"——否则会否定输入 1 已经明确给出的"历史最低 20%"。实测这四个格子有 2,168 只（45.4%），如果整行不发布，估值结论覆盖率只有 54.6%，远低于 80% 的门槛。
 
-| `rule_id` | 优先级 | 条件（全为字面量比较） | 结果 |
-| --- | --- | --- | --- |
-| VAL-00 | 0 | `loss_flag == true` | `loss` |
-| VAL-01 | 1 | `negative_flag == true` | `negative` |
-| VAL-02 | 10 | `pe_hist_pct <= cheap_pctl AND pe_ind_pct >= expensive_pctl` | `hist_cheap_ind_expensive` |
-| VAL-03 | 11 | `pe_hist_pct >= expensive_pctl AND pe_ind_pct <= cheap_pctl` | `hist_expensive_ind_cheap` |
-| VAL-04 | 20 | `pe_hist_pct <= cheap_pctl AND pe_ind_pct <= cheap_pctl` | `rel_cheap` |
-| VAL-05 | 21 | `pe_hist_pct >= expensive_pctl AND pe_ind_pct >= expensive_pctl` | `rel_expensive` |
-| VAL-07 | 30 | `pe_hist_pct <= cheap_pctl AND pe_ind_pct > cheap_pctl AND pe_ind_pct < expensive_pctl` | `hist_cheap_ind_neutral` |
-| VAL-08 | 31 | `pe_hist_pct >= expensive_pctl AND pe_ind_pct > cheap_pctl AND pe_ind_pct < expensive_pctl` | `hist_expensive_ind_neutral` |
-| VAL-09 | 32 | `pe_hist_pct > cheap_pctl AND pe_hist_pct < expensive_pctl AND pe_ind_pct <= cheap_pctl` | `hist_neutral_ind_cheap` |
-| VAL-10 | 33 | `pe_hist_pct > cheap_pctl AND pe_hist_pct < expensive_pctl AND pe_ind_pct >= expensive_pctl` | `hist_neutral_ind_expensive` |
-| VAL-06 | 99 | 其余（即双中性格） | `rel_fair` |
+| 规则编号 | 优先级 | 规则描述 | 判定条件（供程序执行） | 结论 |
+| --- | --- | --- | --- | --- |
+| VAL-00 | 0 | 公司亏损，PE 无意义 | 输入 3 命中 | 亏损（`loss`） |
+| VAL-01 | 1 | 净资产为负，PB 无意义 | 输入 4 命中 | 净资产为负（`negative`） |
+| VAL-02 | 10 | 相对自己历史便宜，但相对同行贵 | 历史档=偏低 且 行业档=偏高 | `hist_cheap_ind_expensive` |
+| VAL-03 | 11 | 相对自己历史贵，但相对同行便宜 | 历史档=偏高 且 行业档=偏低 | `hist_expensive_ind_cheap` |
+| VAL-04 | 20 | 两个角度都便宜，信号共振 | 历史档=偏低 且 行业档=偏低 | 相对偏便宜（`rel_cheap`） |
+| VAL-05 | 21 | 两个角度都贵，信号共振 | 历史档=偏高 且 行业档=偏高 | 相对偏贵（`rel_expensive`） |
+| VAL-07 | 30 | 自身便宜、同行中性 | 历史档=偏低 且 行业档=中性 | `hist_cheap_ind_neutral` |
+| VAL-08 | 31 | 自身贵、同行中性 | 历史档=偏高 且 行业档=中性 | `hist_expensive_ind_neutral` |
+| VAL-09 | 32 | 自身中性、同行便宜 | 历史档=中性 且 行业档=偏低 | `hist_neutral_ind_cheap` |
+| VAL-10 | 33 | 自身中性、同行贵 | 历史档=中性 且 行业档=偏高 | `hist_neutral_ind_expensive` |
+| VAL-06 | 99 | 两个角度都中性 | 兜底 | 相对中性（`rel_fair`） |
 
-> `params`（已冻结）：`coverage_min=0.6`、`cheap_pctl=20`、`expensive_pctl=80`。**20/80 对齐 `quantile.assign_tier` 的 20/40/60/80 档界**（`quantile.py:453-454`）与 `valuation.py:60-71 _pct_to_tier`，是**等频五分档档界的借用**，不是按估值意义单独标定的阈值；业界同类粗筛也用 quintile 20/80、四分位 25/75、均值 ±1σ（约 16/84）或行业中性化 z-score，均按资产类别 / 行业 / 窗口分别标定，无通用常数。实测换成 25/75、30/70 时单侧四格占比仅从 45.4% 降到 42.7%，**切点不敏感**；且改切点会让 L1 显示档与 L2 结论档分叉，故保留 20/80。已废弃 `divergence_gap_pctl`（点差门槛）。
+> 程序实现上，两个分位先按 20/80 切成"偏低/中性/偏高"三档，规则只比较档位（不再写范围表达式），**规则条数和结论码都不变**。
 
-**供 §6.1 使用的 3 类归约映射**：`rel_cheap` / `hist_cheap_ind_expensive` → `cheap`；`rel_fair` / `hist_expensive_ind_cheap` / 4 个单侧码（`hist_cheap_ind_neutral`、`hist_expensive_ind_neutral`、`hist_neutral_ind_cheap`、`hist_neutral_ind_expensive`）→ `neutral`；`rel_expensive` → `expensive`；`loss` / `negative` → `no_anchor`（无有效估值锚）。单侧码统一归中性类，避免单侧信号在 §6.1 误产出「价值陷阱嫌疑」。
+> **为什么用 20/80 做"偏低/偏高"的界线**：它沿用了五等分档位的边界（每档 20%），不是按估值意义专门标定的阈值——业界同类粗筛也常用五分位 20/80、四分位 25/75 或均值±1σ，没有通用标准。实测换成 25/75 或 30/70 时，四角格子的占比只从 45.4% 降到 42.7%，**对切点不敏感**；而改切点会让 L1 显示档与 L2 结论档对不上，所以保留 20/80。覆盖率门槛仍为 60%。旧版的"分位点差"判定已废弃。
+
+**给 L3 交叉判断用的三类归约**（D22 已实施，见 §6.1）：`rel_cheap` → `cheap`；`rel_fair` / `hist_cheap_ind_expensive` / `hist_expensive_ind_cheap` / 4 个单侧码（`hist_cheap_ind_neutral`、`hist_expensive_ind_neutral`、`hist_neutral_ind_cheap`、`hist_neutral_ind_expensive`）→ `neutral`；`rel_expensive` → `expensive`；`loss` / `negative` → `no_anchor`（无有效估值锚）。单侧码统一归中性类，避免单侧信号在 §6.1 误产出「盈利弱价格低」的交叉判断。
 
 ### 5.2 `dim_quality_conclusion` 好不好
 
+**判定输入（5 项，D21 全部取一级行业口径——质量的行业差异主要在一级层面）**：
+
+| 输入 | 中文说明 | 数据来源 |
+| --- | --- | --- |
+| 输入 1：行业内 ROE 分档 | 公司在**一级行业内**的 ROE 高低，1=最低、5=最高；亏损记为无效 | `roe_tier` ← `qal_roe_ind1_tier.key_value`（`int`，`LOSS` 无效） |
+| 输入 2：ROE 波动程度行业内分档 | 最近 3 期同类型报告期 ROE 的标准差（标准差越小越稳定），1=波动最小、5=波动最大 | `roe_stability` ← `qal_roe_stability_ind1.key_value`（`int`） |
+| 输入 3：利润现金转换率行业内分档 | 经营现金流 ÷ 净利润，衡量账面利润有多少转换为现金，1=转换率最低（纸面利润风险）、5=最高；亏损记为无效。**注意：它衡量的是现金转换程度，不能据此判定财务造假与否** | `earnings_quality_tier` ← `qal_earnings_quality_ind1.key_value`（`int`，`LOSS` 无效） |
+| 输入 4：资产负债率行业内分档 | 资产负债率在行业内的相对高低，1=负债率最低、5=最高；D21 起只作降级因素，不一票否决 | `leverage_tier` ← `qal_leverage_ind1_tier.key_value`（`int`） |
+| 输入 5：ROE 绝对值 | ROE 的真实百分比数值，用来设绝对底线（防止"行业里最不差"被误判为高质量） | `roe_raw` ← `qal_roe_ind1_tier.num_value`（`float`） |
+
+> 另外，二级行业的同类指标、毛利率/净利率档、连续盈利年数等只作**旁证**展示，不参与判定（详见下文"旁证信息"）。
+
 | 项 | 内容 |
 | --- | --- |
-| 回答 | 盈利的水平、稳定性、真实性与杠杆结构 |
-| `inputs（判定用）` | `roe_tier` ← `qal_roe_tier.key_value`，`int`（`"1".."5"`，`LOSS` 无效）；`roe_stability` ← `qal_roe_stability.key_value`，`int`（**1=最稳定、5=波动最大**，`quality.py:178-181`）；`earnings_quality_tier` ← `qal_earnings_quality.key_value`，`int`（**1=OCF/净利最低、纸面利润风险最高；5=现金支撑充足；`LOSS` 无效**，`quality.py:205-209`）；`leverage_tier` ← `qal_leverage_tier.key_value`，`int`（**1=杠杆最低、5=最高**，`quality.py:151-154`）。**G1 分母 = 4** |
-| `evidence_only` | `qal_gross_margin_tier`、`qal_net_margin_tier`、`qal_profit_years`（`"0".."4"`）；补数后的 `roic` / 周转率（§8.4）。连续盈利期数作韧性描述，不改结论 |
-| 判定规则表 | 水平（ROE）× 稳定性 × 真实性三腿合取；杠杆单独降级；见下表 |
-| enum 值域 | 6 码，见**附录 D.2** |
-| 门禁 / 频率 | G1 + G2（`roe_tier` 与 `earnings_quality_tier` 至少一个有效）；`quarterly`（财报驱动）；A+H；`pit_capable=False` |
-| 依据键 | `rule_id`、`as_of`、`roe_tier`、`roe_stability`、`earnings_quality_tier`、`leverage_tier`、`profit_years`、`coverage`、`missing_inputs`、`gates`、`report_period`（逐输入标 `report_type`/`report_date`） |
+| 回答 | 盈利的水平、ROE 波动程度、利润现金转换率与资产负债率 |
+| 判定规则表 | ROE 水平 × ROE 波动程度 × 利润现金转换率三腿合取；资产负债率降级（不一票否决）；ROE 绝对底线；见下表 |
+| enum 值域 | **7 种结论**（D21 新增"盈利中等"），见**附录 D.2** |
+| 门禁 / 频率 | 输入 1 和输入 3 至少一个有效才判定，否则不发布；每季度更新（跟随财报）；覆盖 A 股和港股；不可回测历史（财报归属时点还原有前视风险） |
+| 旁证信息 | 毛利率/净利率档（一级、二级）、连续盈利年数、二级行业同类档；补数后的 ROIC / 周转率。连续盈利期数只作韧性描述，不改结论 |
+| 依据键 | 规则编号、判定日、五项输入原值、连续盈利年数、覆盖率、缺失项、门禁结果、**主报告期**（`primary_report_period`，顶层）、报告期（逐项标注于 `evidence.report_period`） |
 | 措辞 | 禁用「好公司 / 优质 / 白马」；「盈利稳且现金实」描述的是**财报特征**，不是「证券好不好」 |
 
-| `rule_id` | 优先级 | 条件 | 结果 |
+**D21 新规则（v3）**：共 7 种结论；杠杆不再一票否决；新增"盈利中等"承接原先被笼统归为"盈利偏弱"的大批平庸公司；ROE 低于 5% 的公司最高只能评"盈利中等"，不能评"盈利稳且现金实"。
+
+| 规则编号 | 优先级 | 规则描述 | 判定条件（供程序执行） | 结论（中文名 / 代码） | 界面简称 |
+| --- | --- | --- | --- | --- | --- |
+| QAL-01 | 0 | 盈利波动大且现金转化弱，最差组合 | `roe_stability >= volatile_min AND earnings_quality_tier <= quality_weak_max` | 质量均偏弱 / `deteriorating` | 质量均偏弱 |
+| QAL-02 | 1 | 利润停留在账面、现金支撑不足 | `earnings_quality_tier <= quality_weak_max` | 现金转化弱 / `paper_profit` | 现金转化弱 |
+| QAL-04 | 10 | ROE 高、波动小、现金实，且 ROE 绝对值达标——真正的"好" | `roe_tier >= roe_high AND roe_stability <= stable_max AND earnings_quality_tier >= quality_ok_min AND roe_raw >= roe_floor_pct` | 盈利稳且现金实 / `solid` | 稳且现金实 |
+| QAL-05 | 11 | ROE 高且绝对值达标，但波动偏大 | `roe_tier >= roe_high AND roe_raw >= roe_floor_pct` | 盈利高但波动大 / `high_but_volatile` | 高但波动 |
+| QAL-03 | 12 | 资产负债率偏高且 ROE 不高时降级；高 ROE 公司不再因负债率被单票否决 | `leverage_tier >= leverage_high AND roe_tier < roe_high` | 高负债率支撑 / `leveraged` | 高负债率 |
+| QAL-07 | 20 | ROE 处于行业中游（3-4 档）且没有负面信号，归入"中等" | `roe_tier >= moderate_min AND roe_tier < roe_high` | 盈利水平中等 / `moderate` | 盈利中等 |
+| QAL-06 | 99 | 其余：ROE 落在最低两档，或有未覆盖的明显短板 | 兜底 | 盈利水平偏弱 / `weak` | 盈利偏弱 |
+
+**代码与界面简称清单**（7 项，供程序同步 `profile.enum_value`）：`deteriorating`=质量均偏弱、`paper_profit`=现金转化弱、`solid`=稳且现金实、`high_but_volatile`=高但波动、`leveraged`=高负债率、`moderate`=盈利中等、`weak`=盈利偏弱。**均为横截面描述，不是"走弱/变好"的时序判断**（L1 无时序档位）。
+
+> **判定阈值**（D21）：覆盖率至少 60%；稳定档 ≤2 算"稳"、≥4 算"波动大"；现金档 ≤2 算"现金差"、≥3 算"现金实"；杠杆档 ≥4 算"高"；ROE 档 ≥4 算"高"、3-4 档算"中等"；ROE 绝对值底线 5%。
+> 与旧版差异：杠杆从"一票否决"改为"仅在没有高 ROE 时触发"；新增"盈利中等"档；"盈利稳且现金实"和"高但波动"必须 ROE 绝对值 ≥5%；"盈利偏弱"从覆盖 73% 收窄到 ROE 最低两档。
+
+**阈值的数据标定（2026-11-23，实测 2026-11-19 快照 5,165 只 A 股）**：
+
+标定目标 = **区分度**：规则既要筛出好公司、也要筛出差公司，不能把多数股票挤进同一档。用**分布熵比**度量（7 档完全均匀=1.0，全部挤一档=0），并约束"好公司档 solid ≥5%"以免只筛差不筛好。
+
+扫描 `现金差门槛 ∈ {1,2,3} × ROE高档 ∈ {4,5} × ROE底线 ∈ {3%,5%,8%} × 中等档下限 ∈ {2,3}` 共 36 种组合，结果：
+
+| 配置 | 熵比 | solid | 最大档 |
 | --- | --- | --- | --- |
-| QAL-01 | 0 | `roe_stability >= volatile_min AND earnings_quality_tier <= quality_weak_max` | `deteriorating` |
-| QAL-02 | 1 | `earnings_quality_tier <= quality_weak_max` | `paper_profit` |
-| QAL-03 | 2 | `leverage_tier >= leverage_high` | `leveraged` |
-| QAL-04 | 10 | `roe_tier >= roe_high AND roe_stability <= stable_max` | `solid` |
-| QAL-05 | 11 | `roe_tier >= roe_high` | `high_but_volatile` |
-| QAL-06 | 99 | 其余 | `weak` |
+| **本规则采用：现金差≤2 / ROE高≥4档 / 底线5% / 中等≥3档** | **0.958** | 7.6% | 26.0% |
+| 现金差≤2 / 底线3% / 中等≥2档 | 0.958 | 7.9% | 26.0% |
+| 现金差≤1（收紧） | 0.941 | 7.6% | 27.8% |
+| 现金差≤3（放宽） | ~0.84 | 1–4% | 39.7% |
 
-> `params`（已冻结）：`coverage_min=0.6`、`stable_max=2`、`volatile_min=4`、`quality_weak_max=2`、`leverage_high=4`、`roe_high=4`。
+**采用的配置是 36 组中熵比最高者**，七档分布为：稳且现金实 7.6% / 高但波动 18.0% / 盈利中等 8.3% / 盈利偏弱 16.1% / 高负债率 11.8% / 现金转化弱 26.0% / 质量均偏弱 12.2%——无死档，最大档 26% 远低于 80% 告警线。
 
-**供 §6.1 使用的 3 类归约映射**：`solid` → `solid`；`high_but_volatile` → `volatile`；`paper_profit` / `leveraged` / `weak` / `deteriorating` → `weak`。
+> 两点说明：① `ROE 底线 5%` 对区分度几乎无影响（3%→8% 熵比基本不变），它的作用是**保险丝**——防止"行业内最不差但绝对很差"的股票被误评高质量，不是区分度来源；② 本次是**描述性标定**（选分布最均衡的阈值），不是预测性验证——未用未来收益检验"solid 是否真的后续表现更好"，那需要接收益数据做 IC/分组收益分析，属更大工程。
+
+**给 L3 价值陷阱判断用的三类归约**（L3 目前暂停产出，此映射保留供将来恢复）：`solid` → `solid`；`high_but_volatile` → `volatile`；`paper_profit` / `leveraged` / `weak` / `deteriorating` → `weak`。
+> ⚠ D21 新增的"盈利中等"（`moderate`）**尚未纳入归约映射**（按裁决 L3 与 `QUAL_CLASS` 本期不动）；将来恢复 L3 时必须补一条 `moderate → weak`（或按届时讨论另定）。
 
 ### 5.3 `dim_growth_conclusion` 快不快
+
+**判定输入（6 项；营收/净利增速档取一级行业口径——增速的行业差异主要在一级层面，二级分组样本更碎）**：
+
+| 输入 | 中文说明 | 数据来源 |
+| --- | --- | --- |
+| 输入 1：营收增速行业内分档 | 公司最近一期营收同比增速在**一级行业内**的位置，1=增长最慢/萎缩最重、5=最快；负增长是正常状态，不单独打标 | `rev_tier` ← `grw_revenue_yoy_ind1_tier.key_value`（`int`） |
+| 输入 2：净利增速行业内分档 | 最近一期归母净利同比增速在一级行业内的位置，1=最慢、5=最快；扭亏可能出现 +3000% 极端值，分档用 rank 免疫，复核请看原值 | `np_tier` ← `grw_profit_yoy_ind1_tier.key_value`（`int`） |
+| 输入 3：营收增速原值 | 营收同比百分比原值，用于识别负增长（档位不区分正负），单位 % | `rev_yoy` ← `grw_revenue_yoy_ind1_tier.num_value`（`float`） |
+| 输入 4：净利增速原值 | 归母净利同比百分比原值，同上，单位 % | `np_yoy` ← `grw_profit_yoy_ind1_tier.num_value`（`float`） |
+| 输入 5：增长持续性 | 从最近一期年报往前数营收同比为正的连续年数，0=最新期负增长/停滞、3=连续 ≥5 年 | `persistence` ← `grw_growth_persistence.key_value`（`int`） |
+| 输入 6：增长加速度 | 最新一期与上一期**同类型**报告期营收增速之差，≥+5pp 抬升、≤−5pp 放缓、其余平稳 | `accel` ← `grw_growth_accel.key_value`（`enum`） |
+
+> `growth_gap = abs(rev_tier − np_tier)`（`int`）是派生字段，写进 `evidence`，不进 G1 分母。
+> 另外，新补的扣非增速（仅 A 股）、研发强度（仅 A 股）、CAPEX 强度（仅港股）、并购现金流（仅港股）、商誉（仅 A 股）只作**旁证**展示，不参与判定（见 §8）。
 
 | 项 | 内容 |
 | --- | --- |
 | 回答 | 增速、持续性、加速度，以及增收与增利是否背离 |
-| `inputs（判定用）` | `rev_tier` ← `grw_revenue_yoy_tier.key_value`，`int`（`"1".."5"`）；`np_tier` ← `grw_profit_yoy_tier.key_value`，`int`；`rev_yoy` / `np_yoy` ← 同两标签的 `num_value`，`float`（增速%，`num_unit='pct'`）；`persistence` ← `grw_growth_persistence.key_value`，`int`（`"0".."3"`，0=连续 0 期、3=连续 ≥5 期，`growth.py:123-133`）；`accel` ← `grw_growth_accel.key_value`，`enum`（`accelerating` / `steady` / `decelerating`，≥+5pp / 其余 / ≤−5pp，`growth.py:38-42,155-163`）。**G1 分母 = 6** |
-| `derived_fields` | `growth_gap = abs(rev_tier − np_tier)`（`int`），写进 `evidence`，不进 G1 分母 |
-| `evidence_only` | 新补的扣非增速（仅 A 股）、研发强度（仅 A 股）、CAPEX 强度（仅港股）、并购现金流（仅港股）、商誉（仅 A 股）——见 §8 |
-| 判定规则表 | 见下表；背离优先于增速 |
-| enum 值域 | 6 码，见**附录 D.3** |
+| 判定规则表 | 背离优先于负增长，再按增速与持续性/加速度组合；见下表 |
+| enum 值域 | **6 种结论**，见下表末的代码清单（附录 D.3 已融合） |
 | 门禁 / 频率 | G1 + G2；`quarterly`；A+H；`pit_capable=False` |
-| 依据键 | `rule_id`、`as_of`、`rev_tier`、`np_tier`、`rev_yoy`、`np_yoy`、`growth_gap`、`persistence`、`accel`、`evidence_enhancements[]`、`market_scope`、`coverage`、`missing_inputs`、`gates`、`report_period`（`persistence` 标 annual 期次，其余财报输入标 auto 期次） |
-| **⚠ 关键约束** | **A/H 可用成员集不同**（§8.1）。若把新补的 A 股扣非 / 港股 CAPEX 放进判定，同一 enum 在两市场语义会不一致——正是 regime `DIM.FLOW` 单锚代理分的陷阱（§2.3 A2）。故新补数据**一律只进 evidence**，判定只用共有 4 标签。此约束不得因「数据补上了」而放宽（§8.4） |
+| 旁证信息 | 扣非增速、研发强度（仅 A 股）、CAPEX 强度、并购现金流（仅港股）、商誉（仅 A 股）——见 §8 |
+| 依据键 | 规则编号、判定日、六项输入原值、`growth_gap`、覆盖率、缺失项、门禁结果、**主报告期**（`primary_report_period`，顶层，取 auto 期次）、报告期（`persistence` 标 annual 期次，其余财报输入标 auto 期次，逐项在 `evidence.report_period`） |
+| 措辞 | 现状判断，不是未来增速预测；「增速放缓」描述当期加速度，不预判后续走势 |
 
-| `rule_id` | 优先级 | 条件 | 结果 |
-| --- | --- | --- | --- |
-| GRW-00 | 0 | `growth_gap >= divergence_gap_tier` | `revenue_profit_divergent` |
-| GRW-01 | 1 | `rev_yoy < 0 OR np_yoy < 0` | `contracting` |
-| GRW-02 | 10 | `rev_tier >= high_growth_min AND np_tier >= high_growth_min AND persistence >= persistence_min AND accel == 'steady'` | `fast_sustained` |
-| GRW-03 | 11 | `rev_tier >= high_growth_min AND accel == 'accelerating'` | `fast_accelerating` |
-| GRW-04 | 12 | `rev_tier >= high_growth_min AND accel == 'decelerating'` | `fast_decelerating` |
-| GRW-05 | 99 | 其余 | `slow_steady` |
+| 规则编号 | 优先级 | 规则描述 | 判定条件（供程序执行） | 结论（中文名 / 代码） | 界面简称 |
+| --- | --- | --- | --- | --- | --- |
+| GRW-00 | 0 | 营收档与净利档相差两档以上，增收与增利背离 | `growth_gap >= 2` | 增收不增利或反之 / `revenue_profit_divergent` | 增收增利背离 |
+| GRW-01 | 1 | 营收或净利同比为负 | `rev_yoy < 0 OR np_yoy < 0` | 负增长 / `contracting` | 负增长 |
+| GRW-02 | 10 | 营收与净利双高增速且持续（加速度不参与本条，`steady`/`accelerating`/`decelerating` 或缺失均可） | `rev_tier >= 4 AND np_tier >= 4 AND persistence >= 2` | 高增速且持续 / `fast_sustained` | 高增速且持续 |
+| GRW-03 | 11 | 营收高增速且加速度抬升 | `rev_tier >= 4 AND accel == 'accelerating'` | 增速抬升 / `fast_accelerating` | 增速抬升 |
+| GRW-04 | 12 | 营收高增速但加速度放缓 | `rev_tier >= 4 AND accel == 'decelerating'` | 增速放缓 / `fast_decelerating` | 增速放缓 |
+| GRW-05 | 99 | 其余：增速未达高档且无背离/负增长 | 兜底 | 低速但稳 / `slow_steady` | 低增速但稳 |
+
+**代码与界面简称清单**（6 项，供程序同步 `profile.enum_value`）：`revenue_profit_divergent`=增收增利背离、`contracting`=负增长、`fast_sustained`=高增速且持续、`fast_accelerating`=增速抬升、`fast_decelerating`=增速放缓、`slow_steady`=低增速但稳。**均为现状描述，不是未来增速预测**。
 
 > `params`（已冻结）：`coverage_min=0.6`、`divergence_gap_tier=2`（**1–5 档差**）、`high_growth_min=4`、`persistence_min=2`。
 
+> **v4 规则变更（2026-11-23，输入档位不变）**：GRW-02 去掉 `accel == 'steady'` 必要条件。加速度描述的只是当期变化方向，不是「持续高增长」的必要条件——加速或放缓中的高增长公司仍属此类；且实测 `steady` 仅占 19%，设为必要条件会让本档只占 1.7%，去掉后升至 8.2%，六档分布熵比 0.813→0.843。加速度仍参与 GRW-03/GRW-04 的判定。`divergence_gap_tier` 保持 2——实测调到 3 会把熵比降到 0.771 且让负增长档膨胀到 50%。
+
+**⚠ 关键约束（沿用原表，不得放宽）**：**A/H 可用成员集不同**（§8.1）。若把新补的 A 股扣非 / 港股 CAPEX 放进判定，同一 enum 在两市场语义会不一致——正是 regime `DIM.FLOW` 单锚代理分的陷阱（§2.3 A2）。故新补数据**一律只进 evidence**，判定只用上表六项输入；此约束不得因「数据补上了」而放宽（§8.4）。
+
 ### 5.4 `dim_position_state` 当前位置与状态
+
+**判定输入（5 项；全部为个股时序 / 市场内口径，不涉及行业分组——L1 三个来源标签均无一级/二级分裂版本）**：
+
+| 输入 | 中文说明 | 数据来源 |
+| --- | --- | --- |
+| 输入 1：股价 52 周位置档 | 个股收盘价在近 252 个交易日高低区间中的相对位置，1=最低 20%（`[0,20)`）…5=最高 20%（`[80,100]`）；窗口高低取日内 high/low，非快照列 | `position_tier` ← `tst_price_position_52w.key_value`（`int`，`trend.py:83-89,203-204`） |
+| 输入 2：动量档 | t−252 到 t−21 交易日的复权价涨幅（剔除最近 1 月规避短期反转），**市场内**五等分，1=最弱、5=最强；需窗口内 >252 交易日 | `momentum_tier` ← `trd_momentum_12_1.key_value`（`int`，`technical.py:283-291`） |
+| 输入 3：量能异动 | 当日成交量相对近 60 日均量的分档：`surge`（≥2 倍）/ `normal`（0.5–2 倍）/ `shrink`（≤0.5 倍） | `volume_surge` ← `att_volume_surge.key_value`（`enum`，`attention.py:290-298`） |
+| 输入 4：量比倍数 | 与输入 3 **同源**，取 L1 已算好的「当日量 / 近 60 日均量」原始倍数，用于精确比较 0.5 / 2.0 阈值——**不另起现算**，避免第二真相源与 G1 分母重复计数 | `volume_ratio_60` ← `att_volume_surge.num_value`（`float`，`attention.py:310-323`） |
+| 输入 5：均线排列 | `MA20 > MA60 且 close > MA20` → `bullish`；`MA20 < MA60 且 close < MA20` → `bearish`；其余 `neutral`。由收盘价现算——`v_daily_quote` 无 MA 列，`daily_trend` 的 MA 列只覆盖采集池（`sql/schema.sql:1083-1134`、`:459-460`） | `ma_alignment` ← `source: "v_daily_quote"`，`close` 的 `rolling(20)` / `rolling(60)` 现算（`enum`） |
+
+> `evidence_only`：`tst_price_position_52w.num_value`（0–100 分位）、`trd_reversal_1m`、`trd_max_drawdown`、`trd_turnover`、`att_turnover_surge_tier`（`"1".."5"`）、`trd_volatility_annual`；两融 / 沽空 / 南向拥挤标签只覆盖子集（`daily_margin_balance` A 股 4,597 只 / `daily_short_selling` 869 只 / `daily_ggt_hold` 627 只，`profiling/tags/attention.py:8-16`），只写 `evidence_flags`，**不进判定、不进 G1 分母**。`att_volume_surge` / `att_turnover_surge_tier` 基于 `a_daily_quote`/`hk_daily_quote`（`attention.py:300,335`），不依赖 `fund_flow_daily`。
 
 | 项 | 内容 |
 | --- | --- |
 | 回答 | **当前处于什么位置 / 状态**（滞后描述），替代口语的「现在买合不合适」 |
-| `inputs（判定用）` | `position_tier` ← `tst_price_position_52w.key_value`，`int`（`"1".."5"`，`1=[0,20)` … `5=[80,100]`，`trend.py:83-89,203-204`）；`momentum_tier` ← `trd_momentum_12_1.key_value`，`int`（`"1".."5"`，1=最弱，`technical.py:282-291`）；`volume_surge` ← `att_volume_surge.key_value`，`enum`（`surge`/`normal`/`shrink`，`attention.py:294-298`）；`volume_ratio_60` ← **`att_volume_surge.num_value`**，`float`——**复用 L1 已算的「当日量 / 近 60 日均量」倍数（`attention.py:310-323`），不再另起现算**，避免第二真相源与 G1 分母重复计数；`ma_alignment` ← `source: "v_daily_quote"`，由 `close` 的 `rolling(20)` / `rolling(60)` **现算 MA20/MA60**（`v_daily_quote` 无 ma 列，`sql/schema.sql:1083-1134`；`daily_trend` 的 MA 列只覆盖 `collect_trend` 采集池，`:459-460`），`enum`，`codes: ["bullish","neutral","bearish"]`（`MA20>MA60 且 close>MA20` → `bullish`；`MA20<MA60 且 close<MA20` → `bearish`；其余 `neutral`）。**G1 分母 = 5** |
-| `evidence_only` | `tst_price_position_52w.num_value`（0–100 分位）、`trd_reversal_1m`、`trd_max_drawdown`、`trd_turnover`、`att_turnover_surge_tier`（`"1".."5"`）、`trd_volatility_annual`；两融 / 沽空 / 南向拥挤标签只覆盖子集（`daily_margin_balance` A 股 4,597 只 / `daily_short_selling` 869 只 / `daily_ggt_hold` 627 只，`profiling/tags/attention.py:8-16`），只写 `evidence_flags`，**不进判定、不进 G1 分母**。`att_volume_surge` / `att_turnover_surge_tier` 基于 `a_daily_quote`/`hk_daily_quote`（`attention.py:300,335`），不依赖 `fund_flow_daily` |
 | 判定规则表 | **确定性条件合取 + 稳定性处理**（§7），不做加权打分、不用方向概率。见下表 |
-| enum 值域 | 6 码，见**附录 D.4** |
+| enum 值域 | **6 种结论**，见下表末的代码清单（附录 D.4 同步） |
 | 门禁 / 频率 | G1 + G2（`position_tier` 必须存在）+ G3 新鲜度；`daily`；A+H；`pit_capable=True` |
-| 依据键 | `rule_id`、`as_of`、`position_tier`、`position_52w`、`ma_alignment`、`volume_ratio_60`、`volume_surge`、`momentum_tier`、`evidence_flags`、`coverage`、`missing_inputs`、`gates`；**日变量** `state_raw`、`since_date`、`dwell_days`、`status`、`candidate{to,progress}`（落点见 §4.6） |
-| **⚠ 声明（必须逐字落入 `compute_logic`）** | 「**描述性滞后状态，不是方向预测、不构成买卖建议**」；照抄 `REGIME_OUTPUT_SCHEMA.state_semantics`（`build_business_value.py:190-195`）的写法 |
+| 旁证信息 | 同 `evidence_only` 栏；不进判定 |
+| 依据键 | `rule_id`、`as_of`、`position_tier`、`ma_alignment`、`volume_ratio_60`、`volume_surge`、`momentum_tier`、`coverage`、`missing_inputs`、`gates`；**日变量** `state_raw`、`since_date`、`dwell_days`、`status`、`candidate{to,progress}`（落点见 §4.6） |
+| 措辞 | **描述性滞后状态，不是方向预测、不构成买卖建议**；照抄 `REGIME_OUTPUT_SCHEMA.state_semantics`（`build_business_value.py:190-195`）的写法 |
 
-| `rule_id` | 优先级 | 条件 | 结果 |
-| --- | --- | --- | --- |
-| POS-00 | 0 | `position_tier <= low_pos_max AND volume_ratio_60 <= vol_quiet_max` | `low_quiet` |
-| POS-01 | 1 | `position_tier <= low_pos_max AND volume_ratio_60 >= vol_active_min AND ma_alignment == 'bullish'` | `low_volume_start` |
-| POS-02 | 2 | `position_tier >= high_pos_min AND volume_ratio_60 >= vol_active_min` | `high_overheat` |
-| POS-03 | 3 | `ma_alignment == 'bearish' AND momentum_tier <= weak_momentum_max` | `downtrend_unresolved` |
-| POS-04 | 4 | `ma_alignment == 'bullish' AND position_tier == 3` | `trend_continuation` |
-| POS-05 | 99 | 其余 | `range_bound` |
+| 规则编号 | 优先级 | 规则描述 | 判定条件（供程序执行） | 结论（中文名 / 代码） | 界面简称 |
+| --- | --- | --- | --- | --- | --- |
+| POS-00 | 0 | 低位且缩量 | `position_tier <= 2 AND volume_ratio_60 <= 0.5` | 低位缩量 / `low_quiet` | 低位缩量 |
+| POS-01 | 1 | 低位且放量（均线不参与本条） | `position_tier <= 2 AND volume_ratio_60 >= 2.0` | 低位放量 / `low_volume_start` | 低位放量 |
+| POS-02 | 2 | 高位且放量 | `position_tier >= 4 AND volume_ratio_60 >= 2.0` | 高位过热 / `high_overheat` | 高位过热 |
+| POS-03 | 3 | 均线空头且动量弱 | `ma_alignment == 'bearish' AND momentum_tier <= 2` | 下跌未止 / `downtrend_unresolved` | 下跌未止 |
+| POS-04 | 4 | 均线多头排列（位置档不设限） | `ma_alignment == 'bullish'` | 均线多头排列 / `trend_continuation` | 均线多头 |
+| POS-05 | 99 | 其余 | 兜底 | 区间震荡 / `range_bound` | 区间震荡 |
+
+**代码与界面简称清单**（6 项，供程序同步 `profile.enum_value`）：`low_quiet`=低位缩量、`low_volume_start`=低位放量、`trend_continuation`=均线多头、`high_overheat`=高位过热、`downtrend_unresolved`=下跌未止、`range_bound`=区间震荡。**均为描述性滞后状态，不是方向预测、不构成买卖建议**；code 中的 `start` / `continuation` 为历史命名（实际语义以 label 为准），**不得据 code 字面解读为方向判断**。
 
 > `params`（已冻结）：`coverage_min=0.6`、`low_pos_max=2`、`high_pos_min=4`、`vol_quiet_max=0.5`、`vol_active_min=2.0`、`weak_momentum_max=2`。
-> **code 命名**：`low_volume_start` / `trend_continuation` 的 code 保留，但 label 已去掉「启动 / 中继」的方向暗示（附录 D.4）；**不得据 code 字面解读为方向判断**。
+
+> **v3 规则变更（2026-11-23，输入与阈值不变）**：① POS-01 去掉 `ma_alignment=='bullish'`——52 周低位与均线多头天然互斥（实测 `(pos=1,bullish)` 仅 49/6,044），三腿合取让本档只占 0.27%，去掉后 5.62%；label「低位放量」本身无方向暗示。② POS-04 去掉 `position_tier==3` 的精确单档约束（其他规则均用范围），改为纯 `ma_alignment=='bullish'`，本档 1.14%→5.18%。六档熵比 0.555→0.711，死档从 3 个降到 1 个（`high_overheat` 0.66% 是高位∩放量的真实稀缺，不人为放宽）。`range_bound` 仍占 52.9%，为"其余"兜底，熊市震荡票本就多。仍为滞后描述，不预测方向。
 
 > **不采用 6 阶段 `tst_stage`**：`profiling/tags/trend.py:18-22` 明确「待建：需 t+20/t+60 前瞻收益验证闭环，短期无法收敛，暂不注册」。本结论是**降维的 6 档描述状态**，不是那套状态机的替代品，也不占用 `tst_stage` 的编码。
 
@@ -623,58 +703,99 @@ WHERE r.source_type = 'derived'
 
 ### 6.1 `biz_value_quality_type` 好公司 × 好价格
 
+**判定输入（2 项；只读两个 L2 的枚举码，不重算原子）**：
+
+| 输入 | 中文说明 | 数据来源 |
+| --- | --- | --- |
+| 输入 1：估值归约类 | 由估值结论 L2 的 11 码按 §5.1 归约为四类：`cheap`（`rel_cheap`）/ `neutral`（`rel_fair` + 5 个单侧码，含 `hist_cheap_ind_expensive`）/ `expensive`（`rel_expensive`）/ `no_anchor`（`loss`/`negative`） | `valuation_class` ← `dim_valuation_conclusion.key_value` 经 `VAL_CLASS` 映射（`enum`） |
+| 输入 2：质量归约类 | 由质量结论 L2 的 7 码按 §5.2 归约为四类：`solid`（`solid`）/ `volatile`（`high_but_volatile`）/ `moderate`（D22 单开，`moderate`）/ `weak`（`paper_profit`/`leveraged`/`weak`/`deteriorating`） | `quality_class` ← `dim_quality_conclusion.key_value` 经 `QAL_CLASS` 映射（`enum`） |
+
+> `evidence_only`：`valuation_code`、`quality_code` 原码、`ocf_to_profit`、`pe_hist_pct`（写 `cross_check` 作交叉校验，不改结论、不进 G1 分母）。
+> **任一侧 L2 未出档，或 `valuation_class == 'no_anchor'` → 整行不发布**。`no_anchor` 不单设码——与 L2 的 `loss` 表达同一事实，违反判据③且丢掉质量侧信息。
+
 | 项 | 内容 |
 | --- | --- |
-| 信息增量 | 单看「相对偏便宜」不知道便宜是不是因为公司变差；单看「盈利稳」不知道价格是否已透支。**交叉才产生「价值陷阱嫌疑」这类单域无法表达的判断** |
-| `inputs（判定用）` | `valuation_class` ← `dim_valuation_conclusion.key_value` 按 §5.1 归约映射，`enum`（`cheap`/`neutral`/`expensive`/`no_anchor`）；`quality_class` ← `dim_quality_conclusion.key_value` 按 §5.2 归约映射，`enum`（`solid`/`volatile`/`weak`）。**只读两个 L2 的枚举码，不重算原子**；**G1 分母 = 2** |
-| `evidence_only` | `valuation_code`、`quality_code` 原码、`ocf_to_profit`、`pe_hist_pct`（写 `cross_check` 作交叉校验，不改结论） |
-| 判定 | 3×3 交叉矩阵（下表）；**任一侧未出档，或 `valuation_class == 'no_anchor'` → 整行不发布** |
-| enum 值域 | **5 码**，见**附录 D.5**；不设 `loss_no_pe` 码（与 L2 的 `loss` 表达同一事实、违反判据③，且丢掉质量侧信息） |
-| 频率 / PIT | `daily`（估值侧日频），但**只在任一 L2 码变化时切换**（§4.6 事件行）；`pit_capable=False`（质量侧财报无港股披露日） |
-| 依据键 | `rule_id`、`as_of`、`valuation_code`、`quality_code`、`matrix_cell`、`cross_check{ocf_to_profit, pe_hist_pct}`、`coverage`、`gates` |
-| 措辞 | 禁用「推荐 / 优选 / 值得买 / 评级」；`value_trap_risk` 写「嫌疑」，不作认定 |
+| 回答 | 好公司 × 好价格的交叉类型；**单看「相对偏便宜」不知便宜是否因公司变差，单看「盈利稳」不知价格是否透支——交叉才产生「盈利弱价格低」这类单域无法表达的判断** |
+| 判定规则表 | 估值三类 × 质量四类交叉矩阵（D22 从 3×3 扩到 3×4）；见下表 |
+| enum 值域 | **8 种结论**，见下表末的代码清单（附录 D.5 同步） |
+| 门禁 / 频率 | G1 + G2（任一侧 L2 未出档即不发布）；`daily`（估值侧日频），但只在任一 L2 码变化时切换（§4.6 事件行）；`pit_capable=False`（质量侧财报无港股披露日） |
+| 旁证信息 | `cross_check{ocf_to_profit, pe_hist_pct}`——只校验不改结论 |
+| 依据键 | `rule_id`、`as_of`、`valuation_code`、`quality_code`、`matrix_cell`、`cross_check`、`coverage`、`gates` |
+| 措辞 | 禁用「推荐 / 优选 / 值得买 / 评级」；所有简称统一为 `盈利{稳/中/弱}价格{低/中/高}` 格式，只描述两个维度的交叉，不作方向判断 |
 
-| `valuation_class` \ `quality_class` | `solid` | `volatile` | `weak` |
-| --- | --- | --- | --- |
-| `cheap` | `VQ-C1` → `quality_rel_cheap` | `VQ-C2` → `value_trap_risk` | `VQ-C3` → `value_trap_risk` |
-| `neutral` | `VQ-C4` → `quality_rel_fair` | **不发布** | **不发布** |
-| `expensive` | `VQ-C6` → `quality_rel_expensive` | `VQ-C8` → `weak_and_expensive` | `VQ-C9` → `weak_and_expensive` |
+**交叉矩阵**（行=估值归约类，列=质量归约类；每格一个规则编号与结论码）：
 
-> `VQ-Cx` 即 `conclusion_dict.rules[].rule_id`，与 `conclusion_detail.rule_id` 对应（§4.3.1）。`neutral × (volatile|weak)` 无明确交叉特征 → 按「宁可不出档」整行不发布（§4.2 纪律），不为凑满码表强行造类型。
+| 估值 ＼ 质量 | `solid` | `moderate` | `volatile` | `weak` |
+| --- | --- | --- | --- | --- |
+| `cheap` | `VQ-C1` → `quality_rel_cheap` | `VQ-C1M` → `moderate_rel_cheap` | `VQ-C2` → `value_trap_risk` | `VQ-C3` → `value_trap_risk` |
+| `neutral` | `VQ-C4` → `quality_rel_fair` | `VQ-C4M` → `moderate_rel_fair` | **不发布** | **不发布** |
+| `expensive` | `VQ-C6` → `quality_rel_expensive` | `VQ-C6M` → `moderate_rel_expensive` | `VQ-C8` → `weak_and_expensive` | `VQ-C9` → `weak_and_expensive` |
 
-**规则表结构化与兜底**：
+> `VQ-Cx` 即 `conclusion_dict.rules[].rule_id`，与 `conclusion_detail.rule_id` 对应（§4.3.1）。`neutral × (volatile|weak)` 无明确交叉特征 → 按「宁可不出档」整行不发布（§4.2 纪律），不为凑满码表强行造类型。「整行不发布」不是 enum 码，按 §4.6 场景③关闭当前有效行。
 
-| `rule_id` | `priority` | 条件 | 结果 |
-| --- | --- | --- | --- |
-| VQ-00 | 0 | `valuation_class == 'no_anchor'` 或任一侧未出档 | **整行不发布** |
-| VQ-C1 / C2 / C3 / C4 / C6 / C8 / C9 | 10 / 11 / 12 / 20 / 30 / 31 / 32 | `valuation_class == '<行类>' AND quality_class == '<列类>'` | 矩阵对应码 |
-| **VQ-99** | **99** | `{"all": []}`（空合取恒真） | **整行不发布**（覆盖 `neutral × (volatile / weak)` 及所有未列 cell） |
+**代码与界面简称清单**（8 项，供程序同步 `profile.enum_value`）：
 
-> 「整行不发布」不写 `tag_value` 行，按 §4.6 场景③关闭当前有效行；**它不是一个 enum 码**，不占附录 D 值域。
+| code | label | short_label |
+| --- | --- | --- |
+| `quality_rel_cheap` | 盈利稳且价格相对偏低 | 盈利稳价格低 |
+| `quality_rel_fair` | 盈利稳价格中性 | 盈利稳价格中 |
+| `quality_rel_expensive` | 盈利稳但价格相对偏贵 | 盈利稳价格高 |
+| `moderate_rel_cheap` | 盈利中等且价格相对偏低 | 盈利中价格低 |
+| `moderate_rel_fair` | 盈利中等且价格中性 | 盈利中价格中 |
+| `moderate_rel_expensive` | 盈利中等但价格相对偏贵 | 盈利中价格高 |
+| `value_trap_risk` | 盈利质量弱且价格相对偏低 | 盈利弱价格低 |
+| `weak_and_expensive` | 盈利质量弱且价格相对偏贵 | 盈利弱价格高 |
+
+> `params`：`coverage_min=0.6`（G1 通用门禁，无其他参数）。规则条数 = 3×4 矩阵 10 个可发布 cell + `VQ-00`（无锚不发布）+ `VQ-99`（兜底不发布）= 12 条，优先级 `VQ-00`=0、10 个 cell=10..33 单调递增、`VQ-99`=99。
+
+> **D22 变更（2026-11-23，三项）**：① `QAL_CLASS` 单开 `moderate → moderate`（原未映射导致 435 只盈利中等票静默不发布）；② 矩阵 3×3 → 3×4，新增 `VQ-C1M/C4M/C6M` 三码，简称按裁决为「盈利中价格低 / 盈利中价格中 / 盈利中价格高」；③ `hist_cheap_ind_expensive`（自身历史便宜但同行贵）归约由 `cheap` 改 `neutral`——单侧信号不支撑陷阱判断，与其余四个单侧码一致。
 
 ### 6.2 `biz_growth_quality_type` 增长质量
 
+**判定输入（5 项；以 L2 成长结论为主锚，交叉盈利真实性与现金流证据）**：
+
+| 输入 | 中文说明 | 数据来源 |
+| --- | --- | --- |
+| 输入 1：增速状态码 | L2 成长结论的六码（`fast_sustained` / `fast_accelerating` / `fast_decelerating` / `slow_steady` / `contracting` / `revenue_profit_divergent`）；**主锚**，L2 未出档时整行不发布 | `growth_code` ← `dim_growth_conclusion.key_value`（`enum`） |
+| 输入 2：利润现金转化档 | 经营现金流 ÷ 净利润，一级行业内五等分，1=纸面利润风险最高、5=现金支撑充足；亏损记为无效 | `earnings_quality_tier` ← `qal_earnings_quality_ind1.key_value`（`int`，`LOSS` 无效） |
+| 输入 3：自由现金流符号 | `financial_indicator.free_cash_flow` 的符号（−1/0/1），**只取符号不取数值**（A/H 推算口径不同） | `fcf_sign` ← `financial_indicator.free_cash_flow`（`int`） |
+| 输入 4：增长持续性 | 从最近一期年报往前数营收同比为正的连续年数，`"0".."3"` | `persistence` ← `grw_growth_persistence.key_value`（`int`） |
+| 输入 5：增长加速度 | 最新一期与上一期同类型报告期营收增速之差，三码 `accelerating` / `steady` / `decelerating` | `accel` ← `grw_growth_accel.key_value`（`enum`） |
+
+> `evidence_only`：增速原值、研发强度 / 扣非增速 / CAPEX 强度等补数字段（§8.4，当前多为 `PLANNED_NO_DATA`），不进判定、不进 G1 分母。
+> **FCF 取数口径（2026-11-23 修正）**：A 股季报（Q1/Q3）几乎不含自由现金流（实测覆盖 7.3%），年报/H1 约 90%；港股 OCF−CAPEX 推算各期都有。故取「每票最近一期**有 FCF 的**报告期」而非无条件取最近一期——修正后 A 股覆盖 5→5,484 只、港股 2,830 只。⚠ **由此 FCF 与其余输入期次可能不一致**（A 股多落在 H1，其余输入多为 Q3 季报）；FCF 是「最近可得的现金流证据」，不是当期同步指标，只取符号、不参与增速比较。此口径已经确认接受。
+> `free_cash_flow` 来源与 A/H 差异见 `get_financial.py:61,77,148,300-326` → `sql/schema.sql:786`；CAPEX 明细见 `capex_fixed` / `capex_intangible`（§8.1）。
+
 | 项 | 内容 |
 | --- | --- |
-| 信息增量 | `dim_growth_conclusion` 只说「快不快」，说不出「是不是真增长」；交叉现金流 / 盈利真实性 / FCF 符号才产生该判断 |
-| `inputs（判定用）` | `growth_code` ← `dim_growth_conclusion.key_value`，`enum`（附录 D.3 六码）；`earnings_quality_tier` ← `qal_earnings_quality.key_value`，`int`（1=纸面利润风险最高）；`fcf_sign` ← `financial_indicator.free_cash_flow` **符号**，`int`（−1/0/1）；`persistence` ← `grw_growth_persistence.key_value`，`int`（`"0".."3"`）；`accel` ← `grw_growth_accel.key_value`，`enum`（三码）。**G1 分母 = 5** |
-| `evidence_only` | 增速原值、研发强度 / 扣非增速 / CAPEX 强度等补数字段（`evidence_enhancements[]`，§8.4） |
-| 说明 | `free_cash_flow` **取自 `financial_indicator`**（`get_financial.py:61,77,148` → `:519-523` 入库；`sql/schema.sql:786`），港股为 OCF−CAPEX 推算、A 股为每股 FCFF 推算（`get_financial.py:300-326`），**口径不同，只取符号不取数值**；CAPEX 明细见 `capex_fixed` / `capex_intangible` 列（§8.1），按 §8.4 只进 evidence。**`free_cash_flow IS NULL`**（港股现金流接口为空 `get_financial.py:300-307`、A 股缺每股 FCFF 行 `:316-320`）→ `fcf_sign` 为**无效成员**，不计入 G1 有效成员数，但 G1 分母仍为 5（`§4.2` 无效成员规则） |
-| 判定规则表 | 见下表；背离优先于增速 |
-| enum 值域 | 5 码，见**附录 D.6** |
-| 频率 / PIT | `quarterly`；`pit_capable=False` |
-| 依据键 | `rule_id`、`as_of`、`growth_code`、`earnings_quality_tier`、`fcf_sign`、`persistence`、`accel`、`evidence_enhancements[]`、`coverage`、`missing_inputs`、`gates` |
+| 回答 | 增长是否有现金与盈利真实性支撑；**`dim_growth_conclusion` 只说「快不快」，交叉现金流 / 盈利真实性 / FCF 符号才产生「是不是真增长」的判断** |
+| 判定规则表 | 负面特征优先（收缩 → 纸面利润 → 烧钱扩张 → 疑似一次性），正面码须有 FCF 实证；见下表 |
+| enum 值域 | **5 种结论**，见下表末的代码清单（附录 D.6 同步） |
+| 门禁 / 频率 | G1 + G2（`growth_code` 主锚）；`quarterly`；`pit_capable=False` |
+| 旁证信息 | 同 `evidence_only` 栏；不进判定 |
+| 依据键 | `rule_id`、`as_of`、`growth_code`、`earnings_quality_tier`、`fcf_sign`、`persistence`、`accel`、`coverage`、`missing_inputs`、`gates` |
 | 措辞 | 禁用「可持续增长 / 真成长 / 未来增速」；`one_off_like` 写「疑似」，不作认定 |
 
-| `rule_id` | 优先级 | 条件 | 结果 |
-| --- | --- | --- | --- |
-| GQ-00 | 0 | `growth_code == 'contracting'` | `contraction` |
-| GQ-01 | 1 | `earnings_quality_tier <= quality_weak_max` | `paper_growth` |
-| GQ-02 | 2 | `fcf_sign < 0 AND growth_code in ('fast_sustained','fast_accelerating')` | `cash_burning_expansion` |
-| GQ-03 | 3 | `persistence <= 1 AND accel == 'accelerating' AND growth_code in ('fast_accelerating','fast_sustained')` | `one_off_like` |
-| GQ-04 | 99 | 其余 | `sustained_cash_backed` |
+| 规则编号 | 优先级 | 规则描述 | 判定条件（供程序执行） | 结论（中文名 / 代码） | 界面简称 |
+| --- | --- | --- | --- | --- | --- |
+| GQ-00 | 0 | 营收或净利同比为负，增长收缩 | `growth_code == 'contracting'` | 收缩 / `contraction` | 收缩 |
+| GQ-01 | 1 | 增长但利润现金转化弱 | `earnings_quality_tier <= 2` | 增长但利润现金转化弱 / `paper_growth` | 转化弱 |
+| GQ-02 | 2 | 高增长但自由现金流为负 | `fcf_sign < 0 AND growth_code in ('fast_sustained','fast_accelerating')` | 高增长但自由现金流为负 / `cash_burning_expansion` | 扩张耗现金 |
+| GQ-03 | 3 | 增速跳变、持续性弱，疑似一次性因素 | `persistence <= 1 AND accel == 'accelerating' AND growth_code in ('fast_accelerating','fast_sustained')` | 疑似一次性因素（增速跳变、持续性弱） / `one_off_like` | 疑似一次性 |
+| GQ-04 | 98 | 增长持续且有非负自由现金流实证 | `fcf_sign >= 0` | 增长持续且现金支撑 / `sustained_cash_backed` | 现金支撑 |
+| GQ-99 | 99 | FCF 缺失或为负且未命中前述 → 整行不发布 | 兜底 | — | — |
 
-> `params`（已冻结）：`coverage_min=0.6`、`quality_weak_max=2`。
+**代码与界面简称清单**（5 项，供程序同步 `profile.enum_value`）：
+
+| code | label | short_label |
+| --- | --- | --- |
+| `sustained_cash_backed` | 增长持续且现金支撑 | 现金支撑 |
+| `cash_burning_expansion` | 高增长但自由现金流为负 | 扩张耗现金 |
+| `paper_growth` | 增长但利润现金转化弱 | 转化弱 |
+| `one_off_like` | 疑似一次性因素（增速跳变、持续性弱） | 疑似一次性 |
+| `contraction` | 收缩 | 收缩 |
+
+> `params`（已冻结）：`coverage_min=0.6`、`quality_weak_max=2`。GQ-04 的 `fcf_sign >= 0` 是**精细化门禁**：只约束正面码，不影响 GQ-00/01/02/03 已命中的负面/中性码；FCF 缺失时 `_compare` 返回 False，同样落 GQ-99 不发布。实测（2026-11-20 快照）发布率 88.1%、熵比 0.847，`sustained_cash_backed` 1,623 只全部有 FCF≥0 实证。
 
 > **L3 首期只做 2 个**。不做「总分 / 综合评级 / 拥挤度预测」——分别违反 §0 非目标 3 与 1。
 
@@ -981,7 +1102,7 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 
 | 域 | tag_code |
 | --- | --- |
-| ③ 估值水平（9） | `val_pe_ttm_tier` `val_pb_tier` `val_ps_ttm_tier` `val_pcf_ttm_tier` `val_peg_tier` `val_pe_ind_pct` `val_pe_hist_pct` `val_pb_ind_pct` `val_fcf_yield_tier` |
+| ③ 估值水平（阶段 C 重构） | 全市场档保留：`val_pe_ttm_tier` `val_pb_tier` `val_fcf_yield_tier` `val_pe_hist_pct`；行业分位改为一级/二级并存：`val_pe_ind1_pct`/`val_pe_ind2_pct`、`val_pb_ind1_pct`/`val_pb_ind2_pct`、`val_ps_ttm_ind1_tier`/`ind2`、`val_pcf_ttm_ind1_tier`/`ind2`、`val_peg_ind1_tier`/`ind2` |
 | ④ 盈利质量（7） | `qal_roe_tier` `qal_gross_margin_tier` `qal_net_margin_tier` `qal_leverage_tier` `qal_roe_stability` `qal_earnings_quality` `qal_profit_years` |
 | ⑤ 成长特征（4） | `grw_revenue_yoy_tier` `grw_profit_yoy_tier` `grw_growth_persistence` `grw_growth_accel` |
 | ⑥ 股东回报（6，第二批） | `shr_dividend_yield_tier` `shr_payout_tier` `shr_consecutive_years` `shr_dividend_growth` `shr_buyback_tier` `shr_total_yield_tier` |
@@ -991,7 +1112,17 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 
 > **值域事实（规则表 `inputs[]` 的对齐基准）**：`assign_tier` 输出的 `key_value` 是**字符串** `"1".."5"`（`profiling/quantile.py:455`），边界 20/40/60/80（`:453-454`）；`num_value` 才是连续值。`qal_roe_stability` 1=最稳定 / 5=波动最大；`qal_earnings_quality` 1=纸面利润风险最高 / 5=现金支撑充足、另有 `LOSS`；`qal_leverage_tier` 1=最低 / 5=最高；`grw_growth_persistence` 为 `"0".."3"` 连续正增长期数档；`grw_growth_accel` 为 `accelerating`/`steady`/`decelerating`（±5pp）；`tst_price_position_52w` 档 `1=[0,20)` … `5=[80,100]`；`att_volume_surge` 为 `surge`/`normal`/`shrink`；`trd_momentum_12_1` 1=最弱。**L1 只有 3 个域用 `enum_values`，其余 6 域用 `TIER + value_range`**，故结论层必须按 `source_col` 明确取 `key_value` 还是 `num_value`。
 
-> **估值域新增 `val_pe_ind2_pct`（2026-11-19，不参与结论）**：与 `val_pe_ind_pct`（GICS **一级**部门分位）并存，分组键为【市场 + GICS **二级**行业组】，口径同 `percentile_0_100`（`profiling/tags/valuation.py`）。二级映射存独立表 `sector_hierarchy_l2`（`build_sector_hierarchy.py` 维护），25 个组按 GICS 2023 四位码 + 标准简体中文名；由富途板块人工语义映射，**非官方 GICS 个股分类**，首期只做港股（A 股不打标），综合企业落 `NONE`。二级组粒度不均（能源/材料/公用事业仅 1 组 = 与一级等价），分位可比性有限。**不进 `dim_valuation_conclusion` 的 `inputs[]`、不改估值结论**，仅供个股估值分析对照。
+> ⚠ **阶段 C 更新（2026-11-23）：行业标签已全面重构为一级/二级并存，GICS 全部废弃**。
+> 本文件绝大多数标签清单、规则 `inputs[]` 是改造前的历史记录，`val_pe_ind_pct` /
+> `val_pb_ind_pct` / `val_ps_ttm_tier` / `qal_roe_tier` / `grw_revenue_yoy_tier` /
+> `scl_revenue_tier` / `shr_payout_tier` / `idt_gics_sector` 等旧 code **已从注册表移除**，
+> 替换为带 `_ind1_` / `_ind2_` 的新 code（完整清单见 `doc/industry_classification_refactor_plan.md` §6）。
+> 分组来源统一为阶段 B 的 `regime.stock_sw_industry_mapping`（A股）/ `stock_hsics_industry_mapping`
+> （港股），层级关系从 `sw_industry_classification` / `hsics_industry_classification`
+> 的 parent 链 join，不再读 GICS 的 `sector_hierarchy` / `sector_hierarchy_l2`。
+> 规则表 `RULES` 中估值 / 质量 / 成长 / 位置四个 L2 已分别整改（v4 / v3 / v4 / v3，见 §5.1 / §5.2 / §5.3 / §5.4）；
+> L3 `biz_value_quality_type` 已按 D22 扩为四档交叉（v3，见 §6.1）；`biz_growth_quality_type` 已修 FCF 取数、切一级行业现金转化档并加精细化门禁（v3，见 §6.2）。**L2/L3 结论当前仍暂停产出**（`compute_profile.py` 的
+> `L2_L3_PAUSED=True`，D3/D17），待行业改造完成、全部输入与切点重设后再恢复。
 
 ## 附录 C：关键证据索引
 
@@ -1013,11 +1144,12 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 | 位置档实现 / 6 阶段暂不注册 | `profiling/tags/trend.py:1-32, 121-220` |
 | 计算任务资源规范 | `AGENTS.md`「计算任务资源约定」；`doc/compute_task_resource_standard.md` §1–§8（§2 为 R1–R7、§5 为 worktree 对比法、§7 为监控登记） |
 | 结论切点标定 | `tools/calibrate_conclusion_cutpoints.py`（只读、不写库；切点已冻结，见 §4.3.1 / §5）。v2 起模拟判定为 3×3 九格映射，与 `RULES` 的 VAL-02..VAL-10 逐格对齐 |
-| GICS 二级映射 / 二级分位标签 | `build_sector_hierarchy.py` `LEVEL2` / `_SECTOR_GROUP_MAP` / `_build_l2_rows`；`sql/schema.sql` 第 3.3b 节 `sector_hierarchy_l2`；`profiling/quantile.py:load_gics_group_map`；`profiling/tags/valuation.py:val_pe_ind2_pct`；`tests/test_sector_stage3.py:test_gics_l2_*` |
+| 阶段 C 行业标签重构（一级/二级并存） | `profiling/quantile.py:load_industry_map`；`profiling/tags/{valuation,scale,quality,growth,shareholder,identity}.py` 的 `_ind1_`/`_ind2_` 标签；映射表 `regime.stock_sw_industry_mapping` / `stock_hsics_industry_mapping`（阶段 B）；`compute_profile.py:L2_L3_PAUSED`；`doc/industry_classification_refactor_plan.md` §6 |
 
-## 附录 D：6 组 enum 值域冻结表（**唯一真相源**）
+## 附录 D：6 组结论 enum 值域（D.2 / D.3 / D.5 / D.6 已融合进 §5.2 / §5.3 / §6.1 / §6.2 规则表）
 
-> 共 **39 个 code**（v1.1 估值结论增 4 个单侧码）。`label` 为中文短句、`short_label` 为短语（≤6 字），全部写进 `enum_values` 的 `(label, short_label)` 元组并同步到 `profile.enum_value`（§3.4 R5）。措辞已按 §11 复核。
+> 共 **39 个 code**（v1.1 估值结论增 4 个单侧码）。**D21（2026-11-23）质量结论新增 `moderate` 使总数 40；D22 同日 `biz_value_quality_type` 新增 3 个 `moderate` 交叉码，实施后总计 43 个 code**——正文历史统计（39）保留原样以反映改造前冻结态。
+> `label` / `short_label` 的**唯一真相源已下沉到各章节的规则表**：D.2 / D.3 / D.5 / D.6 已分别完整融合进 §5.2 / §5.3 / §6.1 / §6.2；其余组仍列在本附录。原 `enum_values` 元组与 `profile.enum_value` 的同步契约不变（§3.4 R5）。
 > `code` / `label` / `short_label` 均为冻结值；中文措辞按 §11 禁用词表复核。
 
 ### D.1 `dim_valuation_conclusion`（11）
@@ -1039,29 +1171,13 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 > 前 9 码对应 §5.1 的 3×3 双分位交叉矩阵；`loss` / `negative` 在矩阵外（亏损股与净资产为负的票无 PE 分位），由 VAL-00 / VAL-01 直接发布。
 
 
-### D.2 `dim_quality_conclusion`（6）
+### D.2 `dim_quality_conclusion`（7）
 
-| code | label | short_label |
-| --- | --- | --- |
-| `solid` | 盈利稳且现金实 | 稳且现金实 |
-| `high_but_volatile` | 盈利高但波动大 | 高但波动 |
-| `paper_profit` | 利润高但现金转化弱 | 现金转化弱 |
-| `leveraged` | 高杠杆支撑 | 高杠杆 |
-| `weak` | 盈利水平偏弱 | 盈利偏弱 |
-| `deteriorating` | 稳定性与真实性均偏弱 | 质量均偏弱 |
-
-> `deteriorating` 的 label 只作横截面描述；L1 无时序档位，不得写「走弱」。
+**已融合进 §5.2 规则表**（结论列含中文名与代码，界面简称见该表末的代码清单）。此处不再重复列值域表——避免两处维护漂移。
 
 ### D.3 `dim_growth_conclusion`（6）
 
-| code | label | short_label |
-| --- | --- | --- |
-| `fast_sustained` | 高增速且持续 | 高且持续 |
-| `fast_accelerating` | 增速抬升 | 增速抬升 |
-| `fast_decelerating` | 增速放缓 | 增速放缓 |
-| `slow_steady` | 低速但稳 | 低速稳 |
-| `contracting` | 负增长 | 负增长 |
-| `revenue_profit_divergent` | 增收不增利或反之 | 增收增利背离 |
+**已融合进 §5.3 规则表**（结论列含中文名与代码，界面简称见该表末的代码清单）。此处不再重复列值域表——避免两处维护漂移。
 
 ### D.4 `dim_position_state`（6）
 
@@ -1069,32 +1185,20 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 | --- | --- | --- |
 | `low_quiet` | 低位缩量 | 低位缩量 |
 | `low_volume_start` | 低位放量 | 低位放量 |
-| `trend_continuation` | 趋势段内运行 | 趋势段内 |
+| `trend_continuation` | 均线多头排列 | 均线多头 |
 | `high_overheat` | 高位过热 | 高位过热 |
 | `downtrend_unresolved` | 下跌未止 | 下跌未止 |
 | `range_bound` | 区间震荡 | 区间震荡 |
 
 
-### D.5 `biz_value_quality_type`（5）
+### D.5 `biz_value_quality_type`（8）
 
-| code | label | short_label |
-| --- | --- | --- |
-| `quality_rel_cheap` | 盈利稳且价格相对偏低 | 稳且偏低 |
-| `quality_rel_fair` | 盈利稳价格中性 | 稳且中性 |
-| `quality_rel_expensive` | 盈利稳但价格相对偏贵 | 稳且偏高 |
-| `value_trap_risk` | 相对偏便宜但盈利质量走弱（价值陷阱嫌疑） | 价值陷阱嫌疑 |
-| `weak_and_expensive` | 盈利质量弱且价格相对偏贵 | 弱且偏高 |
+**已融合进 §6.1 规则表**（结论码与界面简称见该表末的代码清单）。此处不再重复列值域表——避免两处维护漂移。
 
 
 ### D.6 `biz_growth_quality_type`（5）
 
-| code | label | short_label |
-| --- | --- | --- |
-| `sustained_cash_backed` | 增长持续且现金支撑 | 现金支撑 |
-| `cash_burning_expansion` | 高增长但自由现金流为负 | 扩张耗现金 |
-| `paper_growth` | 增长但利润现金转化弱 | 转化弱 |
-| `one_off_like` | 疑似一次性因素（增速跳变、持续性弱） | 疑似一次性 |
-| `contraction` | 收缩 | 收缩 |
+**已融合进 §6.2 规则表**（结论码与界面简称见该表末的代码清单）。此处不再重复列值域表——避免两处维护漂移。
 
 
 ---

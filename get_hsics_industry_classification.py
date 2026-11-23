@@ -35,6 +35,69 @@ T_CLASS = "regime.hsics_industry_classification"
 T_MAP = "regime.futu_hsics_code_mapping"
 
 
+# ── 富途港股 INDUSTRY 板块英文名（富途 API 英文版 get_plate_list，113 个）──────
+#   用途：HSICS 两跳方案第一步「富途板块 → 英文名 → HSICS 官方英文名 → 6位码」。
+FUTU_EN_NAME = {
+    "HK.LIST1001": "Dairy",  "HK.LIST1002": "Procurement & Supply Chain Management",
+    "HK.LIST1003": "Insurance",  "HK.LIST1004": "Credit Services",
+    "HK.LIST1005": "Public Transport",  "HK.LIST1006": "Other Metals & Minerals",
+    "HK.LIST1007": "Other Financial Services",  "HK.LIST1008": "Agriculture",
+    "HK.LIST1009": "publishing",  "HK.LIST1010": "packaged food",
+    "HK.LIST1011": "Agricultural Inputs",  "HK.LIST1012": "Medical Equipment & Supplies",
+    "HK.LIST1013": "Semiconductors",  "HK.LIST1014": "Satellite & Wireless Services",
+    "HK.LIST1015": "Printing & Packaging",  "HK.LIST1016": "Alternative/Renewable Energy",
+    "HK.LIST1017": "Commercial vehicles and trucks",  "HK.LIST1019": "Real Estate Developers",
+    "HK.LIST1020": "Real Estate Investment",  "HK.LIST1021": "furniture",
+    "HK.LIST1022": "Home Appliances",  "HK.LIST1025": "Industrial Parts & Equipment",
+    "HK.LIST1026": "Advertising Agencies",  "HK.LIST1027": "Broadcasting",
+    "HK.LIST1028": "Construction Materials",  "HK.LIST1029": "Entertainment",
+    "HK.LIST1030": "Investment & Asset Management",  "HK.LIST1031": "Other Support Services",
+    "HK.LIST1032": "Sports & Recreation Facilities",  "HK.LIST1033": "New Energy Materials",
+    "HK.LIST1034": "Travel & Sightseeing",  "HK.LIST1035": "Textiles & Fabrics",
+    "HK.LIST1037": "Forestry & Timber",  "HK.LIST1039": "Water Utilities",
+    "HK.LIST1040": "Automobiles",  "HK.LIST1041": "Auto Parts",
+    "HK.LIST1042": "Oil & Gas Producers",  "HK.LIST1043": "Oil & Gas Services",
+    "HK.LIST1044": "Coal",  "HK.LIST1045": "Gas Utilities",
+    "HK.LIST1046": "Speciality Chemicals",  "HK.LIST1047": "Toys & Leisure",
+    "HK.LIST1049": "Jewelry & Watches",  "HK.LIST1050": "Biotechnology",
+    "HK.LIST1051": "Electric Utilities",  "HK.LIST1052": "Consumer Electronics",
+    "HK.LIST1053": "Computers & Equipment",  "HK.LIST1054": "Telecom Services",
+    "HK.LIST1055": "Consumer telecommunications equipment and parts",  "HK.LIST1056": "Diversified Retailers",
+    "HK.LIST1059": "Paper & Packaging",  "HK.LIST1061": "Conglomerates",
+    "HK.LIST1062": "Personal Care",  "HK.LIST1063": "Aerospace & Defense",
+    "HK.LIST1064": "Airlines",  "HK.LIST1065": "Air Cargo & Logistics",
+    "HK.LIST1066": "Shipping & Ports",  "HK.LIST1067": "Pharmaceuticals",
+    "HK.LIST1068": "Securities & Brokerage",  "HK.LIST1069": "Resorts & Casinos",
+    "HK.LIST1070": "Supermarkets & Convenience Stores",  "HK.LIST1071": "Hotels & Resorts",
+    "HK.LIST1072": "Alcoholic Beverages",  "HK.LIST1073": "Heavy Infrastructure",
+    "HK.LIST1074": "Heavy Machinery",  "HK.LIST1075": "Steel",
+    "HK.LIST1076": "Railroads & Highways",  "HK.LIST1077": "Copper",
+    "HK.LIST1078": "Aluminum",  "HK.LIST1079": "Banks",
+    "HK.LIST1080": "Non-Alcoholic Beverages",  "HK.LIST1082": "Food Additives",
+    "HK.LIST1083": "Catering",  "HK.LIST1084": "Gold & Precious Metals",
+    "HK.LIST1086": "Medical Services",  "HK.LIST1089": "Real Estate Services",
+    "HK.LIST1090": "Property Services & Management",  "HK.LIST1091": "Education",
+    "HK.LIST1095": "Engineering & Construction",  "HK.LIST1100": "Application Software",
+    "HK.LIST1268": "Other Clothing Accessories",  "HK.LIST1269": "Auto Retailers",
+    "HK.LIST1270": "Apparel Retailers",  "HK.LIST1271": "Environmental Services",
+    "HK.LIST1272": "Livestock Feed",  "HK.LIST1273": "Meat & Poultry",
+    "HK.LIST1274": "Electrical and electronic components",  "HK.LIST1275": "Footwear",
+    "HK.LIST1276": "Other Retailers",  "HK.LIST1277": "Apparel Manufacturing",
+    "HK.LIST1278": "Home Improvement Retail",  "HK.LIST1284": "Traditional Chinese Medicine",
+    "HK.LIST1311": "REITs",  "HK.LIST1354": "Energy Storage Systems",
+    "HK.LIST1355": "Transport & Logistics",  "HK.LIST1356": "Tobacco",
+    "HK.LIST1357": "Pharmaceutical Distribution",  "HK.LIST1358": "nuclear",
+    "HK.LIST1359": "Gaming",  "HK.LIST1360": "Semiconductor Equipment & Materials",
+    "HK.LIST23360": "Interactive media and services",  "HK.LIST23361": "Online Retailers",
+    "HK.LIST23362": "Payment services",  "HK.LIST23363": "Digital Solution Services",
+    "HK.LIST23364": "Internet services and infrastructure",  "HK.LIST23846": "Track and train equipment",
+    "HK.LIST23847": "Motorcycles and others",  "HK.LIST23848": "household consumables",
+    "HK.LIST23849": "dietary supplements",  "HK.LIST23850": "Skincare and cosmetics",
+    "HK.LIST23851": "Telecommunication network infrastructure",  "HK.LIST24340": "Pharmaceutical and Biotechnology Contract Services",
+    "HK.LIST24341": "Robotics Systems and Solutions",
+}
+
+
 # 代码侧修复（2026-11-20 用户复核发现）：原解析器只认独立纯数字行，漏掉合并行
 # 「Commercial & Professional Services 103010」「Telecommunications 3500」，并把
 # 350010/350020 错挂到医疗父级；名称还会混入描述文字或被换行截断。
@@ -157,21 +220,16 @@ def _norm(s: str) -> str:
 
 
 def _futu_boards() -> list:
-    """港股 INDUSTRY 板块（富途 code + 英文名）。
+    """港股 INDUSTRY 板块（富途 code + 英文名），直接读本文件固化的 FUTU_EN_NAME。
 
-    code 来自 build_sector_hierarchy._SECTOR_MAP 的键；英文名来自该文件**行尾注释**
-    （_SECTOR_MAP 的 value 是 (GICS一级, 中文名)，不含英文名）。单一真相源在
-    build_sector_hierarchy.py，本脚本只解析不复制，避免两处英文名漂移。
+    ⚠ 2026-11-23 改造：不再正则解析 build_sector_hierarchy._SECTOR_MAP 的行尾注释——
+    那是 GICS 展示层遗留、且靠注释传数据极脆弱。英文名改为 2026-11-23 从富途 API
+    英文版 get_plate_list(HK, INDUSTRY) 实测拉取的 113 个板块标准英文名，固化在
+    FUTU_EN_NAME。富途新增板块时手工往该 MAP 补一行即可。
     """
-    import pathlib
-    import build_sector_hierarchy as bsh
-    src = pathlib.Path(bsh.__file__).read_text()
-    en_by_code = dict(re.findall(r'"(HK\.LIST\d+)":\s*\([^)]*\),\s*#\s*(.+)$', src, re.M))
-    codes = [c for c in bsh._SECTOR_MAP if c.startswith("HK.")]
-    missing = [c for c in codes if c not in en_by_code]
-    if missing:
-        raise RuntimeError(f"富途板块缺英文名注释（无法匹配 HSICS）：{missing}")
-    return [(c, en_by_code[c]) for c in codes]
+    if len(FUTU_EN_NAME) < 100:
+        raise RuntimeError(f"富途英文名 MAP 只有 {len(FUTU_EN_NAME)} 项（预期 113），拒绝采集")
+    return list(FUTU_EN_NAME.items())
 
 
 def _build() -> tuple[list, list, list]:

@@ -12,14 +12,16 @@
 本域所有 enum 标签遵循「一个概念 = 一个 code」：
   · key_value 存**规范 code**，中文只作 label（查 profile.enum_value），不参与比较与关联。
     这样「上交所 / 上海证券交易所 / SSE / SH」四种写法被收敛成唯一 XSHG。
-  · 有外部权威体系的优先采用官方代码：交易所用 ISO 10383 MIC（XSHG/XSHE/XHKG/XBEI），
-    GICS 用官方英文标识（INFORMATION_TECHNOLOGY）。
+  · 有外部权威体系的优先采用官方代码：交易所用 ISO 10383 MIC（XSHG/XSHE/XHKG/XBEI）。
   · 已有权威表承载的值域（行业/概念/指数）不复制到字典，用 value_ref 声明引用。
+  · 阶段 C（2026-11-23）：行业归属改为 A 股申万 / 港股 HSICS 官方码（GICS 已废弃，D2）。
 
 数据来源：
     stock_info        股票基本信息（market / symbol / name / list_date / exchange_type）
     stock_sector      板块归属（INDUSTRY 行业 / INDEX 指数成分 / CONCEPT 概念）
-    sector_hierarchy  行业 → GICS 一级部门映射（富途板块 HK.LIST* 与证监会行业码 A01/C39 均覆盖）
+    regime.stock_sw_industry_mapping       A 股个股 → 申万三级行业（阶段 B 统一映射表）
+    regime.stock_hsics_industry_mapping    港股个股 → HSICS 三级行业
+    regime.{sw,hsics}_industry_classification   层级关系（parent 链）
 
 PIT 说明：stock_sector 只有当前快照（无历史归属版本），因此行业/指数/概念类标签
 pit_capable=False——历史 as_of 无法还原当时的归属，重算结果一律以「当前归属」为准，
@@ -264,68 +266,42 @@ def idt_listing_age_tier(as_of: date) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@tag(
-    code="idt_gics_sector", name="GICS一级部门", domain=DOMAIN,
-    value_type=ENUM,
-    # 引用型：值域由 sector_hierarchy 承载，落库存官方英文标识（parent_code），
-    # 中文名通过 enum_values 提供展示字典（label），不另立概念
-    value_ref="table:sector_hierarchy.parent_code",
-    enum_type="gics_sector",
-    enum_values={
-        "ENERGY":                 ("能源", None),
-        "MATERIALS":              ("原材料", None),
-        "INDUSTRIALS":            ("工业", None),
-        "CONSUMER_DISCRETIONARY": ("可选消费", None),
-        "CONSUMER_STAPLES":       ("必需消费", None),
-        "HEALTH_CARE":            ("医疗保健", None),
-        "FINANCIALS":             ("金融", None),
-        "INFORMATION_TECHNOLOGY": ("信息技术", None),
-        "COMMUNICATION":          ("通信服务", None),
-        "UTILITIES":              ("公用事业", None),
-        "REAL_ESTATE":            ("房地产", None),
-        "CONGLOMERATES":          ("综合企业", None),
-        "OTHER":                  ("其他", None),
-    },
-    source_type="external", update_freq="event",
-    data_sources=["stock_sector", "sector_hierarchy"],
-    compute_logic="stock_sector(sector_type=INDUSTRY) JOIN sector_hierarchy 取 parent_code（GICS 官方英文标识）。"
-                  "落库存 code，中文显示名查 profile.enum_value",
-    pit_capable=False, owner="profiling",
-)
-def idt_gics_sector(as_of: date) -> pd.DataFrame:
+def _idt_industry(as_of: date, level: int) -> pd.DataFrame:
+    """阶段 C：个股行业归属（申万/HSICS 统一映射表，level=1/2/3）。"""
     with _conn() as conn:
-        df = _read_sql(
-            conn,
-            """
-            SELECT ss.stock_code, sh.parent_code
-            FROM stock_sector ss
-            JOIN sector_hierarchy sh ON sh.sector_code = ss.sector_code
-            WHERE ss.sector_type = 'INDUSTRY' AND sh.parent_code IS NOT NULL
-            """,
-        )
-    return _frame(df["stock_code"], df["parent_code"])
+        from ..quantile import load_industry_map
+        df = load_industry_map(conn, level)
+    return _frame(df["stock_code"], df["industry_code"])
 
 
-@tag(
-    code="idt_industry", name="行业（细粒度）", domain=DOMAIN,
-    value_type=ENUM,
-    # 引用型：值域完全由 stock_sector 承载（A股=证监会行业，港股=富途行业板块），
-    # 两套体系并存是既有数据事实，由枚举类型自身区分，不在此处强行统一
-    value_ref="table:stock_sector.sector_name[sector_type=INDUSTRY]",
-    source_type="external", update_freq="event", data_sources=["stock_sector"],
-    compute_logic="stock_sector 中 sector_type=INDUSTRY 的 sector_name。"
-                  "注：A股为证监会行业（baostock，含行业码前缀如 C39），港股为富途行业板块名，"
-                  "两者体系不同，跨市场比较请用 idt_gics_sector",
-    pit_capable=False, owner="profiling",
-)
-def idt_industry(as_of: date) -> pd.DataFrame:
-    with _conn() as conn:
-        df = _read_sql(
-            conn,
-            "SELECT stock_code, sector_name FROM stock_sector "
-            "WHERE sector_type = 'INDUSTRY' AND sector_name IS NOT NULL AND sector_name <> ''",
-        )
-    return _frame(df["stock_code"], df["sector_name"])
+_IDT_DATA = ["regime.stock_sw_industry_mapping", "regime.stock_hsics_industry_mapping",
+             "regime.sw_industry_classification", "regime.hsics_industry_classification"]
+
+
+def _register_industry_tags() -> None:
+    def _make(level):
+        def wrapper(as_of: date) -> pd.DataFrame:
+            return _idt_industry(as_of, level)
+        wrapper.__name__ = f"idt_industry_l{level}"
+        return wrapper
+
+    for code, name, level in (
+        ("idt_ind1_sector", "一级行业", 1),
+        ("idt_ind2_sector", "二级行业", 2),
+        ("idt_industry", "行业（细粒度）", 3),
+    ):
+        tag(code=code, name=name, domain=DOMAIN, value_type=ENUM,
+            value_ref=("table:regime.sw_industry_classification.sw_code / "
+                       "regime.hsics_industry_classification.subsector_code"),
+            source_type="external", update_freq="event",
+            data_sources=list(_IDT_DATA),
+            compute_logic=f"个股→{'一级' if level == 1 else '二级' if level == 2 else '三级'}行业码："
+                          "A股读 stock_sw_industry_mapping、港股读 stock_hsics_industry_mapping，"
+                          "层级关系从分类表 parent 链 join（GICS 已废弃，D2）",
+            pit_capable=False, owner="profiling")(_make(level))
+
+
+_register_industry_tags()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

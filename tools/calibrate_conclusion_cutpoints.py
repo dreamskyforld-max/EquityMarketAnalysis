@@ -33,12 +33,13 @@ DOMAIN_CODES = {
                                  "hist_neutral_ind_cheap", "hist_neutral_ind_expensive",
                                  "loss", "negative"],
     "dim_quality_conclusion": ["solid", "high_but_volatile", "paper_profit",
-                               "leveraged", "weak", "deteriorating"],
+                               "leveraged", "moderate", "weak", "deteriorating"],
     "dim_growth_conclusion": ["fast_sustained", "fast_accelerating", "fast_decelerating",
                               "slow_steady", "contracting", "revenue_profit_divergent"],
     "dim_position_state": ["low_quiet", "low_volume_start", "trend_continuation",
                            "high_overheat", "downtrend_unresolved", "range_bound"],
     "biz_value_quality_type": ["quality_rel_cheap", "quality_rel_fair", "quality_rel_expensive",
+                               "moderate_rel_cheap", "moderate_rel_fair", "moderate_rel_expensive",
                                "value_trap_risk", "weak_and_expensive"],
     "biz_growth_quality_type": ["sustained_cash_backed", "cash_burning_expansion",
                                 "paper_growth", "one_off_like", "contraction"],
@@ -47,8 +48,9 @@ DOMAIN_CODES = {
 # 6 个结论判定用输入涉及的 L1 标签（§5 / §6 的 inputs[]）
 TAGS = [
     "val_pe_hist_pct", "val_pe_ind_pct", "val_pe_ttm_tier", "val_pb_tier",
-    "qal_roe_tier", "qal_roe_stability", "qal_earnings_quality", "qal_leverage_tier",
-    "grw_revenue_yoy_tier", "grw_profit_yoy_tier",
+    "qal_roe_ind1_tier", "qal_roe_stability_ind1", "qal_earnings_quality_ind1",
+    "qal_leverage_ind1_tier",
+    "grw_revenue_yoy_ind1_tier", "grw_profit_yoy_ind1_tier",
     "grw_growth_persistence", "grw_growth_accel",
     "tst_price_position_52w", "trd_momentum_12_1", "att_volume_surge",
 ]
@@ -57,8 +59,9 @@ TAGS = [
 P = {
     "coverage_min": 0.6,
     "cheap_pctl": 20, "expensive_pctl": 80,
-    "stable_max": 2, "volatile_min": 4, "quality_weak_max": 2,
+    "stable_max": 2, "volatile_min": 4, "quality_weak_max": 2, "quality_ok_min": 3,
     "leverage_high": 4, "roe_high": 4,
+    "moderate_min": 3, "moderate_max": 4, "roe_floor_pct": 5,
     "divergence_gap_tier": 2, "high_growth_min": 4, "persistence_min": 2,
     "low_pos_max": 2, "high_pos_min": 4, "vol_quiet_max": 0.5,
     "vol_active_min": 2.0, "weak_momentum_max": 2,
@@ -73,16 +76,17 @@ INPUTS = {
         ("negative_flag", "val_pb_tier", "kv"),
     ],
     "dim_quality_conclusion": [
-        ("roe_tier", "qal_roe_tier", "kv"),
-        ("roe_stability", "qal_roe_stability", "kv"),
-        ("earnings_quality_tier", "qal_earnings_quality", "kv"),
-        ("leverage_tier", "qal_leverage_tier", "kv"),
+        ("roe_tier", "qal_roe_ind1_tier", "kv"),
+        ("roe_stability", "qal_roe_stability_ind1", "kv"),
+        ("earnings_quality_tier", "qal_earnings_quality_ind1", "kv"),
+        ("leverage_tier", "qal_leverage_ind1_tier", "kv"),
+        ("roe_raw", "qal_roe_ind1_tier", "num"),
     ],
     "dim_growth_conclusion": [
-        ("rev_tier", "grw_revenue_yoy_tier", "kv"),
-        ("np_tier", "grw_profit_yoy_tier", "kv"),
-        ("rev_yoy", "grw_revenue_yoy_tier", "num"),
-        ("np_yoy", "grw_profit_yoy_tier", "num"),
+        ("rev_tier", "grw_revenue_yoy_ind1_tier", "kv"),
+        ("np_tier", "grw_profit_yoy_ind1_tier", "kv"),
+        ("rev_yoy", "grw_revenue_yoy_ind1_tier", "num"),
+        ("np_yoy", "grw_profit_yoy_ind1_tier", "num"),
         ("persistence", "grw_growth_persistence", "kv"),
         ("accel", "grw_growth_accel", "kv"),
     ],
@@ -114,6 +118,7 @@ def load_snapshot() -> tuple[dict, dict]:
             """
             SELECT DISTINCT ON (stock_code) stock_code, free_cash_flow
             FROM financial_indicator
+            WHERE free_cash_flow IS NOT NULL
             ORDER BY stock_code, report_date DESC
             """
         )
@@ -190,20 +195,27 @@ def judge_valuation(v):
 
 
 def judge_quality(v):
-    s, q, r, l = (v["roe_stability"], v["earnings_quality_tier"],
-                  v["roe_tier"], v["leverage_tier"])
-    if s is None or q is None or r is None or l is None:
+    """D21/v3（§5.2）：7 码；杠杆降级；ROE 绝对值底线；两个主锚至少一个有效。"""
+    s, q, r, l, rr = (v["roe_stability"], v["earnings_quality_tier"],
+                      v["roe_tier"], v["leverage_tier"], v["roe_raw"])
+    if r is None and q is None:
         return None
-    if s >= P["volatile_min"] and q <= P["quality_weak_max"]:
+    if s is not None and q is not None \
+            and s >= P["volatile_min"] and q <= P["quality_weak_max"]:
         return "deteriorating"
-    if q <= P["quality_weak_max"]:
+    if q is not None and q <= P["quality_weak_max"]:
         return "paper_profit"
-    if l >= P["leverage_high"]:
-        return "leveraged"
-    if r >= P["roe_high"] and s <= P["stable_max"]:
-        return "solid"
-    if r >= P["roe_high"]:
+    if r is not None and rr is not None and r >= P["roe_high"] \
+            and rr >= P["roe_floor_pct"]:
+        if s is not None and s <= P["stable_max"] \
+                and q is not None and q >= P["quality_ok_min"]:
+            return "solid"
         return "high_but_volatile"
+    if l is not None and l >= P["leverage_high"] \
+            and r is not None and r < P["roe_high"]:
+        return "leveraged"
+    if r is not None and P["moderate_min"] <= r <= P["moderate_max"]:
+        return "moderate"
     return "weak"
 
 
@@ -217,7 +229,7 @@ def judge_growth(v):
     if (ry is not None and ry < 0) or (ny is not None and ny < 0):
         return "contracting"
     if rt >= P["high_growth_min"] and nt >= P["high_growth_min"] \
-            and pe is not None and pe >= P["persistence_min"] and ac == "steady":
+            and pe is not None and pe >= P["persistence_min"]:
         return "fast_sustained"
     if rt >= P["high_growth_min"] and ac == "accelerating":
         return "fast_accelerating"
@@ -231,9 +243,11 @@ def judge_position(v):
     if pt is None or vr is None:
         return None
     # ma_alignment 本次快照缺失（需 v_daily_quote.close rolling 现算），
-    # 故只统计不依赖 ma_alignment 的三条规则，其余落兜底。
+    # POS-04（纯 bullish）无法统计、落兜底；POS-01 v3 起已不依赖 ma，可正常统计。
     if pt <= P["low_pos_max"] and vr <= P["vol_quiet_max"]:
         return "low_quiet"
+    if pt <= P["low_pos_max"] and vr >= P["vol_active_min"]:
+        return "low_volume_start"
     if pt >= P["high_pos_min"] and vr >= P["vol_active_min"]:
         return "high_overheat"
     if mt is not None and mt <= P["weak_momentum_max"]:
@@ -248,12 +262,14 @@ JUDGES = {
     "dim_position_state": judge_position,
 }
 
-VAL_CLASS = {"rel_cheap": "cheap", "hist_cheap_ind_expensive": "cheap",
+VAL_CLASS = {"rel_cheap": "cheap",
+             "hist_cheap_ind_expensive": "neutral",   # D22：单侧信号归中性
              "rel_fair": "neutral", "hist_expensive_ind_cheap": "neutral",
              "hist_cheap_ind_neutral": "neutral", "hist_expensive_ind_neutral": "neutral",
              "hist_neutral_ind_cheap": "neutral", "hist_neutral_ind_expensive": "neutral",
              "rel_expensive": "expensive", "loss": "no_anchor", "negative": "no_anchor"}
 QAL_CLASS = {"solid": "solid", "high_but_volatile": "volatile",
+             "moderate": "moderate",   # D22：单开中等档
              "paper_profit": "weak", "leveraged": "weak",
              "weak": "weak", "deteriorating": "weak"}
 
@@ -293,12 +309,19 @@ def main():
         qal = l2.get("dim_quality_conclusion", {}).get(stock)
         if val and qal:
             vq_total += 1
-            vc, qc = VAL_CLASS[val], QAL_CLASS[qal]
-            if vc == "no_anchor" or (vc == "neutral" and qc != "solid"):
+            qc = QAL_CLASS.get(qal)
+            if qc is None:
+                continue
+            vc = VAL_CLASS[val]
+            # D22：neutral 下只有 solid/moderate 有明确交叉特征；volatile/weak 不发布
+            if vc == "no_anchor" or (vc == "neutral" and qc not in ("solid", "moderate")):
                 continue  # 整行不发布
-            key = {( "cheap", "solid"): "quality_rel_cheap",
+            key = {("cheap", "solid"): "quality_rel_cheap",
+                   ("cheap", "moderate"): "moderate_rel_cheap",
                    ("neutral", "solid"): "quality_rel_fair",
-                   ("expensive", "solid"): "quality_rel_expensive"}.get((vc, qc))
+                   ("neutral", "moderate"): "moderate_rel_fair",
+                   ("expensive", "solid"): "quality_rel_expensive",
+                   ("expensive", "moderate"): "moderate_rel_expensive"}.get((vc, qc))
             if key is None:
                 key = "weak_and_expensive" if vc == "expensive" else "value_trap_risk"
             vq[key] += 1
@@ -306,7 +329,7 @@ def main():
         grow = l2.get("dim_growth_conclusion", {}).get(stock)
         if grow:
             gq_total += 1
-            q = _int(data.get(("qal_earnings_quality", "kv")))
+            q = _int(data.get(("qal_earnings_quality_ind1", "kv")))
             sign = fcf.get(stock)
             pe = _int(data.get(("grw_growth_persistence", "kv")))
             ac = data.get(("grw_growth_accel", "kv"))
@@ -319,8 +342,9 @@ def main():
             elif pe is not None and pe <= 1 and ac == "accelerating" \
                     and grow in ("fast_accelerating", "fast_sustained"):
                 gq["one_off_like"] += 1
-            else:
+            elif sign is not None and sign >= 0:
                 gq["sustained_cash_backed"] += 1
+            # 否则 FCF 缺失/为负且未命中前述 → 整行不发布（GQ-99）
     report("biz_value_quality_type", vq, vq_total, sum(vq.values()))
     report("biz_growth_quality_type", gq, gq_total, sum(gq.values()))
 

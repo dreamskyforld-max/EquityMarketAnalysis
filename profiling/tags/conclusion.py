@@ -5,7 +5,7 @@
 由 profiling.conclusions.producer 统一生产，不走 engine.compute_tag()。
 compute_profile.py / profiling/run.py 的逐标签循环必须按 source_type 跳过它们。
 
-值域（39 个 code / label / short_label）以文档附录 D 为唯一真相源；
+值域（D21 实施后 40 个 code / label / short_label）以文档附录 D 与 §5.2 规则表为唯一真相源；
 规则契约（inputs/derived_fields/params/rules/output_schema）以
 profiling.conclusions.rules.RULES 为唯一可执行真源。
 
@@ -39,16 +39,17 @@ QUALITY_ENUM = {
     "solid": ("盈利稳且现金实", "稳且现金实"),
     "high_but_volatile": ("盈利高但波动大", "高但波动"),
     "paper_profit": ("利润高但现金转化弱", "现金转化弱"),
-    "leveraged": ("高杠杆支撑", "高杠杆"),
+    "leveraged": ("高负债率支撑", "高负债率"),
+    "moderate": ("盈利水平中等", "盈利中等"),   # D21 新增：承接原 weak 中的中游公司
     "weak": ("盈利水平偏弱", "盈利偏弱"),
     "deteriorating": ("稳定性与真实性均偏弱", "质量均偏弱"),
 }
 
 GROWTH_ENUM = {
-    "fast_sustained": ("高增速且持续", "高且持续"),
+    "fast_sustained": ("高增速且持续", "高增速且持续"),
     "fast_accelerating": ("增速抬升", "增速抬升"),
     "fast_decelerating": ("增速放缓", "增速放缓"),
-    "slow_steady": ("低速但稳", "低速稳"),
+    "slow_steady": ("低速但稳", "低增速但稳"),
     "contracting": ("负增长", "负增长"),
     "revenue_profit_divergent": ("增收不增利或反之", "增收增利背离"),
 }
@@ -56,18 +57,21 @@ GROWTH_ENUM = {
 POSITION_ENUM = {
     "low_quiet": ("低位缩量", "低位缩量"),
     "low_volume_start": ("低位放量", "低位放量"),
-    "trend_continuation": ("趋势段内运行", "趋势段内"),
+    "trend_continuation": ("均线多头排列", "均线多头"),
     "high_overheat": ("高位过热", "高位过热"),
     "downtrend_unresolved": ("下跌未止", "下跌未止"),
     "range_bound": ("区间震荡", "区间震荡"),
 }
 
 VALUE_QUALITY_ENUM = {
-    "quality_rel_cheap": ("盈利稳且价格相对偏低", "稳且偏低"),
-    "quality_rel_fair": ("盈利稳价格中性", "稳且中性"),
-    "quality_rel_expensive": ("盈利稳但价格相对偏贵", "稳且偏高"),
-    "value_trap_risk": ("相对偏便宜但盈利质量走弱（价值陷阱嫌疑）", "价值陷阱嫌疑"),
-    "weak_and_expensive": ("盈利质量弱且价格相对偏贵", "弱且偏高"),
+    "quality_rel_cheap": ("盈利稳且价格相对偏低", "盈利稳价格低"),
+    "quality_rel_fair": ("盈利稳价格中性", "盈利稳价格中"),
+    "quality_rel_expensive": ("盈利稳但价格相对偏贵", "盈利稳价格高"),
+    "moderate_rel_cheap": ("盈利中等且价格相对偏低", "盈利中价格低"),
+    "moderate_rel_fair": ("盈利中等且价格中性", "盈利中价格中"),
+    "moderate_rel_expensive": ("盈利中等但价格相对偏贵", "盈利中价格高"),
+    "value_trap_risk": ("盈利质量弱且价格相对偏低", "盈利弱价格低"),
+    "weak_and_expensive": ("盈利质量弱且价格相对偏贵", "盈利弱价格高"),
 }
 
 GROWTH_QUALITY_ENUM = {
@@ -97,7 +101,7 @@ def _no_direct_compute(name: str):
                   "单侧四格按各自位置单列中性码，双中性格判相对中性。"
                   "LOSS/NEGATIVE 业务码豁免 G1 直接发布。横截面分位不等于绝对贵贱。"
                   + _DISCLAIMER,
-    parent_tag="val_pe_hist_pct", version="v3", pit_capable=True,
+    parent_tag="val_pe_hist_pct", version="v4", pit_capable=True,   # D20：行业分位换二级 + 档位派生
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def dim_valuation_conclusion(as_of: date):
@@ -108,10 +112,12 @@ def dim_valuation_conclusion(as_of: date):
     code="dim_quality_conclusion", name="盈利质量结论", domain="盈利质量",
     value_type=ENUM, enum_type="quality_conclusion", enum_values=QUALITY_ENUM,
     source_type="derived", update_freq="quarterly",
-    data_sources=["qal_roe_tier", "qal_roe_stability", "qal_earnings_quality", "qal_leverage_tier"],
-    compute_logic="盈利水平 × 稳定性 × 现金转化真实性三腿合取；杠杆单独降级。"
+    data_sources=["qal_roe_ind1_tier", "qal_roe_stability_ind1",
+                  "qal_earnings_quality_ind1", "qal_leverage_ind1_tier"],
+    compute_logic="五项输入全取一级行业口径：ROE 档 × ROE 波动档 × 现金转化档三腿合取；"
+                  "杠杆仅在没有高 ROE 时降级；ROE 绝对值低于底线最高只能评盈利中等。"
                   "描述的是财报特征，不评价证券好坏。" + _DISCLAIMER,
-    parent_tag="qal_roe_tier", version="v2", pit_capable=False,
+    parent_tag="qal_roe_ind1_tier", version="v3", pit_capable=False,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def dim_quality_conclusion(as_of: date):
@@ -122,11 +128,11 @@ def dim_quality_conclusion(as_of: date):
     code="dim_growth_conclusion", name="成长结论", domain="成长特征",
     value_type=ENUM, enum_type="growth_conclusion", enum_values=GROWTH_ENUM,
     source_type="derived", update_freq="quarterly",
-    data_sources=["grw_revenue_yoy_tier", "grw_profit_yoy_tier",
+    data_sources=["grw_revenue_yoy_ind1_tier", "grw_profit_yoy_ind1_tier",
                   "grw_growth_persistence", "grw_growth_accel"],
-    compute_logic="增速档 × 持续性 × 加速度 → 状态；营收档与净利档背离优先单列。"
-                  "现状判断，非未来增速预测。" + _DISCLAIMER,
-    parent_tag="grw_revenue_yoy_tier", version="v2", pit_capable=False,
+    compute_logic="营收/净利增速档取一级行业口径；增速档 × 持续性 × 加速度 → 状态；"
+                  "营收档与净利档背离优先单列。现状判断，非未来增速预测。" + _DISCLAIMER,
+    parent_tag="grw_revenue_yoy_ind1_tier", version="v4", pit_capable=False,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def dim_growth_conclusion(as_of: date):
@@ -139,7 +145,7 @@ def dim_growth_conclusion(as_of: date):
     source_type="derived", update_freq="daily",
     data_sources=["tst_price_position_52w", "trd_momentum_12_1", "att_volume_surge", "v_daily_quote"],
     compute_logic="确定性条件合取 + 游程标注（裸判，不加滞回状态机）。" + _DISCLAIMER,
-    parent_tag="tst_price_position_52w", version="v2", pit_capable=True,
+    parent_tag="tst_price_position_52w", version="v3", pit_capable=True,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def dim_position_state(as_of: date):
@@ -151,9 +157,10 @@ def dim_position_state(as_of: date):
     value_type=ENUM, enum_type="value_quality_type", enum_values=VALUE_QUALITY_ENUM,
     source_type="derived", update_freq="daily",
     data_sources=["dim_valuation_conclusion", "dim_quality_conclusion"],
-    compute_logic="估值 × 盈利质量 3×3 交叉矩阵；无估值锚或无明确交叉特征的 cell 整行不发布。"
+    compute_logic="估值三类 × 盈利质量四类（solid/volatile/moderate/weak）交叉矩阵；"
+                  "无估值锚或无明确交叉特征的 cell 整行不发布。"
                   + _DISCLAIMER,
-    parent_tag="dim_valuation_conclusion", version="v2", pit_capable=False,
+    parent_tag="dim_valuation_conclusion", version="v3", pit_capable=False,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def biz_value_quality_type(as_of: date):
@@ -164,9 +171,10 @@ def biz_value_quality_type(as_of: date):
     code="biz_growth_quality_type", name="增长质量", domain="综合研判",
     value_type=ENUM, enum_type="growth_quality_type", enum_values=GROWTH_QUALITY_ENUM,
     source_type="derived", update_freq="quarterly",
-    data_sources=["dim_growth_conclusion", "qal_earnings_quality", "financial_indicator"],
-    compute_logic="增速状态 × 现金转化 × FCF 符号 → 类型码；背离优先于增速。" + _DISCLAIMER,
-    parent_tag="dim_growth_conclusion", version="v2", pit_capable=False,
+    data_sources=["dim_growth_conclusion", "qal_earnings_quality_ind1", "financial_indicator"],
+    compute_logic="增速状态 × 一级行业现金转化档 × FCF 符号 → 类型码；背离优先于增速。"
+                  "正面码须有非负 FCF 实证，FCF 缺失或为负时不发布。" + _DISCLAIMER,
+    parent_tag="dim_growth_conclusion", version="v3", pit_capable=False,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def biz_growth_quality_type(as_of: date):

@@ -125,7 +125,7 @@
 | S6 | `financial_indicator` | 股票×报告期；`revenue/net_profit/gross_profit_rate/roe/net_profit_yoy/revenue_yoy/.../announce_date` | 行业基本面聚合（PIT 按 `announce_date` 取用） | ✅ **可直接用**（季度，周一全量）；⚠ 频率台阶，须按混合频率处理 |
 | S7 | `a_daily_quote` / `hk_daily_quote`（`v_daily_quote`） | 股票×日；QFQ `close`、`amount`、`turnover_rate`、`pe_ttm_ratio`、`pb_ratio`、`circular_market_val` | 行业内宽度 / 离散度 / 估值离散 / 成交额占比 / 拥挤度 | ✅ **数据有**，但**缺股票→行业的 PIT 映射**（见 D1） |
 | S8 | `stock_sector` | 股票×板块多值，**无日期列**，刷新时先 DELETE 全量写 | 板块归属（当前快照） | ❌ **不可直接用于历史**：指数/概念成分、非行业分类；⚠ 阶段 0 实测 **`weight` 12,509 行全部为 NULL**（`get_stock_sector_weight.py` 的 PDF 权重未落本机库）；`INDUSTRY` 7,992 行 / 196 个板块是 BaoStock 证监会代码（`C39` 等）+ 富途港股板块，**不是申万分类**；无 `as_of` → 前视 / 幸存者偏差 |
-| S9 | `sector_hierarchy` | 板块一行；`parent_code` = GICS 11 部门 | 展示层 A/H 统一标签 | ⚠ 静态、**未挂调度**、非股票级、无 `as_of`（`build_sector_hierarchy.py`） |
+| S9 | ~~`sector_hierarchy`~~（D2/D18 已删除） | 原为板块→GICS 11 部门展示映射 | — | 已废弃：GICS 取消，个股↔行业改由 `regime.stock_sw_industry_mapping` / `stock_hsics_industry_mapping` 统一承载 |
 | S10 | `daily_ggt_hold` / `daily_margin_balance` / `daily_short_selling` / `daily_buyback_event` | 股票×日 | 港股南向按行业、A 股两融/卖空按行业 | ⚠ 可按 `stock_code` join `stock_sector`，但同样受当前成分偏差约束；阶段 0 实测南向 **2026-04-20 起仅 136 个交易日**（不足 1 年），回填不可行 |
 | S11 | `daily_market_turnover` / `a_daily_market_turnover` / `daily_northbound_flow` | **市场级，无 `stock_code`** | 分母（成交额） | ⚠ 不能按股票关联；北向已封存 |
 
@@ -611,9 +611,9 @@ L1 原子指标（逐行业逐日，raw + 横截面分位 + 时序分位）
 | `hk_sector_index.py` | **新增**数据层 D4：按月 × 按股票(1000 只/批)双层分批、充分统计量跨批无损合并、M8 两版指数、增量接续 `idx_eq/idx_cap`、南向聚合、`--verify` 一致性 + 两版差异报告、CLI |
 | `sector_layer_hk.py` | **新增**指标层：25 条定义（24 active）、六维定义（4 启用）、L1/L2/L3、`hk1.0` 仅作口径标注（hash 已统一）、2 年分块 + 10 天切片、任务埋点、CLI |
 | `sql/schema.sql` / `regime_schema.py` | 追加第 **27** 号表 + 索引 + COMMENT，**逐字双同步**；字典 PK 扩为 `(market_scope, classification, indicator_code)`；新增 `_migrate_sector_dict_pk()` 幂等迁移、`_SECTOR_DDL_KEYS` / `_SECTOR_COMMENTS` 登记 |
-| `build_sector_hierarchy.py` | 补 `as_of` 列 / 注释 / 幂等 `ALTER`；`run(codes=None, ctx=None)` 兼容调度器进程内调用 |
+| ~~`build_sector_hierarchy.py`~~（D2/D18 已删除） | 原 GICS 展示层映射脚本；英文名来源已迁到 `get_hsics_industry_classification.FUTU_EN_NAME` |
 | `sector_layer.py` | **CN 侧唯一改动**：`sync_dict` 冲突键扩为三列（口径与 `params_hash` 完全不变） |
-| `market_scheduler.py` | 注册「行业层级映射」周二 **18:30**（紧跟 `get_stock_sector.py` 18:00） |
+| `market_scheduler.py` | ~~注册「行业层级映射」周二 18:30~~（D2/D18 已移除：GICS 废弃）；现由 `get_stock_sw_industry_mapping.py` 每日 08:20 / `get_stock_hsics_industry_mapping.py` 每日 08:17 维护统一映射 |
 | `monitor_collector.py` | `_SEED_TASK_CONFIG` 加「行业配置计算HK」；`_REGIME_TABLE_CONFIG` 登记表 27；CN 日历共表残差注释 |
 | `system/sector-layer.service` 第二个 `ExecStart` | CN 完成后串行跑 HK；与 CN 共用单一 512M cgroup，取消原 19:20 错峰单元 |
 | `deploy.sh` / `bootstrap.sh` | `TIMERS` / `units` / `enable --now` 接线 |

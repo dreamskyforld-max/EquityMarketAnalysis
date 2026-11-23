@@ -39,9 +39,8 @@ import pandas as pd
 
 from ..registry import tag, TIER, PLANNED_NO_DATA
 from ..quantile import (
-    QUOTE_TABLES, load_quote_snapshot, load_financial_latest, load_gics_map,
-    load_gics_group_map, assign_tier, historical_percentile, tier_or_flag,
-    load_financial_ttm,
+    QUOTE_TABLES, load_quote_snapshot, load_financial_latest, load_industry_map,
+    assign_tier, historical_percentile, tier_or_flag, load_financial_ttm,
 )
 from ._base import _conn, _read_sql, _frame
 
@@ -70,10 +69,6 @@ def _pct_to_tier(pct: pd.Series, n_tiers: int = 5) -> pd.Series:
         tier = np.ceil(p[valid] / (100.0 / n_tiers)).clip(1, n_tiers).astype(int)
         out[valid] = tier.astype(str)
     return out
-
-
-def _market_industry_key(market: pd.Series, gics: pd.Series) -> pd.Series:
-    return market.astype(str) + "|" + gics.astype(str)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -116,79 +111,135 @@ def val_pb_tier(as_of: date) -> pd.DataFrame:
     return _frame(snap["stock_code"], tier, snap["pb"])
 
 
-@tag(
-    code="val_ps_ttm_tier", name="PS(TTM)档", domain=DOMAIN,
-    num_unit="x",
-    value_type=TIER,
-    value_range={**_TIER_RANGE, "NEGATIVE": "营收为负或无效，不参与分档"},
-    source_type="stat", update_freq="daily",
-    data_sources=["a_daily_quote", "hk_daily_quote", "financial_indicator",
-                  "stock_sector", "sector_hierarchy"],
-    compute_logic="PS(TTM) = 总市值 / 滚动12个月营收，在【市场+GICS】内做横截面五等分；"
-                  "非正值打 NEGATIVE。刻意不用全市场分组：PS 由商业模式决定"
-                  "（零售 0.2x vs 软件 10x），全市场档测量的主要是行业毛利结构而非贵贱。"
-                  "num_value 存 PS 原值。"
-                  "分子取行情表 total_market_val（日采必写），分母取 load_revenue_ttm"
-                  "——TTM 口径仅此一处定义，标签不含自己的公式",
-    pit_capable=False,  # financial_indicator 只有 report_date 无披露日
-    owner="profiling",
-)
-def val_ps_ttm_tier(as_of: date) -> pd.DataFrame:
+def _val_ps_ttm(as_of: date, level: int) -> pd.DataFrame:
+    """PS(TTM) 行业分档内部实现（level=1 一级 / 2 二级，D2 一/二级并存）。"""
     with _conn() as conn:
         snap = load_quote_snapshot(conn, as_of)
-        gics_map = load_gics_map(conn)
+        ind_map = load_industry_map(conn, level)
         ttm = load_financial_ttm(conn, as_of)
 
     df = snap[["stock_code", "market", "total_market_val"]].copy()
     df["total_market_val"] = pd.to_numeric(df["total_market_val"], errors="coerce")
     df = df.merge(ttm[["stock_code", "rev_ttm"]], on="stock_code", how="inner")
-    df = df.merge(gics_map, on="stock_code", how="inner")
+    df = df.merge(ind_map[["stock_code", "industry_code"]], on="stock_code", how="inner")
     df = df[(df["total_market_val"] > 0) & df["rev_ttm"].notna() & (df["rev_ttm"] != 0)]
 
     ps = df["total_market_val"] / df["rev_ttm"]
-    grp = df["market"].astype(str) + "|" + df["gics"].astype(str)
+    grp = df["market"].astype(str) + "|" + df["industry_code"].astype(str)
     tier = tier_or_flag(ps, by=grp, flag="NEGATIVE")
     return _frame(df["stock_code"], tier, ps.round(4))
 
 
-@tag(
-    code="val_pcf_ttm_tier", name="PCF(TTM)档", domain=DOMAIN,
-    num_unit="x",
-    value_type=TIER,
-    value_range={**_TIER_RANGE, "NEGATIVE": "经营现金流为负，不参与分档"},
+_PS_COMMON = dict(
+    domain=DOMAIN, num_unit="x", value_type=TIER,
+    value_range={**_TIER_RANGE, "NEGATIVE": "营收为负或无效，不参与分档"},
     source_type="stat", update_freq="daily",
     data_sources=["a_daily_quote", "hk_daily_quote", "financial_indicator",
-                  "stock_sector", "sector_hierarchy"],
-    compute_logic="PCF(TTM) = 总市值 / 滚动12个月经营现金流，在【市场+GICS】内做横截面五等分；"
-                  "非正值打 NEGATIVE。与 PS 同理：重资产行业的折旧摊销加回会系统性抬高 OCF，"
-                  "全市场比较无意义。PCF 比 PE 更难被会计操纵，适合行业内与 PE 交叉验证。"
-                  "num_value 存 PCF 原值。分子取行情表 total_market_val，分母取 load_revenue_ttm"
-                  "（TTM 口径唯一实现）",
-    pit_capable=False,  # financial_indicator 只有 report_date 无披露日
-    owner="profiling",
+                  "regime.stock_sw_industry_mapping", "regime.stock_hsics_industry_mapping"],
+    pit_capable=False, owner="profiling",
 )
-def val_pcf_ttm_tier(as_of: date) -> pd.DataFrame:
+
+
+@tag(code="val_ps_ttm_ind1_tier", name="PS(TTM)一级行业档", compute_logic=
+     "PS=总市值/滚动12月营收，在【市场+申万/HSICS 一级行业】内横截面五等分；非正值 NEGATIVE。"
+     "num_value 存 PS 原值。分组来自阶段 B 统一映射表，层级关系从分类表 parent 链 join",
+     **_PS_COMMON)
+def val_ps_ttm_ind1_tier(as_of: date) -> pd.DataFrame:
+    return _val_ps_ttm(as_of, 1)
+
+
+@tag(code="val_ps_ttm_ind2_tier", name="PS(TTM)二级行业档", compute_logic=
+     "PS=总市值/滚动12月营收，在【市场+申万/HSICS 二级行业】内横截面五等分；非正值 NEGATIVE。"
+     "num_value 存 PS 原值。分组来自阶段 B 统一映射表，层级关系从分类表 parent 链 join",
+     **_PS_COMMON)
+def val_ps_ttm_ind2_tier(as_of: date) -> pd.DataFrame:
+    return _val_ps_ttm(as_of, 2)
+
+
+def _val_pcf_ttm(as_of: date, level: int) -> pd.DataFrame:
+    """PCF(TTM) 行业分档内部实现（level=1/2）。"""
     with _conn() as conn:
         snap = load_quote_snapshot(conn, as_of)
-        gics_map = load_gics_map(conn)
+        ind_map = load_industry_map(conn, level)
         ttm = load_financial_ttm(conn, as_of)
 
     df = snap[["stock_code", "market", "total_market_val"]].copy()
     df["total_market_val"] = pd.to_numeric(df["total_market_val"], errors="coerce")
     df = df.merge(ttm[["stock_code", "ocf_ttm"]], on="stock_code", how="inner")
-    df = df.merge(gics_map, on="stock_code", how="inner")
+    df = df.merge(ind_map[["stock_code", "industry_code"]], on="stock_code", how="inner")
     df = df[(df["total_market_val"] > 0) & df["ocf_ttm"].notna() & (df["ocf_ttm"] != 0)]
 
     pcf = df["total_market_val"] / df["ocf_ttm"]
-    grp = df["market"].astype(str) + "|" + df["gics"].astype(str)
+    grp = df["market"].astype(str) + "|" + df["industry_code"].astype(str)
     tier = tier_or_flag(pcf, by=grp, flag="NEGATIVE")
     return _frame(df["stock_code"], tier, pcf.round(4))
 
 
-@tag(
-    code="val_peg_tier", name="PEG(TTM)档", domain=DOMAIN,
-    num_unit="x",
-    value_type=TIER,
+_PCF_COMMON = dict(
+    domain=DOMAIN, num_unit="x", value_type=TIER,
+    value_range={**_TIER_RANGE, "NEGATIVE": "经营现金流为负，不参与分档"},
+    source_type="stat", update_freq="daily",
+    data_sources=["a_daily_quote", "hk_daily_quote", "financial_indicator",
+                  "regime.stock_sw_industry_mapping", "regime.stock_hsics_industry_mapping"],
+    pit_capable=False, owner="profiling",
+)
+
+
+@tag(code="val_pcf_ttm_ind1_tier", name="PCF(TTM)一级行业档", compute_logic=
+     "PCF=总市值/滚动12月经营现金流，在【市场+申万/HSICS 一级行业】内横截面五等分；"
+     "非正值 NEGATIVE。num_value 存 PCF 原值。分组来自阶段 B 统一映射表",
+     **_PCF_COMMON)
+def val_pcf_ttm_ind1_tier(as_of: date) -> pd.DataFrame:
+    return _val_pcf_ttm(as_of, 1)
+
+
+@tag(code="val_pcf_ttm_ind2_tier", name="PCF(TTM)二级行业档", compute_logic=
+     "PCF=总市值/滚动12月经营现金流，在【市场+申万/HSICS 二级行业】内横截面五等分；"
+     "非正值 NEGATIVE。num_value 存 PCF 原值。分组来自阶段 B 统一映射表",
+     **_PCF_COMMON)
+def val_pcf_ttm_ind2_tier(as_of: date) -> pd.DataFrame:
+    return _val_pcf_ttm(as_of, 2)
+
+
+def _val_peg(as_of: date, level: int) -> pd.DataFrame:
+    """PEG(TTM) 行业分档内部实现（level=1/2）。"""
+    with _conn() as conn:
+        snap = load_quote_snapshot(conn, as_of)
+        ind_map = load_industry_map(conn, level)
+        ttm = load_financial_ttm(conn, as_of)
+
+    df = snap[["stock_code", "market", "pe_ttm"]].copy()
+    df["pe_ttm"] = pd.to_numeric(df["pe_ttm"], errors="coerce")
+    df = df.merge(ttm[["stock_code", "np_ttm", "np_ttm_prev", "np_ttm_yoy"]],
+                  on="stock_code", how="inner")
+    df = df.merge(ind_map[["stock_code", "industry_code"]], on="stock_code", how="inner")
+    df = df[df["pe_ttm"].notna()]
+
+    pe = df["pe_ttm"]
+    yoy = df["np_ttm_yoy"]
+    prev_np = pd.to_numeric(df["np_ttm_prev"], errors="coerce")
+    np_now = pd.to_numeric(df["np_ttm"], errors="coerce")
+
+    peg = pe / yoy.where(yoy != 0)
+
+    key = pd.Series(pd.NA, index=df.index, dtype="object")
+    loss = pe <= 0
+    turn = (~loss) & (prev_np <= 0) & (np_now > 0)
+    decline = (~loss) & (~turn) & (yoy <= 0)
+    key[loss] = "LOSS"
+    key[turn] = "TURNAROUND"
+    key[decline] = "DECLINE"
+
+    pos = (~loss) & (~turn) & (yoy > 0)
+    if pos.any():
+        grp = df.loc[pos, "market"].astype(str) + "|" + df.loc[pos, "industry_code"].astype(str)
+        key[pos] = assign_tier(peg[pos], 5, by=grp)
+
+    return _frame(df["stock_code"], key, peg.round(4))
+
+
+_PEG_COMMON = dict(
+    domain=DOMAIN, num_unit="x", value_type=TIER,
     value_range={
         **_TIER_RANGE,
         "LOSS": "PE≤0（亏损），PEG 无意义",
@@ -197,57 +248,27 @@ def val_pcf_ttm_tier(as_of: date) -> pd.DataFrame:
     },
     source_type="stat", update_freq="daily",
     data_sources=["a_daily_quote", "hk_daily_quote", "financial_indicator",
-                  "stock_sector", "sector_hierarchy"],
-    compute_logic="PEG = PE(TTM) ÷ 净利 TTM 同比增速(%)，在【市场+GICS】内横截面五等分："
-                  "1=组内最便宜（性价比最高），5=最贵。增速按**百分数数值**代入"
-                  "（增速 20% 记 20，不是 0.2，否则数值差 100 倍）。"
-                  "分子 pe_ttm 取行情表（外部源直供、日采必写）；净利 TTM 与 TTM 同比取"
-                  "load_financial_ttm（累计口径还原为滚动 12 个月后同比，与 PE(TTM) 同期限，"
-                  "全仓唯一实现）。"
-                  "仅 PE>0 且增速>0 的象限参与分档；PE≤0 打 LOSS、增速≤0 打 DECLINE、"
-                  "扭亏（上年同期 TTM≤0）打 TURNAROUND。num_value 存 PEG 原值（可能为负，"
-                  "含义由 key_value 的 flag 表达）。"
-                  "注：本标签为**历史（trailing）PEG**，用已实现增速，非一致预期口径。"
-                  "另注意小基数/扭亏带来的增速极值会把 PEG 压到 0.0x（rank 分位对此免疫），"
-                  "筛选时建议结合 num_value 复核",
-    pit_capable=False,  # financial_indicator 只有 report_date 无披露日
-    owner="profiling",
+                  "regime.stock_sw_industry_mapping", "regime.stock_hsics_industry_mapping"],
+    pit_capable=False, owner="profiling",
 )
-def val_peg_tier(as_of: date) -> pd.DataFrame:
-    with _conn() as conn:
-        snap = load_quote_snapshot(conn, as_of)
-        gics_map = load_gics_map(conn)
-        ttm = load_financial_ttm(conn, as_of)
 
-    df = snap[["stock_code", "market", "pe_ttm"]].copy()
-    df["pe_ttm"] = pd.to_numeric(df["pe_ttm"], errors="coerce")
-    df = df.merge(ttm[["stock_code", "np_ttm", "np_ttm_prev", "np_ttm_yoy"]],
-                  on="stock_code", how="inner")
-    df = df.merge(gics_map, on="stock_code", how="inner")
-    df = df[df["pe_ttm"].notna()]
 
-    pe = df["pe_ttm"]
-    yoy = df["np_ttm_yoy"]
-    prev_np = pd.to_numeric(df["np_ttm_prev"], errors="coerce")
-    np_now = pd.to_numeric(df["np_ttm"], errors="coerce")
+@tag(code="val_peg_ind1_tier", name="PEG(TTM)一级行业档", compute_logic=
+     "PEG=PE(TTM)÷净利TTM同比增速(%)，在【市场+申万/HSICS 一级行业】内横截面五等分；"
+     "增速按百分数数值代入；PE≤0 打 LOSS、增速≤0 打 DECLINE、扭亏打 TURNAROUND。"
+     "num_value 存 PEG 原值。历史(trailing)口径，非一致预期",
+     **_PEG_COMMON)
+def val_peg_ind1_tier(as_of: date) -> pd.DataFrame:
+    return _val_peg(as_of, 1)
 
-    # PEG 原值：增速可算且非 0 时给出（含负值，供复核；档位含义由 key_value 表达）
-    peg = pe / yoy.where(yoy != 0)
 
-    key = pd.Series(pd.NA, index=df.index, dtype="object")
-    loss = pe <= 0
-    turn = (~loss) & (prev_np <= 0) & (np_now > 0)      # 扭亏：增速无定义
-    decline = (~loss) & (~turn) & (yoy <= 0)
-    key[loss] = "LOSS"
-    key[turn] = "TURNAROUND"
-    key[decline] = "DECLINE"
-
-    pos = (~loss) & (~turn) & (yoy > 0)
-    if pos.any():
-        grp = _market_industry_key(df.loc[pos, "market"], df.loc[pos, "gics"])
-        key[pos] = assign_tier(peg[pos], 5, by=grp)
-
-    return _frame(df["stock_code"], key, peg.round(4))
+@tag(code="val_peg_ind2_tier", name="PEG(TTM)二级行业档", compute_logic=
+     "PEG=PE(TTM)÷净利TTM同比增速(%)，在【市场+申万/HSICS 二级行业】内横截面五等分；"
+     "增速按百分数数值代入；PE≤0 打 LOSS、增速≤0 打 DECLINE、扭亏打 TURNAROUND。"
+     "num_value 存 PEG 原值。历史(trailing)口径，非一致预期",
+     **_PEG_COMMON)
+def val_peg_ind2_tier(as_of: date) -> pd.DataFrame:
+    return _val_peg(as_of, 2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -255,56 +276,78 @@ def val_peg_tier(as_of: date) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@tag(
-    code="val_pe_ind_pct", name="PE行业分位", domain=DOMAIN,
-    num_unit="percentile_0_100",
-    value_type=TIER, value_range=dict(_PCT_RANGE),
-    source_type="stat", update_freq="daily",
-    data_sources=["a_daily_quote", "hk_daily_quote", "stock_sector", "sector_hierarchy"],
-    compute_logic="在【市场 + GICS 部门】内对 PE(TTM) 算横截面百分位，再切成五档："
-                  "1=行业内最便宜20%，5=行业内最贵20%。num_value 存百分位(0-100)。"
-                  "仅正 PE 参与，亏损股不打标",
-    pit_capable=True, owner="profiling",
-)
-def val_pe_ind_pct(as_of: date) -> pd.DataFrame:
+def _ind_pct(as_of: date, level: int, value_col: str) -> pd.DataFrame:
+    """行业横截面百分位分档内部实现（PE/PB 共用；level=1/2）。
+
+    分组来自阶段 B 统一映射表（申万/HSICS），一/二级从分类表 parent 链 join。
+    num_value 为百分位 0-100（这类标签本就是分位标签，与 PS/PCF/PEG 的原值语义不同）。
+    """
     with _conn() as conn:
         snap = load_quote_snapshot(conn, as_of)
-        gics_map = load_gics_map(conn)
+        ind_map = load_industry_map(conn, level)
 
-    df = snap[["stock_code", "market", "pe_ttm"]].merge(gics_map, on="stock_code", how="inner")
-    df = df[df["pe_ttm"] > 0]
-
-    grp = _market_industry_key(df["market"], df["gics"])
-    pct = df["pe_ttm"].groupby(grp).rank(pct=True, method="average") * 100.0
-    return _frame(df["stock_code"], _pct_to_tier(pct), pct.round(2))
-
-
-@tag(
-    code="val_pe_ind2_pct", name="PE二级行业分位", domain=DOMAIN,
-    num_unit="percentile_0_100",
-    value_type=TIER, value_range=dict(_PCT_RANGE),
-    source_type="stat", update_freq="daily",
-    data_sources=["a_daily_quote", "hk_daily_quote", "stock_sector", "sector_hierarchy_l2"],
-    compute_logic="在【市场 + GICS 二级行业组】内对 PE(TTM) 算横截面百分位，再切成五档："
-                  "1=二级组内最便宜20%，5=最贵20%。num_value 存百分位(0-100)。"
-                  "仅正 PE 参与，亏损股不打标。二级组来自 sector_hierarchy_l2（GICS 2023 口径 25 组），"
-                  "由富途板块人工语义映射，非官方 GICS 个股分类；首期只做港股，A 股不打标。"
-                  "与 val_pe_ind_pct（一级部门）并存，不参与估值结论判定",
-    pit_capable=True, owner="profiling",
-)
-def val_pe_ind2_pct(as_of: date) -> pd.DataFrame:
-    with _conn() as conn:
-        snap = load_quote_snapshot(conn, as_of)
-        group_map = load_gics_group_map(conn)
-
-    df = snap[["stock_code", "market", "pe_ttm"]].merge(group_map, on="stock_code", how="inner")
-    df = df[df["pe_ttm"] > 0]
+    df = snap[["stock_code", "market", value_col]].merge(
+        ind_map[["stock_code", "industry_code"]], on="stock_code", how="inner")
+    df = df[df[value_col] > 0]
     if df.empty:
         return _frame([], [])
 
-    grp = _market_industry_key(df["market"], df["gics_group"])
-    pct = df["pe_ttm"].groupby(grp).rank(pct=True, method="average") * 100.0
-    return _frame(df["stock_code"], _pct_to_tier(pct), pct.round(2))
+    grp = df["market"].astype(str) + "|" + df["industry_code"].astype(str)
+    # D20 分层样本门禁（仅二级：申万二级 41% 组正 PE<15，一级样本充足不启用）
+    #   ≤5 只不产出（1 只股票自己排 100% 无意义）；6-14 只 conf=0.5；≥15 只 conf=1.0
+    confs = None
+    if level == 2:
+        grp_size = df.groupby(grp)[value_col].transform("size")
+        df = df[grp_size > 5]
+        if df.empty:
+            return _frame([], [])
+        grp = grp.loc[df.index]
+        confs = grp_size.loc[df.index].ge(15).map({True: 1.0, False: 0.5})
+
+    pct = df[value_col].groupby(grp).rank(pct=True, method="average") * 100.0
+    return _frame(df["stock_code"], _pct_to_tier(pct), pct.round(2), confs=confs)
+
+
+_PCT_COMMON = dict(
+    domain=DOMAIN, num_unit="percentile_0_100",
+    value_type=TIER, value_range=dict(_PCT_RANGE),
+    source_type="stat", update_freq="daily",
+    data_sources=["a_daily_quote", "hk_daily_quote",
+                  "regime.stock_sw_industry_mapping", "regime.stock_hsics_industry_mapping"],
+    pit_capable=True, owner="profiling",
+)
+
+
+@tag(code="val_pe_ind1_pct", name="PE一级行业分位", compute_logic=
+     "在【市场+申万/HSICS 一级行业】内对 PE(TTM) 算横截面百分位并切五档；"
+     "num_value 存百分位；仅正 PE 参与。分组来自阶段 B 统一映射表",
+     **_PCT_COMMON)
+def val_pe_ind1_pct(as_of: date) -> pd.DataFrame:
+    return _ind_pct(as_of, 1, "pe_ttm")
+
+
+@tag(code="val_pe_ind2_pct", name="PE二级行业分位", compute_logic=
+     "在【市场+申万/HSICS 二级行业】内对 PE(TTM) 算横截面百分位并切五档；"
+     "num_value 存百分位；仅正 PE 参与。分组来自阶段 B 统一映射表（本 code 由 GICS 口径复用改口径）",
+     **_PCT_COMMON)
+def val_pe_ind2_pct(as_of: date) -> pd.DataFrame:
+    return _ind_pct(as_of, 2, "pe_ttm")
+
+
+@tag(code="val_pb_ind1_pct", name="PB一级行业分位", compute_logic=
+     "在【市场+申万/HSICS 一级行业】内对 PB 算横截面百分位并切五档；"
+     "num_value 存百分位；仅正 PB 参与。分组来自阶段 B 统一映射表",
+     **_PCT_COMMON)
+def val_pb_ind1_pct(as_of: date) -> pd.DataFrame:
+    return _ind_pct(as_of, 1, "pb")
+
+
+@tag(code="val_pb_ind2_pct", name="PB二级行业分位", compute_logic=
+     "在【市场+申万/HSICS 二级行业】内对 PB 算横截面百分位并切五档；"
+     "num_value 存百分位；仅正 PB 参与。分组来自阶段 B 统一映射表",
+     **_PCT_COMMON)
+def val_pb_ind2_pct(as_of: date) -> pd.DataFrame:
+    return _ind_pct(as_of, 2, "pb")
 
 
 @tag(
@@ -334,28 +377,6 @@ def val_pe_hist_pct(as_of: date) -> pd.DataFrame:
     df = pd.concat(parts, ignore_index=True).rename(columns={"index": "stock_code"})
     df = df[df["stock_code"].notna()]
     return _frame(df["stock_code"], _pct_to_tier(df["pct"]), df["pct"])
-
-
-@tag(
-    code="val_pb_ind_pct", name="PB行业分位", domain=DOMAIN,
-    num_unit="percentile_0_100",
-    value_type=TIER, value_range=dict(_PCT_RANGE),
-    source_type="stat", update_freq="daily",
-    data_sources=["a_daily_quote", "hk_daily_quote", "stock_sector", "sector_hierarchy"],
-    compute_logic="PB 在【市场+GICS】内横截面百分位→五档：1=行业内最低20%，5=行业内最高20%。"
-                  "仅正 PB 参与（净资产为负打 NEGATIVE 于全市场档）。与 val_pe_ind_pct 对称，"
-                  "回答「同行业内贵贱」；风格筛选（全市场低 PB）用 val_pb_tier",
-    pit_capable=True, owner="profiling",
-)
-def val_pb_ind_pct(as_of: date) -> pd.DataFrame:
-    with _conn() as conn:
-        snap = load_quote_snapshot(conn, as_of)
-        gics_map = load_gics_map(conn)
-    df = snap[["stock_code", "market", "pb"]].merge(gics_map, on="stock_code", how="inner")
-    df = df[df["pb"] > 0]
-    grp = df["market"].astype(str) + "|" + df["gics"].astype(str)
-    pct = df["pb"].groupby(grp).rank(pct=True, method="average") * 100.0
-    return _frame(df["stock_code"], _pct_to_tier(pct), pct.round(2))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

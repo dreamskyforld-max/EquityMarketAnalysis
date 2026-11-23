@@ -7,7 +7,7 @@
 
 口径约定：
     · 增速分档取每只票**最近一期标准报告期**（有季报用季报，无则年报），
-      分档在【市场 + GICS 部门 + 报告期类型】内做——季报同比与年报同比不混排
+      分档在【市场 + 申万/HSICS 行业 + 报告期类型】内做（阶段 C 一级/二级并存）——季报同比与年报同比不混排
     · `grw_growth_persistence` 保持年报序列，值域语义是「年」不改成「期」；
       `grw_growth_accel` 用同类型报告期序列（全季报或全年报，不混期）
     · yoy 的极端值（小基数 +3000%）不影响分档——rank 分位对异常值免疫，num_value 保留原值
@@ -67,45 +67,60 @@ def _num(s: pd.Series) -> pd.Series:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 增速档（一阶）
+# 增速档（一阶）：阶段 C 一级/二级并存（D2/D16）
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@tag(
-    code="grw_revenue_yoy_tier", name="营收增速档", domain=DOMAIN,
-    num_unit="pct",
-    value_type=TIER, value_range=dict(_TIER_RANGE),
-    source_type="stat", update_freq="quarterly",
-    data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准报告期营收同比增速（有季报用季报，无则年报），"
-                  "在【市场+GICS+报告期类型】内五等分：1=增长最慢/萎缩最重，"
-                  "5=增长最快。负增长是正常状态（与估值域不同），不单独打标。num_value 存 yoy 原值(%)",
-    version="v2", pit_capable=False, owner="profiling",
-)
-def grw_revenue_yoy_tier(as_of: date) -> pd.DataFrame:
+def _grp(df: pd.DataFrame, level: int) -> pd.Series:
+    return df[f"grp_l{level}"]
+
+
+def _grw_revenue_yoy(as_of: date, level: int) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
     df = ctx[ctx["revenue_yoy"].notna()]
-    tier = assign_tier(df["revenue_yoy"], 5, by=df["grp"])
+    tier = assign_tier(df["revenue_yoy"], 5, by=_grp(df, level))
     return _frame(df["stock_code"], tier, df["revenue_yoy"])
 
 
-@tag(
-    code="grw_profit_yoy_tier", name="净利增速档", domain=DOMAIN,
-    num_unit="pct",
-    value_type=TIER, value_range=dict(_TIER_RANGE),
-    source_type="stat", update_freq="quarterly",
-    data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准报告期归母净利同比增速（有季报用季报，无则年报），"
-                  "在【市场+GICS+报告期类型】内五等分。"
-                  "注意：扭亏为盈公司的 yoy 可能出现 +3000% 级极端值，rank 分位对此免疫，"
-                  "但筛选时建议结合 num_value 排序复核",
-    version="v2", pit_capable=False, owner="profiling",
-)
-def grw_profit_yoy_tier(as_of: date) -> pd.DataFrame:
+def _grw_profit_yoy(as_of: date, level: int) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
     df = ctx[ctx["net_profit_yoy"].notna()]
-    tier = assign_tier(df["net_profit_yoy"], 5, by=df["grp"])
+    tier = assign_tier(df["net_profit_yoy"], 5, by=_grp(df, level))
     return _frame(df["stock_code"], tier, df["net_profit_yoy"])
+
+
+_GRW_DATA = ["financial_indicator", "regime.stock_sw_industry_mapping",
+             "regime.stock_hsics_industry_mapping"]
+_GRW_SPECS = (
+    (_grw_revenue_yoy, "grw_revenue_yoy_ind1_tier", "营收增速一级行业档",
+     "grw_revenue_yoy_ind2_tier", "营收增速二级行业档",
+     "最近一期营收同比增速，在【市场+申万/HSICS 行业+报告期类型】内五等分；"
+     "1=增长最慢/萎缩最重，5=最快；负增长是正常状态不单独打标；num_value 存 yoy 原值(%)"),
+    (_grw_profit_yoy, "grw_profit_yoy_ind1_tier", "净利增速一级行业档",
+     "grw_profit_yoy_ind2_tier", "净利增速二级行业档",
+     "最近一期归母净利同比增速，在【市场+申万/HSICS 行业+报告期类型】内五等分；"
+     "扭亏可能出现 +3000% 极端值，rank 分位免疫但筛选需结合 num_value 复核"),
+)
+
+
+def _register_industry_pairs() -> None:
+    def _make(fn, level):
+        def wrapper(as_of: date) -> pd.DataFrame:
+            return fn(as_of, level)
+        wrapper.__name__ = f"{fn.__name__}_l{level}"
+        return wrapper
+
+    for fn, c1, n1, c2, n2, logic in _GRW_SPECS:
+        for code, name, level in ((c1, n1, 1), (c2, n2, 2)):
+            tag(code=code, name=name, domain=DOMAIN, num_unit="pct",
+                value_type=TIER, value_range=dict(_TIER_RANGE),
+                source_type="stat", update_freq="quarterly",
+                data_sources=list(_GRW_DATA),
+                compute_logic=logic + f"（{'一级' if level == 1 else '二级'}行业分组，阶段 B 统一映射表）",
+                version="v2", pit_capable=False, owner="profiling")(_make(fn, level))
+
+
+_register_industry_pairs()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -7,7 +7,6 @@
   ① HK 行业分类（HS_L3）的行业数 / 成分数 / 粒度，与 SECTOR.UP_RATIO 的 113 行业是否一致；
   ② hk_daily_quote 起点 / 有效日数 / 市值·估值·换手列覆盖度（决定 M8 加权列与指数起点）；
   ③ daily_ggt_hold 南向与行业成分的匹配率、est_net_inflow 覆盖；
-  ④ sector_hierarchy 对 HK.LIST* 的覆盖（as_of 缺失现状）；
   ⑤ financial_indicator 是否覆盖 HK（决定 E 组能否做）；
   ⑥ 现有 sector_indicator_dict / sector_constituent 的双市场冲突面。
 
@@ -103,13 +102,6 @@ QUERIES = [
      "(SELECT count(*) FROM s) AS mapped_stocks, "
      "count(*) FILTER (WHERE s.stock_code IS NOT NULL) AS both_stocks "
      "FROM g LEFT JOIN s USING (stock_code)"),
-
-    ("④ sector_hierarchy 概览（当前无 as_of）",
-     "SELECT count(*) AS rows, "
-     "count(*) FILTER (WHERE sector_code LIKE 'HK.%') AS hk_rows, "
-     "count(DISTINCT parent_code) AS parents, "
-     "count(DISTINCT parent_code) FILTER (WHERE sector_code LIKE 'HK.%') AS hk_parents, "
-     "max(updated_at) AS last_update FROM sector_hierarchy"),
 
     ("⑤ financial_indicator 的港股覆盖（决定 E 组能否做）",
      "SELECT count(*) FILTER (WHERE stock_code LIKE 'HK.%') AS hk_rows, "

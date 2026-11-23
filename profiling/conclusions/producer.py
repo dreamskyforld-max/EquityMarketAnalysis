@@ -63,11 +63,21 @@ def _load_l1(conn) -> dict:
 
 
 def _load_fcf_sign(conn) -> dict:
-    """financial_indicator.free_cash_flow 的符号（只取符号，A/H 口径不同）。"""
+    """financial_indicator.free_cash_flow 的符号（只取符号，A/H 口径不同）。
+
+    A 股季报（Q1/Q3）几乎不含自由现金流（实测覆盖率 7.3%），年报/H1 约 90%；
+    港股 OCF−CAPEX 推算则各期都有。若按「最近一期」无条件取，A 股 98% 的股票
+    会取到季报空值。故改为「每票最近一期**有 FCF 的**报告期」。
+
+    ⚠ 由此 FCF 与 growth_code / earnings_quality_tier 的输入期次可能不一致
+    （A 股多落在 H1，其余输入多为 Q3）——FCF 是「最近可得的现金流证据」，
+    不是当期同步指标；只取符号不取数值，不参与增速比较。用户已确认接受该口径。
+    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT DISTINCT ON (stock_code) stock_code, free_cash_flow "
-            "FROM financial_indicator ORDER BY stock_code, report_date DESC"
+            "FROM financial_indicator WHERE free_cash_flow IS NOT NULL "
+            "ORDER BY stock_code, report_date DESC"
         )
         rows = cur.fetchall()
     return {s: (1 if v > 0 else -1 if v < 0 else 0)
@@ -159,6 +169,7 @@ def _build_values(spec: dict, stock: str, snap: dict, extras: dict, l2: dict):
     values: dict = {}
     missing: list[str] = []
     period_by_field: dict = {}
+    primary_period: dict | None = None
     for item in spec["inputs"]:
         field = item["field"]
         compute = item.get("compute")
@@ -172,6 +183,11 @@ def _build_values(spec: dict, stock: str, snap: dict, extras: dict, l2: dict):
                 p = extras.get(f"period_{mode}", {}).get(stock)
                 if p:
                     period_by_field[field] = p
+                    # 主报告期 = 财报类输入最近一期标准报告期（auto），
+                    # 所有 auto 输入同源同期，取首个即可；annual-only 标签（persistence 等）
+                    # 不覆盖它，仍逐字段标在 evidence.report_period 供细查。
+                    if mode == "auto" and primary_period is None:
+                        primary_period = p
         elif compute == "ma_alignment":
             value = extras["ma"].get(stock)
         elif compute == "l2_growth":
@@ -190,19 +206,33 @@ def _build_values(spec: dict, stock: str, snap: dict, extras: dict, l2: dict):
         if value is None:
             missing.append(field)
     coverage = 1.0 - len(missing) / len(spec["inputs"])
-    return values, coverage, missing, period_by_field
+    return values, coverage, missing, period_by_field, primary_period
 
 
 def _derive(spec: dict, values: dict) -> dict:
-    """derived_fields[].expr 仅文档说明，这里显式计算（引擎不解析表达式）。
+    """derived_fields[].expr 仅文档说明，这里显式计算（引擎不解析表达式）。"""
+    params = spec.get("params", {})
+    cheap = params.get("cheap_pctl", 20)
+    expensive = params.get("expensive_pctl", 80)
 
-    v2 起估值结论不再有派生字段：两个百分位是序数排名，相减无经济含义。
-    """
+    def _tier_of(pctl):
+        if pctl is None:
+            return None
+        if pctl <= cheap:
+            return "cheap"
+        if pctl >= expensive:
+            return "expensive"
+        return "mid"
+
     for item in spec["derived_fields"]:
         field = item["field"]
         if field == "growth_gap":
             a, b = values.get("rev_tier"), values.get("np_tier")
             values[field] = abs(a - b) if a is not None and b is not None else None
+        elif field in ("hist_tier", "ind_tier"):
+            # D20：估值分位切档（hist←pe_hist_pct / ind←pe_ind_pct，后者已是二级分位）
+            src = "pe_hist_pct" if field == "hist_tier" else "pe_ind_pct"
+            values[field] = _tier_of(values.get(src))
     return values
 
 
@@ -223,11 +253,18 @@ def _judge(spec: dict, code: str, values: dict, coverage: float):
         gates["G1"] = False
         return None, None, gates
 
-    # G2：主锚必须齐全（缺任一即不发布，与 tools/calibrate_conclusion_cutpoints.py 一致）
+    # G2：主锚默认必须齐全；D21 §5.2 质量结论声明 anchor_any=True，
+    # ROE 档与现金转化档至少一个有效即可判定，两者都缺才不发布。
     anchors = [i["field"] for i in spec["inputs"] if i.get("role") == "anchor"]
-    if any(values.get(a) is None for a in anchors):
-        gates["G2"] = False
-        return None, None, gates
+    if anchors:
+        missing_anchors = [a for a in anchors if values.get(a) is None]
+        if spec.get("anchor_any"):
+            if len(missing_anchors) == len(anchors):
+                gates["G2"] = False
+                return None, None, gates
+        elif missing_anchors:
+            gates["G2"] = False
+            return None, None, gates
 
     rule_id, result = R.first_match(spec, values)
     return rule_id, result, gates
@@ -235,13 +272,16 @@ def _judge(spec: dict, code: str, values: dict, coverage: float):
 
 def _detail(rule_id, values, coverage, missing, gates, as_of: date,
             with_run: bool, eff_from: date | None = None,
-            period_by_field: dict | None = None) -> dict:
+            period_by_field: dict | None = None,
+            primary_report_period: dict | None = None) -> dict:
     evidence = {k: v for k, v in values.items() if v is not None}
     # 每个财报派生输入都标出它实际取数的报告期；年报口径标签标 annual 期次，
     # 自适应标签标 auto 期次。非财报输入（估值分位/量价）不标。
     if period_by_field:
         evidence["report_period"] = period_by_field
     detail = {
+        # 仅财报驱动的 L2（quality/growth）有主报告期；估值/量价 L2 不写此键。
+        **({"primary_report_period": primary_report_period} if primary_report_period else {}),
         "rule_id": rule_id,
         "coverage": round(coverage, 4),
         "missing_inputs": missing,
@@ -367,12 +407,14 @@ def produce(as_of: date | None = None, sync_dict: bool = True) -> dict:
         spec = R.RULES[code]
         bucket: dict = {}
         for stock in snap:
-            values, coverage, missing, periods = _build_values(spec, stock, snap, extras, l2)
+            values, coverage, missing, periods, primary_period = _build_values(
+                spec, stock, snap, extras, l2)
             _derive(spec, values)
             rule_id, result, gates = _judge(spec, code, values, coverage)
             detail = _detail(rule_id, values, coverage, missing, gates, as_of,
                              with_run=(code == "dim_position_state"),
-                             period_by_field=periods)
+                             period_by_field=periods,
+                             primary_report_period=primary_period)
             if "state_raw" in detail:
                 detail["state_raw"] = result
             bucket[stock] = (result, detail)

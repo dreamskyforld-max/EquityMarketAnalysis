@@ -34,7 +34,7 @@ from datetime import date, timedelta
 import pandas as pd
 
 from ..registry import tag, TIER, ENUM
-from ..quantile import assign_tier, load_quote_snapshot, load_financial_context, load_financial_history, load_gics_map
+from ..quantile import assign_tier, load_quote_snapshot, load_financial_context, load_financial_history
 from ._base import _conn, _read_sql, _frame
 
 DOMAIN = "股东回报"
@@ -129,19 +129,8 @@ def shr_dividend_yield_tier(as_of: date) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@tag(
-    code="shr_payout_tier", name="分红率档", domain=DOMAIN,
-    num_unit="pct",
-    value_type=TIER, value_range=dict(_PAYOUT_RANGE),
-    source_type="stat", update_freq="quarterly",
-    data_sources=["dividend_history", "financial_indicator", "a_daily_quote", "hk_daily_quote",
-                  "stock_sector", "sector_hierarchy"],
-    compute_logic="派息率 = 最近完整分红年度（ex 年=去年）的每股分红合计 × 股本（总市值/收盘价）/ "
-                  "上一年报净利润 ×100，在【市场+GICS】内五等分（派息率正常区间行业差异大）。"
-                  "近似口径：ex 年与 report 年按 +1 配对，股本按当前值回推",
-    pit_capable=False, owner="profiling",
-)
-def shr_payout_tier(as_of: date) -> pd.DataFrame:
+def _shr_payout(as_of: date, level: int) -> pd.DataFrame:
+    """分红率行业分档内部实现（level=1/2，行业码取 load_financial_context 的 ind1/ind2）。"""
     ex_year = as_of.year - 1
     with _conn() as conn:
         div = _load_dividends(conn, as_of)
@@ -150,19 +139,42 @@ def shr_payout_tier(as_of: date) -> pd.DataFrame:
 
     d = div[pd.to_datetime(div["ex_date"]).dt.year == ex_year]
     dps_sum = d.groupby("stock_code")["dps"].sum()
-    np_prev = hist[hist["rn"] == 1][["stock_code", "net_profit"]]   # 上一年报（ex_year−1）
+    np_prev = hist[hist["rn"] == 1][["stock_code", "net_profit"]]
 
-    df = ctx[["stock_code", "market", "gics", "total_market_val", "close", "net_profit"]].copy()
+    ind_col = f"ind{level}"
+    df = ctx[["stock_code", "market", ind_col, "total_market_val", "close", "net_profit"]].copy()
     df = df.merge(dps_sum.rename("dps_y"), on="stock_code", how="inner")
     df = df.merge(np_prev.rename(columns={"net_profit": "np_prev"}), on="stock_code", how="inner")
     for c in ("total_market_val", "close", "np_prev"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df[(df["close"] > 0) & (df["np_prev"] > 0)]
-    # 分红总额 = 每股分红 × 股本（股本=总市值/收盘价），再除以上一年报净利润
     df["payout"] = df["dps_y"] * (df["total_market_val"] / df["close"]) / df["np_prev"] * 100.0
 
-    tier = assign_tier(df["payout"], 5, by=_market_key(df["market"], df["gics"]))
+    tier = assign_tier(df["payout"], 5, by=_market_key(df["market"], df[ind_col]))
     return _frame(df["stock_code"], tier, df["payout"].round(2))
+
+
+_PAYOUT_COMMON = dict(
+    domain=DOMAIN, num_unit="pct", value_type=TIER, value_range=dict(_PAYOUT_RANGE),
+    source_type="stat", update_freq="quarterly",
+    data_sources=["dividend_history", "financial_indicator", "a_daily_quote", "hk_daily_quote",
+                  "regime.stock_sw_industry_mapping", "regime.stock_hsics_industry_mapping"],
+    pit_capable=False, owner="profiling",
+)
+
+
+@tag(code="shr_payout_ind1_tier", name="分红率一级行业档", compute_logic=
+     "派息率=最近完整分红年度每股分红合计×股本/上一年报净利润×100，"
+     "在【市场+申万/HSICS 一级行业】内五等分；num_value 存派息率原值", **_PAYOUT_COMMON)
+def shr_payout_ind1_tier(as_of: date) -> pd.DataFrame:
+    return _shr_payout(as_of, 1)
+
+
+@tag(code="shr_payout_ind2_tier", name="分红率二级行业档", compute_logic=
+     "派息率=最近完整分红年度每股分红合计×股本/上一年报净利润×100，"
+     "在【市场+申万/HSICS 二级行业】内五等分；num_value 存派息率原值", **_PAYOUT_COMMON)
+def shr_payout_ind2_tier(as_of: date) -> pd.DataFrame:
+    return _shr_payout(as_of, 2)
 
 
 @tag(

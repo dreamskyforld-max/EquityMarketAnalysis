@@ -27,7 +27,7 @@ import pandas as pd
 
 from ..registry import tag, BOOL, TIER, PLANNED_NO_DATA
 from ..quantile import (
-    load_quote_snapshot, load_financial_latest, load_gics_map,
+    load_quote_snapshot, load_financial_latest, load_industry_map,
     load_stock_connect, assign_tier, rank_within_group,
 )
 from ._base import _conn, _frame
@@ -39,9 +39,9 @@ _TIER_RANGE = {
 }
 
 
-def _market_industry_key(snap: pd.DataFrame, gics: pd.Series) -> pd.Series:
-    """分组键 = 市场 + GICS 部门（同时规避跨市场汇率与跨行业不可比）。"""
-    return snap["market"].astype(str) + "|" + gics.astype(str)
+def _market_industry_key(snap: pd.DataFrame, industry_code: pd.Series) -> pd.Series:
+    """分组键 = 市场 + 行业码（阶段 C：申万/HSICS 统一映射表，一/二级并存）。"""
+    return snap["market"].astype(str) + "|" + industry_code.astype(str)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -89,63 +89,90 @@ def scl_float_mktcap_tier(as_of: date) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@tag(
-    code="scl_revenue_tier", name="营收规模档", domain=DOMAIN,
-    num_unit="CNY|HKD",
-    value_type=TIER, value_range=dict(_TIER_RANGE),
-    source_type="stat", update_freq="quarterly",
-    data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="取最近一期年报 revenue，按【市场+GICS 部门】分组做横截面五等分；"
-                  "营收 <= 0 或缺失不打档。num_value 存营收原值。",
-    pit_capable=False,  # 财报无披露日，见 load_financial_latest 的前视风险说明
-    owner="profiling",
-)
-def scl_revenue_tier(as_of: date) -> pd.DataFrame:
+def _scl_revenue(as_of: date, level: int) -> pd.DataFrame:
+    """营收规模行业分档内部实现（level=1/2）。"""
     with _conn() as conn:
         snap = load_quote_snapshot(conn, as_of)
         fin = load_financial_latest(conn, as_of, "annual")
-        gics_map = load_gics_map(conn)
+        ind_map = load_industry_map(conn, level)
 
     df = snap[["stock_code", "market"]].merge(
         fin[["stock_code", "revenue"]], on="stock_code", how="inner"
     )
-    df = df.merge(gics_map, on="stock_code", how="left")
+    df = df.merge(ind_map[["stock_code", "industry_code"]], on="stock_code", how="left")
     df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce")
     df = df[df["revenue"] > 0]
 
-    tier = assign_tier(df["revenue"], 5, by=_market_industry_key(df, df["gics"]))
+    tier = assign_tier(df["revenue"], 5, by=_market_industry_key(df, df["industry_code"]))
     return _frame(df["stock_code"], tier, df["revenue"])
 
 
-@tag(
-    code="scl_industry_mktcap_rank", name="行业内市值排名", domain=DOMAIN,
-    num_unit="rank",
-    value_type=TIER,
+_REV_COMMON = dict(
+    domain=DOMAIN, num_unit="CNY|HKD", value_type=TIER, value_range=dict(_TIER_RANGE),
+    source_type="stat", update_freq="quarterly",
+    data_sources=["financial_indicator", "regime.stock_sw_industry_mapping",
+                  "regime.stock_hsics_industry_mapping"],
+    pit_capable=False, owner="profiling",
+)
+
+
+@tag(code="scl_revenue_ind1_tier", name="营收一级行业规模档", compute_logic=
+     "取最近一期年报 revenue，按【市场+申万/HSICS 一级行业】横截面五等分；"
+     "营收≤0 或缺失不打档。num_value 存营收原值", **_REV_COMMON)
+def scl_revenue_ind1_tier(as_of: date) -> pd.DataFrame:
+    return _scl_revenue(as_of, 1)
+
+
+@tag(code="scl_revenue_ind2_tier", name="营收二级行业规模档", compute_logic=
+     "取最近一期年报 revenue，按【市场+申万/HSICS 二级行业】横截面五等分；"
+     "营收≤0 或缺失不打档。num_value 存营收原值", **_REV_COMMON)
+def scl_revenue_ind2_tier(as_of: date) -> pd.DataFrame:
+    return _scl_revenue(as_of, 2)
+
+
+def _scl_mktcap_rank(as_of: date, level: int) -> pd.DataFrame:
+    """行业内市值排名内部实现（level=1/2）。"""
+    with _conn() as conn:
+        snap = load_quote_snapshot(conn, as_of)
+        ind_map = load_industry_map(conn, level)
+
+    df = snap[["stock_code", "market", "total_market_val"]].merge(
+        ind_map[["stock_code", "industry_code"]], on="stock_code", how="inner"
+    )
+    df["total_market_val"] = pd.to_numeric(df["total_market_val"], errors="coerce")
+    df = df[df["total_market_val"] > 0]
+
+    grp_key = _market_industry_key(df, df["industry_code"])
+    rank = rank_within_group(df["total_market_val"], by=grp_key, ascending=False)
+    tier = assign_tier(df["total_market_val"], 5, by=grp_key)
+    return _frame(df["stock_code"], tier, rank)
+
+
+_RANK_COMMON = dict(
+    domain=DOMAIN, num_unit="rank", value_type=TIER,
     value_range={
         "1": "行业内规模最小 20%", "2": "次小 20%", "3": "中间 20%",
         "4": "次大 20%", "5": "行业内规模最大 20%（龙头组）",
     },
     source_type="stat", update_freq="daily",
-    data_sources=["a_daily_quote", "hk_daily_quote", "stock_sector", "sector_hierarchy"],
-    compute_logic="在【市场 + GICS 部门】内按总市值排名；key_value 为组内规模档（5=龙头组），"
-                  "num_value 为行业内绝对排名（1=组内市值最大）。用于龙头识别与小市值组内比较",
+    data_sources=["a_daily_quote", "hk_daily_quote",
+                  "regime.stock_sw_industry_mapping", "regime.stock_hsics_industry_mapping"],
     pit_capable=True, owner="profiling",
 )
-def scl_industry_mktcap_rank(as_of: date) -> pd.DataFrame:
-    with _conn() as conn:
-        snap = load_quote_snapshot(conn, as_of)
-        gics_map = load_gics_map(conn)
 
-    df = snap[["stock_code", "market", "total_market_val"]].merge(
-        gics_map, on="stock_code", how="inner"
-    )
-    df["total_market_val"] = pd.to_numeric(df["total_market_val"], errors="coerce")
-    df = df[df["total_market_val"] > 0]
 
-    grp_key = _market_industry_key(df, df["gics"])
-    rank = rank_within_group(df["total_market_val"], by=grp_key, ascending=False)
-    tier = assign_tier(df["total_market_val"], 5, by=grp_key)
-    return _frame(df["stock_code"], tier, rank)
+@tag(code="scl_mktcap_ind1_rank", name="一级行业内市值排名", compute_logic=
+     "在【市场+申万/HSICS 一级行业】内按总市值排名；key_value 为规模档（5=龙头组），"
+     "num_value 为组内绝对排名（1=最大）", **_RANK_COMMON)
+def scl_mktcap_ind1_rank(as_of: date) -> pd.DataFrame:
+    return _scl_mktcap_rank(as_of, 1)
+
+
+@tag(code="scl_mktcap_ind2_rank", name="二级行业内市值排名", compute_logic=
+     "在【市场+申万/HSICS 二级行业】内按总市值排名；key_value 为规模档（5=龙头组），"
+     "num_value 为组内绝对排名（1=最大）", **_RANK_COMMON)
+def scl_mktcap_ind2_rank(as_of: date) -> pd.DataFrame:
+    return _scl_mktcap_rank(as_of, 2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

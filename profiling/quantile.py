@@ -580,32 +580,6 @@ def assign_tier(values: pd.Series, n_tiers: int = 5, by: pd.Series | None = None
     return out
 
 
-def assign_tier_with_pct(values: pd.Series, n_tiers: int = 5,
-                         by: pd.Series | None = None) -> tuple[pd.Series, pd.Series]:
-    """横截面分档 + 连续百分位（D15）。
-
-    与 assign_tier 同逻辑，但额外返回组内 rank(pct=True)*100 连续值——
-    assign_tier 内部本就算了 pct，这里只是不丢弃。原 assign_tier 签名不变（保护存量调用）。
-
-    返回 (tier: 字符串 "1".."5", pct: float 0-100)；无效/样本不足两列都为 NA。
-    """
-    v = pd.to_numeric(values, errors="coerce")
-    valid = v.notna()
-    tier_out = pd.Series(pd.NA, index=values.index, dtype="object")
-    pct_out = pd.Series(pd.NA, index=values.index, dtype="float64")
-    if not valid.any():
-        return tier_out, pct_out
-    groups = pd.Series("_all", index=values.index) if by is None else by
-    for _, idx in valid.groupby(groups[valid]).groups.items():
-        sub = v.loc[idx]
-        if len(sub) < n_tiers:
-            continue
-        pct = sub.rank(pct=True, method="average")
-        tier_out.loc[idx] = np.ceil(pct * n_tiers).clip(1, n_tiers).astype(int).astype(str)
-        pct_out.loc[idx] = (pct * 100).round(2)
-    return tier_out, pct_out
-
-
 def rank_within_group(values: pd.Series, by: pd.Series, ascending: bool = False) -> pd.Series:
     """组内排名（1 起），默认大的排前面。无效值返回 NaN。"""
     v = pd.to_numeric(values, errors="coerce")

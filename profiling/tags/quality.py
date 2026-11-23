@@ -7,7 +7,7 @@
 
 口径约定：
     · 水平/比率类取每只票**最近一期标准报告期**（有季报用季报、无则年报，非标报告期已过滤）；
-      分档在【市场 + GICS 部门 + 报告期类型】内做——Q3 累计 9 个月与 annual 全年不混排
+      分档在【市场 + 申万/HSICS 行业 + 报告期类型】内做（阶段 C 一级/二级并存）——Q3 累计 9 个月与 annual 全年不混排
     · `qal_profit_years`（连续盈利年数）保持年报口径，语义是「年」不改成「期」
     · 档位统一规则 1=数值最小 5=数值最大，好坏方向看语义（label 已注明）
     · 全部标签 pit_capable=False：财报无实际披露日，存在前视（见 load_financial_latest）
@@ -86,157 +86,69 @@ def _bucket_years(n: int) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 水平类：ROE / 毛利率 / 净利率 / 杠杆（分组五档）
+# 行业标签（阶段 C：一级/二级并存，D2/D16）
+#   内部函数统一签名 (as_of, level)，分组取 load_financial_context 的 grp_l1/grp_l2；
+#   公开标签由 _register_industry_pairs 工厂注册，避免 6×2 份重复实现。
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@tag(
-    code="qal_roe_tier", name="ROE档", domain=DOMAIN,
-    num_unit="pct",
-    value_type=TIER,
-    value_range={**_TIER_RANGE, "LOSS": "ROE 为负（当年亏损），不参与分档"},
-    source_type="stat", update_freq="quarterly",
-    data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准报告期加权 ROE（有季报用季报，无则年报），"
-                  "在【市场+GICS+报告期类型】内五等分：1=最低，5=最高。"
-                  "num_value 存 ROE 原值(%)。负值打 LOSS",
-    version="v2", pit_capable=False, owner="profiling",
-)
-def qal_roe_tier(as_of: date) -> pd.DataFrame:
+def _grp(df: pd.DataFrame, level: int) -> pd.Series:
+    """指定层级的分组键（D16 甲：load_financial_context 一次产出 grp_l1/grp_l2）。"""
+    return df[f"grp_l{level}"]
+
+
+def _qal_roe(as_of: date, level: int) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
     df = ctx[ctx["roe"].notna()]
-    return _frame(
-        df["stock_code"],
-        tier_or_flag(df["roe"], by=df["grp"], flag="LOSS"),
-        df["roe"],
-    )
+    return _frame(df["stock_code"],
+                  tier_or_flag(df["roe"], by=_grp(df, level), flag="LOSS"),
+                  df["roe"])
 
 
-@tag(
-    code="qal_gross_margin_tier", name="毛利率档", domain=DOMAIN,
-    num_unit="pct",
-    value_type=TIER,
-    value_range={**_TIER_RANGE, "LOSS": "毛利率为负（毛亏），不参与分档"},
-    source_type="stat", update_freq="quarterly",
-    data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准报告期毛利率（有季报用季报，无则年报），"
-                  "在【市场+GICS+报告期类型】内五等分。毛利率的行业属性极强"
-                  "（白酒 80% vs 零售 15%），必须行业内比较才有意义",
-    version="v2", pit_capable=False, owner="profiling",
-)
-def qal_gross_margin_tier(as_of: date) -> pd.DataFrame:
+def _qal_gross_margin(as_of: date, level: int) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
     df = ctx[ctx["gross_profit_rate"].notna()]
-    return _frame(
-        df["stock_code"],
-        tier_or_flag(df["gross_profit_rate"], by=df["grp"], flag="LOSS"),
-        df["gross_profit_rate"],
-    )
+    return _frame(df["stock_code"],
+                  tier_or_flag(df["gross_profit_rate"], by=_grp(df, level), flag="LOSS"),
+                  df["gross_profit_rate"])
 
 
-@tag(
-    code="qal_net_margin_tier", name="净利率档", domain=DOMAIN,
-    num_unit="pct",
-    value_type=TIER,
-    value_range={**_TIER_RANGE, "LOSS": "净利率为负（亏损），不参与分档"},
-    source_type="stat", update_freq="quarterly",
-    data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准报告期净利率（有季报用季报，无则年报），"
-                  "在【市场+GICS+报告期类型】内五等分",
-    version="v2", pit_capable=False, owner="profiling",
-)
-def qal_net_margin_tier(as_of: date) -> pd.DataFrame:
+def _qal_net_margin(as_of: date, level: int) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
     df = ctx[ctx["net_profit_rate"].notna()]
-    return _frame(
-        df["stock_code"],
-        tier_or_flag(df["net_profit_rate"], by=df["grp"], flag="LOSS"),
-        df["net_profit_rate"],
-    )
+    return _frame(df["stock_code"],
+                  tier_or_flag(df["net_profit_rate"], by=_grp(df, level), flag="LOSS"),
+                  df["net_profit_rate"])
 
 
-@tag(
-    code="qal_leverage_tier", name="杠杆水平档", domain=DOMAIN,
-    num_unit="pct",
-    value_type=TIER,
-    value_range={
-        **_TIER_RANGE,
-        "1": "负债率最低 20%（组内最稳健）", "5": "负债率最高 20%（组内杠杆最重）",
-    },
-    source_type="stat", update_freq="quarterly",
-    data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近一期标准报告期资产负债率（有季报用季报，无则年报），"
-                  "在【市场+GICS+报告期类型】内五等分。"
-                  "注意方向：1=杠杆最低，5=杠杆最高——筛选「财务稳健」应取低档。"
-                  "组内比较可缓解金融业负债率天然偏高的问题，但银行 vs 银行仍需注意商业模式差异",
-    version="v2", pit_capable=False, owner="profiling",
-)
-def qal_leverage_tier(as_of: date) -> pd.DataFrame:
+def _qal_leverage(as_of: date, level: int) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
     df = ctx[ctx["debt_ratio"].notna()]
-    tier = assign_tier(df["debt_ratio"], 5, by=df["grp"])
+    tier = assign_tier(df["debt_ratio"], 5, by=_grp(df, level))
     return _frame(df["stock_code"], tier, df["debt_ratio"])
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 序列类：ROE 稳定性 / 连续盈利年数 / 盈利真实性
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@tag(
-    code="qal_roe_stability", name="ROE稳定性", domain=DOMAIN,
-    num_unit="pct",
-    value_type=TIER,
-    value_range={
-        "1": "波动最小 20%（盈利最稳定）", "2": "次稳 20%", "3": "中间 20%",
-        "4": "次不稳定 20%", "5": "波动最大 20%（盈利大起大落）",
-    },
-    source_type="stat", update_freq="quarterly",
-    data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="最近 3 期同类型报告期 ROE 的标准差（全季报或全年报，不混期），"
-                  "在【市场+GICS+报告期类型】内五等分：1=最稳定，5=波动最大。"
-                  "质量的核心是稳定（MSCI Quality 定义），仅覆盖近 3 期同类型报告期齐全的股票",
-    version="v2", pit_capable=False, owner="profiling",
-)
-def qal_roe_stability(as_of: date) -> pd.DataFrame:
+def _qal_roe_stability(as_of: date, level: int) -> pd.DataFrame:
     g = _hist(as_of, 3)
     g = g[g["rn"] <= 2]
     agg = g.groupby("stock_code")["roe"].agg(cnt="count", std="std").reset_index()
     agg = agg[agg["cnt"] == 3]
     agg["std"] = pd.to_numeric(agg["std"], errors="coerce")
-
-    ctx = _load_ctx(as_of)[["stock_code", "grp"]]
+    ctx = _load_ctx(as_of)[["stock_code", f"grp_l{level}"]].rename(
+        columns={f"grp_l{level}": "grp"})
     df = agg.merge(ctx, on="stock_code", how="inner")
     tier = assign_tier(df["std"], 5, by=df["grp"])
     return _frame(df["stock_code"], tier, df["std"].round(4))
 
 
-@tag(
-    code="qal_earnings_quality", name="盈利真实性", domain=DOMAIN,
-    num_unit="pct",
-    value_type=TIER,
-    value_range={
-        **_TIER_RANGE,
-        "1": "OCF/净利 最低 20%（纸面利润风险最高）", "5": "最高 20%（利润有充足现金流支撑）",
-        "LOSS": "当年亏损，无法评估盈利真实性",
-    },
-    source_type="stat", update_freq="quarterly",
-    data_sources=["financial_indicator", "stock_sector", "sector_hierarchy"],
-    compute_logic="盈利真实性 = 最近一期标准报告期经营现金流 / 净利润 × 100"
-                  "（有季报用季报，无则年报），在【市场+GICS+报告期类型】内五等分。"
-                  "净利>0 才有意义（亏损股打 LOSS）；比率低说明利润停留在应收账款上（纸面利润）",
-    version="v2", pit_capable=False, owner="profiling",
-)
-def qal_earnings_quality(as_of: date) -> pd.DataFrame:
+def _qal_earnings_quality(as_of: date, level: int) -> pd.DataFrame:
     ctx = _load_ctx(as_of)
     np_ = pd.to_numeric(ctx["net_profit"], errors="coerce")
     ocf = pd.to_numeric(ctx["operating_cash_flow"], errors="coerce")
-
     ok = ctx[(np_ > 0) & ocf.notna()]
     ratio = (pd.to_numeric(ok["operating_cash_flow"], errors="coerce")
              / pd.to_numeric(ok["net_profit"], errors="coerce") * 100.0)
-    tier_ok = assign_tier(ratio, 5, by=ok["grp"])
-
+    tier_ok = assign_tier(ratio, 5, by=_grp(ok, level))
     loss = ctx[(np_ <= 0) & np_.notna()]
     tier = pd.concat([
         pd.DataFrame({"stock_code": ok["stock_code"], "key_value": tier_ok.values,
@@ -245,6 +157,59 @@ def qal_earnings_quality(as_of: date) -> pd.DataFrame:
                       "num_value": None, "confidence": 1.0}),
     ], ignore_index=True)
     return _frame(tier["stock_code"], tier["key_value"], tier["num_value"])
+
+
+_QAL_DATA = ["financial_indicator", "regime.stock_sw_industry_mapping",
+             "regime.stock_hsics_industry_mapping"]
+_QAL_IND_SPECS = (
+    # (内部函数, 一级code, 一级中文名, 二级code, 二级中文名, num_unit, value_range, compute_logic)
+    (_qal_roe, "qal_roe_ind1_tier", "ROE一级行业档", "qal_roe_ind2_tier", "ROE二级行业档",
+     "pct", {**_TIER_RANGE, "LOSS": "ROE 为负（当年亏损），不参与分档"},
+     "最近一期标准报告期加权 ROE，在【市场+申万/HSICS 行业+报告期类型】内五等分；num_value 存 ROE 原值(%)"),
+    (_qal_gross_margin, "qal_gross_margin_ind1_tier", "毛利率一级行业档",
+     "qal_gross_margin_ind2_tier", "毛利率二级行业档",
+     "pct", {**_TIER_RANGE, "LOSS": "毛利率为负（毛亏），不参与分档"},
+     "最近一期毛利率，在【市场+行业+报告期类型】内五等分；毛利率行业属性极强，必须行业内比较"),
+    (_qal_net_margin, "qal_net_margin_ind1_tier", "净利率一级行业档",
+     "qal_net_margin_ind2_tier", "净利率二级行业档",
+     "pct", {**_TIER_RANGE, "LOSS": "净利率为负（亏损），不参与分档"},
+     "最近一期净利率，在【市场+行业+报告期类型】内五等分；num_value 存净利率原值(%)"),
+    (_qal_leverage, "qal_leverage_ind1_tier", "资产负债率一级行业档",
+     "qal_leverage_ind2_tier", "资产负债率二级行业档",
+     "pct", {**_TIER_RANGE, "1": "负债率最低 20%（组内最稳健）", "5": "负债率最高 20%（组内负债最重）"},
+     "最近一期资产负债率，在【市场+行业+报告期类型】内五等分；1=负债率最低、5=最高"),
+    (_qal_roe_stability, "qal_roe_stability_ind1", "ROE波动程度一级行业档",
+     "qal_roe_stability_ind2", "ROE波动程度二级行业档",
+     "pct", {"1": "波动最小 20%（盈利最稳定）", "2": "次稳 20%", "3": "中间 20%",
+             "4": "次不稳定 20%", "5": "波动最大 20%"},
+     "最近 3 期同类型报告期 ROE 标准差，在【市场+行业+报告期类型】内五等分；1=波动最小、5=最大"),
+    (_qal_earnings_quality, "qal_earnings_quality_ind1", "利润现金转换率一级行业档",
+     "qal_earnings_quality_ind2", "利润现金转换率二级行业档",
+     "pct", {**_TIER_RANGE, "1": "OCF/净利 最低 20%（纸面利润风险最高）",
+             "5": "最高 20%（利润有充足现金流支撑）", "LOSS": "当年亏损，无法计算利润现金转换率"},
+     "经营现金流/净利润×100，在【市场+行业+报告期类型】内五等分；净利>0 才有意义"),
+)
+
+
+def _register_industry_pairs() -> None:
+    """工厂注册：每个内部函数按 level=1/2 各注册一个标签（导入即生效）。"""
+    def _make(fn, level):
+        def wrapper(as_of: date) -> pd.DataFrame:
+            return fn(as_of, level)
+        wrapper.__name__ = f"{fn.__name__}_l{level}"
+        return wrapper
+
+    for fn, c1, n1, c2, n2, unit, vrange, logic in _QAL_IND_SPECS:
+        for code, name, level in ((c1, n1, 1), (c2, n2, 2)):
+            tag(code=code, name=name, domain=DOMAIN, num_unit=unit,
+                value_type=TIER, value_range=dict(vrange),
+                source_type="stat", update_freq="quarterly",
+                data_sources=list(_QAL_DATA),
+                compute_logic=logic + f"（{'一级' if level == 1 else '二级'}行业分组，阶段 B 统一映射表）",
+                version="v2", pit_capable=False, owner="profiling")(_make(fn, level))
+
+
+_register_industry_pairs()
 
 
 @tag(

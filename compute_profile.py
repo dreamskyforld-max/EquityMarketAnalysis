@@ -138,9 +138,15 @@ def _compute():
 
     # ③ 结论生产者：必须在 ② 全部提交之后跑（§9.1 约束 2/3），内部先 4 个 L2 再 2 个 L3。
     # 接在 compute-profile.service 同链路第二段，不进 market_scheduler（R5）。
-    conclusion_result = conclusion_producer.produce(as_of=as_of, sync_dict=False)
-    log.info("【全量画像】结论层：status=%s stats=%s",
-             conclusion_result.get("status"), conclusion_result.get("stats"))
+    # D3/D17（2026-11-23）：行业改造期间曾暂停 L2/L3 产出。改造已完成（四个 L2
+    # 输入/规则重设 + 两个 L3 口径对齐，版本均与 tag_registry 一致），恢复产出。
+    L2_L3_PAUSED = False
+    if L2_L3_PAUSED:
+        log.info("【全量画像】结论层 L2/L3 暂停产出（D3/D17，行业改造中）")
+    else:
+        conclusion_result = conclusion_producer.produce(as_of=as_of, sync_dict=False)
+        log.info("【全量画像】结论层：status=%s stats=%s",
+                 conclusion_result.get("status"), conclusion_result.get("stats"))
 
     # 释放各域缓存：大对象（窗口行情等）在模块级缓存里不会随函数返回释放，
     # 会驻留到下一轮覆盖。独立进程退出时本可自然归还，保留调用是为兼容

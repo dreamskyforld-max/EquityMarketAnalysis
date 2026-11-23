@@ -4,7 +4,7 @@
 已实现：
     ① 证券属性  →  tags/identity.py     12 个标签
     ② 规模属性  →  tags/scale.py          6 个标签
-    ③ 估值水平  →  tags/valuation.py      9 个标签
+    ③ 估值水平  →  tags/valuation.py      行业标签一级/二级并存（见整改计划阶段 C）
     ④ 盈利质量  →  tags/quality.py       10 个标签
     ⑤ 成长特征  →  tags/growth.py         8 个标签
     ⑥ 股东回报  →  tags/shareholder.py    6 个标签

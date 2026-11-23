@@ -1218,41 +1218,10 @@ COMMENT ON TABLE  benchmark_minute           IS '全球基准指数分钟级行�
 COMMENT ON COLUMN benchmark_minute.bench_code IS '基准代码，如 HK.800000 / SPX';
 COMMENT ON COLUMN benchmark_minute.ts         IS '时间戳(UTC)';
 
--- 3.3 行业层级映射（build_sector_hierarchy.py）
--- 富途细粒度 INDUSTRY → GICS 一级部门（参考数据，低频刷新）
-CREATE TABLE IF NOT EXISTS sector_hierarchy (
-    sector_code   VARCHAR(20)   NOT NULL,        -- 细粒度行业板块 code（= stock_sector.sector_code，如 HK.LIST1019）
-    sector_name   VARCHAR(100),                   -- 细粒度行业板块英文名（冗余自 stock_sector，方便查询）
-    parent_code   VARCHAR(30)   NOT NULL,        -- 一级部门 code（GICS：ENERGY/MATERIALS/...）
-    parent_name   VARCHAR(50),                    -- 一级部门中文名（如 能源/金融）
-    sector_type   VARCHAR(20)   DEFAULT 'INDUSTRY',
-    as_of         DATE,                           -- 本次映射快照归属日（阶段3 D4；不是 PIT 生效日）
-    updated_at    TIMESTAMPTZ   DEFAULT NOW(),
-    PRIMARY KEY (sector_code)
-);
-
-COMMENT ON TABLE  sector_hierarchy              IS '行业层级映射：富途细粒度 INDUSTRY → GICS 一级部门（参考数据，低频刷新）；阶段3 起由 market_scheduler 每周二 18:30 刷新并写 as_of';
-COMMENT ON COLUMN sector_hierarchy.parent_code  IS '一级部门 code：GICS 11 部门 + CONGLOMERATES(综合企业) + OTHER(兜底)';
-COMMENT ON COLUMN sector_hierarchy.parent_name  IS '一级部门中文名';
-COMMENT ON COLUMN sector_hierarchy.as_of        IS '映射快照归属日（build_sector_hierarchy 每次运行写当天）。⚠ 只标快照日，不是 PIT 版本链；GICS 仅作展示层标签，不作行业配置计算口径（阶段3 用 HS_L3 113 行业）';
-
--- 3.3b 行业二级映射（build_sector_hierarchy.py，2026-11-19 新增）
--- 富途细粒度 INDUSTRY 板块 → GICS 二级行业组（2023 口径 25 组）；一级映射仍存 sector_hierarchy
-CREATE TABLE IF NOT EXISTS sector_hierarchy_l2 (
-    sector_code   VARCHAR(20)   NOT NULL,        -- 细粒度行业板块 code（= stock_sector.sector_code）
-    sector_name   VARCHAR(100),                   -- 板块名（冗余自 stock_sector）
-    group_code    VARCHAR(30)   NOT NULL,        -- GICS 二级行业组四位码；NONE=无对应
-    group_name    VARCHAR(50),                    -- 二级组标准简体中文名
-    sector_type   VARCHAR(20)   DEFAULT 'INDUSTRY',
-    as_of         DATE,                           -- 映射快照归属日（不是 PIT 生效日）
-    updated_at    TIMESTAMPTZ   DEFAULT NOW(),
-    PRIMARY KEY (sector_code)
-);
-
-COMMENT ON TABLE  sector_hierarchy_l2             IS '行业二级映射：富途细粒度 INDUSTRY 板块 → GICS 二级行业组（2023 口径 25 组）。⚠ 人工语义近似映射，非官方 GICS 个股分类；供画像 val_pe_ind2_pct 分位使用';
-COMMENT ON COLUMN sector_hierarchy_l2.group_code  IS 'GICS 2023 二级行业组四位码（1010~6020）；NONE=综合企业等无对应二级组的兜底码（非官方 GICS code）';
-COMMENT ON COLUMN sector_hierarchy_l2.group_name  IS '二级行业组标准简体中文名（对齐 GICS 2023 开源中文对照，非 MSCI 官方发布）';
-COMMENT ON COLUMN sector_hierarchy_l2.as_of       IS '映射快照归属日。⚠ 只标快照日，不是 PIT 版本链；stock_sector 当前成分含幸存者偏差';
+-- 3.3 / 3.3b（已删除，D2/D18）：GICS 展示层映射 sector_hierarchy / sector_hierarchy_l2
+--     GICS 体系已废弃；个股↔行业映射统一收口到 regime.stock_sw_industry_mapping /
+--     stock_hsics_industry_mapping（阶段 B），层级关系在 regime.{sw,hsics}_industry_classification。
+--     富途英文名来源改为 get_hsics_industry_classification.FUTU_EN_NAME（富途 API 英文版实测）。
 
 -- 3.4 个股-基准相关性（benchmark_correlation_daily.py）
 CREATE TABLE IF NOT EXISTS benchmark_correlation (
