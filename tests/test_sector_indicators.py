@@ -99,8 +99,11 @@ class TestSectorMappingAndDaily(unittest.TestCase):
         except Exception as e:
             raise unittest.SkipTest(f"数据库不可用: {e}")
         cls.cur = cls.conn.cursor()
-        cls.cur.execute("SELECT DISTINCT bench_code FROM daily_benchmark WHERE bench_code LIKE 'CN.SW%'")
-        cls.sw_codes = {r[0].replace("CN.SW", "") for r in cls.cur.fetchall()}
+        cls.cur.execute("""SELECT DISTINCT c.sw_code
+                           FROM regime.sw_industry_classification c
+                           JOIN daily_benchmark b ON c.sw_code = replace(b.bench_code, 'CN.SW', '')
+                           WHERE c.level = 1 AND b.bench_code LIKE 'CN.SW%'""")
+        cls.sw_codes = {r[0] for r in cls.cur.fetchall()}
 
     @classmethod
     def tearDownClass(cls):

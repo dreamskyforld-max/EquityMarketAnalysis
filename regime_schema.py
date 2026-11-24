@@ -284,14 +284,24 @@ CREATE TABLE IF NOT EXISTS regime.sw_industry_classification (
 CREATE TABLE IF NOT EXISTS regime.hsics_industry_classification (
     subsector_code VARCHAR(8)    NOT NULL,          -- HSICS 三级子行业官方 6 位码（如 702015）
     subsector_name VARCHAR(120)  NOT NULL,          -- 三级子行业英文名
+    subsector_name_cn VARCHAR(120),                 -- 三级子行业官方中文名（恒生官方中文 PDF 繁体→简体）
     sector_code    VARCHAR(8)    NOT NULL,          -- 二级 sector 官方 4 位码（如 7020）
     sector_name    VARCHAR(120),                    -- 二级 sector 英文名
+    sector_name_cn VARCHAR(120),                    -- 二级 sector 官方中文名（恒生官方中文 PDF 繁体→简体）
     industry_code  VARCHAR(8)    NOT NULL,          -- 一级 industry 官方 2 位码（如 70）
     industry_name  VARCHAR(120),                    -- 一级 industry 英文名
+    industry_name_cn VARCHAR(120),                  -- 一级 industry 官方中文名（恒生官方中文 PDF 繁体→简体）
     as_of          DATE          NOT NULL,
     updated_at     TIMESTAMPTZ   DEFAULT NOW(),
     PRIMARY KEY (subsector_code)
 )
+""",
+
+    # ── HSICS 官方中文名（存量库自愈；CREATE TABLE IF NOT EXISTS 不会补列）────
+    "hsics_industry_classification_cn_cols": """
+ALTER TABLE regime.hsics_industry_classification ADD COLUMN IF NOT EXISTS industry_name_cn  VARCHAR(120);
+ALTER TABLE regime.hsics_industry_classification ADD COLUMN IF NOT EXISTS sector_name_cn    VARCHAR(120);
+ALTER TABLE regime.hsics_industry_classification ADD COLUMN IF NOT EXISTS subsector_name_cn VARCHAR(120)
 """,
 
     "futu_hsics_code_mapping": """
@@ -1233,7 +1243,13 @@ _SECTOR_COMMENTS = [
     ("COLUMN", "regime.sw_industry_classification.level",
      "层级：1=申万一级 / 2=二级 / 3=三级。按 level 过滤即可定位某层级全部行业"),
     ("TABLE", "regime.hsics_industry_classification",
-     "恒生 HSICS 官方分类层级（一级 industry 12 / 二级 sector 31 / 三级 subsector 114，官方 6 位码）。纯分类主数据：不含富途码/映射"),
+     "恒生 HSICS 官方分类层级（一级 industry 12 / 二级 sector 31 / 三级 subsector 114，官方 6 位码）。纯分类主数据：不含富途码/映射；*_name_cn 为官方中文 PDF 转简体"),
+    ("COLUMN", "regime.hsics_industry_classification.industry_name_cn",
+     "一级 industry 官方中文名：恒生官方中文 PDF（zh_hk/B_HSICS.pdf）繁体经 NFKC+OpenCC t2s 转简体"),
+    ("COLUMN", "regime.hsics_industry_classification.sector_name_cn",
+     "二级 sector 官方中文名：同上"),
+    ("COLUMN", "regime.hsics_industry_classification.subsector_name_cn",
+     "三级 subsector 官方中文名：同上"),
     ("TABLE", "regime.futu_hsics_code_mapping",
      "富途板块码 HK.LISTxxxx → HSICS 官方三级 6 位码的映射（D4 两跳方案中间层）。confirmed=true 的行为人工核对，每日重算不覆盖"),
     ("COLUMN", "regime.futu_hsics_code_mapping.match_method",

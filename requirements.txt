@@ -28,6 +28,7 @@ matplotlib==3.11.2             # 分时切分研究：窗口切分图 / 人工�
 
 # ── 数据处理 (akshare/pandas-datareader 间接依赖，显式锁定) ──
 pymupdf==1.28.2               # get_stock_sector_weight 解析恒生 factsheet PDF
+opencc-python-reimplemented==0.1.7  # get_hsics_industry_classification 官方中文 PDF 繁体→简体（纯 Python 无编译依赖）
 pandas==3.0.2
 numpy==2.4.4
 requests==2.33.1

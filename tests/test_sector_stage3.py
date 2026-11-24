@@ -374,11 +374,11 @@ class TestEngineeringGuards(unittest.TestCase):
         self.assertIn("regime.stock_sw_industry_mapping", src)
         self.assertIn("regime.stock_hsics_industry_mapping", src)
 
-    def test_stage_c_l2_l3_paused(self):
-        """D3/D17：L2/L3 结论在生产入口跳过（保留 RULES 代码）。"""
+    def test_stage_c_l2_l3_resumed(self):
+        """D3/D17 整改完成（f394528）：L2/L3 结论在生产入口恢复产出。"""
         cp = _read("compute_profile.py")
-        self.assertIn("L2_L3_PAUSED = True", cp)
-        self.assertIn("conclusion_producer.produce(", cp)   # 恢复开关仍在
+        self.assertIn("L2_L3_PAUSED = False", cp)
+        self.assertIn("conclusion_producer.produce(as_of=as_of", cp)
 
     def test_hk_runs_after_cn_in_same_unit(self):
         src = _read("system/sector-layer.service")

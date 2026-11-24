@@ -2,7 +2,10 @@
 """HSICS 行业分类层级 + 富途码映射采集 —— 写入两张表（单一职责各一张）。
 
 数据源：恒生官方 B_HSICS.pdf（HKEX/HSI 官网，含 12 industry / 31 sector / 114 subsector）。
-  PDF URL 固定为实测可用的官方地址；如需更换直接改本脚本 PDF_URL 常量。
+  · 英文版（PDF_URL）解析官方码与英文名；中文版（PDF_URL_ZH）解析官方中文名；
+  · 中文列 = 官方繁体经 NFKC 归一化 + OpenCC t2s 转简体（不意译，按官方码对齐）；
+  · 两份 PDF 的码集合已实测一一对应；中文解析缺码即整批拒绝写库（防中文列被覆盖为 NULL）。
+  PDF URL 固定为实测可用的官方地址；如需更换直接改本脚本常量。
 
 两张表（各司其职，见 AGENTS.md 单一职责）：
   1) regime.hsics_industry_classification —— 纯 HSICS 官方分类层级（6位 subsector + 父级）；
@@ -31,6 +34,7 @@ import urllib.request
 from db import bulk_upsert, get_conn
 
 PDF_URL = "https://www.hsi.com.hk/content/dam/wpb/hsil/index_review/en_hk/B_HSICS.pdf"
+PDF_URL_ZH = "https://www.hsi.com.hk/content/dam/wpb/hsil/index_review/zh_hk/B_HSICS.pdf"
 T_CLASS = "regime.hsics_industry_classification"
 T_MAP = "regime.futu_hsics_code_mapping"
 
@@ -208,6 +212,38 @@ def _parse_pdf() -> list:
     return rows
 
 
+def _parse_pdf_zh() -> dict:
+    """解析恒生官方中文 PDF（zh_hk），返回 {官方码: 简体中文名}。
+
+    中文版结构与英文版一致：2/4/6 位码独占一行、官方中文名紧随下一行；
+    原文为繁体且含 CJK 兼容表意文字（⽣/⼀/⼯），故先 NFKC 归一化再
+    OpenCC t2s 转简体。与英文版共用同一套官方码，按 code 直接对齐，
+    不做名称模糊匹配。硬校验 12/31/114，缺任一码即整批拒绝写库——
+    bulk_upsert 按 record keys 生成列，缺键会被补 None 覆盖已有中文列。
+    """
+    import unicodedata
+
+    import opencc
+    import pymupdf
+
+    raw = urllib.request.urlopen(PDF_URL_ZH, timeout=30).read()
+    doc = pymupdf.open(stream=raw, filetype="pdf")
+    lines = [l.strip() for l in text_lines(doc) if l.strip()]
+    cc = opencc.OpenCC("t2s")
+    names = {}
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"\d{2}|\d{4}|\d{6}", line) and line not in names:
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            name = cc.convert(unicodedata.normalize("NFKC", nxt)).strip()
+            if name:
+                names[line] = name
+    counts = {n: sum(1 for c in names if len(c) == n) for n in (2, 4, 6)}
+    if counts != {2: 12, 4: 31, 6: 114}:
+        raise RuntimeError(
+            f"HSICS 官方中文 PDF 结构校验失败：{counts}（期望 2位12/4位31/6位114），拒绝写库")
+    return names
+
+
 def text_lines(doc):
     return "".join(p.get_text() for p in doc).split("\n")
 
@@ -234,12 +270,23 @@ def _futu_boards() -> list:
 
 def _build() -> tuple[list, list, list]:
     as_of = datetime.date.today()
-    hsics = _parse_pdf()   # 内部已硬校验 12/31/114
+    hsics = _parse_pdf()        # 内部已硬校验 12/31/114
+    zh_names = _parse_pdf_zh()  # 内部已硬校验 12/31/114
+
+    def cn(code):
+        name = zh_names.get(code)
+        if not name:
+            raise RuntimeError(
+                f"HSICS 官方中文 PDF 缺码 {code}，拒绝写库（避免中文列被 bulk_upsert 覆盖为 NULL）")
+        return name
 
     class_rows = [{
         "industry_code": ind, "industry_name": ind_name,
+        "industry_name_cn": cn(ind),
         "sector_code": sec, "sector_name": sec_name,
+        "sector_name_cn": cn(sec),
         "subsector_code": sub, "subsector_name": sub_name,
+        "subsector_name_cn": cn(sub),
         "as_of": as_of,
     } for ind, ind_name, sec, sec_name, sub, sub_name in hsics]
 

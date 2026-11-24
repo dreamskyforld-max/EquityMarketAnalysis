@@ -155,8 +155,8 @@ L2/L3 结论   本期暂停产出（D3），行业改造完成后再优化
 
 **A3 HSICS 行业分类层级表（新建）**
 
-- 数据源：恒生官方 PDF（`B_HSICS.pdf`，可 `pymupdf` 解析，已验证可提取 114 条 subsector + 父级 sector/industry（含合并行/跨行解析修复））。
-- 新表 `regime.hsics_industry_classification`：`subsector_code / subsector_name / sector_code / sector_name / industry_code / industry_name / as_of`（与 `sql/schema.sql` 一致）。存**纯 HSICS 官方分类层级**，不含富途码、不含映射（单一职责）。
+- 数据源：恒生官方 PDF（`B_HSICS.pdf`，可 `pymupdf` 解析，已验证可提取 114 条 subsector + 父级 sector/industry（含合并行/跨行解析修复））。英文名取 `en_hk` 版；中文名取 `zh_hk` 官方中文版，繁体经 NFKC 归一化 + OpenCC `t2s` 转简体（2026-11-24 新增，按官方码直接对齐，不意译）。
+- 新表 `regime.hsics_industry_classification`：`subsector_code / subsector_name / subsector_name_cn / sector_code / sector_name / sector_name_cn / industry_code / industry_name / industry_name_cn / as_of`（与 `sql/schema.sql` 一致）。存**纯 HSICS 官方分类层级**，不含富途码、不含映射（单一职责）。
 
 **A3b 富途码↔HSICS 官方码映射表（新建，D11 拆表）**
 
