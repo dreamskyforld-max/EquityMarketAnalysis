@@ -118,14 +118,16 @@ class TestRulesSchema(unittest.TestCase):
 
 
 class TestEnumContract(unittest.TestCase):
-    def test_43_codes_exactly_cover_all_results(self):
+    def test_54_codes_exactly_cover_all_results(self):
         codes = set()
         for m in registry.all_tags():
             if m.source_type == "derived":
                 codes |= set(m.enum_values)
         results = {r["result"] for spec in R.RULES.values()
                    for r in spec["rules"] if r["result"] is not None}
-        self.assertEqual(len(codes), 43)   # D21 质量 moderate + D22 价值质量 3 码
+        # 43（D21 moderate + D22 价值质量 3 码）− 5（增长质量旧链码）
+        # + 16（§6.2 v2 成长×质量 4×4）= 54
+        self.assertEqual(len(codes), 54)
         self.assertEqual(codes, results)  # 无越界码、无孤儿码
 
     def test_all_short_labels_nonempty(self):
@@ -146,11 +148,11 @@ class TestEnumContract(unittest.TestCase):
             # D21 质量结论 v2→v3（一级行业口径+7 码），估值 v4，其余维持 v2；
             # 与 RULES.version 必须逐码一致（sync_conclusion_dict 会硬校验）
             expected = {"dim_valuation_conclusion": "v4",
-                        "dim_quality_conclusion": "v3",
+                        "dim_quality_conclusion": "v4",   # §11 裁定 1：ROE 底线分报告期
                         "dim_growth_conclusion": "v4",
                         "dim_position_state": "v3",
                         "biz_value_quality_type": "v3",
-                        "biz_growth_quality_type": "v3"}.get(m.code, "v2")
+                        "biz_growth_quality_type": "v4"}.get(m.code, "v2")
             self.assertEqual(m.version, expected, m.code)
             self.assertEqual(m.version, R.RULES[m.code]["version"], m.code)
             self.assertEqual(m.status, "active")
@@ -337,35 +339,55 @@ class TestValueQualityV3(unittest.TestCase):
         self.assertEqual(len(ps), len(set(ps)))
 
 
-class TestGrowthQualityV3(unittest.TestCase):
-    """§6.2 v3：FCF 精细化门禁 + 一级行业现金转化档。"""
+class TestGrowthQualityV4(unittest.TestCase):
+    """§6.2 v2（2026-11-25）：5 码链式漏斗 → 4×4 成长 × 质量矩阵（16 码）。"""
 
     def setUp(self):
         self.spec = R.RULES["biz_growth_quality_type"]
 
-    def test_inputs(self):
-        codes = {i["tag_code"] for i in self.spec["inputs"] if "tag_code" in i}
-        self.assertIn("qal_earnings_quality_ind1", codes)
-        self.assertNotIn("qal_earnings_quality", codes)
-        # FCF 不设 anchor：GQ-00/01/03 不能被门禁无差别拦截
-        fcf = next(i for i in self.spec["inputs"] if i["field"] == "fcf_sign")
-        self.assertIsNone(fcf.get("role"))
+    def test_inputs_are_two_l2_classes_only(self):
+        fields = [i["field"] for i in self.spec["inputs"]]
+        self.assertEqual(fields, ["growth_class", "quality_class"])
+        for i in self.spec["inputs"]:
+            self.assertEqual(i.get("role"), "anchor")  # 任一侧未出档整行不发布
+            self.assertEqual(i.get("source"), "derived")
+        # 旧判定输入全部降为旁证，不再进 inputs / 判定
+        self.assertNotIn("fcf_sign", fields)
+        self.assertNotIn("earnings_quality_tier", fields)
+        cross = {i["field"] for i in self.spec["cross_check_inputs"]}
+        self.assertEqual(cross, {"growth_code", "earnings_quality_tier", "fcf_sign",
+                                 "persistence", "accel"})
 
-    def test_fcf_gate_only_blocks_positive_code(self):
-        base = {"growth_code": "slow_steady", "earnings_quality_tier": 3,
-                "persistence": 2, "accel": "steady"}
-        for sign in (0, 1):
-            self.assertEqual(R.first_match(self.spec, {**base, "fcf_sign": sign}),
-                             ("GQ-04", "sustained_cash_backed"))
-        for sign in (None, -1):
-            self.assertEqual(R.first_match(self.spec, {**base, "fcf_sign": sign})[1], None)
-        # 负面码不依赖 FCF，缺 FCF 仍发布
-        self.assertEqual(R.first_match(self.spec, {**base, "growth_code": "contracting",
-                                                  "fcf_sign": None}),
-                         ("GQ-00", "contraction"))
-        self.assertEqual(R.first_match(self.spec, {**base, "earnings_quality_tier": 2,
-                                                  "fcf_sign": None}),
-                         ("GQ-01", "paper_growth"))
+    def test_grow_class_map(self):
+        self.assertEqual(R.GROW_CLASS["fast_sustained"], "high")
+        self.assertEqual(R.GROW_CLASS["fast_decelerating"], "high")
+        self.assertEqual(R.GROW_CLASS["slow_steady"], "steady")
+        self.assertEqual(R.GROW_CLASS["revenue_profit_divergent"], "divergent")
+        self.assertEqual(R.GROW_CLASS["contracting"], "negative")
+        self.assertIsNone(R.GROW_CLASS.get("unknown"))
+
+    def test_all_16_cells_first_match(self):
+        for gi, g in enumerate(("high", "steady", "divergent", "negative"), start=1):
+            for qi, q in enumerate(("solid", "moderate", "volatile", "weak"), start=1):
+                with self.subTest(g=g, q=q):
+                    self.assertEqual(
+                        R.first_match(self.spec, {"growth_class": g, "quality_class": q}),
+                        (f"GQ-{gi}{qi}", f"{g}_{q}"))
+
+    def test_no_short_circuit_and_no_fcf_dependency(self):
+        # 16 格互斥完备、无优先级短路：同一格在任何无关字段取值下结果不变
+        base = {"growth_class": "negative", "quality_class": "weak",
+                "fcf_sign": None, "earnings_quality_tier": None}
+        self.assertEqual(R.first_match(self.spec, base), ("GQ-44", "negative_weak"))
+        self.assertEqual(len(self.spec["rules"]), 17)  # 16 格 + GQ-99
+
+    def test_cross_check_writer(self):
+        """producer 必须把旁证写进 conclusion_detail.cross_check，且旁证不进 G1 分母。"""
+        src = (ROOT / "profiling/conclusions/producer.py").read_text(encoding="utf-8")
+        self.assertIn('cross_check_inputs', src)
+        self.assertIn('"cross_check": cross_check', src)
+        self.assertIn('inputs=spec["cross_check_inputs"]', src)
+        self.assertIn('denom = sum(1 for i in spec["inputs"]', src)  # G1 分母仍只按 inputs
 
 
 class TestPositionStateV3(unittest.TestCase):
@@ -407,7 +429,11 @@ class TestQualityConclusionD21(unittest.TestCase):
         codes = {i["tag_code"] for i in self.spec["inputs"] if "tag_code" in i}
         self.assertEqual(len(codes), 4)
         self.assertTrue(all("_ind1" in c for c in codes), codes)
-        self.assertEqual(self.spec["inputs"][-1]["source_col"], "num_value")
+        tag_inputs = [i for i in self.spec["inputs"] if "tag_code" in i]
+        self.assertEqual(tag_inputs[-1]["source_col"], "num_value")
+        # §11 裁定 1：report_type 为 aux 控制字段，不计 G1 分母
+        aux = [i for i in self.spec["inputs"] if i.get("role") == "aux"]
+        self.assertEqual([i["field"] for i in aux], ["report_type"])
 
     def test_seven_results_literal_params(self):
         results = {r["result"] for r in self.spec["rules"]}
@@ -416,8 +442,12 @@ class TestQualityConclusionD21(unittest.TestCase):
         p = self.spec["params"]
         self.assertEqual((p["stable_max"], p["volatile_min"], p["quality_weak_max"],
                           p["quality_ok_min"], p["leverage_high"], p["roe_high"],
-                          p["moderate_min"], p["moderate_max"], p["roe_floor_pct"]),
-                         (2, 4, 2, 3, 4, 4, 3, 4, 5))
+                          p["moderate_min"], p["moderate_max"]),
+                         (2, 4, 2, 3, 4, 4, 3, 4))
+        # §11 裁定 1：ROE 底线按 report_type 分设，不再是单一标量
+        self.assertEqual(p["roe_floor_pct_by_report_type"],
+                         {"Q1": 0.43, "H1": 2.23, "Q3": 3.27, "annual": 1.36})
+        self.assertNotIn("roe_floor_pct", p)
 
     def test_all_seven_rules_first_match(self):
         cases = [
@@ -425,9 +455,9 @@ class TestQualityConclusionD21(unittest.TestCase):
              "QAL-01", "deteriorating"),
             ({"roe_stability": 2, "earnings_quality_tier": 2},
              "QAL-02", "paper_profit"),
-            ({"roe_tier": 4, "roe_stability": 2, "earnings_quality_tier": 3, "roe_raw": 6.0},
+            ({"roe_tier": 4, "roe_stability": 2, "earnings_quality_tier": 3, "roe_floor_ok": True},
              "QAL-04", "solid"),
-            ({"roe_tier": 4, "roe_stability": 4, "earnings_quality_tier": 3, "roe_raw": 6.0},
+            ({"roe_tier": 4, "roe_stability": 4, "earnings_quality_tier": 3, "roe_floor_ok": True},
              "QAL-05", "high_but_volatile"),
             ({"roe_tier": 2, "leverage_tier": 4, "earnings_quality_tier": 3},
              "QAL-03", "leveraged"),
@@ -443,14 +473,14 @@ class TestQualityConclusionD21(unittest.TestCase):
     def test_leverage_is_downgrade_not_veto(self):
         # 高 ROE 且现金实：即使杠杆档=4 也不被 QAL-03 一票否决
         values = {"roe_tier": 4, "roe_stability": 2, "earnings_quality_tier": 3,
-                  "roe_raw": 6.0, "leverage_tier": 4}
+                  "roe_floor_ok": True, "leverage_tier": 4}
         self.assertEqual(R.first_match(self.spec, values), ("QAL-04", "solid"))
 
     def test_roe_floor_falls_to_moderate(self):
-        # §5.2 中文写法：3-4 档归中等。ROE 绝对值 <5% 的 4 档票落 moderate 而非 weak，
-        # 兑现「低于 5% 最高只能评盈利中等」
+        # §5.2 中文写法：3-4 档归中等。ROE 绝对值未过线的 4 档票落 moderate 而非 weak，
+        # 兑现「未达底线最高只能评盈利中等」（§11 裁定 1：底线按 report_type 分设）
         values = {"roe_tier": 4, "roe_stability": 2, "earnings_quality_tier": 3,
-                  "roe_raw": 3.0, "leverage_tier": 1}
+                  "roe_floor_ok": False, "leverage_tier": 1}
         self.assertEqual(R.first_match(self.spec, values), ("QAL-07", "moderate"))
         # 5 档同样不得评两个正面码（保险丝）
         self.assertNotIn(R.first_match(self.spec, {**values, "roe_tier": 5})[1],
@@ -498,17 +528,19 @@ class TestReportPeriodAdaptation(unittest.TestCase):
         self.assertIn('df["grp_l2"]', src)
         self.assertIn('if report_type == "auto" else ""', src)
 
-    def test_quality_growth_use_auto_except_years_tags(self):
+    def test_quality_growth_use_period_basis(self):
         q = _src("profiling/tags/quality.py")
         g = _src("profiling/tags/growth.py")
-        self.assertIn('load_financial_context(conn, as_of, "auto")', q)
-        self.assertIn('load_financial_context(conn, as_of, "auto")', g)
+        # P2：水平/比率与增速类改走分维度底表（load_financial_period）
+        self.assertIn("load_financial_period(conn, as_of)", q)
+        self.assertIn("load_financial_period(conn, as_of)", g)
         # 年报口径的两个标签必须走 _hist_annual
         self.assertIn("streak = _streak(_hist_annual(as_of, 15),", q)
         self.assertIn("hist = _hist_annual(as_of, 15)", g)
-        # 序列类走同类型 auto 历史
+        # ROE 稳定性保持同类型序列；加速度改走同 basis 两期 yoy
         self.assertIn("g = _hist(as_of, 3)", q)
-        self.assertIn("hist = _hist(as_of, 2)", g)
+        self.assertIn("load_financial_period_yoy_series(conn, as_of, periods=2)", g)
+        self.assertIn("period_yoy(ctx, \"revenue\")", g)
 
     def test_years_tags_keep_v1_and_semantics(self):
         q = registry.get("qal_profit_years")
@@ -519,16 +551,28 @@ class TestReportPeriodAdaptation(unittest.TestCase):
         self.assertIn("年", q.compute_logic)
 
     def test_changed_l1_tags_bumped_to_v2(self):
-        # 阶段 C：行业标签已拆成一级/二级并存（新 code），仍须保持 v2 版本指纹
-        for code in ("qal_roe_ind1_tier", "qal_roe_ind2_tier",
-                     "qal_gross_margin_ind1_tier", "qal_net_margin_ind1_tier",
-                     "qal_leverage_ind1_tier", "qal_roe_stability_ind1",
-                     "qal_earnings_quality_ind1",
-                     "grw_revenue_yoy_ind1_tier", "grw_profit_yoy_ind1_tier",
-                     "grw_growth_accel"):
+        # 阶段 C：行业标签已拆成一级/二级并存（新 code），未改口径的保持 v2 版本指纹
+        for code in ("qal_gross_margin_ind1_tier", "qal_net_margin_ind1_tier",
+                     "qal_roe_stability_ind1"):
             with self.subTest(code=code):
                 self.assertIsNotNone(registry.get(code), code)
                 self.assertEqual(registry.get(code).version, "v2", code)
+
+    def test_period_basis_l1_tags_bumped_to_v3(self):
+        # doc/financial_period_basis_refactor.md §7：口径变更的标签 bump v3
+        for code in ("qal_roe_ind1_tier", "qal_roe_ind2_tier",
+                     "qal_leverage_ind1_tier", "qal_leverage_ind2_tier",
+                     "qal_earnings_quality_ind1", "qal_earnings_quality_ind2",
+                     "grw_revenue_yoy_ind1_tier", "grw_revenue_yoy_ind2_tier",
+                     "grw_profit_yoy_ind1_tier", "grw_profit_yoy_ind2_tier",
+                     "grw_growth_accel"):
+            with self.subTest(code=code):
+                self.assertEqual(registry.get(code).version, "v3", code)
+
+    def test_years_tags_still_v1(self):
+        for code in ("qal_profit_years", "grw_growth_persistence"):
+            with self.subTest(code=code):
+                self.assertEqual(registry.get(code).version, "v1", code)
 
 
 class TestWiringAndSchema(unittest.TestCase):

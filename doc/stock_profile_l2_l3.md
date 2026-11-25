@@ -737,65 +737,108 @@ WHERE r.source_type = 'derived'
 
 | code | label | short_label |
 | --- | --- | --- |
-| `quality_rel_cheap` | 盈利稳且价格相对偏低 | 盈利稳价格低 |
-| `quality_rel_fair` | 盈利稳价格中性 | 盈利稳价格中 |
-| `quality_rel_expensive` | 盈利稳但价格相对偏贵 | 盈利稳价格高 |
-| `moderate_rel_cheap` | 盈利中等且价格相对偏低 | 盈利中价格低 |
-| `moderate_rel_fair` | 盈利中等且价格中性 | 盈利中价格中 |
-| `moderate_rel_expensive` | 盈利中等但价格相对偏贵 | 盈利中价格高 |
-| `value_trap_risk` | 盈利质量弱且价格相对偏低 | 盈利弱价格低 |
-| `weak_and_expensive` | 盈利质量弱且价格相对偏贵 | 盈利弱价格高 |
+| `quality_rel_cheap` | 盈利稳且价格相对偏低 | 盈利稳 · 价格低 |
+| `quality_rel_fair` | 盈利稳价格中性 | 盈利稳 · 价格中 |
+| `quality_rel_expensive` | 盈利稳但价格相对偏贵 | 盈利稳 · 价格高 |
+| `moderate_rel_cheap` | 盈利中等且价格相对偏低 | 盈利中 · 价格低 |
+| `moderate_rel_fair` | 盈利中等且价格中性 | 盈利中 · 价格中 |
+| `moderate_rel_expensive` | 盈利中等但价格相对偏贵 | 盈利中 · 价格高 |
+| `value_trap_risk` | 盈利质量弱且价格相对偏低 | 盈利弱 · 价格低 |
+| `weak_and_expensive` | 盈利质量弱且价格相对偏贵 | 盈利弱 · 价格高 |
 
 > `params`：`coverage_min=0.6`（G1 通用门禁，无其他参数）。规则条数 = 3×4 矩阵 10 个可发布 cell + `VQ-00`（无锚不发布）+ `VQ-99`（兜底不发布）= 12 条，优先级 `VQ-00`=0、10 个 cell=10..33 单调递增、`VQ-99`=99。
 
-> **D22 变更（2026-11-23，三项）**：① `QAL_CLASS` 单开 `moderate → moderate`（原未映射导致 435 只盈利中等票静默不发布）；② 矩阵 3×3 → 3×4，新增 `VQ-C1M/C4M/C6M` 三码，简称按裁决为「盈利中价格低 / 盈利中价格中 / 盈利中价格高」；③ `hist_cheap_ind_expensive`（自身历史便宜但同行贵）归约由 `cheap` 改 `neutral`——单侧信号不支撑陷阱判断，与其余四个单侧码一致。
+> **D22 变更（2026-11-23，三项）**：① `QAL_CLASS` 单开 `moderate → moderate`（原未映射导致 435 只盈利中等票静默不发布）；② 矩阵 3×3 → 3×4，新增 `VQ-C1M/C4M/C6M` 三码，简称按裁决为「盈利中 · 价格低 / 盈利中 · 价格中 / 盈利中 · 价格高」（2026-11-25 统一插入 ` · ` 分隔）；③ `hist_cheap_ind_expensive`（自身历史便宜但同行贵）归约由 `cheap` 改 `neutral`——单侧信号不支撑陷阱判断，与其余四个单侧码一致。
 
 ### 6.2 `biz_growth_quality_type` 增长质量
 
-**判定输入（5 项；以 L2 成长结论为主锚，交叉盈利真实性与现金流证据）**：
+> **v2 方案（2026-11-25，已落地）**：由「负面特征优先 + 单一兜底正面码」的 5 码链式漏斗，改为**成长性 × 盈利质量两维交叉矩阵**，使每个结论码都同时携带两维信息。本节为规格真源；落地时同步 `profiling/conclusions/rules.py`、`profiling/tags/conclusion.py`、`profile.enum_value` 与 §10 验收。中文 label / short_label 见文末代码清单（已确认并落库）。
+
+**为什么要改（实测证据，2026-11-25 本机库）**
+
+现有 5 码中 3 个只覆盖单一维度：`contraction` 2933 只（48%）仅是 L2 `contracting` 的搬运、完全不带质量信息；`sustained_cash_backed` 1427 只里 54.2% 是 `revenue_profit_divergent`、62% `persistence<=1`，成长性信息近乎为零。链式规则一旦命中即 `return`，后一维度永不被表达——使用方从一个码读不出「成长性 + 盈利质量」两方面，与本 L3 的设计目标（§6.0 判据①信息增量）相悖。且 `contraction` 与 L2 `dim_growth_conclusion.contracting`、`paper_growth` 与 L2 `dim_quality_conclusion.paper_profit` 语义重复，违反判据③单一真相源。
+
+**金融行业方法**：成长与质量是正交的两个因子（Barra / MSCI 的 growth、quality 暴露；Morningstar 风格箱的价值-成长 × 规模）。成熟做法是 double sort / 交叉分组，各自独立归约成粗类再交叉成离散格，每格保留两维标签；**不做加权总分**（§0 非目标 3）。同层 §6.1 `biz_value_quality_type` 已是 3×4 矩阵，本 L3 改为同构结构，消除两层结构不一致。
+
+**判定输入（2 项；只读两个 L2 的枚举码，不重算原子）**：
 
 | 输入 | 中文说明 | 数据来源 |
 | --- | --- | --- |
-| 输入 1：增速状态码 | L2 成长结论的六码（`fast_sustained` / `fast_accelerating` / `fast_decelerating` / `slow_steady` / `contracting` / `revenue_profit_divergent`）；**主锚**，L2 未出档时整行不发布 | `growth_code` ← `dim_growth_conclusion.key_value`（`enum`） |
-| 输入 2：利润现金转化档 | 经营现金流 ÷ 净利润，一级行业内五等分，1=纸面利润风险最高、5=现金支撑充足；亏损记为无效 | `earnings_quality_tier` ← `qal_earnings_quality_ind1.key_value`（`int`，`LOSS` 无效） |
-| 输入 3：自由现金流符号 | `financial_indicator.free_cash_flow` 的符号（−1/0/1），**只取符号不取数值**（A/H 推算口径不同） | `fcf_sign` ← `financial_indicator.free_cash_flow`（`int`） |
-| 输入 4：增长持续性 | 从最近一期年报往前数营收同比为正的连续年数，`"0".."3"` | `persistence` ← `grw_growth_persistence.key_value`（`int`） |
-| 输入 5：增长加速度 | 最新一期与上一期同类型报告期营收增速之差，三码 `accelerating` / `steady` / `decelerating` | `accel` ← `grw_growth_accel.key_value`（`enum`） |
+| 输入 1：成长性归约类 | L2 成长结论六码归为 4 类（见下表）；两维主锚之一 | `growth_class` ← `dim_growth_conclusion.key_value` 经 `GROW_CLASS` 映射（`enum`） |
+| 输入 2：盈利质量归约类 | L2 质量结论七码归为 4 类，**复用 §6.1 的 `QAL_CLASS`**，不在本 L3 另立口径 | `quality_class` ← `dim_quality_conclusion.key_value` 经 `QAL_CLASS` 映射（`enum`） |
 
-> `evidence_only`：增速原值、研发强度 / 扣非增速 / CAPEX 强度等补数字段（§8.4，当前多为 `PLANNED_NO_DATA`），不进判定、不进 G1 分母。
-> **FCF 取数口径（2026-11-23 修正）**：A 股季报（Q1/Q3）几乎不含自由现金流（实测覆盖 7.3%），年报/H1 约 90%；港股 OCF−CAPEX 推算各期都有。故取「每票最近一期**有 FCF 的**报告期」而非无条件取最近一期——修正后 A 股覆盖 5→5,484 只、港股 2,830 只。⚠ **由此 FCF 与其余输入期次可能不一致**（A 股多落在 H1，其余输入多为 Q3 季报）；FCF 是「最近可得的现金流证据」，不是当期同步指标，只取符号、不参与增速比较。此口径已经确认接受。
-> `free_cash_flow` 来源与 A/H 差异见 `get_financial.py:61,77,148,300-326` → `sql/schema.sql:786`；CAPEX 明细见 `capex_fixed` / `capex_intangible`（§8.1）。
+> `evidence_only`（不进判定、不进 G1 分母）：`growth_code` 原码、`earnings_quality_tier`（现金转化档）、`fcf_sign`（自由现金流符号）、`persistence`、`accel`、增速原值、研发强度 / 扣非增速 / CAPEX 强度等补数字段。全部写入 `conclusion_detail.cross_check` 供归因——腾讯 2026Q3 单季净现比骤降（4.17% vs 累计 88.18%）的可解释性由这条保证。
+> **FCF 从判定降为旁证的必要说明**：`free_cash_flow` 取「每票最近一期有 FCF 的报告期」，与其余输入期次不一致（A 股多落 H1、其余多为 Q3）；它是「最近可得的现金流证据」而非同步指标。原 v1 把它作为判定输入（GQ-02/04），与「每个码同时表达两维」的矩阵结构不兼容；改后它只作旁证，理由与 §6.1 `cross_check{ocf_to_profit, pe_hist_pct}` 一致。`free_cash_flow` 来源与 A/H 差异见 `get_financial.py:61,77,148,300-326` → `sql/schema.sql:786`。
+
+**成长性归约（`GROW_CLASS`）**：
+
+| 归约类 | L2 成长结论原码 | 本机票数 |
+| --- | --- | --- |
+| `high` | `fast_sustained` / `fast_accelerating` / `fast_decelerating` | 1456 |
+| `steady` | `slow_steady` | 585 |
+| `divergent` | `revenue_profit_divergent`（增收与增利背离） | 1668 |
+| `negative` | `contracting` | 2934 |
+
+**盈利质量归约（`QAL_CLASS`，复用 §6.1）**：`solid`（`solid`）/ `moderate`（`moderate`）/ `volatile`（`high_but_volatile`）/ `weak`（`paper_profit`、`leveraged`、`weak`、`deteriorating`）。
 
 | 项 | 内容 |
 | --- | --- |
-| 回答 | 增长是否有现金与盈利真实性支撑；**`dim_growth_conclusion` 只说「快不快」，交叉现金流 / 盈利真实性 / FCF 符号才产生「是不是真增长」的判断** |
-| 判定规则表 | 负面特征优先（收缩 → 纸面利润 → 烧钱扩张 → 疑似一次性），正面码须有 FCF 实证；见下表 |
-| enum 值域 | **5 种结论**，见下表末的代码清单（附录 D.6 同步） |
-| 门禁 / 频率 | G1 + G2（`growth_code` 主锚）；`quarterly`；`pit_capable=False` |
-| 旁证信息 | 同 `evidence_only` 栏；不进判定 |
-| 依据键 | `rule_id`、`as_of`、`growth_code`、`earnings_quality_tier`、`fcf_sign`、`persistence`、`accel`、`coverage`、`missing_inputs`、`gates` |
-| 措辞 | 禁用「可持续增长 / 真成长 / 未来增速」；`one_off_like` 写「疑似」，不作认定 |
+| 回答 | 成长性与盈利质量的交叉类型：高增长但质量弱、增长背离但质量稳、低增长但质量好等单域说不出的组合；**描述性现状判断，不是预测** |
+| 判定规则表 | 4×4 交叉矩阵，每格一个规则编号与结论码；不设「负面优先短路」，16 格全部可发布（实测无零格、最大格 29.4%） |
+| enum 值域 | **16 种结论**（4 成长 × 4 质量），见矩阵与代码清单（附录 D.6 同步） |
+| 门禁 / 频率 | G1 + G2（任一侧 L2 未出档即整行不发布）；`quarterly`；`pit_capable=False`（沿用上游最弱环） |
+| 旁证信息 | `cross_check{growth_code, earnings_quality_tier, fcf_sign, persistence, accel}`；不进判定 |
+| 依据键 | `rule_id`、`as_of`、`growth_class`、`quality_class`、`cross_check`、`coverage`、`missing_inputs`、`gates` |
+| 措辞 | 禁用「可持续增长 / 真成长 / 未来增速 / 推荐」；所有码只描述两维交叉现状，不作方向判断 |
 
-| 规则编号 | 优先级 | 规则描述 | 判定条件（供程序执行） | 结论（中文名 / 代码） | 界面简称 |
-| --- | --- | --- | --- | --- | --- |
-| GQ-00 | 0 | 营收或净利同比为负，增长收缩 | `growth_code == 'contracting'` | 收缩 / `contraction` | 收缩 |
-| GQ-01 | 1 | 增长但利润现金转化弱 | `earnings_quality_tier <= 2` | 增长但利润现金转化弱 / `paper_growth` | 转化弱 |
-| GQ-02 | 2 | 高增长但自由现金流为负 | `fcf_sign < 0 AND growth_code in ('fast_sustained','fast_accelerating')` | 高增长但自由现金流为负 / `cash_burning_expansion` | 扩张耗现金 |
-| GQ-03 | 3 | 增速跳变、持续性弱，疑似一次性因素 | `persistence <= 1 AND accel == 'accelerating' AND growth_code in ('fast_accelerating','fast_sustained')` | 疑似一次性因素（增速跳变、持续性弱） / `one_off_like` | 疑似一次性 |
-| GQ-04 | 98 | 增长持续且有非负自由现金流实证 | `fcf_sign >= 0` | 增长持续且现金支撑 / `sustained_cash_backed` | 现金支撑 |
-| GQ-99 | 99 | FCF 缺失或为负且未命中前述 → 整行不发布 | 兜底 | — | — |
+**交叉矩阵**（行=成长性归约类，列=盈利质量归约类；每格一个独立 enum 码，code 命名 `<growth>_<quality>`）：
 
-**代码与界面简称清单**（5 项，供程序同步 `profile.enum_value`）：
+| 成长 ＼ 质量 | `solid` | `moderate` | `volatile` | `weak` |
+| --- | --- | --- | --- | --- |
+| `high` | GQ-11 → `high_solid` | GQ-12 → `high_moderate` | GQ-13 → `high_volatile` | GQ-14 → `high_weak` |
+| `steady` | GQ-21 → `steady_solid` | GQ-22 → `steady_moderate` | GQ-23 → `steady_volatile` | GQ-24 → `steady_weak` |
+| `divergent` | GQ-31 → `divergent_solid` | GQ-32 → `divergent_moderate` | GQ-33 → `divergent_volatile` | GQ-34 → `divergent_weak` |
+| `negative` | GQ-41 → `negative_solid` | GQ-42 → `negative_moderate` | GQ-43 → `negative_volatile` | GQ-44 → `negative_weak` |
+
+> 规则编号 `GQ-{行}{列}`，与 `conclusion_detail.rule_id` 对应。不设优先级短路：16 格互斥且完备，两侧 L2 出档即命中唯一格。规则条件为两个 `==` 叶子合取（`growth_class == <行> AND quality_class == <列>`），符合 §4.3.1 结构化条件契约。
+
+**本机实测分布（2026-11-25，5,516 只有双侧 L2 的票）**：
+
+| 成长 ＼ 质量 | solid | moderate | volatile | weak |
+| --- | --- | --- | --- | --- |
+| high | 136 | 78 | 352 | 836 |
+| steady | 60 | 47 | 92 | 348 |
+| divergent | 72 | 108 | 196 | 1001 |
+| negative | 137 | 174 | 259 | 1620 |
+
+16 格全部非零；最小格 47 只（0.9%）、最大格 1620 只（29.4%），满足 §10.1「无 0% 档、单档 ≤80%」。
+
+**代码清单（16 项）——中文 label / short_label（已确认并落库）**：
 
 | code | label | short_label |
 | --- | --- | --- |
-| `sustained_cash_backed` | 增长持续且现金支撑 | 现金支撑 |
-| `cash_burning_expansion` | 高增长但自由现金流为负 | 扩张耗现金 |
-| `paper_growth` | 增长但利润现金转化弱 | 转化弱 |
-| `one_off_like` | 疑似一次性因素（增速跳变、持续性弱） | 疑似一次性 |
-| `contraction` | 收缩 | 收缩 |
+| `high_solid` | 高成长且盈利稳 | 高成长 · 盈利稳 |
+| `high_moderate` | 高成长且盈利中等 | 高成长 · 盈利中 |
+| `high_volatile` | 高成长但盈利波动大 | 高成长 · 盈利波动 |
+| `high_weak` | 高成长但盈利质量弱 | 高成长 · 盈利弱 |
+| `steady_solid` | 成长平稳且盈利稳 | 成长平稳 · 盈利稳 |
+| `steady_moderate` | 成长平稳且盈利中等 | 成长平稳 · 盈利中 |
+| `steady_volatile` | 成长平稳但盈利波动大 | 成长平稳 · 盈利波动 |
+| `steady_weak` | 成长平稳但盈利质量弱 | 成长平稳 · 盈利弱 |
+| `divergent_solid` | 增收增利背离但盈利稳 | 增收背离 · 盈利稳 |
+| `divergent_moderate` | 增收增利背离且盈利中等 | 增收背离 · 盈利中 |
+| `divergent_volatile` | 增收增利背离且盈利波动大 | 增收背离 · 盈利波动 |
+| `divergent_weak` | 增收增利背离且盈利质量弱 | 增收背离 · 盈利弱 |
+| `negative_solid` | 衰退但盈利稳 | 衰退 · 盈利稳 |
+| `negative_moderate` | 衰退且盈利中等 | 衰退 · 盈利中 |
+| `negative_volatile` | 衰退且盈利波动大 | 衰退 · 盈利波动 |
+| `negative_weak` | 衰退且盈利质量弱 | 衰退 · 盈利弱 |
 
-> `params`（已冻结）：`coverage_min=0.6`、`quality_weak_max=2`。GQ-04 的 `fcf_sign >= 0` 是**精细化门禁**：只约束正面码，不影响 GQ-00/01/02/03 已命中的负面/中性码；FCF 缺失时 `_compare` 返回 False，同样落 GQ-99 不发布。实测（2026-11-20 快照）发布率 88.1%、熵比 0.847，`sustained_cash_backed` 1,623 只全部有 FCF≥0 实证。
+> 命名风格（已确认）：沿用 §6.1 的「盈利X · 价格Y」分隔符风格，采用「成长X · 质量Y」——成长词根为「高成长 / 成长平稳 / 增收背离 / 衰退」，质量词根为「盈利稳 / 盈利中 / 盈利波动 / 盈利弱」，如 `high_solid` 简称「高成长 · 盈利稳」、`negative_weak` 简称「衰退 · 盈利弱」。
+
+> `params`（v2 冻结）：`coverage_min=0.6`；无其他判定阈值——回归纯矩阵，原 `quality_weak_max=2` 随链式规则废除而移除。落地后需重跑 `tools/calibrate_conclusion_cutpoints.py` 的分布校验（期望 16 个 enum 全非零、最大档 29.4%）。
+
+> **旧 v1 的 5 个码（`sustained_cash_backed` / `cash_burning_expansion` / `paper_growth` / `one_off_like` / `contraction`）在 v2 全部停用**；因 §4.4 规则升级触发全量重建，旧码行会被 DELETE 清除，不保留历史快照（§4.4.4）。消费端若按旧码筛选需同步改造（§12.1 第 1 项本轮不实施，已标注）。
 
 > **L3 首期只做 2 个**。不做「总分 / 综合评级 / 拥挤度预测」——分别违反 §0 非目标 3 与 1。
 
@@ -1196,9 +1239,10 @@ system/compute-profile.timer (Mon-Fri 17:30, oneshot / MemoryMax=512M)
 **已融合进 §6.1 规则表**（结论码与界面简称见该表末的代码清单）。此处不再重复列值域表——避免两处维护漂移。
 
 
-### D.6 `biz_growth_quality_type`（5）
+### D.6 `biz_growth_quality_type`（v1=5 码 / v2=16 码）
 
 **已融合进 §6.2 规则表**（结论码与界面简称见该表末的代码清单）。此处不再重复列值域表——避免两处维护漂移。
+> v2（2026-11-25，已落地）：5 码链式漏斗 → 4×4 交叉矩阵（16 码），旧 5 码已从 `profile.enum_value` 删除；中文 label / short_label 已确认并落库。
 
 
 ---

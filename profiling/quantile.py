@@ -554,6 +554,249 @@ def load_financial_context(conn, as_of: date,
     return df
 
 
+# ── 分析期（报告期维度）取数 · P1 ──────────────────────────────────
+# doc/financial_period_basis_refactor.md §5/§8 P1
+_FIN_PERIOD_CACHE: dict[date, pd.DataFrame] = {}
+_FIN_PERIOD_MIN_GROUP = 20   # §11 裁定 2：分组质量阈值，保持 20
+_FIN_PERIOD_STALE_DAYS = 15 * 30  # D8 陈旧门禁：15 月（P0 实测 A 股零命中、港股 2.2%）
+_BASIS_PRIORITY = {"quarterly": 0, "semi_annual": 1, "annual": 2}
+
+
+def assign_group_level(
+    df: pd.DataFrame, level1_col: str = "ind1",
+    period_col: str = "report_basis",
+) -> pd.DataFrame:
+    """D7 分组层级回退（纯函数，供单测）。
+
+    输入需含 stock_code / market / {period_col} / {level1_col}。
+    产出 grp_l1 / grp_l2（分档键）与 peer_level（industry_l1 / market）：
+      市场|行业|period 组内有效样本 >=20 → 行业级；否则回退 市场|period；再不足 <5 → NaN（不发布）。
+    period_col 默认 report_basis（增速/现金转化/杠杆）；ROE 按 D4 细分到 report_type，传
+    period_col="report_type"。二级行业列不存在时 grp_l2 退化为与 grp_l1 同层级。
+    """
+    out = df.copy()
+    out["_g1"] = (out["market"].astype(str) + "|"
+                  + out[level1_col].fillna("NA").astype(str) + "|"
+                  + out[period_col].astype(str))
+    out["_gm"] = (out["market"].astype(str) + "|"
+                  + out[period_col].astype(str))
+    cnt = out.groupby("_g1")["stock_code"].transform("size")
+    out["peer_level"] = np.where(cnt >= _FIN_PERIOD_MIN_GROUP, "industry_l1", "market")
+    grp = out["_g1"].where(cnt >= _FIN_PERIOD_MIN_GROUP, out["_gm"])
+    # 市场级仍不足 5 只 → 不发布（assign_tier 也会跳过，这里显式置 NaN 便于 evidence 标注）
+    cnt_m = out.groupby("_gm")["stock_code"].transform("size")
+    out["grp_l1"] = grp.where(cnt_m >= 5)
+    if "ind2" in out.columns:
+        out["_g2"] = (out["market"].astype(str) + "|"
+                      + out["ind2"].fillna("NA").astype(str) + "|"
+                      + out[period_col].astype(str))
+        out["grp_l2"] = out["_g2"].where(cnt_m >= 5)
+    else:
+        out["grp_l2"] = out["grp_l1"]
+    return out.drop(columns=["_g1", "_gm"] + (["_g2"] if "_g2" in out.columns else []))
+
+
+def load_financial_period(conn, as_of: date) -> pd.DataFrame:
+    """④⑤ 分报告期维度底表（每票一行，已按 D8 阶梯选期）。
+
+    选期阶梯（用户裁决）：quarterly → semi_annual → annual → 不发布。
+    - quarterly 准入：可拆单季（revenue_q 非空）+ 去年同季可比 + 基期 >0 + 不陈旧；
+    - H1 / annual 准入：累计同比可得 + 基期 >0 + 不陈旧；
+    - 任意维度失败 → 降级到下一维；全部失败 → 不返回该票。
+
+    返回列（关键）：stock_code / market / report_basis / period_months / report_type /
+    report_date / grp_l1 / grp_l2 / peer_level / basis_reason /
+    revenue_ytd,np_ytd,ocf_ytd / revenue_q,np_q,ocf_q（单季现金转化率用）/
+    roe（报告期原值，不年化）/ debt_ratio / revenue_yoy_reported,np_yoy_reported。
+    同比自算（单季用 revenue_q vs 去年同季；H1/annual 沿用源字段）由标签层做，
+    本函数只提供对齐好的两期数值与可比期日期。
+
+    资源约定：视图查询带 report_date 上下界（R7）；约 3.6 万行 < 50 万不分批（R1）。
+    """
+    if as_of in _FIN_PERIOD_CACHE:
+        return _FIN_PERIOD_CACHE[as_of]
+
+    lower = as_of.replace(year=as_of.year - 3)  # 覆盖去年同季 + 年报两级回退
+    df = _read_sql(
+        conn,
+        """
+        SELECT stock_code, report_date, report_type, report_basis, period_months,
+               fiscal_year_start, announce_date,
+               revenue_ytd, np_ytd, ocf_ytd, fcf_ytd,
+               revenue_q, np_q, ocf_q,
+               roe, gross_profit_rate, net_profit_rate, debt_ratio,
+               revenue_yoy_reported, np_yoy_reported,
+               prev_comparable_date
+        FROM v_financial_analysis_period
+        WHERE report_date <= %s AND report_date >= %s
+        """,
+        (as_of, lower),
+    )
+    if df.empty:
+        return df
+    for c in ("revenue_ytd", "np_ytd", "ocf_ytd", "fcf_ytd",
+              "revenue_q", "np_q", "ocf_q", "roe", "debt_ratio",
+              "gross_profit_rate", "net_profit_rate",
+              "revenue_yoy_reported", "np_yoy_reported"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["report_date"] = pd.to_datetime(df["report_date"]).dt.date
+    df["prev_comparable_date"] = pd.to_datetime(
+        df["prev_comparable_date"], errors="coerce").dt.date
+    df["age_days"] = df["report_date"].map(lambda d: (as_of - d).days)
+
+    # 去年同 basis 可比期的实际指标值（D8「基期 >0」需真值，不能只看日期列存在）
+    prev = df[["stock_code", "report_date", "report_type", "report_basis",
+               "revenue_ytd", "np_ytd", "revenue_q", "np_q"]].copy()
+    # prev 的 report_date 就是 df 的 prev_comparable_date（= 本期 -1 年），不要再平移一年
+    prev = prev.rename(columns={
+        "report_date": "prev_comparable_date",
+        "revenue_ytd": "py_revenue_ytd", "np_ytd": "py_np_ytd",
+        "revenue_q": "py_revenue_q", "np_q": "py_np_q",
+    })
+    df = df.merge(prev, on=["stock_code", "report_type", "report_basis",
+                            "prev_comparable_date"], how="left")
+
+    # D8：先在本期集合上算准入，再按 priority 选每票最高可行维度
+    fresh = df["age_days"] <= _FIN_PERIOD_STALE_DAYS
+    has_prev = df["py_revenue_ytd"].notna()
+    base_ok = (df["revenue_ytd"].notna() & (df["py_revenue_ytd"] > 0)
+               & (df["py_np_ytd"] > 0))
+    df["_eligible"] = (
+        fresh & has_prev & base_ok
+        & (df["report_basis"].map(_BASIS_PRIORITY).notna())
+    )
+    # quarterly 另外要求单季可拆 + 去年同季单季可比
+    df.loc[(df["report_basis"] == "quarterly")
+           & (df["revenue_q"].isna() | df["py_revenue_q"].isna()), "_eligible"] = False
+
+    elig = df[df["_eligible"]].copy()
+    elig["_pri"] = elig["report_basis"].map(_BASIS_PRIORITY)
+    elig = elig.sort_values(["stock_code", "_pri", "report_date"],
+                            ascending=[True, True, False])
+    picked = elig.drop_duplicates("stock_code", keep="first").copy()
+    if picked.empty:
+        return picked
+
+    def _reason(r) -> str:
+        if r["report_basis"] == "quarterly":
+            return "quarterly"
+        if r["report_basis"] == "semi_annual":
+            return "no_quarterly"
+        return "no_quarterly_no_h1"
+
+    picked["basis_reason"] = picked.apply(_reason, axis=1)
+
+    # 市场维度（供分组）+ 行业一/二级
+    picked["market"] = np.where(picked["stock_code"].str.startswith("HK."), "HK", "A")
+    m1 = load_industry_map(conn, 1)[["stock_code", "industry_code"]].rename(
+        columns={"industry_code": "ind1"})
+    m2 = load_industry_map(conn, 2)[["stock_code", "industry_code"]].rename(
+        columns={"industry_code": "ind2"})
+    picked = (picked.merge(m1, on="stock_code", how="left")
+                    .merge(m2, on="stock_code", how="left"))
+    picked = assign_group_level(picked)
+    picked = picked.drop(columns=["_eligible", "_pri", "age_days"], errors="ignore")
+
+    _FIN_PERIOD_CACHE.clear()
+    _FIN_PERIOD_CACHE[as_of] = picked
+    return picked
+
+
+def load_financial_period_yoy_series(conn, as_of: date, periods: int = 2) -> pd.DataFrame:
+    """D6 加速度用：每票最近 N 期（同选定 basis）的营收同比序列。
+
+    每期同比按 basis 自算：quarterly 用单季 vs 去年同季；semi_annual/annual
+    用累计 vs 去年同期累计。基期 <=0 → NaN。
+    返回列：stock_code / report_basis / report_date / rn(0=最新) / rev_yoy。
+    时间下界 3 年（覆盖去年同季），单帧约 10 万行 <50 万（AGENTS.md R1/R7）。
+    """
+    picked = load_financial_period(conn, as_of)
+    if picked.empty:
+        return pd.DataFrame(columns=["stock_code", "report_basis", "report_date", "rn", "rev_yoy"])
+    lower = as_of.replace(year=as_of.year - 3)
+    v = _read_sql(
+        conn,
+        """
+        SELECT stock_code, report_date, report_type, report_basis,
+               revenue_ytd, revenue_q,
+               (report_date - INTERVAL '1 year')::date AS prev_date
+        FROM v_financial_analysis_period
+        WHERE report_date <= %s AND report_date >= %s
+        """,
+        (as_of, lower),
+    )
+    if v.empty:
+        return pd.DataFrame(columns=["stock_code", "report_basis", "report_date", "rn", "rev_yoy"])
+    for c in ("revenue_ytd", "revenue_q"):
+        v[c] = pd.to_numeric(v[c], errors="coerce")
+    v["report_date"] = pd.to_datetime(v["report_date"]).dt.date
+
+    # 只保留每票选定的 basis（D1 同维度）
+    want = picked[["stock_code", "report_basis"]].rename(columns={"report_basis": "_picked_basis"})
+    v = v.merge(want, on="stock_code", how="inner")
+    v = v[v["report_basis"] == v["_picked_basis"]].copy()
+
+    # 去年同期自联接：同票 + 同报告期类型的上一年期末日
+    prev = v[["stock_code", "report_date", "report_type", "revenue_ytd", "revenue_q"]].copy()
+    prev = prev.rename(columns={
+        "report_date": "prev_date",
+        "revenue_ytd": "py_rev_ytd", "revenue_q": "py_rev_q",
+    })
+    v = v.merge(prev, on=["stock_code", "report_type", "prev_date"], how="left")
+
+    q = v["report_basis"] == "quarterly"
+    cur = v["revenue_q"].where(q).fillna(v["revenue_ytd"].where(~q))
+    pyr = v["py_rev_q"].where(q).fillna(v["py_rev_ytd"].where(~q))
+    valid = pyr.notna() & (pyr > 0) & cur.notna()
+    v["rev_yoy"] = np.nan
+    v.loc[valid, "rev_yoy"] = (cur.loc[valid] / pyr.loc[valid] - 1) * 100
+
+    v = v.sort_values(["stock_code", "report_date"], ascending=[True, False])
+    v["rn"] = v.groupby("stock_code").cumcount()
+    out = v[v["rn"] < periods][["stock_code", "report_basis", "report_date", "rn", "rev_yoy"]]
+    return out.reset_index(drop=True)
+
+
+def period_yoy(df: pd.DataFrame, field: str) -> pd.Series:
+    """按选定 basis 自算同比（P2，D3）。
+
+    - quarterly：单季 vs 去年同季（revenue_q / py_revenue_q）；
+    - semi_annual / annual：累计 vs 去年同期累计（*_ytd / py_*_ytd）。
+    基期 <=0 或缺失 → NaN（D3：增速无定义，不打标、不判负增长）。
+    field 取 'revenue' 或 'np'（对应 revenue/np 两族）。
+    """
+    q = df["report_basis"] == "quarterly"
+    cur = pd.to_numeric(df[f"{field}_q"], errors="coerce").where(q)
+    prev = pd.to_numeric(df[f"py_{field}_q"], errors="coerce").where(q)
+    cur_y = pd.to_numeric(df[f"{field}_ytd"], errors="coerce").where(~q)
+    prev_y = pd.to_numeric(df[f"py_{field}_ytd"], errors="coerce").where(~q)
+    cur = cur.fillna(cur_y)
+    prev = prev.fillna(prev_y)
+    valid = prev.notna() & (prev > 0) & cur.notna()
+    out = pd.Series(np.nan, index=df.index, dtype="float64")
+    out.loc[valid] = (cur.loc[valid] / prev.loc[valid] - 1) * 100
+    return out
+
+
+def cash_conversion(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """现金转化率双口径（P2，D5）：返回 (single_q, accumulated)。
+
+    single_q = ocf_q / np_q *100（净利<=0 → NaN 由上层打 LOSS）；
+    accumulated = ocf_ytd / np_ytd *100。两列并列进 evidence 供归因。
+    """
+    np_q = pd.to_numeric(df["np_q"], errors="coerce")
+    ocf_q = pd.to_numeric(df["ocf_q"], errors="coerce")
+    np_y = pd.to_numeric(df["np_ytd"], errors="coerce")
+    ocf_y = pd.to_numeric(df["ocf_ytd"], errors="coerce")
+    sq = pd.Series(np.nan, index=df.index, dtype="float64")
+    ac = pd.Series(np.nan, index=df.index, dtype="float64")
+    okq = np_q.notna() & (np_q > 0)
+    oka = np_y.notna() & (np_y > 0)
+    sq.loc[okq] = ocf_q.loc[okq] / np_q.loc[okq] * 100
+    ac.loc[oka] = ocf_y.loc[oka] / np_y.loc[oka] * 100
+    return sq, ac
+
+
 def assign_tier(values: pd.Series, n_tiers: int = 5, by: pd.Series | None = None) -> pd.Series:
     """横截面分档：把连续值切成 1..n_tiers 档（1=最小，n=最大）。
 
@@ -639,3 +882,4 @@ def clear_caches() -> None:
     _SNAPSHOT_CACHE.clear()
     _TTM_CACHE.clear()
     _FIN_CTX_CACHE.clear()
+    _FIN_PERIOD_CACHE.clear()

@@ -41,8 +41,10 @@ DOMAIN_CODES = {
     "biz_value_quality_type": ["quality_rel_cheap", "quality_rel_fair", "quality_rel_expensive",
                                "moderate_rel_cheap", "moderate_rel_fair", "moderate_rel_expensive",
                                "value_trap_risk", "weak_and_expensive"],
-    "biz_growth_quality_type": ["sustained_cash_backed", "cash_burning_expansion",
-                                "paper_growth", "one_off_like", "contraction"],
+    # §6.2 v2：4 成长 × 4 质量 = 16 码
+    "biz_growth_quality_type": [f"{g}_{q}"
+                                for g in ("high", "steady", "divergent", "negative")
+                                for q in ("solid", "moderate", "volatile", "weak")],
 }
 
 # 6 个结论判定用输入涉及的 L1 标签（§5 / §6 的 inputs[]）
@@ -272,6 +274,9 @@ QAL_CLASS = {"solid": "solid", "high_but_volatile": "volatile",
              "moderate": "moderate",   # D22：单开中等档
              "paper_profit": "weak", "leveraged": "weak",
              "weak": "weak", "deteriorating": "weak"}
+GROW_CLASS = {"fast_sustained": "high", "fast_accelerating": "high",
+              "fast_decelerating": "high", "slow_steady": "steady",
+              "revenue_profit_divergent": "divergent", "contracting": "negative"}
 
 
 def main():
@@ -326,25 +331,15 @@ def main():
                 key = "weak_and_expensive" if vc == "expensive" else "value_trap_risk"
             vq[key] += 1
 
+        # §6.2 v2：两侧 L2 出档即交叉命中 16 格之一，FCF/持久度等只作旁证
         grow = l2.get("dim_growth_conclusion", {}).get(stock)
-        if grow:
+        qal = l2.get("dim_quality_conclusion", {}).get(stock)
+        if grow and qal:
             gq_total += 1
-            q = _int(data.get(("qal_earnings_quality_ind1", "kv")))
-            sign = fcf.get(stock)
-            pe = _int(data.get(("grw_growth_persistence", "kv")))
-            ac = data.get(("grw_growth_accel", "kv"))
-            if grow == "contracting":
-                gq["contraction"] += 1
-            elif q is not None and q <= P["quality_weak_max"]:
-                gq["paper_growth"] += 1
-            elif sign is not None and sign < 0 and grow in ("fast_sustained", "fast_accelerating"):
-                gq["cash_burning_expansion"] += 1
-            elif pe is not None and pe <= 1 and ac == "accelerating" \
-                    and grow in ("fast_accelerating", "fast_sustained"):
-                gq["one_off_like"] += 1
-            elif sign is not None and sign >= 0:
-                gq["sustained_cash_backed"] += 1
-            # 否则 FCF 缺失/为负且未命中前述 → 整行不发布（GQ-99）
+            gc = GROW_CLASS.get(grow)
+            qc = QAL_CLASS.get(qal)
+            if gc and qc:
+                gq[f"{gc}_{qc}"] += 1
     report("biz_value_quality_type", vq, vq_total, sum(vq.values()))
     report("biz_growth_quality_type", gq, gq_total, sum(gq.values()))
 

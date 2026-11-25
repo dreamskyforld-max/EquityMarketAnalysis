@@ -22,7 +22,10 @@ from datetime import date
 import pandas as pd
 
 from ..registry import tag, TIER, PLANNED_NO_DATA
-from ..quantile import assign_tier, load_financial_context, load_financial_history
+from ..quantile import (
+    assign_tier, load_financial_context, load_financial_history,
+    load_financial_period, load_financial_period_yoy_series, period_yoy,
+)
 from ._base import _conn, _frame
 
 DOMAIN = "成长特征"
@@ -75,18 +78,29 @@ def _grp(df: pd.DataFrame, level: int) -> pd.Series:
     return df[f"grp_l{level}"]
 
 
+def _load_period(as_of: date) -> pd.DataFrame:
+    """④⑤ 分维度底表：每票一行，已按 D8 阶梯选 basis（P1）。"""
+    with _conn() as conn:
+        return load_financial_period(conn, as_of)
+
+
 def _grw_revenue_yoy(as_of: date, level: int) -> pd.DataFrame:
-    ctx = _load_ctx(as_of)
-    df = ctx[ctx["revenue_yoy"].notna()]
-    tier = assign_tier(df["revenue_yoy"], 5, by=_grp(df, level))
-    return _frame(df["stock_code"], tier, df["revenue_yoy"])
+    # D3 裁决：按选定 basis 自算同比（单季 vs 去年同季 / 累计 vs 去年同期累计）
+    ctx = _load_period(as_of)
+    yoy = period_yoy(ctx, "revenue")
+    df = ctx.assign(_yoy=yoy)
+    df = df[df["_yoy"].notna()]
+    tier = assign_tier(df["_yoy"], 5, by=_grp(df, level))
+    return _frame(df["stock_code"], tier, df["_yoy"])
 
 
 def _grw_profit_yoy(as_of: date, level: int) -> pd.DataFrame:
-    ctx = _load_ctx(as_of)
-    df = ctx[ctx["net_profit_yoy"].notna()]
-    tier = assign_tier(df["net_profit_yoy"], 5, by=_grp(df, level))
-    return _frame(df["stock_code"], tier, df["net_profit_yoy"])
+    ctx = _load_period(as_of)
+    yoy = period_yoy(ctx, "np")
+    df = ctx.assign(_yoy=yoy)
+    df = df[df["_yoy"].notna()]
+    tier = assign_tier(df["_yoy"], 5, by=_grp(df, level))
+    return _frame(df["stock_code"], tier, df["_yoy"])
 
 
 _GRW_DATA = ["financial_indicator", "regime.stock_sw_industry_mapping",
@@ -117,7 +131,7 @@ def _register_industry_pairs() -> None:
                 source_type="stat", update_freq="quarterly",
                 data_sources=list(_GRW_DATA),
                 compute_logic=logic + f"（{'一级' if level == 1 else '二级'}行业分组，阶段 B 统一映射表）",
-                version="v2", pit_capable=False, owner="profiling")(_make(fn, level))
+                version="v3", pit_capable=False, owner="profiling")(_make(fn, level))
 
 
 _register_industry_pairs()
@@ -170,12 +184,14 @@ def grw_growth_persistence(as_of: date) -> pd.DataFrame:
                   "两期同为非年报或同为年报，不混期）。"
                   "≥+5pp 记 accelerating，≤−5pp 记 decelerating，其余 steady。"
                   "增速的拐点往往比增速本身更有信息量",
-    version="v2", pit_capable=False, owner="profiling",
+    version="v3", pit_capable=False, owner="profiling",
 )
 def grw_growth_accel(as_of: date) -> pd.DataFrame:
-    hist = _hist(as_of, 2)
-    cur = hist[hist["rn"] == 0][["stock_code", "revenue_yoy"]].rename(columns={"revenue_yoy": "cur"})
-    prev = hist[hist["rn"] == 1][["stock_code", "revenue_yoy"]].rename(columns={"revenue_yoy": "prev"})
+    # D6 裁决：同 basis 相邻两期同比之差（单季维度用单季同比，低频维度用累计同比）
+    with _conn() as conn:
+        hist = load_financial_period_yoy_series(conn, as_of, periods=2)
+    cur = hist[hist["rn"] == 0][["stock_code", "rev_yoy"]].rename(columns={"rev_yoy": "cur"})
+    prev = hist[hist["rn"] == 1][["stock_code", "rev_yoy"]].rename(columns={"rev_yoy": "prev"})
     df = cur.merge(prev, on="stock_code")
     df = df[df["cur"].notna() & df["prev"].notna()]
     df["delta"] = _num(df["cur"]) - _num(df["prev"])

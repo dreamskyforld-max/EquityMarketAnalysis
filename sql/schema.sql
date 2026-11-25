@@ -1042,6 +1042,83 @@ ORDER BY stock_code, report_date;
 
 COMMENT ON VIEW v_financial_quarterly IS '单季财务指标视图：将 financial_indicator 中累计值按【财年】(fiscal_year_start) 拆解为单季数据。仅当期次类型严格连续（Q1→H1→Q3→annual）且前一期有值时相减，否则保留累计原值（标签同步保持 Q1/H1/Q3/annual）；revenue/net_profit/ocf 相减求单季，free_cash_flow 单季行因数据源缺 capex 明细设 NULL；比率指标(ROE/毛利率等)保持原值。';
 
+-- 22. 分析期财务口径视图（doc/financial_period_basis_refactor.md §5 P1）
+-- 每票每期一行（不是每票一行）：带 report_basis（quarterly / semi_annual /
+-- annual）与 period_months（3/6/12）；累计列族(ytd) + 单季列族(q，仅可拆期次有值)并存。
+-- 单季化复用 v_financial_quarterly 的财年内累减口径（同财年、期次严格连续），
+-- 本视图只做「打标 + 对齐可比期」，不重复实现累减；每票选哪一期由
+-- quantile.load_financial_period 按 D8 阶梯（quarterly→semi_annual→annual）决定。
+-- 只读，不写表；时间下界由调用方施加（AGENTS.md R7）。
+CREATE OR REPLACE VIEW v_financial_analysis_period AS
+WITH ord AS (
+    SELECT
+        f.stock_code,
+        f.report_date,
+        f.report_type,
+        f.fiscal_year_start,
+        f.announce_date,
+        f.revenue::float8          AS revenue_ytd,
+        f.net_profit::float8       AS np_ytd,
+        f.operating_cash_flow::float8 AS ocf_ytd,
+        f.free_cash_flow::float8   AS fcf_ytd,
+        f.roe::float8              AS roe,
+        f.gross_profit_rate::float8 AS gross_profit_rate,
+        f.net_profit_rate::float8  AS net_profit_rate,
+        f.debt_ratio::float8       AS debt_ratio,
+        f.revenue_yoy::float8      AS revenue_yoy_reported,
+        f.net_profit_yoy::float8   AS np_yoy_reported,
+        LAG(f.report_type) OVER w  AS prev_type,
+        LAG(f.revenue) OVER w      AS prev_revenue
+    FROM financial_indicator f
+    WHERE f.report_type IN ('Q1','H1','Q3','annual')
+    WINDOW w AS (
+        PARTITION BY f.stock_code,
+                     COALESCE(f.fiscal_year_start, DATE_TRUNC('year', f.report_date)::date)
+        ORDER BY f.report_date
+    )
+), q AS (
+    -- 单季拆解：period_type ∈ {Q1,Q2,Q3,Q4} 才是真正可拆单季的行；
+    -- 其余行（缺前序期次）保留累计原值、period_type 仍为 H1/Q3/annual
+    SELECT stock_code, report_date, report_type AS src_type,
+           report_type AS period_type,
+           revenue::float8 AS revenue_q,
+           net_profit::float8 AS np_q,
+           operating_cash_flow::float8 AS ocf_q
+    FROM v_financial_quarterly
+), tagged AS (
+    SELECT
+           o.stock_code, o.report_date, o.report_type, o.fiscal_year_start, o.announce_date,
+           o.revenue_ytd, o.np_ytd, o.ocf_ytd, o.fcf_ytd,
+           o.roe, o.gross_profit_rate, o.net_profit_rate, o.debt_ratio,
+           o.revenue_yoy_reported, o.np_yoy_reported,
+           -- basis 由「是否有可拆单季」决定：Q1/Q2/Q3/Q4 → quarterly；否则累计维度
+           CASE WHEN q.period_type IN ('Q1','Q2','Q3','Q4') THEN 'quarterly'
+                WHEN o.report_type = 'H1' THEN 'semi_annual'
+                ELSE 'annual' END AS report_basis,
+           CASE WHEN q.period_type IN ('Q1','Q2','Q3','Q4') THEN 3
+                WHEN o.report_type = 'H1' THEN 6
+                ELSE 12 END AS period_months,
+           q.period_type AS quarter_type,
+           o.prev_type, o.prev_revenue,
+           q.revenue_q, q.np_q, q.ocf_q
+    FROM ord o
+    LEFT JOIN q
+      ON q.stock_code = o.stock_code
+     AND q.report_date = o.report_date
+)
+SELECT
+    stock_code, report_date, report_type, report_basis, period_months,
+    fiscal_year_start, announce_date, quarter_type,
+    revenue_ytd, np_ytd, ocf_ytd, fcf_ytd,
+    revenue_q, np_q, ocf_q,
+    roe, gross_profit_rate, net_profit_rate, debt_ratio,
+    revenue_yoy_reported, np_yoy_reported,
+    prev_type, prev_revenue,
+    (report_date - INTERVAL '1 year')::date AS prev_comparable_date
+FROM tagged;
+
+COMMENT ON VIEW v_financial_analysis_period IS '分析期财务口径视图：每票每期一行，report_basis∈{quarterly,semi_annual,annual}、period_months∈{3,6,12}；quarterly 覆盖所有可拆单季期次（Q1/Q2/Q3/Q4，quarter_type 标具体季），缺前序期次的 H1/Q3/annual 保留累计；累计列族(ytd)与单季列族(q)并存；roe 等比率保持报告期原值不年化；prev_comparable_date 为去年同期末日。每票选哪期由 load_financial_period 按 D8 阶梯决定（doc/financial_period_basis_refactor.md）。';
+
 -- ============================================================================
 -- 第三部分：扩展采集 / 监控 / 分析中间表
 -- （以下表在采集/分析脚本中以 CREATE TABLE IF NOT EXISTS 自建，未纳入原 schema，

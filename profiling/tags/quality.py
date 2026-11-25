@@ -22,7 +22,8 @@ import pandas as pd
 
 from ..registry import tag, TIER, PLANNED_NO_DATA
 from ..quantile import (
-    assign_tier, load_financial_context, load_financial_history, tier_or_flag,
+    assign_group_level, assign_tier, cash_conversion,
+    load_financial_context, load_financial_history, load_financial_period, tier_or_flag,
 )
 from ._base import _conn, _frame
 
@@ -97,11 +98,21 @@ def _grp(df: pd.DataFrame, level: int) -> pd.Series:
     return df[f"grp_l{level}"]
 
 
+def _load_period(as_of: date) -> pd.DataFrame:
+    """④⑤ 分维度底表：每票一行，已按 D8 阶梯选 basis（P1）。"""
+    with _conn() as conn:
+        return load_financial_period(conn, as_of)
+
+
 def _qal_roe(as_of: date, level: int) -> pd.DataFrame:
-    ctx = _load_ctx(as_of)
-    df = ctx[ctx["roe"].notna()]
+    # D4 裁决：ROE 用报告期原值（不年化），分档按 report_type 细分，绝不跨期长混排
+    ctx = _load_period(as_of)
+    df = ctx[ctx["roe"].notna()].copy()
+    # report_type 分组的层级回退（复用 D7，period_col 传 report_type）
+    df = assign_group_level(df, period_col="report_type") if "ind1" in df else df
+    grp = df[f"grp_l{level}"] if f"grp_l{level}" in df else df["market"] + "|" + df["report_type"]
     return _frame(df["stock_code"],
-                  tier_or_flag(df["roe"], by=_grp(df, level), flag="LOSS"),
+                  tier_or_flag(df["roe"], by=grp, flag="LOSS"),
                   df["roe"])
 
 
@@ -122,7 +133,8 @@ def _qal_net_margin(as_of: date, level: int) -> pd.DataFrame:
 
 
 def _qal_leverage(as_of: date, level: int) -> pd.DataFrame:
-    ctx = _load_ctx(as_of)
+    # 存量比率本身不变，分组键按 D7 切到 report_basis（含层级回退）
+    ctx = _load_period(as_of)
     df = ctx[ctx["debt_ratio"].notna()]
     tier = assign_tier(df["debt_ratio"], 5, by=_grp(df, level))
     return _frame(df["stock_code"], tier, df["debt_ratio"])
@@ -142,17 +154,22 @@ def _qal_roe_stability(as_of: date, level: int) -> pd.DataFrame:
 
 
 def _qal_earnings_quality(as_of: date, level: int) -> pd.DataFrame:
-    ctx = _load_ctx(as_of)
-    np_ = pd.to_numeric(ctx["net_profit"], errors="coerce")
-    ocf = pd.to_numeric(ctx["operating_cash_flow"], errors="coerce")
-    ok = ctx[(np_ > 0) & ocf.notna()]
-    ratio = (pd.to_numeric(ok["operating_cash_flow"], errors="coerce")
-             / pd.to_numeric(ok["net_profit"], errors="coerce") * 100.0)
-    tier_ok = assign_tier(ratio, 5, by=_grp(ok, level))
-    loss = ctx[(np_ <= 0) & np_.notna()]
+    # D5 裁决：单季 OCF ÷ 单季净利；单季不可得时降级累计口径（loader 已按 D8 选期），
+    # 两者并列进 evidence 由结论层写；本标签只产判定用档位与原值。
+    ctx = _load_period(as_of)
+    sq, ac = cash_conversion(ctx)
+    # 每行只走一个口径：单季可用（净利>0）→ 单季；否则累计。
+    # 分母与比率同源，LOSS 只在该口径分母<=0 时打，避免 ok/loss 重叠。
+    ratio = sq.where(sq.notna(), ac)
+    denom = pd.to_numeric(ctx["np_q"], errors="coerce").where(sq.notna())
+    denom = denom.fillna(pd.to_numeric(ctx["np_ytd"], errors="coerce"))
+    work = ctx.assign(_cash=ratio, _denom=denom)
+    ok = work[work["_cash"].notna()]
+    tier_ok = assign_tier(ok["_cash"], 5, by=_grp(ok, level))
+    loss = work[(work["_denom"] <= 0) & work["_denom"].notna() & work["_cash"].isna()]
     tier = pd.concat([
         pd.DataFrame({"stock_code": ok["stock_code"], "key_value": tier_ok.values,
-                      "num_value": ratio.values, "confidence": 1.0}),
+                      "num_value": ok["_cash"].values, "confidence": 1.0}),
         pd.DataFrame({"stock_code": loss["stock_code"], "key_value": "LOSS",
                       "num_value": None, "confidence": 1.0}),
     ], ignore_index=True)
@@ -191,6 +208,10 @@ _QAL_IND_SPECS = (
 )
 
 
+# 版本即口径：口径变更的标签 bump 到 v3，未变的保持 v2（§4.4 / §7）
+_QAL_BUMPED_V3 = {_qal_roe, _qal_leverage, _qal_earnings_quality}
+
+
 def _register_industry_pairs() -> None:
     """工厂注册：每个内部函数按 level=1/2 各注册一个标签（导入即生效）。"""
     def _make(fn, level):
@@ -206,7 +227,8 @@ def _register_industry_pairs() -> None:
                 source_type="stat", update_freq="quarterly",
                 data_sources=list(_QAL_DATA),
                 compute_logic=logic + f"（{'一级' if level == 1 else '二级'}行业分组，阶段 B 统一映射表）",
-                version="v2", pit_capable=False, owner="profiling")(_make(fn, level))
+                version="v3" if fn in _QAL_BUMPED_V3 else "v2",
+                pit_capable=False, owner="profiling")(_make(fn, level))
 
 
 _register_industry_pairs()

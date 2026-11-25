@@ -41,9 +41,20 @@ QAL_CLASS = {
     "paper_profit": "weak", "leveraged": "weak",
     "weak": "weak", "deteriorating": "weak",
 }
+# §6.2 v2：成长性归约（4 类）。只读 L2 dim_growth_conclusion 的 enum 码，
+# 与 QAL_CLASS 一起构成 4×4 交叉矩阵；FCF 不再参与判定。
+GROW_CLASS = {
+    "fast_sustained": "high", "fast_accelerating": "high", "fast_decelerating": "high",
+    "slow_steady": "steady",
+    "revenue_profit_divergent": "divergent",
+    "contracting": "negative",
+}
 
 # ── 通用参数（各结论可覆盖）──────────────────────────────────────────
 _COMMON = {"coverage_min": 0.6}
+
+# §11 裁定 1：ROE 绝对值底线按 report_type 分设（P3 标定 P30，正值子样本）
+_ROE_FLOOR_BY_REPORT_TYPE = {"Q1": 0.43, "H1": 2.23, "Q3": 3.27, "annual": 1.36}
 
 
 def _cond(field: str, op: str, value: Any) -> dict:
@@ -130,7 +141,7 @@ RULES: dict[str, dict] = {
 
     # ── §5.2 盈利质量 ─────────────────────────────────────────────
     "dim_quality_conclusion": {
-        "version": "v3",   # D21：一级行业口径 + 7 码 + 杠杆降级 + ROE 绝对底线
+        "version": "v4",   # §11 裁定 1：ROE 底线按 report_type 分设（v3=单一5%）
         "update_freq": _QUARTERLY,
         "inputs": [
             {"field": "roe_tier", "tag_code": "qal_roe_ind1_tier",
@@ -143,14 +154,20 @@ RULES: dict[str, dict] = {
              "source_col": "key_value", "dtype": "int"},
             {"field": "roe_raw", "tag_code": "qal_roe_ind1_tier",
              "source_col": "num_value", "dtype": "float"},
+            # §11 裁定 1：报告期类型作为控制字段（role=aux，不计 G1 分母）
+            {"field": "report_type", "compute": "report_type", "dtype": "str", "role": "aux"},
         ],
         # D21 §5.2：两个主锚（ROE 档 / 现金转化档）至少一个有效即可判定
         "anchor_any": True,
-        "derived_fields": [],
+        "derived_fields": [
+            # 按 report_type 查分设底线，产出布尔供结构化条件用字面量比较
+            {"field": "roe_floor_ok", "expr": "roe_raw >= ROE_FLOOR[report_type]", "dtype": "bool"},
+        ],
         "params": {**_COMMON, "stable_max": 2, "volatile_min": 4,
                    "quality_weak_max": 2, "quality_ok_min": 3,
                    "leverage_high": 4, "roe_high": 4,
-                   "moderate_min": 3, "moderate_max": 4, "roe_floor_pct": 5},
+                   "moderate_min": 3, "moderate_max": 4,
+                   "roe_floor_pct_by_report_type": dict(_ROE_FLOOR_BY_REPORT_TYPE)},
         "rules": [
             {"rule_id": "QAL-01", "priority": 0,
              "conditions": _all(_cond("roe_stability", ">=", 4),
@@ -163,11 +180,11 @@ RULES: dict[str, dict] = {
              "conditions": _all(_cond("roe_tier", ">=", 4),
                                 _cond("roe_stability", "<=", 2),
                                 _cond("earnings_quality_tier", ">=", 3),
-                                _cond("roe_raw", ">=", 5)),
+                                _cond("roe_floor_ok", "==", True)),
              "result": "solid"},
             {"rule_id": "QAL-05", "priority": 11,
              "conditions": _all(_cond("roe_tier", ">=", 4),
-                                _cond("roe_raw", ">=", 5)),
+                                _cond("roe_floor_ok", "==", True)),
              "result": "high_but_volatile"},
             {"rule_id": "QAL-03", "priority": 12,
              "conditions": _all(_cond("leverage_tier", ">=", 4),
@@ -357,61 +374,109 @@ RULES: dict[str, dict] = {
         },
     },
 
-    # ── §6.2 增长质量 ─────────────────────────────────────────────
+    # ── §6.2 v2 成长质量（4×4 矩阵，2026-11-25）──────────────────────
     "biz_growth_quality_type": {
-        "version": "v3",   # 修 FCF 取数 + 现金转化档切 ind1 + GQ-04 精细化门禁
+        "version": "v4",   # v2 设计：5 码链式漏斗 → 4×4 交叉矩阵（16 码）
         "update_freq": _QUARTERLY,
         "inputs": [
-            # 主锚：L2 未出档时整行不发布，否则 GQ-04 兜底会把数据不足的票
-            # 误判成 sustained_cash_backed（违反 §4.2「宁可不出档」）
-            {"field": "growth_code", "source": "derived", "compute": "l2_growth",
+            # 只读两个 L2 的归约码，不重算原子；两侧主锚均必须出档（G2）
+            {"field": "growth_class", "source": "derived", "compute": "grow_class",
              "dtype": "enum", "role": "anchor",
-             "codes": ["fast_sustained", "fast_accelerating", "fast_decelerating",
-                       "slow_steady", "contracting", "revenue_profit_divergent"]},
-            # D22：切一级行业口径，与 §5.2 质量结论同源（旧 qal_earnings_quality 已停更）
+             "codes": ["high", "steady", "divergent", "negative"]},
+            {"field": "quality_class", "source": "derived", "compute": "qal_class",
+             "dtype": "enum", "role": "anchor",
+             "codes": ["solid", "moderate", "volatile", "weak"]},
+        ],
+        "derived_fields": [],
+        "params": {**_COMMON},
+        # 旁证：不进判定、不进 G1 分母，写入 conclusion_detail.cross_check 供归因。
+        # FCF 取「最近一期有值」报告期，与其余输入期次不一致，只作旁证（§6.2）。
+        "cross_check_inputs": [
+            {"field": "growth_code", "source": "derived", "compute": "l2_growth",
+             "dtype": "enum"},
             {"field": "earnings_quality_tier", "tag_code": "qal_earnings_quality_ind1",
              "source_col": "key_value", "dtype": "int", "invalid": ["LOSS"]},
-            # 不设 anchor：GQ-00/01/03 不依赖 FCF，不能被门禁无差别拦掉。
-            # 精细化门禁只放在 GQ-04 兜底前（GQ-99），见下方规则。
             {"field": "fcf_sign", "source": "financial_indicator",
-             "column": "free_cash_flow", "dtype": "int", "codes": [-1, 0, 1]},
+             "column": "free_cash_flow", "dtype": "int"},
             {"field": "persistence", "tag_code": "grw_growth_persistence",
              "source_col": "key_value", "dtype": "int"},
             {"field": "accel", "tag_code": "grw_growth_accel",
-             "source_col": "key_value", "dtype": "enum",
-             "codes": ["accelerating", "steady", "decelerating"]},
+             "source_col": "key_value", "dtype": "enum"},
         ],
-        "derived_fields": [],
-        "params": {**_COMMON, "quality_weak_max": 2},
         "rules": [
-            {"rule_id": "GQ-00", "priority": 0,
-             "conditions": _all(_cond("growth_code", "==", "contracting")),
-             "result": "contraction"},
-            {"rule_id": "GQ-01", "priority": 1,
-             "conditions": _all(_cond("earnings_quality_tier", "<=", 2)),
-             "result": "paper_growth"},
-            {"rule_id": "GQ-02", "priority": 2,
-             "conditions": _all(_cond("fcf_sign", "<", 0),
-                                _cond("growth_code", "in",
-                                      ["fast_sustained", "fast_accelerating"])),
-             "result": "cash_burning_expansion"},
-            {"rule_id": "GQ-03", "priority": 3,
-             "conditions": _all(_cond("persistence", "<=", 1),
-                                _cond("accel", "==", "accelerating"),
-                                _cond("growth_code", "in",
-                                      ["fast_accelerating", "fast_sustained"])),
-             "result": "one_off_like"},
-            # 精细化门禁：正面码必须有非负 FCF 实证（_compare 对 None 返回 False，
-            # 故 FCF 缺失同样落不进 GQ-04）。GQ-00/01/02/03 优先级更高，不受影响。
-            {"rule_id": "GQ-04", "priority": 98,
-             "conditions": _all(_cond("fcf_sign", ">=", 0)),
-             "result": "sustained_cash_backed"},
+            {"rule_id": "GQ-11", "priority": 11,
+             "conditions": _all(_cond("growth_class", "==", "high"),
+                                _cond("quality_class", "==", "solid")),
+             "result": "high_solid"},
+            {"rule_id": "GQ-12", "priority": 12,
+             "conditions": _all(_cond("growth_class", "==", "high"),
+                                _cond("quality_class", "==", "moderate")),
+             "result": "high_moderate"},
+            {"rule_id": "GQ-13", "priority": 13,
+             "conditions": _all(_cond("growth_class", "==", "high"),
+                                _cond("quality_class", "==", "volatile")),
+             "result": "high_volatile"},
+            {"rule_id": "GQ-14", "priority": 14,
+             "conditions": _all(_cond("growth_class", "==", "high"),
+                                _cond("quality_class", "==", "weak")),
+             "result": "high_weak"},
+            {"rule_id": "GQ-21", "priority": 21,
+             "conditions": _all(_cond("growth_class", "==", "steady"),
+                                _cond("quality_class", "==", "solid")),
+             "result": "steady_solid"},
+            {"rule_id": "GQ-22", "priority": 22,
+             "conditions": _all(_cond("growth_class", "==", "steady"),
+                                _cond("quality_class", "==", "moderate")),
+             "result": "steady_moderate"},
+            {"rule_id": "GQ-23", "priority": 23,
+             "conditions": _all(_cond("growth_class", "==", "steady"),
+                                _cond("quality_class", "==", "volatile")),
+             "result": "steady_volatile"},
+            {"rule_id": "GQ-24", "priority": 24,
+             "conditions": _all(_cond("growth_class", "==", "steady"),
+                                _cond("quality_class", "==", "weak")),
+             "result": "steady_weak"},
+            {"rule_id": "GQ-31", "priority": 31,
+             "conditions": _all(_cond("growth_class", "==", "divergent"),
+                                _cond("quality_class", "==", "solid")),
+             "result": "divergent_solid"},
+            {"rule_id": "GQ-32", "priority": 32,
+             "conditions": _all(_cond("growth_class", "==", "divergent"),
+                                _cond("quality_class", "==", "moderate")),
+             "result": "divergent_moderate"},
+            {"rule_id": "GQ-33", "priority": 33,
+             "conditions": _all(_cond("growth_class", "==", "divergent"),
+                                _cond("quality_class", "==", "volatile")),
+             "result": "divergent_volatile"},
+            {"rule_id": "GQ-34", "priority": 34,
+             "conditions": _all(_cond("growth_class", "==", "divergent"),
+                                _cond("quality_class", "==", "weak")),
+             "result": "divergent_weak"},
+            {"rule_id": "GQ-41", "priority": 41,
+             "conditions": _all(_cond("growth_class", "==", "negative"),
+                                _cond("quality_class", "==", "solid")),
+             "result": "negative_solid"},
+            {"rule_id": "GQ-42", "priority": 42,
+             "conditions": _all(_cond("growth_class", "==", "negative"),
+                                _cond("quality_class", "==", "moderate")),
+             "result": "negative_moderate"},
+            {"rule_id": "GQ-43", "priority": 43,
+             "conditions": _all(_cond("growth_class", "==", "negative"),
+                                _cond("quality_class", "==", "volatile")),
+             "result": "negative_volatile"},
+            {"rule_id": "GQ-44", "priority": 44,
+             "conditions": _all(_cond("growth_class", "==", "negative"),
+                                _cond("quality_class", "==", "weak")),
+             "result": "negative_weak"},
+            # 16 格互斥且完备；兜底仅为 schema 契约保留，正常不触发
             {"rule_id": "GQ-99", "priority": 99, "conditions": _all(),
              "result": None},
         ],
         "output_schema": {
-            "key_value_semantics": "增长 × 现金转化的交叉类型，现状判断而非可持续性预测",
-            "value_codes": {"sustained_cash_backed": "增长持续且现金支撑"},
+            "key_value_semantics": "成长性 × 盈利质量的 4×4 交叉类型，现状判断而非预测；"
+                                   "result=None 表示任一侧 L2 未出档整行不发布",
+            "value_codes": {"high_weak": "高成长但盈利质量弱",
+                            "negative_solid": "衰退但盈利稳"},
         },
     },
 }

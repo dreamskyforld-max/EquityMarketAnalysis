@@ -64,22 +64,33 @@ POSITION_ENUM = {
 }
 
 VALUE_QUALITY_ENUM = {
-    "quality_rel_cheap": ("盈利稳且价格相对偏低", "盈利稳价格低"),
-    "quality_rel_fair": ("盈利稳价格中性", "盈利稳价格中"),
-    "quality_rel_expensive": ("盈利稳但价格相对偏贵", "盈利稳价格高"),
-    "moderate_rel_cheap": ("盈利中等且价格相对偏低", "盈利中价格低"),
-    "moderate_rel_fair": ("盈利中等且价格中性", "盈利中价格中"),
-    "moderate_rel_expensive": ("盈利中等但价格相对偏贵", "盈利中价格高"),
-    "value_trap_risk": ("盈利质量弱且价格相对偏低", "盈利弱价格低"),
-    "weak_and_expensive": ("盈利质量弱且价格相对偏贵", "盈利弱价格高"),
+    "quality_rel_cheap": ("盈利稳且价格相对偏低", "盈利稳 · 价格低"),
+    "quality_rel_fair": ("盈利稳价格中性", "盈利稳 · 价格中"),
+    "quality_rel_expensive": ("盈利稳但价格相对偏贵", "盈利稳 · 价格高"),
+    "moderate_rel_cheap": ("盈利中等且价格相对偏低", "盈利中 · 价格低"),
+    "moderate_rel_fair": ("盈利中等且价格中性", "盈利中 · 价格中"),
+    "moderate_rel_expensive": ("盈利中等但价格相对偏贵", "盈利中 · 价格高"),
+    "value_trap_risk": ("盈利质量弱且价格相对偏低", "盈利弱 · 价格低"),
+    "weak_and_expensive": ("盈利质量弱且价格相对偏贵", "盈利弱 · 价格高"),
 }
 
 GROWTH_QUALITY_ENUM = {
-    "sustained_cash_backed": ("增长持续且现金支撑", "现金支撑"),
-    "cash_burning_expansion": ("高增长但自由现金流为负", "扩张耗现金"),
-    "paper_growth": ("增长但利润现金转化弱", "转化弱"),
-    "one_off_like": ("疑似一次性因素（增速跳变、持续性弱）", "疑似一次性"),
-    "contraction": ("收缩", "收缩"),
+    "high_solid": ("高成长且盈利稳", "高成长 · 盈利稳"),
+    "high_moderate": ("高成长且盈利中等", "高成长 · 盈利中"),
+    "high_volatile": ("高成长但盈利波动大", "高成长 · 盈利波动"),
+    "high_weak": ("高成长但盈利质量弱", "高成长 · 盈利弱"),
+    "steady_solid": ("成长平稳且盈利稳", "成长平稳 · 盈利稳"),
+    "steady_moderate": ("成长平稳且盈利中等", "成长平稳 · 盈利中"),
+    "steady_volatile": ("成长平稳但盈利波动大", "成长平稳 · 盈利波动"),
+    "steady_weak": ("成长平稳但盈利质量弱", "成长平稳 · 盈利弱"),
+    "divergent_solid": ("增收增利背离但盈利稳", "增收背离 · 盈利稳"),
+    "divergent_moderate": ("增收增利背离且盈利中等", "增收背离 · 盈利中"),
+    "divergent_volatile": ("增收增利背离且盈利波动大", "增收背离 · 盈利波动"),
+    "divergent_weak": ("增收增利背离且盈利质量弱", "增收背离 · 盈利弱"),
+    "negative_solid": ("衰退但盈利稳", "衰退 · 盈利稳"),
+    "negative_moderate": ("衰退且盈利中等", "衰退 · 盈利中"),
+    "negative_volatile": ("衰退且盈利波动大", "衰退 · 盈利波动"),
+    "negative_weak": ("衰退且盈利质量弱", "衰退 · 盈利弱"),
 }
 
 
@@ -117,7 +128,7 @@ def dim_valuation_conclusion(as_of: date):
     compute_logic="五项输入全取一级行业口径：ROE 档 × ROE 波动档 × 现金转化档三腿合取；"
                   "杠杆仅在没有高 ROE 时降级；ROE 绝对值低于底线最高只能评盈利中等。"
                   "描述的是财报特征，不评价证券好坏。" + _DISCLAIMER,
-    parent_tag="qal_roe_ind1_tier", version="v3", pit_capable=False,
+    parent_tag="qal_roe_ind1_tier", version="v4", pit_capable=False,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def dim_quality_conclusion(as_of: date):
@@ -171,10 +182,11 @@ def biz_value_quality_type(as_of: date):
     code="biz_growth_quality_type", name="增长质量", domain="综合研判",
     value_type=ENUM, enum_type="growth_quality_type", enum_values=GROWTH_QUALITY_ENUM,
     source_type="derived", update_freq="quarterly",
-    data_sources=["dim_growth_conclusion", "qal_earnings_quality_ind1", "financial_indicator"],
-    compute_logic="增速状态 × 一级行业现金转化档 × FCF 符号 → 类型码；背离优先于增速。"
-                  "正面码须有非负 FCF 实证，FCF 缺失或为负时不发布。" + _DISCLAIMER,
-    parent_tag="dim_growth_conclusion", version="v3", pit_capable=False,
+    data_sources=["dim_growth_conclusion", "dim_quality_conclusion"],
+    compute_logic="成长性四类（高成长/成长平稳/增收增利背离/衰退）× 盈利质量四类"
+                  "（稳/中等/波动大/弱）→ 4×4 交叉类型；两侧 L2 任一未出档整行不发布。"
+                  "FCF 等补数字段只作 cross_check 旁证，不进判定。" + _DISCLAIMER,
+    parent_tag="dim_growth_conclusion", version="v4", pit_capable=False,
     is_exclusive=False, confidence_req=False, status=ACTIVE, owner="profiling",
 )
 def biz_growth_quality_type(as_of: date):

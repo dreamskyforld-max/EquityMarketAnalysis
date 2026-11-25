@@ -40,9 +40,12 @@ _MA_MIN_OBS = 20
 def _all_l1_tags() -> list[str]:
     tags = set()
     for spec in R.RULES.values():
-        for item in spec["inputs"]:
-            if "tag_code" in item:
-                tags.add(item["tag_code"])
+        # cross_check_inputs 的旁证标签也要进快照，否则 v2 成长质量的
+        # earnings_quality_tier / persistence / accel 取不到（§6.2）
+        for key in ("inputs", "cross_check_inputs"):
+            for item in spec.get(key, []):
+                if "tag_code" in item:
+                    tags.add(item["tag_code"])
     return sorted(tags)
 
 
@@ -96,8 +99,17 @@ def _load_financial_period(conn, as_of: date, report_type: str) -> dict:
     qal_*/grw_* 标签，'annual' 对应保留年报口径的 qal_profit_years /
     grw_growth_persistence。保证「结论说基于哪一期」与「L1 实际用哪一期」一致。
     """
-    from profiling.quantile import load_financial_latest
+    from profiling.quantile import load_financial_latest, load_financial_period
 
+    # P2 后 qal_*/grw_* 走分维度底表（D8 选期），evidence 与控制字段必须同源；
+    # 否则「结论说基于哪一期」与 L1 实际取数不一致。annual-only 标签仍走年报口径。
+    if report_type == "auto":
+        df = load_financial_period(conn, as_of)
+        return {
+            s: {"report_type": rt, "report_date": str(rd), "report_basis": bs}
+            for s, rt, rd, bs in zip(df["stock_code"], df["report_type"],
+                                     df["report_date"], df["report_basis"])
+        }
     df = load_financial_latest(conn, as_of, report_type)
     if df.empty:
         return {}
@@ -165,12 +177,14 @@ def _cast(raw, item: dict):
     return raw  # enum / str
 
 
-def _build_values(spec: dict, stock: str, snap: dict, extras: dict, l2: dict):
+def _build_values(spec: dict, stock: str, snap: dict, extras: dict, l2: dict,
+                  inputs: list[dict] | None = None):
+    """按 inputs（默认判定输入，也可传 cross_check_inputs）取当前票的字段值。"""
     values: dict = {}
     missing: list[str] = []
     period_by_field: dict = {}
     primary_period: dict | None = None
-    for item in spec["inputs"]:
+    for item in (spec["inputs"] if inputs is None else inputs):
         field = item["field"]
         compute = item.get("compute")
         if "tag_code" in item:
@@ -188,10 +202,17 @@ def _build_values(spec: dict, stock: str, snap: dict, extras: dict, l2: dict):
                     # 不覆盖它，仍逐字段标在 evidence.report_period 供细查。
                     if mode == "auto" and primary_period is None:
                         primary_period = p
+        elif compute == "report_type":
+            # §11 裁定 1：报告期类型控制字段，来自 L1 取数同一 auto 期次
+            p = extras.get("period_auto", {}).get(stock)
+            value = p.get("report_type") if p else None
         elif compute == "ma_alignment":
             value = extras["ma"].get(stock)
         elif compute == "l2_growth":
             value = l2.get("dim_growth_conclusion", {}).get(stock)
+        elif compute == "grow_class":
+            code = l2.get("dim_growth_conclusion", {}).get(stock)
+            value = R.GROW_CLASS.get(code)
         elif compute == "val_class":
             code = l2.get("dim_valuation_conclusion", {}).get(stock)
             value = R.VAL_CLASS.get(code)
@@ -205,7 +226,11 @@ def _build_values(spec: dict, stock: str, snap: dict, extras: dict, l2: dict):
         values[field] = value
         if value is None:
             missing.append(field)
-    coverage = 1.0 - len(missing) / len(spec["inputs"])
+    # role=aux 是控制字段（如 report_type），不进 G1 分母（§4.2 inputs 只含判定用）
+    denom = sum(1 for i in spec["inputs"] if i.get("role") != "aux")
+    denom_missing = sum(1 for i in spec["inputs"]
+                        if i.get("role") != "aux" and values.get(i["field"]) is None)
+    coverage = 1.0 - denom_missing / denom if denom else 1.0
     return values, coverage, missing, period_by_field, primary_period
 
 
@@ -229,6 +254,12 @@ def _derive(spec: dict, values: dict) -> dict:
         if field == "growth_gap":
             a, b = values.get("rev_tier"), values.get("np_tier")
             values[field] = abs(a - b) if a is not None and b is not None else None
+        elif field == "roe_floor_ok":
+            # §11 裁定 1：按 report_type 查分设底线；报告期或 ROE 缺失 → 不通过
+            floors = params.get("roe_floor_pct_by_report_type", {})
+            rt, rr = values.get("report_type"), values.get("roe_raw")
+            floor = floors.get(rt) if rt is not None else None
+            values[field] = bool(rr >= floor) if (floor is not None and rr is not None) else False
         elif field in ("hist_tier", "ind_tier"):
             # D20：估值分位切档（hist←pe_hist_pct / ind←pe_ind_pct，后者已是二级分位）
             src = "pe_hist_pct" if field == "hist_tier" else "pe_ind_pct"
@@ -273,7 +304,8 @@ def _judge(spec: dict, code: str, values: dict, coverage: float):
 def _detail(rule_id, values, coverage, missing, gates, as_of: date,
             with_run: bool, eff_from: date | None = None,
             period_by_field: dict | None = None,
-            primary_report_period: dict | None = None) -> dict:
+            primary_report_period: dict | None = None,
+            cross_check: dict | None = None) -> dict:
     evidence = {k: v for k, v in values.items() if v is not None}
     # 每个财报派生输入都标出它实际取数的报告期；年报口径标签标 annual 期次，
     # 自适应标签标 auto 期次。非财报输入（估值分位/量价）不标。
@@ -281,13 +313,17 @@ def _detail(rule_id, values, coverage, missing, gates, as_of: date,
         evidence["report_period"] = period_by_field
     detail = {
         # 仅财报驱动的 L2（quality/growth）有主报告期；估值/量价 L2 不写此键。
-        **({"primary_report_period": primary_report_period} if primary_report_period else {}),
+        # §D11：report_basis 同时置于顶层，供消费端不解析嵌套即可判断同维度对比口径。
+        **({"primary_report_period": primary_report_period,
+            "report_basis": primary_report_period.get("report_basis")}
+           if primary_report_period else {}),
         "rule_id": rule_id,
         "coverage": round(coverage, 4),
         "missing_inputs": missing,
         "evidence": evidence,
         "gates": gates,
         "as_of": str(as_of),
+        **({"cross_check": cross_check} if cross_check is not None else {}),
     }
     if with_run:
         since = eff_from or as_of
@@ -411,10 +447,18 @@ def produce(as_of: date | None = None, sync_dict: bool = True) -> dict:
                 spec, stock, snap, extras, l2)
             _derive(spec, values)
             rule_id, result, gates = _judge(spec, code, values, coverage)
+            cross_check = None
+            if spec.get("cross_check_inputs"):
+                cc_values, _cc_cov, _cc_missing, cc_periods, _cc_primary = _build_values(
+                    spec, stock, snap, extras, l2, inputs=spec["cross_check_inputs"])
+                cross_check = {k: v for k, v in cc_values.items() if v is not None}
+                if cc_periods:
+                    cross_check["report_period"] = cc_periods
             detail = _detail(rule_id, values, coverage, missing, gates, as_of,
                              with_run=(code == "dim_position_state"),
                              period_by_field=periods,
-                             primary_report_period=primary_period)
+                             primary_report_period=primary_period,
+                             cross_check=cross_check)
             if "state_raw" in detail:
                 detail["state_raw"] = result
             bucket[stock] = (result, detail)
